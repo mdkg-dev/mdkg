@@ -1,0 +1,28 @@
+{
+  "tool": "mdkg",
+  "work": {
+    "status_enum": ["backlog", "blocked", "todo", "progress", "review", "done"],
+    "priority_min": 0,
+    "priority_max": 9,
+    "next": {"status_preference": ["progress", "todo", "review", "blocked", "backlog"]}
+  },
+  "templates": {"root_path": ".mdkg/templates", "default_set": "default"},
+  "index": {
+    "tolerant": false,
+    "limits": {"max_files": 100000, "max_file_bytes": 8388608, "max_total_bytes": 536870912, "max_depth": 64}
+  },
+  "customization": {"skill_mirrors": {"targets": [".agents/skills", ".claude/skills"]}},
+  "coordination": {"leases": {"default": "exclusive", "paths": [], "unleased": "warn"}},
+  "orchestration": {"branch": "agent/{agent}", "worktree": ".worktrees/{agent}"},
+  "agents": {"defaults": {
+    "trigger": "mail",
+    "shape": {"kind": "batch", "max": 20},
+    "session": "resume",
+    "loop_guard": {"turns": 10, "window_secs": 3600},
+    "concurrency": null,
+    "timeout": null,
+    "retry": "none",
+    "budget": null,
+    "auth": {"prefer": "subscription", "api_key_fallback": false}
+  }}
+}

@@ -1,0 +1,58 @@
+{
+  "oracle": "mdkg 0.6.0 (TypeScript)",
+  "args": [
+    "search",
+    "kernel",
+    "--json"
+  ],
+  "exit_code": 0,
+  "stdout": {
+    "json": {
+      "command": "search",
+      "kind": "node",
+      "count": 1,
+      "returned_count": 1,
+      "limit": 50,
+      "truncated": false,
+      "items": [
+        {
+          "id": "edd-1",
+          "qid": "root:edd-1",
+          "ws": "root",
+          "type": "edd",
+          "title": "Example kernel design",
+          "created": "2026-01-15",
+          "updated": "2026-01-15",
+          "tags": [
+            "kernel",
+            "example"
+          ],
+          "owners": [
+            "example-team"
+          ],
+          "links": [
+            "https://example.com/design"
+          ],
+          "artifacts": [],
+          "refs": [],
+          "aliases": [
+            "kernel-design"
+          ],
+          "skills": [],
+          "attributes": {},
+          "path": ".mdkg/design/edd-1-example.md",
+          "edges": {
+            "relates": [
+              "root:dec-1"
+            ],
+            "blocked_by": [],
+            "blocks": [],
+            "context_refs": [],
+            "evidence_refs": []
+          }
+        }
+      ]
+    }
+  },
+  "stderr": ""
+}

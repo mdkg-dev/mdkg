@@ -1,0 +1,6 @@
+list --status TODO --json
+list --ws ROOT --json
+list --tags "ALPHA, gamma" --json
+search basic task --json
+show task-1
+show task-1 --meta

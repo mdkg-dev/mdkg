@@ -1,0 +1,88 @@
+{
+  "oracle": "mdkg 0.6.0 (TypeScript)",
+  "args": [
+    "list",
+    "--tags",
+    "ALPHA, gamma",
+    "--json"
+  ],
+  "exit_code": 0,
+  "stdout": {
+    "json": {
+      "command": "list",
+      "kind": "node",
+      "count": 2,
+      "items": [
+        {
+          "id": "task-1",
+          "qid": "root:task-1",
+          "ws": "root",
+          "type": "task",
+          "title": "Basic task",
+          "status": "todo",
+          "priority": 3,
+          "created": "2026-10-18",
+          "updated": "2026-10-18",
+          "tags": [
+            "alpha",
+            "beta-two"
+          ],
+          "owners": [
+            "nick"
+          ],
+          "links": [
+            "https://example.com/a"
+          ],
+          "artifacts": [],
+          "refs": [
+            "task-2"
+          ],
+          "aliases": [
+            "basic"
+          ],
+          "skills": [],
+          "attributes": {},
+          "path": ".mdkg/work/task-1-basic.md",
+          "edges": {
+            "relates": [
+              "root:task-2"
+            ],
+            "blocked_by": [],
+            "blocks": [],
+            "context_refs": [],
+            "evidence_refs": []
+          }
+        },
+        {
+          "id": "task-2",
+          "qid": "root:task-2",
+          "ws": "root",
+          "type": "task",
+          "title": "Other task",
+          "status": "backlog",
+          "created": "2026-10-18",
+          "updated": "2026-10-18",
+          "tags": [
+            "gamma"
+          ],
+          "owners": [],
+          "links": [],
+          "artifacts": [],
+          "refs": [],
+          "aliases": [],
+          "skills": [],
+          "attributes": {},
+          "path": ".mdkg/work/task-2-other.md",
+          "edges": {
+            "relates": [],
+            "blocked_by": [],
+            "blocks": [],
+            "context_refs": [],
+            "evidence_refs": []
+          }
+        }
+      ]
+    }
+  },
+  "stderr": ""
+}

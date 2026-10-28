@@ -1,0 +1,94 @@
+{
+  "oracle": "mdkg 0.6.0 (TypeScript)",
+  "args": [
+    "list",
+    "--json"
+  ],
+  "exit_code": 0,
+  "stdout": {
+    "json": {
+      "command": "list",
+      "kind": "node",
+      "count": 3,
+      "items": [
+        {
+          "id": "prd-1",
+          "qid": "root:prd-1",
+          "ws": "root",
+          "type": "prd",
+          "title": "Product",
+          "created": "2026-10-18",
+          "updated": "2026-10-18",
+          "tags": [],
+          "owners": [],
+          "links": [],
+          "artifacts": [],
+          "refs": [],
+          "aliases": [],
+          "skills": [],
+          "attributes": {},
+          "path": ".mdkg/design/prd-1-p.md",
+          "edges": {
+            "relates": [],
+            "blocked_by": [],
+            "blocks": [],
+            "context_refs": [],
+            "evidence_refs": []
+          }
+        },
+        {
+          "id": "rule-1",
+          "qid": "root:rule-1",
+          "ws": "root",
+          "type": "rule",
+          "title": "Rule one",
+          "created": "2026-10-18",
+          "updated": "2026-10-18",
+          "tags": [],
+          "owners": [],
+          "links": [],
+          "artifacts": [],
+          "refs": [],
+          "aliases": [],
+          "skills": [],
+          "attributes": {},
+          "path": ".mdkg/core/rule-1-r.md",
+          "edges": {
+            "relates": [],
+            "blocked_by": [],
+            "blocks": [],
+            "context_refs": [],
+            "evidence_refs": []
+          }
+        },
+        {
+          "id": "task-1",
+          "qid": "root:task-1",
+          "ws": "root",
+          "type": "task",
+          "title": "Nested",
+          "status": "todo",
+          "created": "2026-10-18",
+          "updated": "2026-10-18",
+          "tags": [],
+          "owners": [],
+          "links": [],
+          "artifacts": [],
+          "refs": [],
+          "aliases": [],
+          "skills": [],
+          "attributes": {},
+          "path": ".mdkg/work/sub/deeper/task-1-a.md",
+          "edges": {
+            "relates": [],
+            "blocked_by": [],
+            "blocks": [],
+            "context_refs": [],
+            "evidence_refs": []
+          }
+        }
+      ]
+    }
+  },
+  "stderr": ""
+}

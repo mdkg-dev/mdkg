@@ -1,0 +1,43 @@
+{
+  "oracle": "mdkg 0.6.0 (TypeScript)",
+  "args": [
+    "show",
+    "a_b:task-1",
+    "--json"
+  ],
+  "exit_code": 0,
+  "stdout": {
+    "json": {
+      "command": "show",
+      "kind": "node",
+      "item": {
+        "id": "task-1",
+        "qid": "a_b:task-1",
+        "ws": "a_b",
+        "type": "task",
+        "title": "Underscore workspace",
+        "status": "todo",
+        "created": "2026-10-18",
+        "updated": "2026-10-18",
+        "tags": [],
+        "owners": [],
+        "links": [],
+        "artifacts": [],
+        "refs": [],
+        "aliases": [],
+        "skills": [],
+        "attributes": {},
+        "path": "ws1/.mdkg/work/task-1.md",
+        "edges": {
+          "relates": [],
+          "blocked_by": [],
+          "blocks": [],
+          "context_refs": [],
+          "evidence_refs": []
+        },
+        "body": "# Overview\n\nBody text."
+      }
+    }
+  },
+  "stderr": ""
+}

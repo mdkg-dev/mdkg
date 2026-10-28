@@ -1,0 +1,21 @@
+[package]
+name = "mdkg-coord-sqlite"
+version = "0.7.0"
+description = "The local coordinator backend: SQLite in the git common dir, plus git reads for settlement. Internal to mdkg, no stable API; depend on the mdkg binary"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+readme = "README.md"
+
+[dependencies]
+mdkg-coord = { path = "../mdkg-coord", version = "0.7.0" }
+mdkg-format = { path = "../mdkg-format", version = "0.7.0" }
+mdkg-log = { path = "../mdkg-log", version = "0.7.0" }
+rusqlite.workspace = true
+rustix.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

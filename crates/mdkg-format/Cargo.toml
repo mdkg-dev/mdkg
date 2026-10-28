@@ -1,0 +1,31 @@
+[package]
+name = "mdkg-format"
+version = "0.7.0"
+description = "Parse and write mdkg markdown + frontmatter nodes. Internal to mdkg, no stable API; depend on the mdkg binary"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+readme = "README.md"
+
+[features]
+# `NodeId::mint` and `Uuid7::now` read the clock and the OS random source.
+# Turn it off (`default-features = false`) for a sans-IO or WASM build.
+default = ["mint"]
+mint = ["dep:uuid"]
+# Native configuration file reads; pure merge/origin support needs no I/O.
+settings-fs = ["dep:rustix"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+uuid = { workspace = true, optional = true }
+rustix = { workspace = true, optional = true }
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

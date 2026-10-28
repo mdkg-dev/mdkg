@@ -1,0 +1,41 @@
+[package]
+name = "mdkg"
+version = "0.7.0"
+description = "Local-first knowledge graph and coordination kernel for humans and coding agents"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+keywords = ["agents", "knowledge-graph", "markdown", "git", "mcp"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "mdkg"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+mdkg-coord = { path = "../mdkg-coord", version = "0.7.0" }
+mdkg-coord-sqlite = { path = "../mdkg-coord-sqlite", version = "0.7.0" }
+mdkg-log = { path = "../mdkg-log", version = "0.7.0" }
+mdkg-format = { path = "../mdkg-format", version = "0.7.0" }
+mdkg-graph = { path = "../mdkg-graph", version = "0.7.0" }
+mdkg-index = { path = "../mdkg-index", version = "0.7.0" }
+mdkg-run = { path = "../mdkg-run", version = "0.7.0" }
+# doctor reads the coordinator store's version read-only, never upgrading it;
+# migrate snapshots the store with SQLite's backup API.
+rusqlite.workspace = true
+# migrate swaps the new .mdkg in with one rename call (RENAME_EXCHANGE / RENAME_SWAP).
+rustix.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# doctor reads the Codex MCP config.
+toml_edit.workspace = true
+# init mints the graph's graph_id.
+uuid.workspace = true
+
+[lints]
+workspace = true

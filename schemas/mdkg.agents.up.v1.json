@@ -1,0 +1,793 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "mdkg.agents.up.v1",
+  "description": "Every command's JSON output.",
+  "type": "object",
+  "properties": {
+    "schema": {
+      "description": "`mdkg.<command>.v<major>`.",
+      "const": "mdkg.agents.up.v1"
+    },
+    "ok": {
+      "description": "False exactly when there is an error diagnostic; the exit code is\nnon-zero exactly when this is false.",
+      "type": "boolean"
+    },
+    "data": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/UpEvent"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "diagnostics": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/DiagnosticOut"
+      }
+    }
+  },
+  "required": [
+    "schema",
+    "ok",
+    "diagnostics"
+  ],
+  "$defs": {
+    "UpEvent": {
+      "description": "One event of `agents up`, as its JSON lines carry it.",
+      "type": "object",
+      "properties": {
+        "agent": {
+          "type": "string"
+        },
+        "event": {
+          "description": "`turn`, `wake`, `paused`, `manual` or `trouble`.",
+          "type": "string"
+        },
+        "turn": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TurnReport"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "wake": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Report"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "paused": {
+          "description": "Threads the loop guard paused, with mail waiting.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "cooldown_secs": {
+          "description": "Seconds until the soonest paused thread runs again.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "agent",
+        "event"
+      ]
+    },
+    "TurnReport": {
+      "type": "object",
+      "properties": {
+        "agent": {
+          "type": "string"
+        },
+        "harness": {
+          "$ref": "#/$defs/Harness"
+        },
+        "role": {
+          "$ref": "#/$defs/Role"
+        },
+        "outcome": {
+          "$ref": "#/$defs/Outcome"
+        },
+        "turn": {
+          "description": "The turn's number for this agent.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "session": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "shown": {
+          "description": "The messages shown to the agent (and acked, when it replied).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "approved_decisions": {
+          "description": "Revalidated decisions actually promoted into this turn prompt.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "dropped_decisions": {
+          "description": "Valid decisions left untrusted because the trusted section had no\nroom; ask their delegate to send them again.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "reply_id": {
+          "description": "The imported reply's message id.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reply": {
+          "description": "A task-only turn's final message, which wasn't imported.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "command": {
+          "description": "`--dry-run`: what would run, and its prompt.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentCommand"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "prompt": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "logs": {
+          "description": "Where the turn's files are, when they were kept.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "commit": {
+          "description": "Historical launcher-commit field, omitted by current turns. Workers commit themselves.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "commit_refused": {
+          "description": "Historical launcher-commit refusal, omitted by current turns.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "commit_refused_code": {
+          "description": "Historical launcher-commit refusal code, omitted by current turns.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "commit_note": {
+          "description": "Historical launcher-commit note, omitted by current turns.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "commit_note_failed": {
+          "description": "Historical launcher-commit note error, omitted by current turns.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "launcher_notes": {
+          "description": "Launcher notes in the agent's mail (from the launcher's own actor),\nacked unseen and dropped: their message ids.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "not_answered": {
+          "description": "Mail no reply could reach (the agent's own post, a sender whose\nname holds a comma), acked as not answered: their message ids.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "thread": {
+          "description": "The thread this turn answered ([`thread_key`]).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "usage": {
+          "description": "What the turn used, as its harness reported it (cost, tokens).",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Usage"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "paused": {
+          "description": "Threads with unacked mail this turn left alone: the loop guard\npaused them.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "dropped_allow": {
+          "description": "The agent's allow rules that are never passed to its harness (fail\nclosed): one that can't be read (an unbalanced quote, a stray\nescape, a list of rules), or one that lets mdkg run with open\narguments (`Bash(mdkg *)`, `Bash(*)`), each with what to allow\ninstead (`Bash(mdkg validate *)`, or the mdkg MCP server).",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DroppedAllow"
+          }
+        },
+        "codex_hook_trust": {
+          "description": "Per-attempt hook trust decisions, including authentication retries.\nEmpty for idle turns, reviewers and other harnesses.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CodexHookTrustReceipt"
+          }
+        }
+      },
+      "required": [
+        "agent",
+        "harness",
+        "role",
+        "outcome",
+        "shown"
+      ]
+    },
+    "Harness": {
+      "type": "string",
+      "enum": [
+        "claude",
+        "codex",
+        "opencode"
+      ]
+    },
+    "Role": {
+      "type": "string",
+      "enum": [
+        "worker",
+        "reviewer"
+      ]
+    },
+    "Outcome": {
+      "oneOf": [
+        {
+          "description": "No mail and no task: nothing ran.",
+          "type": "string",
+          "const": "idle"
+        },
+        {
+          "description": "The agent replied and the reply was imported.",
+          "type": "string",
+          "const": "replied"
+        },
+        {
+          "description": "A task-only turn ran; with no message to reply to, nothing was\nimported and the reply is in the report.",
+          "type": "string",
+          "const": "ran"
+        },
+        {
+          "description": "`--dry-run`: the command and prompt, unrun.",
+          "type": "string",
+          "const": "dry_run"
+        }
+      ]
+    },
+    "AgentCommand": {
+      "description": "A process to start for one turn. It runs with the launcher's whole\nenvironment plus `env`.",
+      "type": "object",
+      "properties": {
+        "program": {
+          "type": "string"
+        },
+        "args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "cwd": {
+          "type": "string"
+        },
+        "env": {
+          "description": "Variables set on top of the launcher's environment.",
+          "type": "array",
+          "items": {
+            "type": "array",
+            "prefixItems": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "string"
+              }
+            ],
+            "minItems": 2,
+            "maxItems": 2
+          }
+        },
+        "prompt_on_stdin": {
+          "description": "Whether the prompt goes on stdin (otherwise it's in `args`).",
+          "type": "boolean"
+        },
+        "output_file": {
+          "description": "Codex writes its final message here (`-o`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "program",
+        "args",
+        "cwd",
+        "env",
+        "prompt_on_stdin"
+      ]
+    },
+    "Usage": {
+      "description": "A turn's cost and tokens as its harness prints them: Claude's result\nevent, Codex's `tokens used` line, OpenCode's step events. Each field is\nwhat that harness says, or absent; nothing is estimated.",
+      "type": "object",
+      "properties": {
+        "cost_usd": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "input_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "output_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "cache_read_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "total_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        }
+      }
+    },
+    "DroppedAllow": {
+      "description": "An allow rule that's never passed to the harness, and what to write\ninstead.",
+      "type": "object",
+      "properties": {
+        "rule": {
+          "description": "The rule, as configured.",
+          "type": "string"
+        },
+        "fix": {
+          "description": "Why it's dropped, and what to allow instead.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "rule",
+        "fix"
+      ]
+    },
+    "CodexHookTrustReceipt": {
+      "description": "A fixed explanation of the decision made at a Codex worker spawn boundary.\nDry-run entries are previews; every actual attempt records its decision.",
+      "type": "object",
+      "properties": {
+        "attempt": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "decision": {
+          "$ref": "#/$defs/CodexHookTrust"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "preview": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "attempt",
+        "decision",
+        "reason",
+        "preview"
+      ]
+    },
+    "CodexHookTrust": {
+      "description": "The hook-trust decision for one actual Codex worker launch attempt.\nA turn with an authentication retry may have a different second decision.",
+      "oneOf": [
+        {
+          "description": "Historical receipt variant. New launches do not emit this until a\ncomplete invocation-wide hook-source inventory is qualified.",
+          "type": "string",
+          "const": "bypassed"
+        },
+        {
+          "description": "All active hook sources could not be verified; ordinary trust applies.",
+          "type": "string",
+          "const": "required"
+        }
+      ]
+    },
+    "Report": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "$ref": "#/$defs/WakeStatus"
+        },
+        "session": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "through": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "status",
+        "session",
+        "through"
+      ]
+    },
+    "WakeStatus": {
+      "type": "string",
+      "enum": [
+        "waiting",
+        "busy",
+        "suspended",
+        "paused",
+        "no_mail",
+        "queued",
+        "not_sent",
+        "delivery_unknown",
+        "mode_changed"
+      ]
+    },
+    "DiagnosticOut": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/Code"
+        },
+        "severity": {
+          "$ref": "#/$defs/SeverityName"
+        },
+        "path": {
+          "description": "Relative to the repository root.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "line": {
+          "description": "1-based.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "node": {
+          "description": "The node's id (`ws:id` outside the root workspace).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message": {
+          "type": "string"
+        },
+        "hint": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "holders": {
+          "description": "The actors it's about (a lease's holders): names other actors\nchose, so data, never part of the message.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "related": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/LocationOut"
+          }
+        }
+      },
+      "required": [
+        "code",
+        "severity",
+        "message"
+      ]
+    },
+    "Code": {
+      "description": "A stable diagnostic code.",
+      "type": "string",
+      "enum": [
+        "usage.invalid_arguments",
+        "usage.empty_query",
+        "usage.bad_limit",
+        "usage.unsupported_type",
+        "usage.unknown_field",
+        "usage.unknown_status",
+        "usage.unknown_type",
+        "usage.unknown_changeset",
+        "usage.bad_status",
+        "usage.bad_value",
+        "usage.path_outside_worktree",
+        "config.missing",
+        "config.unreadable",
+        "config.invalid",
+        "config.unknown_workspace",
+        "config.graph_v2_unsupported",
+        "frontmatter.missing_open",
+        "frontmatter.unclosed",
+        "frontmatter.blank_line",
+        "frontmatter.not_key_value",
+        "frontmatter.stray_cr",
+        "frontmatter.invalid_key",
+        "frontmatter.duplicate_key",
+        "frontmatter.empty_value",
+        "frontmatter.bad_list",
+        "frontmatter.empty_list_item",
+        "frontmatter.too_large",
+        "node.unknown_type",
+        "node.bad_id",
+        "node.unknown_key",
+        "node.wrong_kind",
+        "node.empty_field",
+        "node.not_lowercase",
+        "node.bad_date",
+        "node.missing_status",
+        "node.bad_status",
+        "node.status_not_allowed",
+        "node.bad_priority",
+        "node.priority_not_allowed",
+        "node.bad_ref",
+        "node.bad_skill_slug",
+        "node.skills_not_allowed",
+        "node.bad_scope",
+        "node.supersedes_not_allowed",
+        "node.bad_supersedes",
+        "node.bad_identity",
+        "node.identity_unsupported",
+        "node.bad_integer",
+        "node.duplicate_id",
+        "node.bad_legacy_id",
+        "node.duplicate_legacy_id",
+        "node.extension_key_conflict",
+        "node.stale_type",
+        "node.date_only",
+        "node.legacy_extension_key",
+        "node.bad_body_link",
+        "node.not_found",
+        "node.ambiguous",
+        "node.resolved",
+        "node.exists",
+        "node.none_ready",
+        "node.not_work",
+        "node.heading_missing",
+        "node.raw_prompt",
+        "node.raw_payload",
+        "node.raw_secret",
+        "node.legacy_spec_file",
+        "node.legacy_spec_type",
+        "goal.bad_state",
+        "goal.condition_too_long",
+        "goal.bad_scope_ref",
+        "goal.empty_check",
+        "goal.scope_ref_missing",
+        "goal.scope_ref_wrong_type",
+        "goal.active_node_missing",
+        "goal.active_node_wrong_type",
+        "goal.active_node_outside_scope",
+        "goal.multiple_active",
+        "goal.none_active",
+        "goal.not_goal",
+        "edge.missing_target",
+        "edge.prev_next_asymmetric",
+        "edge.cycle",
+        "template.missing",
+        "template.invalid",
+        "template.fallback",
+        "skill.both_files",
+        "skill.missing_file",
+        "skill.legacy_file",
+        "skill.missing_slug",
+        "skill.mirror_missing",
+        "skill.mirror_manifest_missing",
+        "index.limit_exceeded",
+        "io.read_failed",
+        "io.git_failed",
+        "io.write_failed",
+        "coord.lease_held",
+        "coord.cas_failed",
+        "coord.past_deadline",
+        "coord.not_owner",
+        "coord.not_active",
+        "coord.no_lease",
+        "coord.unknown_lease",
+        "coord.unknown_changeset",
+        "coord.already_settled",
+        "coord.out_of_scope",
+        "coord.observation_raced",
+        "coord.key_reused",
+        "coord.duplicate_lease",
+        "coord.sync_needed",
+        "coord.sync_failed",
+        "coord.path_missing",
+        "coord.lease_limit",
+        "coord.lease_shared",
+        "coord.node_done",
+        "coord.contains_abandoned",
+        "coord.store_failed",
+        "coord.store_restored",
+        "coord.store_upgraded",
+        "coord.authority_failed",
+        "coord.authority_remote",
+        "coord.authority_note",
+        "coord.authority_ignored",
+        "log.broken",
+        "log.anchor_mismatch",
+        "log.anchor_missing",
+        "log.anchored",
+        "edge.target_not_on_branch",
+        "edge.private_target",
+        "edge.blocks_ancestor",
+        "msg.human_actor",
+        "msg.reserved_actor",
+        "msg.bad_kind",
+        "msg.bad_id",
+        "msg.no_parts",
+        "msg.too_large",
+        "msg.secret_refused",
+        "msg.id_reused",
+        "msg.no_recipients",
+        "msg.unknown_message",
+        "msg.unknown_context",
+        "msg.not_holder",
+        "msg.not_shown",
+        "msg.wait_timeout",
+        "room.unknown",
+        "room.exists",
+        "room.not_member",
+        "room.human_member",
+        "mcp.call_timeout",
+        "mcp.cli_failed",
+        "run.unknown_agent",
+        "run.agent_failed",
+        "run.sandbox_mismatch",
+        "run.no_reply",
+        "run.mail_failed",
+        "run.io_failed",
+        "run.unsupported",
+        "run.branch_refused",
+        "run.too_many_failures",
+        "run.cwd_outside",
+        "install.unmergeable",
+        "install.unsupported_layout",
+        "init.exists",
+        "doctor.check_failed",
+        "doctor.check_warned",
+        "skill.not_found",
+        "skill.invalid",
+        "skill.mirror_drift",
+        "skill.mirror_stale",
+        "skill.mirror_targets_unsupported",
+        "skill.exists",
+        "init.needs_migrate",
+        "init.conflict",
+        "init.unexplained",
+        "usage.deprecated",
+        "migrate.plan_mismatch",
+        "migrate.dirty",
+        "migrate.in_progress",
+        "migrate.not_migrated",
+        "migrate.moved_on",
+        "migrate.store_changed",
+        "migrate.unsupported",
+        "migrate.already_migrated",
+        "migrate.step_failed"
+      ]
+    },
+    "SeverityName": {
+      "type": "string",
+      "enum": [
+        "error",
+        "warning",
+        "info"
+      ]
+    },
+    "LocationOut": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "line": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "path"
+      ]
+    }
+  }
+}

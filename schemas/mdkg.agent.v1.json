@@ -1,0 +1,168 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "mdkg.agent.v1",
+  "description": "One `.mdkg/agents/<name>.json` file. The filename names the actor.",
+  "type": "object",
+  "properties": {
+    "schema": {
+      "type": "string",
+      "const": "mdkg.agent.v1"
+    },
+    "extends": {
+      "description": "Reserved for remote definitions. Accepted and preserved, but not\nresolved by this release; a launcher refuses it explicitly.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1
+    },
+    "harness": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Harness"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "role": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Role"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "cwd": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "worktree": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "model": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "effort": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "allow": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "protect": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "base": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "instructions": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "policy": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": true
+    },
+    "reports_to": {
+      "description": "The actor receiving deterministic turn receipts.",
+      "type": "string",
+      "default": "orchestrator"
+    },
+    "mode": {
+      "description": "Cross-harness preset. This release supports auto only.",
+      "type": "string",
+      "const": "auto",
+      "default": "auto"
+    },
+    "sandbox": {
+      "description": "Override the preset with the harness's native sandbox value.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "approvals": {
+      "description": "Override the preset with the harness's native approval value.",
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "schema"
+  ],
+  "anyOf": [
+    {
+      "properties": {
+        "harness": {
+          "type": "string"
+        },
+        "role": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "harness",
+        "role"
+      ]
+    },
+    {
+      "properties": {
+        "extends": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "extends"
+      ]
+    }
+  ],
+  "$defs": {
+    "Harness": {
+      "type": "string",
+      "enum": [
+        "claude",
+        "codex",
+        "opencode"
+      ]
+    },
+    "Role": {
+      "type": "string",
+      "enum": [
+        "worker",
+        "reviewer"
+      ]
+    }
+  }
+}

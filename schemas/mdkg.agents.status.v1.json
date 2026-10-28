@@ -1,0 +1,1294 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "mdkg.agents.status.v1",
+  "description": "Every command's JSON output.",
+  "type": "object",
+  "properties": {
+    "schema": {
+      "description": "`mdkg.<command>.v<major>`.",
+      "const": "mdkg.agents.status.v1"
+    },
+    "ok": {
+      "description": "False exactly when there is an error diagnostic; the exit code is\nnon-zero exactly when this is false.",
+      "type": "boolean"
+    },
+    "data": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/StatusData"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "diagnostics": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/DiagnosticOut"
+      }
+    }
+  },
+  "required": [
+    "schema",
+    "ok",
+    "diagnostics"
+  ],
+  "$defs": {
+    "StatusData": {
+      "type": "object",
+      "properties": {
+        "agents": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AgentStatus"
+          }
+        },
+        "threads": {
+          "description": "The central record of agent threads, every harness's, newest first:\ninteractive sessions their hooks keep (working while in a turn, idle\nafter it), and threads `agents attach` keeps while it runs.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Thread"
+          }
+        },
+        "receivers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ReceiverStatus"
+          }
+        },
+        "processes": {
+          "description": "Registered launcher and MCP processes whose build-record locks are held.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Process"
+          }
+        },
+        "build_warnings": {
+          "description": "Mixed builds, changed executables, or unreadable process build records.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "agents",
+        "threads",
+        "receivers",
+        "processes",
+        "build_warnings"
+      ]
+    },
+    "AgentStatus": {
+      "description": "One agent in `agents status`.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "configured": {
+          "description": "Named in the config's `agents`.",
+          "type": "boolean"
+        },
+        "known": {
+          "description": "Has saved machine-local runtime state.",
+          "type": "boolean"
+        },
+        "harness": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Harness"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "role": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Role"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cwd": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "turns": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "policy": {
+          "$ref": "#/$defs/Policy"
+        },
+        "paused": {
+          "description": "Threads the loop guard pauses now.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "problem": {
+          "description": "Why this agent's config or policy can't run, if it can't.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "dropped_allow": {
+          "description": "Its allow rules that are never passed to its harness: unreadable,\nor letting mdkg run with open arguments, each with what to allow\ninstead. Read against this binary; a turn reads them against the\n`--binary` it runs, and its report names any it drops.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DroppedAllow"
+          }
+        },
+        "auth": {
+          "description": "The account its turns would bill now, from its harness's own login\ncheck and the Keychain's list (no key is read).",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AuthStatus"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "name",
+        "configured",
+        "known",
+        "turns",
+        "policy"
+      ]
+    },
+    "Harness": {
+      "type": "string",
+      "enum": [
+        "claude",
+        "codex",
+        "opencode"
+      ]
+    },
+    "Role": {
+      "type": "string",
+      "enum": [
+        "worker",
+        "reviewer"
+      ]
+    },
+    "Policy": {
+      "description": "An agent's policy, every field resolved.",
+      "type": "object",
+      "properties": {
+        "trigger": {
+          "$ref": "#/$defs/Trigger"
+        },
+        "shape": {
+          "$ref": "#/$defs/Shape"
+        },
+        "session": {
+          "$ref": "#/$defs/Session"
+        },
+        "loop_guard": {
+          "description": "`None` is off.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LoopGuard"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "concurrency": {
+          "description": "The most turns this supervisor runs at once; `None` is no cap.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "timeout": {
+          "description": "How long one turn may run; `None` is no limit.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "retry": {
+          "$ref": "#/$defs/Retry"
+        },
+        "budget": {
+          "description": "Planned: tokens or cost. 0.7.0 has none, so any value is a later\nkind.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Later"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "auth": {
+          "description": "Which account turns bill ([`crate::auth`]).",
+          "$ref": "#/$defs/Auth"
+        },
+        "later": {
+          "description": "Later kinds of `loop_guard`, `concurrency` and `timeout`, whose\n0.7.0 values have no room for one: kept here, so `agents status`\nshows them and an agent's own value can replace a default's.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Later"
+          }
+        }
+      },
+      "required": [
+        "trigger",
+        "shape",
+        "session",
+        "loop_guard",
+        "concurrency",
+        "timeout",
+        "retry",
+        "budget",
+        "auth"
+      ]
+    },
+    "Trigger": {
+      "oneOf": [
+        {
+          "description": "Mail to the agent or its rooms wakes it.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "mail"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "description": "Run explicitly with `mdkg agents up <name> --once`.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "manual"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "later"
+            }
+          },
+          "$ref": "#/$defs/Later",
+          "required": [
+            "kind"
+          ]
+        }
+      ]
+    },
+    "Later": {
+      "description": "A kind a later release adds, read now so the config doesn't break.",
+      "type": "object",
+      "properties": {
+        "field": {
+          "type": "string"
+        },
+        "later_kind": {
+          "description": "The kind as written (`schedule`); the field's own `kind` says\n`later`.",
+          "type": "string"
+        },
+        "settings": {
+          "description": "Its settings, as written."
+        }
+      },
+      "required": [
+        "field",
+        "later_kind",
+        "settings"
+      ]
+    },
+    "Shape": {
+      "oneOf": [
+        {
+          "description": "One run shows the agent's unacked mail (one conversation, up to\n`max` messages) and replies once; mail left over wakes the next.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "batch"
+            },
+            "max": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "kind",
+            "max"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "later"
+            }
+          },
+          "$ref": "#/$defs/Later",
+          "required": [
+            "kind"
+          ]
+        }
+      ]
+    },
+    "Session": {
+      "oneOf": [
+        {
+          "description": "Each turn resumes the agent's session.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "resume"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "later"
+            }
+          },
+          "$ref": "#/$defs/Later",
+          "required": [
+            "kind"
+          ]
+        }
+      ]
+    },
+    "LoopGuard": {
+      "description": "At most `turns` automatic turns per thread in any `window`.",
+      "type": "object",
+      "properties": {
+        "turns": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "window": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "turns",
+        "window"
+      ]
+    },
+    "Retry": {
+      "oneOf": [
+        {
+          "description": "A failed turn leaves its mail unacked; the next trigger retries.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "none"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "later"
+            }
+          },
+          "$ref": "#/$defs/Later",
+          "required": [
+            "kind"
+          ]
+        }
+      ]
+    },
+    "Auth": {
+      "description": "Which account an agent's turns bill: its harness's subscription login\nfirst, and an API key from the Keychain only when `api_key_fallback` is\non.",
+      "type": "object",
+      "properties": {
+        "prefer": {
+          "description": "Always `subscription` in 0.7.0.",
+          "$ref": "#/$defs/Prefer"
+        },
+        "api_key_fallback": {
+          "description": "Use the key when the harness isn't logged in, or once when the\nsubscription hits its usage limit.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "prefer",
+        "api_key_fallback"
+      ]
+    },
+    "Prefer": {
+      "type": "string",
+      "enum": [
+        "subscription"
+      ]
+    },
+    "DroppedAllow": {
+      "description": "An allow rule that's never passed to the harness, and what to write\ninstead.",
+      "type": "object",
+      "properties": {
+        "rule": {
+          "description": "The rule, as configured.",
+          "type": "string"
+        },
+        "fix": {
+          "description": "Why it's dropped, and what to allow instead.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "rule",
+        "fix"
+      ]
+    },
+    "AuthStatus": {
+      "description": "The account a harness would bill now, for `agents status` and `doctor`,\nwithout reading any key.",
+      "type": "object",
+      "properties": {
+        "source": {
+          "description": "`subscription`, `api_key` (the fallback), `own_config` (OpenCode) or\n`none`.",
+          "type": "string"
+        },
+        "method": {
+          "description": "The login method the harness reports, when logged in.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "api_key_fallback": {
+          "type": "boolean"
+        },
+        "key_in_keychain": {
+          "description": "Whether the Keychain holds the fallback's key.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "source",
+        "api_key_fallback",
+        "key_in_keychain"
+      ]
+    },
+    "Thread": {
+      "description": "One agent thread (a session of any harness) in the central record of\nagent threads. All harnesses share this record, with two kinds:\n- hook-observed: no owner. A session's start and stop hooks keep it,\n  short-lived processes with nothing to own it.\n- attach-owned: `owner` is the attach's process, which binds the session\n  to its actor while it runs and removes the record when it ends.\n\n`agents status` lists both.",
+      "type": "object",
+      "properties": {
+        "actor": {
+          "type": "string"
+        },
+        "harness": {
+          "description": "claude, codex or opencode.",
+          "type": "string"
+        },
+        "session": {
+          "description": "The harness's session or thread id.",
+          "type": "string"
+        },
+        "cwd": {
+          "type": "string"
+        },
+        "state": {
+          "$ref": "#/$defs/ThreadState"
+        },
+        "first_seen_ms": {
+          "description": "Earliest known observation, in milliseconds since the epoch. Old\nrecords default to zero; their next write uses the old last-seen time.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "default": 0
+        },
+        "last_seen_ms": {
+          "description": "Latest observation or attach update, in milliseconds since the epoch.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "last_state_change_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "default": 0
+        },
+        "last_observation": {
+          "description": "The latest hook, kept independently of attach updates.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HookObservation"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "last_session_start": {
+          "description": "Retained across prompt/stop hooks so attach cannot miss a SessionStart\nmerely because another hook followed it before the next poll.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HookObservation"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "owner": {
+          "description": "The attach owning it; `None` for a hook-observed thread.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Owner"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "actor",
+        "harness",
+        "session",
+        "cwd",
+        "state",
+        "first_seen_ms",
+        "last_seen_ms",
+        "last_state_change_ms"
+      ]
+    },
+    "ThreadState": {
+      "description": "Whether an agent thread is in a turn or waiting for one.",
+      "type": "string",
+      "enum": [
+        "working",
+        "idle"
+      ]
+    },
+    "HookObservation": {
+      "description": "One hook observation, with its own time. A later attach update must not\nmake an old hook observation look new.",
+      "type": "object",
+      "properties": {
+        "event": {
+          "$ref": "#/$defs/HookEvent"
+        },
+        "harness_event": {
+          "description": "Unknown or absent harness events stay absent; never infer SessionStart.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HarnessEvent"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "at_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "start_provenance": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StartProvenance"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "event",
+        "harness_event",
+        "at_ms"
+      ]
+    },
+    "HookEvent": {
+      "description": "The mdkg event that observed a thread. Waits and edits do not change it.",
+      "type": "string",
+      "enum": [
+        "start",
+        "stop"
+      ]
+    },
+    "HarnessEvent": {
+      "description": "Only harness events that mdkg uses to observe a thread. Never store a\ncaller's free text in an event field.",
+      "type": "string",
+      "enum": [
+        "SessionStart",
+        "UserPromptSubmit",
+        "Stop",
+        "context",
+        "session.execution.succeeded"
+      ]
+    },
+    "StartProvenance": {
+      "type": "object",
+      "properties": {
+        "source": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StartSource"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "agent_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "StartSource": {
+      "description": "The allowed reasons for a SessionStart, including Codex's `source`.",
+      "type": "string",
+      "enum": [
+        "startup",
+        "resume",
+        "clear",
+        "compact",
+        "fork"
+      ]
+    },
+    "AgentId": {
+      "description": "A subagent id, bounded and restricted to ASCII letters, digits, `_`\nand `-`. The private field and validated deserializer enforce the same\ngrammar for hook input and stored records.",
+      "type": "string"
+    },
+    "Owner": {
+      "description": "The process that owns an attach-owned thread (Codex's foreground\n`mdkg agents attach`, which wraps the TUI): the launcher's holder record\n(host, pid and start time, so a reused pid isn't taken for it) and a\ngeneration, so an attach removes only its own record.",
+      "type": "object",
+      "properties": {
+        "host": {
+          "type": "string"
+        },
+        "pid": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "started": {
+          "description": "The process's start time as `ps` prints it.",
+          "type": "string"
+        },
+        "generation": {
+          "description": "Chosen by the attach, new for each run.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "host",
+        "pid",
+        "started",
+        "generation"
+      ]
+    },
+    "ReceiverStatus": {
+      "type": "object",
+      "properties": {
+        "actor": {
+          "type": "string"
+        },
+        "route": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Route"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "problem": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "actor",
+        "route",
+        "problem"
+      ]
+    },
+    "Route": {
+      "type": "object",
+      "properties": {
+        "actor": {
+          "type": "string"
+        },
+        "session": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cwd": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "suspended": {
+          "type": "boolean"
+        },
+        "working": {
+          "type": "boolean"
+        },
+        "at_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "reset_at_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "generation": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "default": 0
+        },
+        "observation_pending": {
+          "type": "boolean",
+          "default": true
+        },
+        "last_attempt": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Attempt"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "primaries": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string"
+          }
+        },
+        "subagents": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "actor",
+        "session",
+        "cwd",
+        "suspended",
+        "working",
+        "at_ms",
+        "reset_at_ms",
+        "generation",
+        "observation_pending",
+        "last_attempt",
+        "primaries",
+        "subagents"
+      ]
+    },
+    "Attempt": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "session": {
+          "type": "string"
+        },
+        "through": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "at_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "delivery": {
+          "$ref": "#/$defs/Delivery"
+        }
+      },
+      "required": [
+        "id",
+        "session",
+        "through",
+        "at_ms",
+        "delivery"
+      ]
+    },
+    "Delivery": {
+      "type": "string",
+      "enum": [
+        "queued",
+        "not_sent",
+        "delivery_unknown"
+      ]
+    },
+    "Process": {
+      "type": "object",
+      "properties": {
+        "schema": {
+          "type": "string"
+        },
+        "pid": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "kind": {
+          "$ref": "#/$defs/Kind"
+        },
+        "executable": {
+          "type": "string"
+        },
+        "fingerprint": {
+          "$ref": "#/$defs/Fingerprint"
+        },
+        "build": {
+          "$ref": "#/$defs/Build"
+        },
+        "agents": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "pid",
+        "kind",
+        "executable",
+        "fingerprint",
+        "build",
+        "agents"
+      ]
+    },
+    "Kind": {
+      "type": "string",
+      "enum": [
+        "launcher",
+        "mcp"
+      ]
+    },
+    "Fingerprint": {
+      "description": "An executable's identity and change times. Following a symlink here is\ndeliberate: replacing either the link's target or the file is an upgrade.",
+      "type": "object",
+      "properties": {
+        "dev": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "ino": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "size": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "mtime": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "mtime_ns": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "ctime": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "ctime_ns": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "dev",
+        "ino",
+        "size",
+        "mtime",
+        "mtime_ns",
+        "ctime",
+        "ctime_ns"
+      ]
+    },
+    "Build": {
+      "type": "object",
+      "properties": {
+        "version": {
+          "type": "string"
+        },
+        "commit": {
+          "type": "string"
+        },
+        "dirty": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "built": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "commit",
+        "dirty",
+        "built"
+      ]
+    },
+    "DiagnosticOut": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/Code"
+        },
+        "severity": {
+          "$ref": "#/$defs/SeverityName"
+        },
+        "path": {
+          "description": "Relative to the repository root.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "line": {
+          "description": "1-based.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "node": {
+          "description": "The node's id (`ws:id` outside the root workspace).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message": {
+          "type": "string"
+        },
+        "hint": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "holders": {
+          "description": "The actors it's about (a lease's holders): names other actors\nchose, so data, never part of the message.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "related": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/LocationOut"
+          }
+        }
+      },
+      "required": [
+        "code",
+        "severity",
+        "message"
+      ]
+    },
+    "Code": {
+      "description": "A stable diagnostic code.",
+      "type": "string",
+      "enum": [
+        "usage.invalid_arguments",
+        "usage.empty_query",
+        "usage.bad_limit",
+        "usage.unsupported_type",
+        "usage.unknown_field",
+        "usage.unknown_status",
+        "usage.unknown_type",
+        "usage.unknown_changeset",
+        "usage.bad_status",
+        "usage.bad_value",
+        "usage.path_outside_worktree",
+        "config.missing",
+        "config.unreadable",
+        "config.invalid",
+        "config.unknown_workspace",
+        "config.graph_v2_unsupported",
+        "frontmatter.missing_open",
+        "frontmatter.unclosed",
+        "frontmatter.blank_line",
+        "frontmatter.not_key_value",
+        "frontmatter.stray_cr",
+        "frontmatter.invalid_key",
+        "frontmatter.duplicate_key",
+        "frontmatter.empty_value",
+        "frontmatter.bad_list",
+        "frontmatter.empty_list_item",
+        "frontmatter.too_large",
+        "node.unknown_type",
+        "node.bad_id",
+        "node.unknown_key",
+        "node.wrong_kind",
+        "node.empty_field",
+        "node.not_lowercase",
+        "node.bad_date",
+        "node.missing_status",
+        "node.bad_status",
+        "node.status_not_allowed",
+        "node.bad_priority",
+        "node.priority_not_allowed",
+        "node.bad_ref",
+        "node.bad_skill_slug",
+        "node.skills_not_allowed",
+        "node.bad_scope",
+        "node.supersedes_not_allowed",
+        "node.bad_supersedes",
+        "node.bad_identity",
+        "node.identity_unsupported",
+        "node.bad_integer",
+        "node.duplicate_id",
+        "node.bad_legacy_id",
+        "node.duplicate_legacy_id",
+        "node.extension_key_conflict",
+        "node.stale_type",
+        "node.date_only",
+        "node.legacy_extension_key",
+        "node.bad_body_link",
+        "node.not_found",
+        "node.ambiguous",
+        "node.resolved",
+        "node.exists",
+        "node.none_ready",
+        "node.not_work",
+        "node.heading_missing",
+        "node.raw_prompt",
+        "node.raw_payload",
+        "node.raw_secret",
+        "node.legacy_spec_file",
+        "node.legacy_spec_type",
+        "goal.bad_state",
+        "goal.condition_too_long",
+        "goal.bad_scope_ref",
+        "goal.empty_check",
+        "goal.scope_ref_missing",
+        "goal.scope_ref_wrong_type",
+        "goal.active_node_missing",
+        "goal.active_node_wrong_type",
+        "goal.active_node_outside_scope",
+        "goal.multiple_active",
+        "goal.none_active",
+        "goal.not_goal",
+        "edge.missing_target",
+        "edge.prev_next_asymmetric",
+        "edge.cycle",
+        "template.missing",
+        "template.invalid",
+        "template.fallback",
+        "skill.both_files",
+        "skill.missing_file",
+        "skill.legacy_file",
+        "skill.missing_slug",
+        "skill.mirror_missing",
+        "skill.mirror_manifest_missing",
+        "index.limit_exceeded",
+        "io.read_failed",
+        "io.git_failed",
+        "io.write_failed",
+        "coord.lease_held",
+        "coord.cas_failed",
+        "coord.past_deadline",
+        "coord.not_owner",
+        "coord.not_active",
+        "coord.no_lease",
+        "coord.unknown_lease",
+        "coord.unknown_changeset",
+        "coord.already_settled",
+        "coord.out_of_scope",
+        "coord.observation_raced",
+        "coord.key_reused",
+        "coord.duplicate_lease",
+        "coord.sync_needed",
+        "coord.sync_failed",
+        "coord.path_missing",
+        "coord.lease_limit",
+        "coord.lease_shared",
+        "coord.node_done",
+        "coord.contains_abandoned",
+        "coord.store_failed",
+        "coord.store_restored",
+        "coord.store_upgraded",
+        "coord.authority_failed",
+        "coord.authority_remote",
+        "coord.authority_note",
+        "coord.authority_ignored",
+        "log.broken",
+        "log.anchor_mismatch",
+        "log.anchor_missing",
+        "log.anchored",
+        "edge.target_not_on_branch",
+        "edge.private_target",
+        "edge.blocks_ancestor",
+        "msg.human_actor",
+        "msg.reserved_actor",
+        "msg.bad_kind",
+        "msg.bad_id",
+        "msg.no_parts",
+        "msg.too_large",
+        "msg.secret_refused",
+        "msg.id_reused",
+        "msg.no_recipients",
+        "msg.unknown_message",
+        "msg.unknown_context",
+        "msg.not_holder",
+        "msg.not_shown",
+        "msg.wait_timeout",
+        "room.unknown",
+        "room.exists",
+        "room.not_member",
+        "room.human_member",
+        "mcp.call_timeout",
+        "mcp.cli_failed",
+        "run.unknown_agent",
+        "run.agent_failed",
+        "run.sandbox_mismatch",
+        "run.no_reply",
+        "run.mail_failed",
+        "run.io_failed",
+        "run.unsupported",
+        "run.branch_refused",
+        "run.too_many_failures",
+        "run.cwd_outside",
+        "install.unmergeable",
+        "install.unsupported_layout",
+        "init.exists",
+        "doctor.check_failed",
+        "doctor.check_warned",
+        "skill.not_found",
+        "skill.invalid",
+        "skill.mirror_drift",
+        "skill.mirror_stale",
+        "skill.mirror_targets_unsupported",
+        "skill.exists",
+        "init.needs_migrate",
+        "init.conflict",
+        "init.unexplained",
+        "usage.deprecated",
+        "migrate.plan_mismatch",
+        "migrate.dirty",
+        "migrate.in_progress",
+        "migrate.not_migrated",
+        "migrate.moved_on",
+        "migrate.store_changed",
+        "migrate.unsupported",
+        "migrate.already_migrated",
+        "migrate.step_failed"
+      ]
+    },
+    "SeverityName": {
+      "type": "string",
+      "enum": [
+        "error",
+        "warning",
+        "info"
+      ]
+    },
+    "LocationOut": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "line": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "path"
+      ]
+    }
+  }
+}

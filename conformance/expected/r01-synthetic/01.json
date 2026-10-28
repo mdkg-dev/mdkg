@@ -1,0 +1,278 @@
+{
+  "oracle": "mdkg 0.6.0 (TypeScript)",
+  "args": [
+    "list",
+    "--json"
+  ],
+  "exit_code": 0,
+  "stdout": {
+    "json": {
+      "command": "list",
+      "kind": "node",
+      "count": 7,
+      "items": [
+        {
+          "id": "task-1",
+          "qid": "aux:task-1",
+          "ws": "aux",
+          "type": "task",
+          "title": "Finish the example",
+          "status": "done",
+          "priority": 3,
+          "created": "2026-01-15",
+          "updated": "2026-01-15",
+          "tags": [
+            "example",
+            "finish"
+          ],
+          "owners": [],
+          "links": [],
+          "artifacts": [],
+          "refs": [],
+          "aliases": [],
+          "skills": [],
+          "attributes": {},
+          "path": "aux/.mdkg/work/task-1-finish.md",
+          "edges": {
+            "parent": "root:goal-1",
+            "prev": "root:task-1",
+            "relates": [
+              "root:dec-1"
+            ],
+            "blocked_by": [
+              "root:task-1"
+            ],
+            "blocks": [],
+            "context_refs": [],
+            "evidence_refs": []
+          }
+        },
+        {
+          "id": "chk-1",
+          "qid": "root:chk-1",
+          "ws": "root",
+          "type": "checkpoint",
+          "title": "Example summary",
+          "status": "done",
+          "created": "2026-01-15",
+          "updated": "2026-01-15",
+          "tags": [
+            "example"
+          ],
+          "owners": [],
+          "links": [],
+          "artifacts": [],
+          "refs": [],
+          "aliases": [],
+          "skills": [],
+          "attributes": {},
+          "path": ".mdkg/work/chk-1-summary.md",
+          "edges": {
+            "relates": [],
+            "blocked_by": [],
+            "blocks": [],
+            "context_refs": [],
+            "evidence_refs": []
+          }
+        },
+        {
+          "id": "dec-1",
+          "qid": "root:dec-1",
+          "ws": "root",
+          "type": "dec",
+          "title": "Example decision",
+          "status": "accepted",
+          "created": "2026-01-15",
+          "updated": "2026-01-15",
+          "tags": [
+            "example"
+          ],
+          "owners": [],
+          "links": [],
+          "artifacts": [],
+          "refs": [
+            "edd-1"
+          ],
+          "aliases": [],
+          "skills": [],
+          "attributes": {},
+          "path": ".mdkg/design/dec-1-example.md",
+          "edges": {
+            "relates": [
+              "root:edd-1",
+              "root:goal-1"
+            ],
+            "blocked_by": [],
+            "blocks": [],
+            "context_refs": [],
+            "evidence_refs": []
+          }
+        },
+        {
+          "id": "edd-1",
+          "qid": "root:edd-1",
+          "ws": "root",
+          "type": "edd",
+          "title": "Example kernel design",
+          "created": "2026-01-15",
+          "updated": "2026-01-15",
+          "tags": [
+            "kernel",
+            "example"
+          ],
+          "owners": [
+            "example-team"
+          ],
+          "links": [
+            "https://example.com/design"
+          ],
+          "artifacts": [],
+          "refs": [],
+          "aliases": [
+            "kernel-design"
+          ],
+          "skills": [],
+          "attributes": {},
+          "path": ".mdkg/design/edd-1-example.md",
+          "edges": {
+            "relates": [
+              "root:dec-1"
+            ],
+            "blocked_by": [],
+            "blocks": [],
+            "context_refs": [],
+            "evidence_refs": []
+          }
+        },
+        {
+          "id": "goal-1",
+          "qid": "root:goal-1",
+          "ws": "root",
+          "type": "goal",
+          "title": "Example goal",
+          "status": "todo",
+          "priority": 1,
+          "created": "2026-01-15",
+          "updated": "2026-01-15",
+          "tags": [
+            "example"
+          ],
+          "owners": [],
+          "links": [],
+          "artifacts": [],
+          "refs": [],
+          "aliases": [],
+          "skills": [],
+          "attributes": {
+            "goal_state": "active",
+            "goal_condition": "Both example tasks are done",
+            "scope_refs": [
+              "task-1"
+            ],
+            "active_node": "task-1",
+            "required_skills": [
+              "example-check"
+            ],
+            "required_checks": [
+              "the example check passes"
+            ],
+            "max_iterations": "5",
+            "blocked_after_attempts": "2"
+          },
+          "path": ".mdkg/work/goal-1-example.md",
+          "edges": {
+            "relates": [
+              "root:dec-1"
+            ],
+            "blocked_by": [],
+            "blocks": [],
+            "context_refs": [],
+            "evidence_refs": []
+          }
+        },
+        {
+          "id": "rule-1",
+          "qid": "root:rule-1",
+          "ws": "root",
+          "type": "rule",
+          "title": "Example writing rule",
+          "created": "2026-01-15",
+          "updated": "2026-01-15",
+          "tags": [
+            "style"
+          ],
+          "owners": [
+            "example-team"
+          ],
+          "links": [
+            "https://example.com/style"
+          ],
+          "artifacts": [],
+          "refs": [
+            "edd-1"
+          ],
+          "aliases": [
+            "writing-rule"
+          ],
+          "skills": [],
+          "attributes": {},
+          "path": ".mdkg/core/rule-1-example.md",
+          "edges": {
+            "relates": [],
+            "blocked_by": [],
+            "blocks": [],
+            "context_refs": [],
+            "evidence_refs": []
+          }
+        },
+        {
+          "id": "task-1",
+          "qid": "root:task-1",
+          "ws": "root",
+          "type": "task",
+          "title": "Start the example",
+          "status": "todo",
+          "priority": 2,
+          "created": "2026-01-15",
+          "updated": "2026-01-15",
+          "tags": [
+            "example",
+            "start"
+          ],
+          "owners": [
+            "example-team"
+          ],
+          "links": [],
+          "artifacts": [],
+          "refs": [
+            "rule-1"
+          ],
+          "aliases": [],
+          "skills": [
+            "example-check"
+          ],
+          "attributes": {},
+          "path": ".mdkg/work/task-1-start.md",
+          "edges": {
+            "parent": "root:goal-1",
+            "next": "aux:task-1",
+            "relates": [
+              "root:dec-1"
+            ],
+            "blocked_by": [],
+            "blocks": [
+              "aux:task-1"
+            ],
+            "context_refs": [
+              "root:edd-1"
+            ],
+            "evidence_refs": [
+              "https://example.com/evidence"
+            ]
+          }
+        }
+      ]
+    }
+  },
+  "stderr": ""
+}

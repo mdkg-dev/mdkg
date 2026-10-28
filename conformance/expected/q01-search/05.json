@@ -1,0 +1,55 @@
+{
+  "oracle": "mdkg 0.6.0 (TypeScript)",
+  "args": [
+    "search",
+    "frontmatter",
+    "--type",
+    "task",
+    "--limit",
+    "1",
+    "--json"
+  ],
+  "exit_code": 0,
+  "stdout": {
+    "json": {
+      "command": "search",
+      "kind": "node",
+      "count": 2,
+      "returned_count": 1,
+      "limit": 1,
+      "truncated": true,
+      "items": [
+        {
+          "id": "task-1",
+          "qid": "root:task-1",
+          "ws": "root",
+          "type": "task",
+          "title": "Parser for Frontmatter",
+          "status": "todo",
+          "created": "2026-10-18",
+          "updated": "2026-10-18",
+          "tags": [
+            "format",
+            "parser"
+          ],
+          "owners": [],
+          "links": [],
+          "artifacts": [],
+          "refs": [],
+          "aliases": [],
+          "skills": [],
+          "attributes": {},
+          "path": ".mdkg/work/task-1-a.md",
+          "edges": {
+            "relates": [],
+            "blocked_by": [],
+            "blocks": [],
+            "context_refs": [],
+            "evidence_refs": []
+          }
+        }
+      ]
+    }
+  },
+  "stderr": ""
+}

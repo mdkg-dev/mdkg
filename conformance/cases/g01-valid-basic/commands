@@ -1,0 +1,4 @@
+list --json
+validate --json
+show task-1 --json
+show root:task-2 --json

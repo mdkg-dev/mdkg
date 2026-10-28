@@ -1,0 +1,12 @@
+{
+  "oracle": "mdkg 0.6.0 (TypeScript)",
+  "args": [
+    "list",
+    "--json"
+  ],
+  "exit_code": 4,
+  "stdout": {
+    "json": null
+  },
+  "stderr": "<ROOT>/.mdkg/work/x-1.md: parent must be a string\n"
+}

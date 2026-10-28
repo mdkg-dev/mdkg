@@ -1,0 +1,5 @@
+list --json
+validate --json
+show task-1 --json
+show task-2 --json
+show task-3 --json

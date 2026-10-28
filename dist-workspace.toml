@@ -1,0 +1,45 @@
+[workspace]
+members = ["cargo:."]
+
+# cargo-dist builds the release from a version tag (.github/workflows/
+# release.yml, which `dist generate` writes from this file: edit this, then
+# run `dist generate`). docs/releasing.md has the steps.
+[dist]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.32.0"
+# CI backends to support
+ci = "github"
+# The installers to generate for each app. "powershell" joins when the
+# Windows target does (0.7.1).
+installers = ["shell", "npm", "homebrew"]
+# A GitHub repo to push Homebrew formulas to
+tap = "mdkg-dev/homebrew-tap"
+# Publish jobs to run in CI
+publish-jobs = ["homebrew", "npm"]
+# Target platforms to build apps for (Rust target-triple syntax). Windows
+# waits for 0.7.1: the coordinator's git and file handling are Unix-only
+# today. To turn it on, swap the two `targets` lines, add "powershell" to
+# `installers`, and run `dist generate`.
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-musl", "x86_64-unknown-linux-musl"]
+# targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-musl", "x86_64-unknown-linux-musl", "x86_64-pc-windows-msvc"]
+# Path that installers should place binaries in
+install-path = "CARGO_HOME"
+# Whether to install an updater program
+install-updater = false
+# The archive format to use for non-windows builds (defaults .tar.xz)
+unix-archive = ".tar.gz"
+# Checksums to generate for each App
+checksum = "sha256"
+# The npm package should have this name
+npm-package = "mdkg"
+# Which actions to run on pull requests
+pr-run-mode = "plan"
+# release.yml is edited after `dist generate`: scripts/pin-workflows.py pins
+# its actions by commit and installs dist at a fixed version with
+# `cargo install --locked`. Run it after every `dist generate`.
+allow-dirty = ["ci"]
+# Whether to enable GitHub Attestations
+github-attestations = true
+# The dependencies' license notices go in every archive, beside LICENSE
+# (scripts/third-party-notices.py writes them).
+include = ["THIRD_PARTY_NOTICES.md"]

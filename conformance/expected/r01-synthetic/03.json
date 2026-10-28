@@ -1,0 +1,53 @@
+{
+  "oracle": "mdkg 0.6.0 (TypeScript)",
+  "args": [
+    "show",
+    "edd-1",
+    "--json"
+  ],
+  "exit_code": 0,
+  "stdout": {
+    "json": {
+      "command": "show",
+      "kind": "node",
+      "item": {
+        "id": "edd-1",
+        "qid": "root:edd-1",
+        "ws": "root",
+        "type": "edd",
+        "title": "Example kernel design",
+        "created": "2026-01-15",
+        "updated": "2026-01-15",
+        "tags": [
+          "kernel",
+          "example"
+        ],
+        "owners": [
+          "example-team"
+        ],
+        "links": [
+          "https://example.com/design"
+        ],
+        "artifacts": [],
+        "refs": [],
+        "aliases": [
+          "kernel-design"
+        ],
+        "skills": [],
+        "attributes": {},
+        "path": ".mdkg/design/edd-1-example.md",
+        "edges": {
+          "relates": [
+            "root:dec-1"
+          ],
+          "blocked_by": [],
+          "blocks": [],
+          "context_refs": [],
+          "evidence_refs": []
+        },
+        "body": "# Overview\n\nAn invented design for a small kernel.\n\n# Architecture\n\nAn invented design for a small kernel.\n\n# Data model\n\nAn invented design for a small kernel.\n\n# APIs / interfaces\n\nAn invented design for a small kernel.\n\n# Failure modes\n\nAn invented design for a small kernel.\n\n# Observability\n\nAn invented design for a small kernel.\n\n# Security / privacy\n\nAn invented design for a small kernel.\n\n# Testing strategy\n\nAn invented design for a small kernel."
+      }
+    }
+  },
+  "stderr": ""
+}

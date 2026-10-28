@@ -1,0 +1,63 @@
+{
+  "oracle": "mdkg 0.6.0 (TypeScript)",
+  "args": [
+    "search",
+    "basic",
+    "task",
+    "--json"
+  ],
+  "exit_code": 0,
+  "stdout": {
+    "json": {
+      "command": "search",
+      "kind": "node",
+      "count": 1,
+      "returned_count": 1,
+      "limit": 50,
+      "truncated": false,
+      "items": [
+        {
+          "id": "task-1",
+          "qid": "root:task-1",
+          "ws": "root",
+          "type": "task",
+          "title": "Basic task",
+          "status": "todo",
+          "priority": 3,
+          "created": "2026-10-18",
+          "updated": "2026-10-18",
+          "tags": [
+            "alpha",
+            "beta-two"
+          ],
+          "owners": [
+            "nick"
+          ],
+          "links": [
+            "https://example.com/a"
+          ],
+          "artifacts": [],
+          "refs": [
+            "task-2"
+          ],
+          "aliases": [
+            "basic"
+          ],
+          "skills": [],
+          "attributes": {},
+          "path": ".mdkg/work/task-1-basic.md",
+          "edges": {
+            "relates": [
+              "root:task-2"
+            ],
+            "blocked_by": [],
+            "blocks": [],
+            "context_refs": [],
+            "evidence_refs": []
+          }
+        }
+      ]
+    }
+  },
+  "stderr": ""
+}

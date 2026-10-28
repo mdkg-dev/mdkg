@@ -1,0 +1,12 @@
+{
+  "oracle": "mdkg 0.6.0 (TypeScript)",
+  "args": [
+    "list",
+    "--json"
+  ],
+  "exit_code": 4,
+  "stdout": {
+    "json": null
+  },
+  "stderr": "<ROOT>/.mdkg/work/task-1-x.md:5: frontmatter lines must not be blank\n"
+}

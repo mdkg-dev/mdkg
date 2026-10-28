@@ -1,0 +1,98 @@
+{
+  "oracle": "mdkg 0.6.0 (TypeScript)",
+  "args": [
+    "list",
+    "--json"
+  ],
+  "exit_code": 0,
+  "stdout": {
+    "json": {
+      "command": "list",
+      "kind": "node",
+      "count": 3,
+      "items": [
+        {
+          "id": "dec-1",
+          "qid": "root:dec-1",
+          "ws": "root",
+          "type": "dec",
+          "title": "Accepted",
+          "status": "accepted",
+          "created": "2026-10-18",
+          "updated": "2026-10-18",
+          "tags": [],
+          "owners": [],
+          "links": [],
+          "artifacts": [],
+          "refs": [],
+          "aliases": [],
+          "skills": [],
+          "attributes": {},
+          "path": ".mdkg/design/dec-1-a.md",
+          "edges": {
+            "relates": [],
+            "blocked_by": [],
+            "blocks": [],
+            "context_refs": [],
+            "evidence_refs": []
+          }
+        },
+        {
+          "id": "dec-2",
+          "qid": "root:dec-2",
+          "ws": "root",
+          "type": "dec",
+          "title": "Supersedes one",
+          "status": "proposed",
+          "created": "2026-10-18",
+          "updated": "2026-10-18",
+          "tags": [],
+          "owners": [],
+          "links": [],
+          "artifacts": [],
+          "refs": [],
+          "aliases": [],
+          "skills": [],
+          "attributes": {
+            "supersedes": "dec-1"
+          },
+          "path": ".mdkg/design/dec-2-b.md",
+          "edges": {
+            "relates": [],
+            "blocked_by": [],
+            "blocks": [],
+            "context_refs": [],
+            "evidence_refs": []
+          }
+        },
+        {
+          "id": "dec-3",
+          "qid": "root:dec-3",
+          "ws": "root",
+          "type": "dec",
+          "title": "Rejected",
+          "status": "rejected",
+          "created": "2026-10-18",
+          "updated": "2026-10-18",
+          "tags": [],
+          "owners": [],
+          "links": [],
+          "artifacts": [],
+          "refs": [],
+          "aliases": [],
+          "skills": [],
+          "attributes": {},
+          "path": ".mdkg/design/dec-3-c.md",
+          "edges": {
+            "relates": [],
+            "blocked_by": [],
+            "blocks": [],
+            "context_refs": [],
+            "evidence_refs": []
+          }
+        }
+      ]
+    }
+  },
+  "stderr": ""
+}

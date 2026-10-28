@@ -1,0 +1,13 @@
+{
+  "schema_version": 3,
+  "format_version": "0.7",
+  "graph_id": "01a18297-cc6e-749e-b721-4af38d164099",
+  "work": {
+    "location": "git"
+  },
+  "orchestration": {
+    "branch": "agent/{agent}",
+    "worktree": ".worktrees/{agent}"
+  },
+  "projections": []
+}

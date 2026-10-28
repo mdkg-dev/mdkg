@@ -1,0 +1,172 @@
+{
+  "oracle": "mdkg 0.6.0 (TypeScript)",
+  "args": [
+    "list",
+    "--json"
+  ],
+  "exit_code": 0,
+  "stdout": {
+    "json": {
+      "command": "list",
+      "kind": "node",
+      "count": 5,
+      "items": [
+        {
+          "id": "epic-1",
+          "qid": "root:epic-1",
+          "ws": "root",
+          "type": "epic",
+          "title": "Epic",
+          "status": "todo",
+          "created": "2026-10-18",
+          "updated": "2026-10-18",
+          "tags": [],
+          "owners": [],
+          "links": [],
+          "artifacts": [],
+          "refs": [],
+          "aliases": [],
+          "skills": [],
+          "attributes": {},
+          "path": ".mdkg/work/epic-1-e.md",
+          "edges": {
+            "relates": [],
+            "blocked_by": [],
+            "blocks": [],
+            "context_refs": [],
+            "evidence_refs": []
+          }
+        },
+        {
+          "id": "goal-1",
+          "qid": "root:goal-1",
+          "ws": "root",
+          "type": "goal",
+          "title": "Goal",
+          "status": "todo",
+          "created": "2026-10-18",
+          "updated": "2026-10-18",
+          "tags": [],
+          "owners": [],
+          "links": [],
+          "artifacts": [],
+          "refs": [],
+          "aliases": [],
+          "skills": [],
+          "attributes": {
+            "goal_state": "active",
+            "goal_condition": "Ship it",
+            "scope_refs": [],
+            "required_skills": [],
+            "required_checks": [],
+            "max_iterations": "25",
+            "blocked_after_attempts": "3"
+          },
+          "path": ".mdkg/work/goal-1-g.md",
+          "edges": {
+            "relates": [],
+            "blocked_by": [],
+            "blocks": [],
+            "context_refs": [],
+            "evidence_refs": []
+          }
+        },
+        {
+          "id": "task-1",
+          "qid": "root:task-1",
+          "ws": "root",
+          "type": "task",
+          "title": "A",
+          "status": "todo",
+          "created": "2026-10-18",
+          "updated": "2026-10-18",
+          "tags": [],
+          "owners": [],
+          "links": [],
+          "artifacts": [],
+          "refs": [],
+          "aliases": [],
+          "skills": [],
+          "attributes": {},
+          "path": ".mdkg/work/task-1-a.md",
+          "edges": {
+            "epic": "root:epic-1",
+            "parent": "root:goal-1",
+            "next": "root:task-2",
+            "relates": [
+              "root:task-3"
+            ],
+            "blocked_by": [],
+            "blocks": [
+              "root:task-2"
+            ],
+            "context_refs": [],
+            "evidence_refs": []
+          }
+        },
+        {
+          "id": "task-2",
+          "qid": "root:task-2",
+          "ws": "root",
+          "type": "task",
+          "title": "B",
+          "status": "todo",
+          "created": "2026-10-18",
+          "updated": "2026-10-18",
+          "tags": [],
+          "owners": [],
+          "links": [],
+          "artifacts": [],
+          "refs": [],
+          "aliases": [],
+          "skills": [],
+          "attributes": {},
+          "path": ".mdkg/work/task-2-b.md",
+          "edges": {
+            "prev": "root:task-1",
+            "relates": [],
+            "blocked_by": [
+              "root:task-1"
+            ],
+            "blocks": [],
+            "context_refs": [
+              "root:epic-1"
+            ],
+            "evidence_refs": [
+              "root:task-3"
+            ]
+          }
+        },
+        {
+          "id": "task-3",
+          "qid": "root:task-3",
+          "ws": "root",
+          "type": "task",
+          "title": "C",
+          "status": "todo",
+          "created": "2026-10-18",
+          "updated": "2026-10-18",
+          "tags": [],
+          "owners": [],
+          "links": [],
+          "artifacts": [],
+          "refs": [],
+          "aliases": [],
+          "skills": [],
+          "attributes": {},
+          "path": ".mdkg/work/task-3-c.md",
+          "edges": {
+            "relates": [
+              "root:task-1"
+            ],
+            "blocked_by": [],
+            "blocks": [],
+            "context_refs": [],
+            "evidence_refs": []
+          }
+        }
+      ]
+    }
+  },
+  "stderr": ""
+}

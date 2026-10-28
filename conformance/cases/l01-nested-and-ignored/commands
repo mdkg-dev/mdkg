@@ -1,0 +1,4 @@
+list --json
+validate --json
+list --type rule --json
+list --type prd --json

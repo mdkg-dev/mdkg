@@ -1,0 +1,6 @@
+{
+  "schema_version": 2,
+  "tool": "mdkg",
+  "workspaces": { "root": { "path": ".", "enabled": true, "mdkg_dir": ".mdkg" } },
+  "index": { "backend": "json" }
+}

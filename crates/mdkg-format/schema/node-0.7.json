@@ -1,0 +1,2212 @@
+{
+  "$comment": "The normative node schema of mdkg format 0.7 (docs/format-0.7.md, section 3.5). Changing it is a format change: a new format_version.",
+  "format_version": "0.7",
+  "kinds": {
+    "scalar": "a string value",
+    "list": "a [a, b] list",
+    "boolean": "true or false"
+  },
+  "constraints": {
+    "node-id": "<type>-<uuid> (section 4)",
+    "type": "one of the types below",
+    "non-empty": "not empty after trimming",
+    "status": "work types: the config's statuses (a goal also takes archived); dec: proposed, accepted, rejected, superseded; other types: not allowed",
+    "integer": "-?[0-9]+, within the config's priority range; work types only",
+    "timestamp": "YYYY-MM-DDTHH:MM:SS.mmmZ, or YYYY-MM-DD (warned)",
+    "lowercase": "every item lowercase",
+    "text": "any string; the format doesn't interpret it (section 5: other *_refs keys of loops and agent workflow types)",
+    "ref-or-uri": "a node ref (section 5) or a URI whose scheme isn't mdkg",
+    "skill-slug": "kebab-case, [a-z0-9]+(-[a-z0-9]+)*; skills only on work types",
+    "dec-id": "a node id of type dec",
+    "goal-state": "active, paused, achieved, blocked, budget_limited or archived",
+    "goal-condition": "not empty, at most 4000 UTF-16 code units",
+    "unpinned-ref": "a node id or graph ref, with no pin",
+    "positive-integer": "[1-9][0-9]*",
+    "legacy-id": "a lowercase mdkg 0.6.0 canonical or portable id"
+  },
+  "common_keys": {
+    "legacy_id": {
+      "kind": "scalar",
+      "constraint": "legacy-id"
+    }
+  },
+  "extension_keys": "x-<namespace>.<field>[.<field>...] (section 8), and legacy x_<anything>, on every type; never in this schema",
+  "types": {
+    "rule": {
+      "required": [
+        "id",
+        "type",
+        "title",
+        "created",
+        "updated"
+      ],
+      "keys": {
+        "id": {
+          "kind": "scalar",
+          "constraint": "node-id"
+        },
+        "type": {
+          "kind": "scalar",
+          "constraint": "type"
+        },
+        "title": {
+          "kind": "scalar",
+          "constraint": "non-empty"
+        },
+        "tags": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "owners": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "links": {
+          "kind": "list"
+        },
+        "artifacts": {
+          "kind": "list"
+        },
+        "relates": {
+          "kind": "list",
+          "constraint": "node-id"
+        },
+        "refs": {
+          "kind": "list",
+          "constraint": "ref-or-uri"
+        },
+        "aliases": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "created": {
+          "kind": "scalar",
+          "constraint": "timestamp"
+        },
+        "updated": {
+          "kind": "scalar",
+          "constraint": "timestamp"
+        }
+      }
+    },
+    "prd": {
+      "required": [
+        "id",
+        "type",
+        "title",
+        "created",
+        "updated"
+      ],
+      "keys": {
+        "id": {
+          "kind": "scalar",
+          "constraint": "node-id"
+        },
+        "type": {
+          "kind": "scalar",
+          "constraint": "type"
+        },
+        "title": {
+          "kind": "scalar",
+          "constraint": "non-empty"
+        },
+        "tags": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "owners": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "links": {
+          "kind": "list"
+        },
+        "artifacts": {
+          "kind": "list"
+        },
+        "relates": {
+          "kind": "list",
+          "constraint": "node-id"
+        },
+        "refs": {
+          "kind": "list",
+          "constraint": "ref-or-uri"
+        },
+        "aliases": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "created": {
+          "kind": "scalar",
+          "constraint": "timestamp"
+        },
+        "updated": {
+          "kind": "scalar",
+          "constraint": "timestamp"
+        }
+      }
+    },
+    "edd": {
+      "required": [
+        "id",
+        "type",
+        "title",
+        "created",
+        "updated"
+      ],
+      "keys": {
+        "id": {
+          "kind": "scalar",
+          "constraint": "node-id"
+        },
+        "type": {
+          "kind": "scalar",
+          "constraint": "type"
+        },
+        "title": {
+          "kind": "scalar",
+          "constraint": "non-empty"
+        },
+        "tags": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "owners": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "links": {
+          "kind": "list"
+        },
+        "artifacts": {
+          "kind": "list"
+        },
+        "relates": {
+          "kind": "list",
+          "constraint": "node-id"
+        },
+        "refs": {
+          "kind": "list",
+          "constraint": "ref-or-uri"
+        },
+        "aliases": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "created": {
+          "kind": "scalar",
+          "constraint": "timestamp"
+        },
+        "updated": {
+          "kind": "scalar",
+          "constraint": "timestamp"
+        }
+      }
+    },
+    "dec": {
+      "required": [
+        "id",
+        "type",
+        "title",
+        "created",
+        "updated",
+        "status"
+      ],
+      "keys": {
+        "id": {
+          "kind": "scalar",
+          "constraint": "node-id"
+        },
+        "type": {
+          "kind": "scalar",
+          "constraint": "type"
+        },
+        "title": {
+          "kind": "scalar",
+          "constraint": "non-empty"
+        },
+        "status": {
+          "kind": "scalar",
+          "constraint": "status"
+        },
+        "supersedes": {
+          "kind": "scalar",
+          "constraint": "dec-id"
+        },
+        "tags": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "owners": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "links": {
+          "kind": "list"
+        },
+        "artifacts": {
+          "kind": "list"
+        },
+        "relates": {
+          "kind": "list",
+          "constraint": "node-id"
+        },
+        "refs": {
+          "kind": "list",
+          "constraint": "ref-or-uri"
+        },
+        "aliases": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "created": {
+          "kind": "scalar",
+          "constraint": "timestamp"
+        },
+        "updated": {
+          "kind": "scalar",
+          "constraint": "timestamp"
+        }
+      }
+    },
+    "prop": {
+      "required": [
+        "id",
+        "type",
+        "title",
+        "created",
+        "updated"
+      ],
+      "keys": {
+        "id": {
+          "kind": "scalar",
+          "constraint": "node-id"
+        },
+        "type": {
+          "kind": "scalar",
+          "constraint": "type"
+        },
+        "title": {
+          "kind": "scalar",
+          "constraint": "non-empty"
+        },
+        "tags": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "owners": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "links": {
+          "kind": "list"
+        },
+        "artifacts": {
+          "kind": "list"
+        },
+        "relates": {
+          "kind": "list",
+          "constraint": "node-id"
+        },
+        "refs": {
+          "kind": "list",
+          "constraint": "ref-or-uri"
+        },
+        "aliases": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "created": {
+          "kind": "scalar",
+          "constraint": "timestamp"
+        },
+        "updated": {
+          "kind": "scalar",
+          "constraint": "timestamp"
+        }
+      }
+    },
+    "goal": {
+      "required": [
+        "id",
+        "type",
+        "title",
+        "created",
+        "updated",
+        "status",
+        "goal_state",
+        "goal_condition"
+      ],
+      "keys": {
+        "id": {
+          "kind": "scalar",
+          "constraint": "node-id"
+        },
+        "type": {
+          "kind": "scalar",
+          "constraint": "type"
+        },
+        "title": {
+          "kind": "scalar",
+          "constraint": "non-empty"
+        },
+        "status": {
+          "kind": "scalar",
+          "constraint": "status"
+        },
+        "priority": {
+          "kind": "scalar",
+          "constraint": "integer"
+        },
+        "goal_state": {
+          "kind": "scalar",
+          "constraint": "goal-state"
+        },
+        "goal_condition": {
+          "kind": "scalar",
+          "constraint": "goal-condition"
+        },
+        "scope_refs": {
+          "kind": "list",
+          "constraint": "unpinned-ref"
+        },
+        "active_node": {
+          "kind": "scalar",
+          "constraint": "unpinned-ref"
+        },
+        "last_active_node": {
+          "kind": "scalar",
+          "constraint": "unpinned-ref"
+        },
+        "required_skills": {
+          "kind": "list",
+          "constraint": "skill-slug"
+        },
+        "required_checks": {
+          "kind": "list",
+          "constraint": "non-empty"
+        },
+        "max_iterations": {
+          "kind": "scalar",
+          "constraint": "positive-integer"
+        },
+        "blocked_after_attempts": {
+          "kind": "scalar",
+          "constraint": "positive-integer"
+        },
+        "epic": {
+          "kind": "scalar",
+          "constraint": "node-id"
+        },
+        "parent": {
+          "kind": "scalar",
+          "constraint": "node-id"
+        },
+        "prev": {
+          "kind": "scalar",
+          "constraint": "node-id"
+        },
+        "next": {
+          "kind": "scalar",
+          "constraint": "node-id"
+        },
+        "tags": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "owners": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "links": {
+          "kind": "list"
+        },
+        "artifacts": {
+          "kind": "list"
+        },
+        "relates": {
+          "kind": "list",
+          "constraint": "node-id"
+        },
+        "blocked_by": {
+          "kind": "list",
+          "constraint": "node-id"
+        },
+        "blocks": {
+          "kind": "list",
+          "constraint": "node-id"
+        },
+        "refs": {
+          "kind": "list",
+          "constraint": "ref-or-uri"
+        },
+        "context_refs": {
+          "kind": "list",
+          "constraint": "ref-or-uri"
+        },
+        "evidence_refs": {
+          "kind": "list",
+          "constraint": "ref-or-uri"
+        },
+        "aliases": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "skills": {
+          "kind": "list",
+          "constraint": "skill-slug"
+        },
+        "created": {
+          "kind": "scalar",
+          "constraint": "timestamp"
+        },
+        "updated": {
+          "kind": "scalar",
+          "constraint": "timestamp"
+        }
+      }
+    },
+    "loop": {
+      "required": [
+        "id",
+        "type",
+        "title",
+        "created",
+        "updated",
+        "status"
+      ],
+      "keys": {
+        "id": {
+          "kind": "scalar",
+          "constraint": "node-id"
+        },
+        "type": {
+          "kind": "scalar",
+          "constraint": "type"
+        },
+        "title": {
+          "kind": "scalar",
+          "constraint": "non-empty"
+        },
+        "status": {
+          "kind": "scalar",
+          "constraint": "status"
+        },
+        "priority": {
+          "kind": "scalar",
+          "constraint": "integer"
+        },
+        "loop_mode": {
+          "kind": "scalar"
+        },
+        "loop_role": {
+          "kind": "scalar"
+        },
+        "scope_refs": {
+          "kind": "list"
+        },
+        "scope_description": {
+          "kind": "scalar"
+        },
+        "template_refs": {
+          "kind": "list"
+        },
+        "materialization_mode": {
+          "kind": "scalar"
+        },
+        "child_refs": {
+          "kind": "list"
+        },
+        "pre_run_questions": {
+          "kind": "list"
+        },
+        "question_answer_refs": {
+          "kind": "list"
+        },
+        "pre_approved_actions": {
+          "kind": "list"
+        },
+        "approval_gated_actions": {
+          "kind": "list"
+        },
+        "required_actions": {
+          "kind": "list"
+        },
+        "requested_actions": {
+          "kind": "list"
+        },
+        "prohibited_actions": {
+          "kind": "list"
+        },
+        "action_approval_refs": {
+          "kind": "list"
+        },
+        "evidence_lanes": {
+          "kind": "list"
+        },
+        "evidence_lane_refs": {
+          "kind": "list"
+        },
+        "lane_waiver_refs": {
+          "kind": "list"
+        },
+        "lane_waiver_decision_refs": {
+          "kind": "list"
+        },
+        "lane_waiver_approval_refs": {
+          "kind": "list"
+        },
+        "run_refs": {
+          "kind": "list"
+        },
+        "decision_refs": {
+          "kind": "list"
+        },
+        "output_refs": {
+          "kind": "list"
+        },
+        "approval_refs": {
+          "kind": "list"
+        },
+        "evaluation_refs": {
+          "kind": "list"
+        },
+        "definition_of_done": {
+          "kind": "scalar"
+        },
+        "blocker_policy": {
+          "kind": "scalar"
+        },
+        "epic": {
+          "kind": "scalar",
+          "constraint": "node-id"
+        },
+        "parent": {
+          "kind": "scalar",
+          "constraint": "node-id"
+        },
+        "prev": {
+          "kind": "scalar",
+          "constraint": "node-id"
+        },
+        "next": {
+          "kind": "scalar",
+          "constraint": "node-id"
+        },
+        "tags": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "owners": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "links": {
+          "kind": "list"
+        },
+        "artifacts": {
+          "kind": "list"
+        },
+        "relates": {
+          "kind": "list",
+          "constraint": "node-id"
+        },
+        "blocked_by": {
+          "kind": "list",
+          "constraint": "node-id"
+        },
+        "blocks": {
+          "kind": "list",
+          "constraint": "node-id"
+        },
+        "refs": {
+          "kind": "list",
+          "constraint": "ref-or-uri"
+        },
+        "context_refs": {
+          "kind": "list",
+          "constraint": "ref-or-uri"
+        },
+        "evidence_refs": {
+          "kind": "list",
+          "constraint": "ref-or-uri"
+        },
+        "aliases": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "skills": {
+          "kind": "list",
+          "constraint": "skill-slug"
+        },
+        "created": {
+          "kind": "scalar",
+          "constraint": "timestamp"
+        },
+        "updated": {
+          "kind": "scalar",
+          "constraint": "timestamp"
+        }
+      }
+    },
+    "epic": {
+      "required": [
+        "id",
+        "type",
+        "title",
+        "created",
+        "updated",
+        "status"
+      ],
+      "keys": {
+        "id": {
+          "kind": "scalar",
+          "constraint": "node-id"
+        },
+        "type": {
+          "kind": "scalar",
+          "constraint": "type"
+        },
+        "title": {
+          "kind": "scalar",
+          "constraint": "non-empty"
+        },
+        "status": {
+          "kind": "scalar",
+          "constraint": "status"
+        },
+        "priority": {
+          "kind": "scalar",
+          "constraint": "integer"
+        },
+        "tags": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "owners": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "links": {
+          "kind": "list"
+        },
+        "artifacts": {
+          "kind": "list"
+        },
+        "relates": {
+          "kind": "list",
+          "constraint": "node-id"
+        },
+        "blocked_by": {
+          "kind": "list",
+          "constraint": "node-id"
+        },
+        "blocks": {
+          "kind": "list",
+          "constraint": "node-id"
+        },
+        "refs": {
+          "kind": "list",
+          "constraint": "ref-or-uri"
+        },
+        "context_refs": {
+          "kind": "list",
+          "constraint": "ref-or-uri"
+        },
+        "evidence_refs": {
+          "kind": "list",
+          "constraint": "ref-or-uri"
+        },
+        "aliases": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "skills": {
+          "kind": "list",
+          "constraint": "skill-slug"
+        },
+        "created": {
+          "kind": "scalar",
+          "constraint": "timestamp"
+        },
+        "updated": {
+          "kind": "scalar",
+          "constraint": "timestamp"
+        }
+      }
+    },
+    "feat": {
+      "required": [
+        "id",
+        "type",
+        "title",
+        "created",
+        "updated",
+        "status"
+      ],
+      "keys": {
+        "id": {
+          "kind": "scalar",
+          "constraint": "node-id"
+        },
+        "type": {
+          "kind": "scalar",
+          "constraint": "type"
+        },
+        "title": {
+          "kind": "scalar",
+          "constraint": "non-empty"
+        },
+        "status": {
+          "kind": "scalar",
+          "constraint": "status"
+        },
+        "priority": {
+          "kind": "scalar",
+          "constraint": "integer"
+        },
+        "epic": {
+          "kind": "scalar",
+          "constraint": "node-id"
+        },
+        "parent": {
+          "kind": "scalar",
+          "constraint": "node-id"
+        },
+        "prev": {
+          "kind": "scalar",
+          "constraint": "node-id"
+        },
+        "next": {
+          "kind": "scalar",
+          "constraint": "node-id"
+        },
+        "tags": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "owners": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "links": {
+          "kind": "list"
+        },
+        "artifacts": {
+          "kind": "list"
+        },
+        "relates": {
+          "kind": "list",
+          "constraint": "node-id"
+        },
+        "blocked_by": {
+          "kind": "list",
+          "constraint": "node-id"
+        },
+        "blocks": {
+          "kind": "list",
+          "constraint": "node-id"
+        },
+        "refs": {
+          "kind": "list",
+          "constraint": "ref-or-uri"
+        },
+        "context_refs": {
+          "kind": "list",
+          "constraint": "ref-or-uri"
+        },
+        "evidence_refs": {
+          "kind": "list",
+          "constraint": "ref-or-uri"
+        },
+        "aliases": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "skills": {
+          "kind": "list",
+          "constraint": "skill-slug"
+        },
+        "created": {
+          "kind": "scalar",
+          "constraint": "timestamp"
+        },
+        "updated": {
+          "kind": "scalar",
+          "constraint": "timestamp"
+        }
+      }
+    },
+    "task": {
+      "required": [
+        "id",
+        "type",
+        "title",
+        "created",
+        "updated",
+        "status"
+      ],
+      "keys": {
+        "id": {
+          "kind": "scalar",
+          "constraint": "node-id"
+        },
+        "type": {
+          "kind": "scalar",
+          "constraint": "type"
+        },
+        "title": {
+          "kind": "scalar",
+          "constraint": "non-empty"
+        },
+        "status": {
+          "kind": "scalar",
+          "constraint": "status"
+        },
+        "priority": {
+          "kind": "scalar",
+          "constraint": "integer"
+        },
+        "epic": {
+          "kind": "scalar",
+          "constraint": "node-id"
+        },
+        "parent": {
+          "kind": "scalar",
+          "constraint": "node-id"
+        },
+        "prev": {
+          "kind": "scalar",
+          "constraint": "node-id"
+        },
+        "next": {
+          "kind": "scalar",
+          "constraint": "node-id"
+        },
+        "tags": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "owners": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "links": {
+          "kind": "list"
+        },
+        "artifacts": {
+          "kind": "list"
+        },
+        "relates": {
+          "kind": "list",
+          "constraint": "node-id"
+        },
+        "blocked_by": {
+          "kind": "list",
+          "constraint": "node-id"
+        },
+        "blocks": {
+          "kind": "list",
+          "constraint": "node-id"
+        },
+        "refs": {
+          "kind": "list",
+          "constraint": "ref-or-uri"
+        },
+        "context_refs": {
+          "kind": "list",
+          "constraint": "ref-or-uri"
+        },
+        "evidence_refs": {
+          "kind": "list",
+          "constraint": "ref-or-uri"
+        },
+        "aliases": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "skills": {
+          "kind": "list",
+          "constraint": "skill-slug"
+        },
+        "created": {
+          "kind": "scalar",
+          "constraint": "timestamp"
+        },
+        "updated": {
+          "kind": "scalar",
+          "constraint": "timestamp"
+        }
+      }
+    },
+    "bug": {
+      "required": [
+        "id",
+        "type",
+        "title",
+        "created",
+        "updated",
+        "status"
+      ],
+      "keys": {
+        "id": {
+          "kind": "scalar",
+          "constraint": "node-id"
+        },
+        "type": {
+          "kind": "scalar",
+          "constraint": "type"
+        },
+        "title": {
+          "kind": "scalar",
+          "constraint": "non-empty"
+        },
+        "status": {
+          "kind": "scalar",
+          "constraint": "status"
+        },
+        "priority": {
+          "kind": "scalar",
+          "constraint": "integer"
+        },
+        "epic": {
+          "kind": "scalar",
+          "constraint": "node-id"
+        },
+        "parent": {
+          "kind": "scalar",
+          "constraint": "node-id"
+        },
+        "prev": {
+          "kind": "scalar",
+          "constraint": "node-id"
+        },
+        "next": {
+          "kind": "scalar",
+          "constraint": "node-id"
+        },
+        "tags": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "owners": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "links": {
+          "kind": "list"
+        },
+        "artifacts": {
+          "kind": "list"
+        },
+        "relates": {
+          "kind": "list",
+          "constraint": "node-id"
+        },
+        "blocked_by": {
+          "kind": "list",
+          "constraint": "node-id"
+        },
+        "blocks": {
+          "kind": "list",
+          "constraint": "node-id"
+        },
+        "refs": {
+          "kind": "list",
+          "constraint": "ref-or-uri"
+        },
+        "context_refs": {
+          "kind": "list",
+          "constraint": "ref-or-uri"
+        },
+        "evidence_refs": {
+          "kind": "list",
+          "constraint": "ref-or-uri"
+        },
+        "aliases": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "skills": {
+          "kind": "list",
+          "constraint": "skill-slug"
+        },
+        "created": {
+          "kind": "scalar",
+          "constraint": "timestamp"
+        },
+        "updated": {
+          "kind": "scalar",
+          "constraint": "timestamp"
+        }
+      }
+    },
+    "spike": {
+      "required": [
+        "id",
+        "type",
+        "title",
+        "created",
+        "updated",
+        "status"
+      ],
+      "keys": {
+        "id": {
+          "kind": "scalar",
+          "constraint": "node-id"
+        },
+        "type": {
+          "kind": "scalar",
+          "constraint": "type"
+        },
+        "title": {
+          "kind": "scalar",
+          "constraint": "non-empty"
+        },
+        "status": {
+          "kind": "scalar",
+          "constraint": "status"
+        },
+        "priority": {
+          "kind": "scalar",
+          "constraint": "integer"
+        },
+        "epic": {
+          "kind": "scalar",
+          "constraint": "node-id"
+        },
+        "parent": {
+          "kind": "scalar",
+          "constraint": "node-id"
+        },
+        "prev": {
+          "kind": "scalar",
+          "constraint": "node-id"
+        },
+        "next": {
+          "kind": "scalar",
+          "constraint": "node-id"
+        },
+        "tags": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "owners": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "links": {
+          "kind": "list"
+        },
+        "artifacts": {
+          "kind": "list"
+        },
+        "relates": {
+          "kind": "list",
+          "constraint": "node-id"
+        },
+        "blocked_by": {
+          "kind": "list",
+          "constraint": "node-id"
+        },
+        "blocks": {
+          "kind": "list",
+          "constraint": "node-id"
+        },
+        "refs": {
+          "kind": "list",
+          "constraint": "ref-or-uri"
+        },
+        "context_refs": {
+          "kind": "list",
+          "constraint": "ref-or-uri"
+        },
+        "evidence_refs": {
+          "kind": "list",
+          "constraint": "ref-or-uri"
+        },
+        "aliases": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "skills": {
+          "kind": "list",
+          "constraint": "skill-slug"
+        },
+        "created": {
+          "kind": "scalar",
+          "constraint": "timestamp"
+        },
+        "updated": {
+          "kind": "scalar",
+          "constraint": "timestamp"
+        }
+      }
+    },
+    "checkpoint": {
+      "required": [
+        "id",
+        "type",
+        "title",
+        "created",
+        "updated",
+        "status"
+      ],
+      "keys": {
+        "id": {
+          "kind": "scalar",
+          "constraint": "node-id"
+        },
+        "type": {
+          "kind": "scalar",
+          "constraint": "type"
+        },
+        "title": {
+          "kind": "scalar",
+          "constraint": "non-empty"
+        },
+        "checkpoint_kind": {
+          "kind": "scalar"
+        },
+        "status": {
+          "kind": "scalar",
+          "constraint": "status"
+        },
+        "priority": {
+          "kind": "scalar",
+          "constraint": "integer"
+        },
+        "epic": {
+          "kind": "scalar",
+          "constraint": "node-id"
+        },
+        "parent": {
+          "kind": "scalar",
+          "constraint": "node-id"
+        },
+        "prev": {
+          "kind": "scalar",
+          "constraint": "node-id"
+        },
+        "next": {
+          "kind": "scalar",
+          "constraint": "node-id"
+        },
+        "tags": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "owners": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "links": {
+          "kind": "list"
+        },
+        "artifacts": {
+          "kind": "list"
+        },
+        "relates": {
+          "kind": "list",
+          "constraint": "node-id"
+        },
+        "blocked_by": {
+          "kind": "list",
+          "constraint": "node-id"
+        },
+        "blocks": {
+          "kind": "list",
+          "constraint": "node-id"
+        },
+        "refs": {
+          "kind": "list",
+          "constraint": "ref-or-uri"
+        },
+        "context_refs": {
+          "kind": "list",
+          "constraint": "ref-or-uri"
+        },
+        "evidence_refs": {
+          "kind": "list",
+          "constraint": "ref-or-uri"
+        },
+        "aliases": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "skills": {
+          "kind": "list",
+          "constraint": "skill-slug"
+        },
+        "scope": {
+          "kind": "list",
+          "constraint": "node-id"
+        },
+        "created": {
+          "kind": "scalar",
+          "constraint": "timestamp"
+        },
+        "updated": {
+          "kind": "scalar",
+          "constraint": "timestamp"
+        }
+      }
+    },
+    "test": {
+      "required": [
+        "id",
+        "type",
+        "title",
+        "created",
+        "updated",
+        "status"
+      ],
+      "keys": {
+        "id": {
+          "kind": "scalar",
+          "constraint": "node-id"
+        },
+        "type": {
+          "kind": "scalar",
+          "constraint": "type"
+        },
+        "title": {
+          "kind": "scalar",
+          "constraint": "non-empty"
+        },
+        "status": {
+          "kind": "scalar",
+          "constraint": "status"
+        },
+        "priority": {
+          "kind": "scalar",
+          "constraint": "integer"
+        },
+        "epic": {
+          "kind": "scalar",
+          "constraint": "node-id"
+        },
+        "parent": {
+          "kind": "scalar",
+          "constraint": "node-id"
+        },
+        "prev": {
+          "kind": "scalar",
+          "constraint": "node-id"
+        },
+        "next": {
+          "kind": "scalar",
+          "constraint": "node-id"
+        },
+        "tags": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "owners": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "links": {
+          "kind": "list"
+        },
+        "artifacts": {
+          "kind": "list"
+        },
+        "relates": {
+          "kind": "list",
+          "constraint": "node-id"
+        },
+        "blocked_by": {
+          "kind": "list",
+          "constraint": "node-id"
+        },
+        "blocks": {
+          "kind": "list",
+          "constraint": "node-id"
+        },
+        "refs": {
+          "kind": "list",
+          "constraint": "ref-or-uri"
+        },
+        "context_refs": {
+          "kind": "list",
+          "constraint": "ref-or-uri"
+        },
+        "evidence_refs": {
+          "kind": "list",
+          "constraint": "ref-or-uri"
+        },
+        "aliases": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "skills": {
+          "kind": "list",
+          "constraint": "skill-slug"
+        },
+        "cases": {
+          "kind": "list"
+        },
+        "created": {
+          "kind": "scalar",
+          "constraint": "timestamp"
+        },
+        "updated": {
+          "kind": "scalar",
+          "constraint": "timestamp"
+        }
+      }
+    },
+    "archive": {
+      "required": [
+        "id",
+        "type",
+        "title",
+        "created",
+        "updated"
+      ],
+      "keys": {
+        "id": {
+          "kind": "scalar",
+          "constraint": "node-id"
+        },
+        "type": {
+          "kind": "scalar",
+          "constraint": "type"
+        },
+        "title": {
+          "kind": "scalar",
+          "constraint": "non-empty"
+        },
+        "archive_kind": {
+          "kind": "scalar"
+        },
+        "source_path": {
+          "kind": "scalar"
+        },
+        "stored_path": {
+          "kind": "scalar"
+        },
+        "compressed_path": {
+          "kind": "scalar"
+        },
+        "mime_type": {
+          "kind": "scalar"
+        },
+        "byte_size": {
+          "kind": "scalar"
+        },
+        "sha256": {
+          "kind": "scalar"
+        },
+        "compressed_sha256": {
+          "kind": "scalar"
+        },
+        "visibility": {
+          "kind": "scalar"
+        },
+        "provenance": {
+          "kind": "scalar"
+        },
+        "ingest_status": {
+          "kind": "scalar"
+        },
+        "tags": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "owners": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "links": {
+          "kind": "list"
+        },
+        "artifacts": {
+          "kind": "list"
+        },
+        "relates": {
+          "kind": "list",
+          "constraint": "node-id"
+        },
+        "refs": {
+          "kind": "list",
+          "constraint": "ref-or-uri"
+        },
+        "aliases": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "created": {
+          "kind": "scalar",
+          "constraint": "timestamp"
+        },
+        "updated": {
+          "kind": "scalar",
+          "constraint": "timestamp"
+        }
+      }
+    },
+    "manifest": {
+      "required": [
+        "id",
+        "type",
+        "title",
+        "created",
+        "updated"
+      ],
+      "keys": {
+        "id": {
+          "kind": "scalar",
+          "constraint": "node-id"
+        },
+        "type": {
+          "kind": "scalar",
+          "constraint": "type"
+        },
+        "title": {
+          "kind": "scalar",
+          "constraint": "non-empty"
+        },
+        "version": {
+          "kind": "scalar"
+        },
+        "spec_kind": {
+          "kind": "scalar"
+        },
+        "role": {
+          "kind": "scalar"
+        },
+        "runtime_mode": {
+          "kind": "scalar"
+        },
+        "work_contracts": {
+          "kind": "list"
+        },
+        "contract_profile": {
+          "kind": "scalar"
+        },
+        "validation_policy_ref": {
+          "kind": "scalar"
+        },
+        "evidence_policy_ref": {
+          "kind": "scalar"
+        },
+        "requested_capabilities": {
+          "kind": "list"
+        },
+        "skill_refs": {
+          "kind": "list"
+        },
+        "tool_refs": {
+          "kind": "list"
+        },
+        "model_refs": {
+          "kind": "list"
+        },
+        "wasm_component_refs": {
+          "kind": "list"
+        },
+        "runtime_image_refs": {
+          "kind": "list"
+        },
+        "subagent_refs": {
+          "kind": "list"
+        },
+        "resource_profile": {
+          "kind": "scalar"
+        },
+        "update_policy": {
+          "kind": "scalar"
+        },
+        "tags": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "owners": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "links": {
+          "kind": "list"
+        },
+        "artifacts": {
+          "kind": "list"
+        },
+        "relates": {
+          "kind": "list",
+          "constraint": "node-id"
+        },
+        "refs": {
+          "kind": "list",
+          "constraint": "ref-or-uri"
+        },
+        "aliases": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "created": {
+          "kind": "scalar",
+          "constraint": "timestamp"
+        },
+        "updated": {
+          "kind": "scalar",
+          "constraint": "timestamp"
+        },
+        "profile": {
+          "kind": "scalar",
+          "compat": true
+        }
+      }
+    },
+    "spec": {
+      "required": [
+        "id",
+        "type",
+        "title",
+        "created",
+        "updated"
+      ],
+      "keys": {
+        "id": {
+          "kind": "scalar",
+          "constraint": "node-id"
+        },
+        "type": {
+          "kind": "scalar",
+          "constraint": "type"
+        },
+        "title": {
+          "kind": "scalar",
+          "constraint": "non-empty"
+        },
+        "version": {
+          "kind": "scalar"
+        },
+        "spec_kind": {
+          "kind": "scalar"
+        },
+        "role": {
+          "kind": "scalar"
+        },
+        "runtime_mode": {
+          "kind": "scalar"
+        },
+        "work_contracts": {
+          "kind": "list"
+        },
+        "contract_profile": {
+          "kind": "scalar"
+        },
+        "validation_policy_ref": {
+          "kind": "scalar"
+        },
+        "evidence_policy_ref": {
+          "kind": "scalar"
+        },
+        "requested_capabilities": {
+          "kind": "list"
+        },
+        "skill_refs": {
+          "kind": "list"
+        },
+        "tool_refs": {
+          "kind": "list"
+        },
+        "model_refs": {
+          "kind": "list"
+        },
+        "wasm_component_refs": {
+          "kind": "list"
+        },
+        "runtime_image_refs": {
+          "kind": "list"
+        },
+        "subagent_refs": {
+          "kind": "list"
+        },
+        "resource_profile": {
+          "kind": "scalar"
+        },
+        "update_policy": {
+          "kind": "scalar"
+        },
+        "tags": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "owners": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "links": {
+          "kind": "list"
+        },
+        "artifacts": {
+          "kind": "list"
+        },
+        "relates": {
+          "kind": "list",
+          "constraint": "node-id"
+        },
+        "refs": {
+          "kind": "list",
+          "constraint": "ref-or-uri"
+        },
+        "aliases": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "created": {
+          "kind": "scalar",
+          "constraint": "timestamp"
+        },
+        "updated": {
+          "kind": "scalar",
+          "constraint": "timestamp"
+        },
+        "profile": {
+          "kind": "scalar",
+          "compat": true
+        }
+      }
+    },
+    "work": {
+      "required": [
+        "id",
+        "type",
+        "title",
+        "created",
+        "updated"
+      ],
+      "keys": {
+        "id": {
+          "kind": "scalar",
+          "constraint": "node-id"
+        },
+        "type": {
+          "kind": "scalar",
+          "constraint": "type"
+        },
+        "title": {
+          "kind": "scalar",
+          "constraint": "non-empty"
+        },
+        "version": {
+          "kind": "scalar"
+        },
+        "agent_id": {
+          "kind": "scalar"
+        },
+        "kind": {
+          "kind": "scalar"
+        },
+        "contract_profile": {
+          "kind": "scalar"
+        },
+        "required_capabilities": {
+          "kind": "list"
+        },
+        "skill_refs": {
+          "kind": "list"
+        },
+        "tool_refs": {
+          "kind": "list"
+        },
+        "model_refs": {
+          "kind": "list"
+        },
+        "wasm_component_refs": {
+          "kind": "list"
+        },
+        "runtime_image_refs": {
+          "kind": "list"
+        },
+        "subagent_refs": {
+          "kind": "list"
+        },
+        "inputs": {
+          "kind": "list"
+        },
+        "outputs": {
+          "kind": "list"
+        },
+        "receipt_required": {
+          "kind": "boolean"
+        },
+        "tags": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "owners": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "links": {
+          "kind": "list"
+        },
+        "artifacts": {
+          "kind": "list"
+        },
+        "relates": {
+          "kind": "list",
+          "constraint": "node-id"
+        },
+        "refs": {
+          "kind": "list",
+          "constraint": "ref-or-uri"
+        },
+        "aliases": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "created": {
+          "kind": "scalar",
+          "constraint": "timestamp"
+        },
+        "updated": {
+          "kind": "scalar",
+          "constraint": "timestamp"
+        },
+        "profile": {
+          "kind": "scalar",
+          "compat": true
+        }
+      }
+    },
+    "work_order": {
+      "required": [
+        "id",
+        "type",
+        "title",
+        "created",
+        "updated"
+      ],
+      "keys": {
+        "id": {
+          "kind": "scalar",
+          "constraint": "node-id"
+        },
+        "type": {
+          "kind": "scalar",
+          "constraint": "type"
+        },
+        "title": {
+          "kind": "scalar",
+          "constraint": "non-empty"
+        },
+        "version": {
+          "kind": "scalar"
+        },
+        "work_id": {
+          "kind": "scalar"
+        },
+        "work_version": {
+          "kind": "scalar"
+        },
+        "requester": {
+          "kind": "scalar"
+        },
+        "order_status": {
+          "kind": "scalar"
+        },
+        "request_ref": {
+          "kind": "scalar"
+        },
+        "trigger_ref": {
+          "kind": "scalar"
+        },
+        "payload_hash": {
+          "kind": "scalar"
+        },
+        "contract_profile": {
+          "kind": "scalar"
+        },
+        "validation_policy_ref": {
+          "kind": "scalar"
+        },
+        "evidence_policy_ref": {
+          "kind": "scalar"
+        },
+        "input_refs": {
+          "kind": "list"
+        },
+        "queue_refs": {
+          "kind": "list"
+        },
+        "requested_outputs": {
+          "kind": "list"
+        },
+        "constraint_refs": {
+          "kind": "list"
+        },
+        "artifact_policy": {
+          "kind": "scalar"
+        },
+        "tags": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "owners": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "links": {
+          "kind": "list"
+        },
+        "artifacts": {
+          "kind": "list"
+        },
+        "relates": {
+          "kind": "list",
+          "constraint": "node-id"
+        },
+        "refs": {
+          "kind": "list",
+          "constraint": "ref-or-uri"
+        },
+        "aliases": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "created": {
+          "kind": "scalar",
+          "constraint": "timestamp"
+        },
+        "updated": {
+          "kind": "scalar",
+          "constraint": "timestamp"
+        },
+        "profile": {
+          "kind": "scalar",
+          "compat": true
+        }
+      }
+    },
+    "receipt": {
+      "required": [
+        "id",
+        "type",
+        "title",
+        "created",
+        "updated"
+      ],
+      "keys": {
+        "id": {
+          "kind": "scalar",
+          "constraint": "node-id"
+        },
+        "type": {
+          "kind": "scalar",
+          "constraint": "type"
+        },
+        "title": {
+          "kind": "scalar",
+          "constraint": "non-empty"
+        },
+        "version": {
+          "kind": "scalar"
+        },
+        "work_order_id": {
+          "kind": "scalar"
+        },
+        "receipt_status": {
+          "kind": "scalar"
+        },
+        "outcome": {
+          "kind": "scalar"
+        },
+        "cost_ref": {
+          "kind": "scalar"
+        },
+        "redaction_policy": {
+          "kind": "scalar"
+        },
+        "contract_profile": {
+          "kind": "scalar"
+        },
+        "receipt_kind": {
+          "kind": "scalar"
+        },
+        "redaction_class": {
+          "kind": "scalar"
+        },
+        "validation_policy_ref": {
+          "kind": "scalar"
+        },
+        "evidence_policy_ref": {
+          "kind": "scalar"
+        },
+        "proof_refs": {
+          "kind": "list"
+        },
+        "attestation_refs": {
+          "kind": "list"
+        },
+        "evidence_hashes": {
+          "kind": "list"
+        },
+        "input_hashes": {
+          "kind": "list"
+        },
+        "output_hashes": {
+          "kind": "list"
+        },
+        "tags": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "owners": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "links": {
+          "kind": "list"
+        },
+        "artifacts": {
+          "kind": "list"
+        },
+        "relates": {
+          "kind": "list",
+          "constraint": "node-id"
+        },
+        "refs": {
+          "kind": "list",
+          "constraint": "ref-or-uri"
+        },
+        "aliases": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "created": {
+          "kind": "scalar",
+          "constraint": "timestamp"
+        },
+        "updated": {
+          "kind": "scalar",
+          "constraint": "timestamp"
+        },
+        "profile": {
+          "kind": "scalar",
+          "compat": true
+        }
+      }
+    },
+    "feedback": {
+      "required": [
+        "id",
+        "type",
+        "title",
+        "created",
+        "updated"
+      ],
+      "keys": {
+        "id": {
+          "kind": "scalar",
+          "constraint": "node-id"
+        },
+        "type": {
+          "kind": "scalar",
+          "constraint": "type"
+        },
+        "title": {
+          "kind": "scalar",
+          "constraint": "non-empty"
+        },
+        "version": {
+          "kind": "scalar"
+        },
+        "target_id": {
+          "kind": "scalar"
+        },
+        "sentiment": {
+          "kind": "scalar"
+        },
+        "feedback_status": {
+          "kind": "scalar"
+        },
+        "source_ref": {
+          "kind": "scalar"
+        },
+        "tags": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "owners": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "links": {
+          "kind": "list"
+        },
+        "artifacts": {
+          "kind": "list"
+        },
+        "relates": {
+          "kind": "list",
+          "constraint": "node-id"
+        },
+        "refs": {
+          "kind": "list",
+          "constraint": "ref-or-uri"
+        },
+        "aliases": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "created": {
+          "kind": "scalar",
+          "constraint": "timestamp"
+        },
+        "updated": {
+          "kind": "scalar",
+          "constraint": "timestamp"
+        }
+      }
+    },
+    "dispute": {
+      "required": [
+        "id",
+        "type",
+        "title",
+        "created",
+        "updated"
+      ],
+      "keys": {
+        "id": {
+          "kind": "scalar",
+          "constraint": "node-id"
+        },
+        "type": {
+          "kind": "scalar",
+          "constraint": "type"
+        },
+        "title": {
+          "kind": "scalar",
+          "constraint": "non-empty"
+        },
+        "version": {
+          "kind": "scalar"
+        },
+        "work_order_id": {
+          "kind": "scalar"
+        },
+        "receipt_id": {
+          "kind": "scalar"
+        },
+        "dispute_status": {
+          "kind": "scalar"
+        },
+        "severity": {
+          "kind": "scalar"
+        },
+        "tags": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "owners": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "links": {
+          "kind": "list"
+        },
+        "artifacts": {
+          "kind": "list"
+        },
+        "relates": {
+          "kind": "list",
+          "constraint": "node-id"
+        },
+        "refs": {
+          "kind": "list",
+          "constraint": "ref-or-uri"
+        },
+        "aliases": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "created": {
+          "kind": "scalar",
+          "constraint": "timestamp"
+        },
+        "updated": {
+          "kind": "scalar",
+          "constraint": "timestamp"
+        }
+      }
+    },
+    "proposal": {
+      "required": [
+        "id",
+        "type",
+        "title",
+        "created",
+        "updated"
+      ],
+      "keys": {
+        "id": {
+          "kind": "scalar",
+          "constraint": "node-id"
+        },
+        "type": {
+          "kind": "scalar",
+          "constraint": "type"
+        },
+        "title": {
+          "kind": "scalar",
+          "constraint": "non-empty"
+        },
+        "version": {
+          "kind": "scalar"
+        },
+        "target_id": {
+          "kind": "scalar"
+        },
+        "proposal_status": {
+          "kind": "scalar"
+        },
+        "proposal_kind": {
+          "kind": "scalar"
+        },
+        "evidence_refs": {
+          "kind": "list"
+        },
+        "tags": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "owners": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "links": {
+          "kind": "list"
+        },
+        "artifacts": {
+          "kind": "list"
+        },
+        "relates": {
+          "kind": "list",
+          "constraint": "node-id"
+        },
+        "refs": {
+          "kind": "list",
+          "constraint": "ref-or-uri"
+        },
+        "aliases": {
+          "kind": "list",
+          "constraint": "lowercase"
+        },
+        "created": {
+          "kind": "scalar",
+          "constraint": "timestamp"
+        },
+        "updated": {
+          "kind": "scalar",
+          "constraint": "timestamp"
+        }
+      }
+    }
+  }
+}

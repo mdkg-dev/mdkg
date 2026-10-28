@@ -1,0 +1,776 @@
+{
+  "oracle": "mdkg 0.6.0 (TypeScript)",
+  "args": [
+    "validate",
+    "--json"
+  ],
+  "exit_code": 0,
+  "stdout": {
+    "json": {
+      "action": "validated",
+      "ok": true,
+      "warning_count": 53,
+      "error_count": 0,
+      "warnings": [
+        "root:dec-5: missing recommended heading \"Context\"",
+        "root:dec-5: missing recommended heading \"Decision\"",
+        "root:dec-5: missing recommended heading \"Alternatives considered\"",
+        "root:dec-5: missing recommended heading \"Consequences\"",
+        "root:dec-5: missing recommended heading \"Links / references\"",
+        "root:edd-1: missing recommended heading \"Architecture\"",
+        "root:edd-1: missing recommended heading \"Data model\"",
+        "root:edd-1: missing recommended heading \"APIs / interfaces\"",
+        "root:edd-1: missing recommended heading \"Failure modes\"",
+        "root:edd-1: missing recommended heading \"Observability\"",
+        "root:edd-1: missing recommended heading \"Security / privacy\"",
+        "root:edd-1: missing recommended heading \"Testing strategy\"",
+        "root:edd-1: missing recommended heading \"Rollout plan\"",
+        "root:bug-3: missing recommended heading \"Acceptance Criteria\"",
+        "root:bug-3: missing recommended heading \"Files Affected\"",
+        "root:bug-3: missing recommended heading \"Implementation Notes\"",
+        "root:bug-3: missing recommended heading \"Test Plan\"",
+        "root:bug-3: missing recommended heading \"Links / Artifacts\"",
+        "root:feat-20: missing recommended heading \"Acceptance Criteria\"",
+        "root:feat-20: missing recommended heading \"Files Affected\"",
+        "root:feat-20: missing recommended heading \"Implementation Notes\"",
+        "root:feat-20: missing recommended heading \"Test Plan\"",
+        "root:feat-20: missing recommended heading \"Links / Artifacts\"",
+        "root:spike-1: missing recommended heading \"Acceptance Criteria\"",
+        "root:spike-1: missing recommended heading \"Files Affected\"",
+        "root:spike-1: missing recommended heading \"Implementation Notes\"",
+        "root:spike-1: missing recommended heading \"Test Plan\"",
+        "root:spike-1: missing recommended heading \"Links / Artifacts\"",
+        "root:task-1: missing recommended heading \"Acceptance Criteria\"",
+        "root:task-1: missing recommended heading \"Files Affected\"",
+        "root:task-1: missing recommended heading \"Implementation Notes\"",
+        "root:task-1: missing recommended heading \"Test Plan\"",
+        "root:task-1: missing recommended heading \"Links / Artifacts\"",
+        "root:task-10: missing recommended heading \"Acceptance Criteria\"",
+        "root:task-10: missing recommended heading \"Files Affected\"",
+        "root:task-10: missing recommended heading \"Implementation Notes\"",
+        "root:task-10: missing recommended heading \"Test Plan\"",
+        "root:task-10: missing recommended heading \"Links / Artifacts\"",
+        "root:task-100: missing recommended heading \"Acceptance Criteria\"",
+        "root:task-100: missing recommended heading \"Files Affected\"",
+        "root:task-100: missing recommended heading \"Implementation Notes\"",
+        "root:task-100: missing recommended heading \"Test Plan\"",
+        "root:task-100: missing recommended heading \"Links / Artifacts\"",
+        "root:task-11: missing recommended heading \"Acceptance Criteria\"",
+        "root:task-11: missing recommended heading \"Files Affected\"",
+        "root:task-11: missing recommended heading \"Implementation Notes\"",
+        "root:task-11: missing recommended heading \"Test Plan\"",
+        "root:task-11: missing recommended heading \"Links / Artifacts\"",
+        "root:task-2: missing recommended heading \"Acceptance Criteria\"",
+        "root:task-2: missing recommended heading \"Files Affected\"",
+        "root:task-2: missing recommended heading \"Implementation Notes\"",
+        "root:task-2: missing recommended heading \"Test Plan\"",
+        "root:task-2: missing recommended heading \"Links / Artifacts\""
+      ],
+      "warning_diagnostics": [
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:dec-5: missing recommended heading \"Context\"",
+          "qid": "root:dec-5",
+          "node_type": "dec",
+          "path": ".mdkg/design/dec-5.md",
+          "ref": "root:dec-5",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:dec-5: missing recommended heading \"Decision\"",
+          "qid": "root:dec-5",
+          "node_type": "dec",
+          "path": ".mdkg/design/dec-5.md",
+          "ref": "root:dec-5",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:dec-5: missing recommended heading \"Alternatives considered\"",
+          "qid": "root:dec-5",
+          "node_type": "dec",
+          "path": ".mdkg/design/dec-5.md",
+          "ref": "root:dec-5",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:dec-5: missing recommended heading \"Consequences\"",
+          "qid": "root:dec-5",
+          "node_type": "dec",
+          "path": ".mdkg/design/dec-5.md",
+          "ref": "root:dec-5",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:dec-5: missing recommended heading \"Links / references\"",
+          "qid": "root:dec-5",
+          "node_type": "dec",
+          "path": ".mdkg/design/dec-5.md",
+          "ref": "root:dec-5",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:edd-1: missing recommended heading \"Architecture\"",
+          "qid": "root:edd-1",
+          "node_type": "edd",
+          "path": ".mdkg/design/edd-1.md",
+          "ref": "root:edd-1",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:edd-1: missing recommended heading \"Data model\"",
+          "qid": "root:edd-1",
+          "node_type": "edd",
+          "path": ".mdkg/design/edd-1.md",
+          "ref": "root:edd-1",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:edd-1: missing recommended heading \"APIs / interfaces\"",
+          "qid": "root:edd-1",
+          "node_type": "edd",
+          "path": ".mdkg/design/edd-1.md",
+          "ref": "root:edd-1",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:edd-1: missing recommended heading \"Failure modes\"",
+          "qid": "root:edd-1",
+          "node_type": "edd",
+          "path": ".mdkg/design/edd-1.md",
+          "ref": "root:edd-1",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:edd-1: missing recommended heading \"Observability\"",
+          "qid": "root:edd-1",
+          "node_type": "edd",
+          "path": ".mdkg/design/edd-1.md",
+          "ref": "root:edd-1",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:edd-1: missing recommended heading \"Security / privacy\"",
+          "qid": "root:edd-1",
+          "node_type": "edd",
+          "path": ".mdkg/design/edd-1.md",
+          "ref": "root:edd-1",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:edd-1: missing recommended heading \"Testing strategy\"",
+          "qid": "root:edd-1",
+          "node_type": "edd",
+          "path": ".mdkg/design/edd-1.md",
+          "ref": "root:edd-1",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:edd-1: missing recommended heading \"Rollout plan\"",
+          "qid": "root:edd-1",
+          "node_type": "edd",
+          "path": ".mdkg/design/edd-1.md",
+          "ref": "root:edd-1",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:bug-3: missing recommended heading \"Acceptance Criteria\"",
+          "qid": "root:bug-3",
+          "node_type": "task",
+          "path": ".mdkg/work/bug-3.md",
+          "ref": "root:bug-3",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:bug-3: missing recommended heading \"Files Affected\"",
+          "qid": "root:bug-3",
+          "node_type": "task",
+          "path": ".mdkg/work/bug-3.md",
+          "ref": "root:bug-3",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:bug-3: missing recommended heading \"Implementation Notes\"",
+          "qid": "root:bug-3",
+          "node_type": "task",
+          "path": ".mdkg/work/bug-3.md",
+          "ref": "root:bug-3",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:bug-3: missing recommended heading \"Test Plan\"",
+          "qid": "root:bug-3",
+          "node_type": "task",
+          "path": ".mdkg/work/bug-3.md",
+          "ref": "root:bug-3",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:bug-3: missing recommended heading \"Links / Artifacts\"",
+          "qid": "root:bug-3",
+          "node_type": "task",
+          "path": ".mdkg/work/bug-3.md",
+          "ref": "root:bug-3",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:feat-20: missing recommended heading \"Acceptance Criteria\"",
+          "qid": "root:feat-20",
+          "node_type": "task",
+          "path": ".mdkg/work/feat-20.md",
+          "ref": "root:feat-20",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:feat-20: missing recommended heading \"Files Affected\"",
+          "qid": "root:feat-20",
+          "node_type": "task",
+          "path": ".mdkg/work/feat-20.md",
+          "ref": "root:feat-20",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:feat-20: missing recommended heading \"Implementation Notes\"",
+          "qid": "root:feat-20",
+          "node_type": "task",
+          "path": ".mdkg/work/feat-20.md",
+          "ref": "root:feat-20",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:feat-20: missing recommended heading \"Test Plan\"",
+          "qid": "root:feat-20",
+          "node_type": "task",
+          "path": ".mdkg/work/feat-20.md",
+          "ref": "root:feat-20",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:feat-20: missing recommended heading \"Links / Artifacts\"",
+          "qid": "root:feat-20",
+          "node_type": "task",
+          "path": ".mdkg/work/feat-20.md",
+          "ref": "root:feat-20",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:spike-1: missing recommended heading \"Acceptance Criteria\"",
+          "qid": "root:spike-1",
+          "node_type": "task",
+          "path": ".mdkg/work/spike-1.md",
+          "ref": "root:spike-1",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:spike-1: missing recommended heading \"Files Affected\"",
+          "qid": "root:spike-1",
+          "node_type": "task",
+          "path": ".mdkg/work/spike-1.md",
+          "ref": "root:spike-1",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:spike-1: missing recommended heading \"Implementation Notes\"",
+          "qid": "root:spike-1",
+          "node_type": "task",
+          "path": ".mdkg/work/spike-1.md",
+          "ref": "root:spike-1",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:spike-1: missing recommended heading \"Test Plan\"",
+          "qid": "root:spike-1",
+          "node_type": "task",
+          "path": ".mdkg/work/spike-1.md",
+          "ref": "root:spike-1",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:spike-1: missing recommended heading \"Links / Artifacts\"",
+          "qid": "root:spike-1",
+          "node_type": "task",
+          "path": ".mdkg/work/spike-1.md",
+          "ref": "root:spike-1",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:task-1: missing recommended heading \"Acceptance Criteria\"",
+          "qid": "root:task-1",
+          "node_type": "task",
+          "path": ".mdkg/work/task-1.md",
+          "ref": "root:task-1",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:task-1: missing recommended heading \"Files Affected\"",
+          "qid": "root:task-1",
+          "node_type": "task",
+          "path": ".mdkg/work/task-1.md",
+          "ref": "root:task-1",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:task-1: missing recommended heading \"Implementation Notes\"",
+          "qid": "root:task-1",
+          "node_type": "task",
+          "path": ".mdkg/work/task-1.md",
+          "ref": "root:task-1",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:task-1: missing recommended heading \"Test Plan\"",
+          "qid": "root:task-1",
+          "node_type": "task",
+          "path": ".mdkg/work/task-1.md",
+          "ref": "root:task-1",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:task-1: missing recommended heading \"Links / Artifacts\"",
+          "qid": "root:task-1",
+          "node_type": "task",
+          "path": ".mdkg/work/task-1.md",
+          "ref": "root:task-1",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:task-10: missing recommended heading \"Acceptance Criteria\"",
+          "qid": "root:task-10",
+          "node_type": "task",
+          "path": ".mdkg/work/task-10.md",
+          "ref": "root:task-10",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:task-10: missing recommended heading \"Files Affected\"",
+          "qid": "root:task-10",
+          "node_type": "task",
+          "path": ".mdkg/work/task-10.md",
+          "ref": "root:task-10",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:task-10: missing recommended heading \"Implementation Notes\"",
+          "qid": "root:task-10",
+          "node_type": "task",
+          "path": ".mdkg/work/task-10.md",
+          "ref": "root:task-10",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:task-10: missing recommended heading \"Test Plan\"",
+          "qid": "root:task-10",
+          "node_type": "task",
+          "path": ".mdkg/work/task-10.md",
+          "ref": "root:task-10",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:task-10: missing recommended heading \"Links / Artifacts\"",
+          "qid": "root:task-10",
+          "node_type": "task",
+          "path": ".mdkg/work/task-10.md",
+          "ref": "root:task-10",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:task-100: missing recommended heading \"Acceptance Criteria\"",
+          "qid": "root:task-100",
+          "node_type": "task",
+          "path": ".mdkg/work/task-100.md",
+          "ref": "root:task-100",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:task-100: missing recommended heading \"Files Affected\"",
+          "qid": "root:task-100",
+          "node_type": "task",
+          "path": ".mdkg/work/task-100.md",
+          "ref": "root:task-100",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:task-100: missing recommended heading \"Implementation Notes\"",
+          "qid": "root:task-100",
+          "node_type": "task",
+          "path": ".mdkg/work/task-100.md",
+          "ref": "root:task-100",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:task-100: missing recommended heading \"Test Plan\"",
+          "qid": "root:task-100",
+          "node_type": "task",
+          "path": ".mdkg/work/task-100.md",
+          "ref": "root:task-100",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:task-100: missing recommended heading \"Links / Artifacts\"",
+          "qid": "root:task-100",
+          "node_type": "task",
+          "path": ".mdkg/work/task-100.md",
+          "ref": "root:task-100",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:task-11: missing recommended heading \"Acceptance Criteria\"",
+          "qid": "root:task-11",
+          "node_type": "task",
+          "path": ".mdkg/work/task-11.md",
+          "ref": "root:task-11",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:task-11: missing recommended heading \"Files Affected\"",
+          "qid": "root:task-11",
+          "node_type": "task",
+          "path": ".mdkg/work/task-11.md",
+          "ref": "root:task-11",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:task-11: missing recommended heading \"Implementation Notes\"",
+          "qid": "root:task-11",
+          "node_type": "task",
+          "path": ".mdkg/work/task-11.md",
+          "ref": "root:task-11",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:task-11: missing recommended heading \"Test Plan\"",
+          "qid": "root:task-11",
+          "node_type": "task",
+          "path": ".mdkg/work/task-11.md",
+          "ref": "root:task-11",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:task-11: missing recommended heading \"Links / Artifacts\"",
+          "qid": "root:task-11",
+          "node_type": "task",
+          "path": ".mdkg/work/task-11.md",
+          "ref": "root:task-11",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:task-2: missing recommended heading \"Acceptance Criteria\"",
+          "qid": "root:task-2",
+          "node_type": "task",
+          "path": ".mdkg/work/task-2.md",
+          "ref": "root:task-2",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:task-2: missing recommended heading \"Files Affected\"",
+          "qid": "root:task-2",
+          "node_type": "task",
+          "path": ".mdkg/work/task-2.md",
+          "ref": "root:task-2",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:task-2: missing recommended heading \"Implementation Notes\"",
+          "qid": "root:task-2",
+          "node_type": "task",
+          "path": ".mdkg/work/task-2.md",
+          "ref": "root:task-2",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:task-2: missing recommended heading \"Test Plan\"",
+          "qid": "root:task-2",
+          "node_type": "task",
+          "path": ".mdkg/work/task-2.md",
+          "ref": "root:task-2",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:task-2: missing recommended heading \"Links / Artifacts\"",
+          "qid": "root:task-2",
+          "node_type": "task",
+          "path": ".mdkg/work/task-2.md",
+          "ref": "root:task-2",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        }
+      ],
+      "warning_summary": {
+        "total": 53,
+        "emitted": 53,
+        "truncated": false,
+        "omitted_count": 0,
+        "limit": null,
+        "affected_file_count": 10,
+        "by_id": [
+          {
+            "key": "heading.missing",
+            "count": 53
+          }
+        ],
+        "by_category": [
+          {
+            "key": "headings",
+            "count": 53
+          }
+        ],
+        "by_node_type": [
+          {
+            "key": "task",
+            "count": 40
+          },
+          {
+            "key": "edd",
+            "count": 8
+          },
+          {
+            "key": "dec",
+            "count": 5
+          }
+        ],
+        "top_qids": [
+          {
+            "key": "root:edd-1",
+            "count": 8
+          },
+          {
+            "key": "root:bug-3",
+            "count": 5
+          },
+          {
+            "key": "root:dec-5",
+            "count": 5
+          },
+          {
+            "key": "root:feat-20",
+            "count": 5
+          },
+          {
+            "key": "root:spike-1",
+            "count": 5
+          },
+          {
+            "key": "root:task-1",
+            "count": 5
+          },
+          {
+            "key": "root:task-10",
+            "count": 5
+          },
+          {
+            "key": "root:task-100",
+            "count": 5
+          },
+          {
+            "key": "root:task-11",
+            "count": 5
+          },
+          {
+            "key": "root:task-2",
+            "count": 5
+          }
+        ],
+        "top_paths": [
+          {
+            "key": ".mdkg/design/edd-1.md",
+            "count": 8
+          },
+          {
+            "key": ".mdkg/design/dec-5.md",
+            "count": 5
+          },
+          {
+            "key": ".mdkg/work/bug-3.md",
+            "count": 5
+          },
+          {
+            "key": ".mdkg/work/feat-20.md",
+            "count": 5
+          },
+          {
+            "key": ".mdkg/work/spike-1.md",
+            "count": 5
+          },
+          {
+            "key": ".mdkg/work/task-1.md",
+            "count": 5
+          },
+          {
+            "key": ".mdkg/work/task-10.md",
+            "count": 5
+          },
+          {
+            "key": ".mdkg/work/task-100.md",
+            "count": 5
+          },
+          {
+            "key": ".mdkg/work/task-11.md",
+            "count": 5
+          },
+          {
+            "key": ".mdkg/work/task-2.md",
+            "count": 5
+          }
+        ]
+      },
+      "errors": []
+    }
+  },
+  "stderr": ""
+}

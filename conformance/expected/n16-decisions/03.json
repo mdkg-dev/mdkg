@@ -1,0 +1,45 @@
+{
+  "oracle": "mdkg 0.6.0 (TypeScript)",
+  "args": [
+    "show",
+    "dec-2",
+    "--json"
+  ],
+  "exit_code": 0,
+  "stdout": {
+    "json": {
+      "command": "show",
+      "kind": "node",
+      "item": {
+        "id": "dec-2",
+        "qid": "root:dec-2",
+        "ws": "root",
+        "type": "dec",
+        "title": "Supersedes one",
+        "status": "proposed",
+        "created": "2026-10-18",
+        "updated": "2026-10-18",
+        "tags": [],
+        "owners": [],
+        "links": [],
+        "artifacts": [],
+        "refs": [],
+        "aliases": [],
+        "skills": [],
+        "attributes": {
+          "supersedes": "dec-1"
+        },
+        "path": ".mdkg/design/dec-2-b.md",
+        "edges": {
+          "relates": [],
+          "blocked_by": [],
+          "blocks": [],
+          "context_refs": [],
+          "evidence_refs": []
+        },
+        "body": "# Overview\n\nBody text."
+      }
+    }
+  },
+  "stderr": ""
+}

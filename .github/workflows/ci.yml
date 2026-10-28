@@ -1,0 +1,54 @@
+# Runs every gate an agent must pass before asking for a merge
+# (scripts/check.sh): fmt, clippy, the tests and the third-party notices.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: check (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # Git 2.41.0 or later is required; private CI setup is in scripts/ci-remote.md.
+        os: [ubuntu-24.04, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # build.rs reads the commit for `--version`.
+          fetch-depth: 0
+      # mdkg 0.6.0 is the oracle: the write-command tests check that it
+      # still reads the 0.6 graphs this build writes to (conformance
+      # fixtures). This repository's own graph is format 0.7, which 0.6.0
+      # can't read, so check.sh skips 0.6.0's validate on it. It needs
+      # Node 24 (node:sqlite). Pinned, since `mdkg` on npm becomes 0.7.0.
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+      - name: Install mdkg 0.6.0 (the oracle)
+        run: npm install --global mdkg@0.6.0
+      - name: Configure git for the tests' commits
+        run: |
+          git config --global user.name "mdkg CI"
+          git config --global user.email "ci@mdkg.invalid"
+          git config --global init.defaultBranch main
+      - name: Install the toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: scripts/check.sh
+        run: |
+          export MDKG_NODE24="$(command -v node)"
+          export MDKG_TS_CLI="$(npm root --global)/mdkg/dist/cli.js"
+          scripts/check.sh

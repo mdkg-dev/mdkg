@@ -1,0 +1,22 @@
+[package]
+name = "mdkg-coord"
+version = "0.7.0"
+description = "Sans-IO coordinator: leases, claims, settlement through git, idempotent requests, sequencing and readable aliases. Internal to mdkg, no stable API; depend on the mdkg binary"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+readme = "README.md"
+
+[dependencies]
+mdkg-format = { path = "../mdkg-format", version = "0.7.0" }
+mdkg-log = { path = "../mdkg-log", version = "0.7.0" }
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+proptest.workspace = true
+
+[lints]
+workspace = true

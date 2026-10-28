@@ -1,0 +1,228 @@
+{
+  "oracle": "mdkg 0.6.0 (TypeScript)",
+  "args": [
+    "validate",
+    "--json"
+  ],
+  "exit_code": 0,
+  "stdout": {
+    "json": {
+      "action": "validated",
+      "ok": true,
+      "warning_count": 13,
+      "error_count": 0,
+      "warnings": [
+        "root:prd-1: missing recommended heading \"Problem\"",
+        "root:prd-1: missing recommended heading \"Goals\"",
+        "root:prd-1: missing recommended heading \"Non-goals\"",
+        "root:prd-1: missing recommended heading \"Requirements\"",
+        "root:prd-1: missing recommended heading \"Acceptance Criteria\"",
+        "root:prd-1: missing recommended heading \"Metrics / Success\"",
+        "root:prd-1: missing recommended heading \"Risks\"",
+        "root:prd-1: missing recommended heading \"Open Questions\"",
+        "root:task-1: missing recommended heading \"Acceptance Criteria\"",
+        "root:task-1: missing recommended heading \"Files Affected\"",
+        "root:task-1: missing recommended heading \"Implementation Notes\"",
+        "root:task-1: missing recommended heading \"Test Plan\"",
+        "root:task-1: missing recommended heading \"Links / Artifacts\""
+      ],
+      "warning_diagnostics": [
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:prd-1: missing recommended heading \"Problem\"",
+          "qid": "root:prd-1",
+          "node_type": "prd",
+          "path": ".mdkg/design/prd-1-p.md",
+          "ref": "root:prd-1",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:prd-1: missing recommended heading \"Goals\"",
+          "qid": "root:prd-1",
+          "node_type": "prd",
+          "path": ".mdkg/design/prd-1-p.md",
+          "ref": "root:prd-1",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:prd-1: missing recommended heading \"Non-goals\"",
+          "qid": "root:prd-1",
+          "node_type": "prd",
+          "path": ".mdkg/design/prd-1-p.md",
+          "ref": "root:prd-1",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:prd-1: missing recommended heading \"Requirements\"",
+          "qid": "root:prd-1",
+          "node_type": "prd",
+          "path": ".mdkg/design/prd-1-p.md",
+          "ref": "root:prd-1",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:prd-1: missing recommended heading \"Acceptance Criteria\"",
+          "qid": "root:prd-1",
+          "node_type": "prd",
+          "path": ".mdkg/design/prd-1-p.md",
+          "ref": "root:prd-1",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:prd-1: missing recommended heading \"Metrics / Success\"",
+          "qid": "root:prd-1",
+          "node_type": "prd",
+          "path": ".mdkg/design/prd-1-p.md",
+          "ref": "root:prd-1",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:prd-1: missing recommended heading \"Risks\"",
+          "qid": "root:prd-1",
+          "node_type": "prd",
+          "path": ".mdkg/design/prd-1-p.md",
+          "ref": "root:prd-1",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:prd-1: missing recommended heading \"Open Questions\"",
+          "qid": "root:prd-1",
+          "node_type": "prd",
+          "path": ".mdkg/design/prd-1-p.md",
+          "ref": "root:prd-1",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:task-1: missing recommended heading \"Acceptance Criteria\"",
+          "qid": "root:task-1",
+          "node_type": "task",
+          "path": ".mdkg/work/sub/deeper/task-1-a.md",
+          "ref": "root:task-1",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:task-1: missing recommended heading \"Files Affected\"",
+          "qid": "root:task-1",
+          "node_type": "task",
+          "path": ".mdkg/work/sub/deeper/task-1-a.md",
+          "ref": "root:task-1",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:task-1: missing recommended heading \"Implementation Notes\"",
+          "qid": "root:task-1",
+          "node_type": "task",
+          "path": ".mdkg/work/sub/deeper/task-1-a.md",
+          "ref": "root:task-1",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:task-1: missing recommended heading \"Test Plan\"",
+          "qid": "root:task-1",
+          "node_type": "task",
+          "path": ".mdkg/work/sub/deeper/task-1-a.md",
+          "ref": "root:task-1",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:task-1: missing recommended heading \"Links / Artifacts\"",
+          "qid": "root:task-1",
+          "node_type": "task",
+          "path": ".mdkg/work/sub/deeper/task-1-a.md",
+          "ref": "root:task-1",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        }
+      ],
+      "warning_summary": {
+        "total": 13,
+        "emitted": 13,
+        "truncated": false,
+        "omitted_count": 0,
+        "limit": null,
+        "affected_file_count": 2,
+        "by_id": [
+          {
+            "key": "heading.missing",
+            "count": 13
+          }
+        ],
+        "by_category": [
+          {
+            "key": "headings",
+            "count": 13
+          }
+        ],
+        "by_node_type": [
+          {
+            "key": "prd",
+            "count": 8
+          },
+          {
+            "key": "task",
+            "count": 5
+          }
+        ],
+        "top_qids": [
+          {
+            "key": "root:prd-1",
+            "count": 8
+          },
+          {
+            "key": "root:task-1",
+            "count": 5
+          }
+        ],
+        "top_paths": [
+          {
+            "key": ".mdkg/design/prd-1-p.md",
+            "count": 8
+          },
+          {
+            "key": ".mdkg/work/sub/deeper/task-1-a.md",
+            "count": 5
+          }
+        ]
+      },
+      "errors": []
+    }
+  },
+  "stderr": ""
+}

@@ -1,0 +1,79 @@
+{
+  "oracle": "mdkg 0.6.0 (TypeScript)",
+  "args": [
+    "search",
+    "frontmatter",
+    "--json"
+  ],
+  "exit_code": 0,
+  "stdout": {
+    "json": {
+      "command": "search",
+      "kind": "node",
+      "count": 2,
+      "returned_count": 2,
+      "limit": 50,
+      "truncated": false,
+      "items": [
+        {
+          "id": "task-1",
+          "qid": "root:task-1",
+          "ws": "root",
+          "type": "task",
+          "title": "Parser for Frontmatter",
+          "status": "todo",
+          "created": "2026-10-18",
+          "updated": "2026-10-18",
+          "tags": [
+            "format",
+            "parser"
+          ],
+          "owners": [],
+          "links": [],
+          "artifacts": [],
+          "refs": [],
+          "aliases": [],
+          "skills": [],
+          "attributes": {},
+          "path": ".mdkg/work/task-1-a.md",
+          "edges": {
+            "relates": [],
+            "blocked_by": [],
+            "blocks": [],
+            "context_refs": [],
+            "evidence_refs": []
+          }
+        },
+        {
+          "id": "task-3",
+          "qid": "root:task-3",
+          "ws": "root",
+          "type": "task",
+          "title": "Merkle roots",
+          "status": "todo",
+          "created": "2026-10-18",
+          "updated": "2026-10-18",
+          "tags": [],
+          "owners": [],
+          "links": [],
+          "artifacts": [],
+          "refs": [],
+          "aliases": [
+            "frontmatter-roots"
+          ],
+          "skills": [],
+          "attributes": {},
+          "path": ".mdkg/work/task-3-c.md",
+          "edges": {
+            "relates": [],
+            "blocked_by": [],
+            "blocks": [],
+            "context_refs": [],
+            "evidence_refs": []
+          }
+        }
+      ]
+    }
+  },
+  "stderr": ""
+}

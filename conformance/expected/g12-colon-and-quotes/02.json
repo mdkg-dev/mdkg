@@ -1,0 +1,256 @@
+{
+  "oracle": "mdkg 0.6.0 (TypeScript)",
+  "args": [
+    "validate",
+    "--json"
+  ],
+  "exit_code": 0,
+  "stdout": {
+    "json": {
+      "action": "validated",
+      "ok": true,
+      "warning_count": 15,
+      "error_count": 0,
+      "warnings": [
+        "root:task-1: missing recommended heading \"Acceptance Criteria\"",
+        "root:task-1: missing recommended heading \"Files Affected\"",
+        "root:task-1: missing recommended heading \"Implementation Notes\"",
+        "root:task-1: missing recommended heading \"Test Plan\"",
+        "root:task-1: missing recommended heading \"Links / Artifacts\"",
+        "root:task-2: missing recommended heading \"Acceptance Criteria\"",
+        "root:task-2: missing recommended heading \"Files Affected\"",
+        "root:task-2: missing recommended heading \"Implementation Notes\"",
+        "root:task-2: missing recommended heading \"Test Plan\"",
+        "root:task-2: missing recommended heading \"Links / Artifacts\"",
+        "root:task-3: missing recommended heading \"Acceptance Criteria\"",
+        "root:task-3: missing recommended heading \"Files Affected\"",
+        "root:task-3: missing recommended heading \"Implementation Notes\"",
+        "root:task-3: missing recommended heading \"Test Plan\"",
+        "root:task-3: missing recommended heading \"Links / Artifacts\""
+      ],
+      "warning_diagnostics": [
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:task-1: missing recommended heading \"Acceptance Criteria\"",
+          "qid": "root:task-1",
+          "node_type": "task",
+          "path": ".mdkg/work/task-1-colon.md",
+          "ref": "root:task-1",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:task-1: missing recommended heading \"Files Affected\"",
+          "qid": "root:task-1",
+          "node_type": "task",
+          "path": ".mdkg/work/task-1-colon.md",
+          "ref": "root:task-1",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:task-1: missing recommended heading \"Implementation Notes\"",
+          "qid": "root:task-1",
+          "node_type": "task",
+          "path": ".mdkg/work/task-1-colon.md",
+          "ref": "root:task-1",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:task-1: missing recommended heading \"Test Plan\"",
+          "qid": "root:task-1",
+          "node_type": "task",
+          "path": ".mdkg/work/task-1-colon.md",
+          "ref": "root:task-1",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:task-1: missing recommended heading \"Links / Artifacts\"",
+          "qid": "root:task-1",
+          "node_type": "task",
+          "path": ".mdkg/work/task-1-colon.md",
+          "ref": "root:task-1",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:task-2: missing recommended heading \"Acceptance Criteria\"",
+          "qid": "root:task-2",
+          "node_type": "task",
+          "path": ".mdkg/work/task-2-quotes.md",
+          "ref": "root:task-2",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:task-2: missing recommended heading \"Files Affected\"",
+          "qid": "root:task-2",
+          "node_type": "task",
+          "path": ".mdkg/work/task-2-quotes.md",
+          "ref": "root:task-2",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:task-2: missing recommended heading \"Implementation Notes\"",
+          "qid": "root:task-2",
+          "node_type": "task",
+          "path": ".mdkg/work/task-2-quotes.md",
+          "ref": "root:task-2",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:task-2: missing recommended heading \"Test Plan\"",
+          "qid": "root:task-2",
+          "node_type": "task",
+          "path": ".mdkg/work/task-2-quotes.md",
+          "ref": "root:task-2",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:task-2: missing recommended heading \"Links / Artifacts\"",
+          "qid": "root:task-2",
+          "node_type": "task",
+          "path": ".mdkg/work/task-2-quotes.md",
+          "ref": "root:task-2",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:task-3: missing recommended heading \"Acceptance Criteria\"",
+          "qid": "root:task-3",
+          "node_type": "task",
+          "path": ".mdkg/work/task-3-spaces.md",
+          "ref": "root:task-3",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:task-3: missing recommended heading \"Files Affected\"",
+          "qid": "root:task-3",
+          "node_type": "task",
+          "path": ".mdkg/work/task-3-spaces.md",
+          "ref": "root:task-3",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:task-3: missing recommended heading \"Implementation Notes\"",
+          "qid": "root:task-3",
+          "node_type": "task",
+          "path": ".mdkg/work/task-3-spaces.md",
+          "ref": "root:task-3",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:task-3: missing recommended heading \"Test Plan\"",
+          "qid": "root:task-3",
+          "node_type": "task",
+          "path": ".mdkg/work/task-3-spaces.md",
+          "ref": "root:task-3",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:task-3: missing recommended heading \"Links / Artifacts\"",
+          "qid": "root:task-3",
+          "node_type": "task",
+          "path": ".mdkg/work/task-3-spaces.md",
+          "ref": "root:task-3",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        }
+      ],
+      "warning_summary": {
+        "total": 15,
+        "emitted": 15,
+        "truncated": false,
+        "omitted_count": 0,
+        "limit": null,
+        "affected_file_count": 3,
+        "by_id": [
+          {
+            "key": "heading.missing",
+            "count": 15
+          }
+        ],
+        "by_category": [
+          {
+            "key": "headings",
+            "count": 15
+          }
+        ],
+        "by_node_type": [
+          {
+            "key": "task",
+            "count": 15
+          }
+        ],
+        "top_qids": [
+          {
+            "key": "root:task-1",
+            "count": 5
+          },
+          {
+            "key": "root:task-2",
+            "count": 5
+          },
+          {
+            "key": "root:task-3",
+            "count": 5
+          }
+        ],
+        "top_paths": [
+          {
+            "key": ".mdkg/work/task-1-colon.md",
+            "count": 5
+          },
+          {
+            "key": ".mdkg/work/task-2-quotes.md",
+            "count": 5
+          },
+          {
+            "key": ".mdkg/work/task-3-spaces.md",
+            "count": 5
+          }
+        ]
+      },
+      "errors": []
+    }
+  },
+  "stderr": ""
+}

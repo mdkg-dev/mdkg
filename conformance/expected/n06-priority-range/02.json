@@ -1,0 +1,35 @@
+{
+  "oracle": "mdkg 0.6.0 (TypeScript)",
+  "args": [
+    "validate",
+    "--json"
+  ],
+  "exit_code": 2,
+  "stdout": {
+    "json": {
+      "action": "validated",
+      "ok": false,
+      "warning_count": 0,
+      "error_count": 1,
+      "warnings": [],
+      "warning_diagnostics": [],
+      "warning_summary": {
+        "total": 0,
+        "emitted": 0,
+        "truncated": false,
+        "omitted_count": 0,
+        "limit": null,
+        "affected_file_count": 0,
+        "by_id": [],
+        "by_category": [],
+        "by_node_type": [],
+        "top_qids": [],
+        "top_paths": []
+      },
+      "errors": [
+        "<ROOT>/.mdkg/work/x-1.md: priority must be between 0 and 9"
+      ]
+    }
+  },
+  "stderr": "validation failed with 1 error(s)\n"
+}

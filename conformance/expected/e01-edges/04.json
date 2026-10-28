@@ -1,0 +1,50 @@
+{
+  "oracle": "mdkg 0.6.0 (TypeScript)",
+  "args": [
+    "show",
+    "task-2",
+    "--json"
+  ],
+  "exit_code": 0,
+  "stdout": {
+    "json": {
+      "command": "show",
+      "kind": "node",
+      "item": {
+        "id": "task-2",
+        "qid": "root:task-2",
+        "ws": "root",
+        "type": "task",
+        "title": "B",
+        "status": "todo",
+        "created": "2026-10-18",
+        "updated": "2026-10-18",
+        "tags": [],
+        "owners": [],
+        "links": [],
+        "artifacts": [],
+        "refs": [],
+        "aliases": [],
+        "skills": [],
+        "attributes": {},
+        "path": ".mdkg/work/task-2-b.md",
+        "edges": {
+          "prev": "root:task-1",
+          "relates": [],
+          "blocked_by": [
+            "root:task-1"
+          ],
+          "blocks": [],
+          "context_refs": [
+            "root:epic-1"
+          ],
+          "evidence_refs": [
+            "root:task-3"
+          ]
+        },
+        "body": "# Overview\n\nBody text."
+      }
+    }
+  },
+  "stderr": ""
+}

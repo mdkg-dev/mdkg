@@ -1,0 +1,25 @@
+[package]
+name = "mdkg-run"
+version = "0.7.0"
+description = "The launcher: wakes Claude Code, Codex and OpenCode agents with their inbox for one headless turn. Internal to mdkg, no stable API; depend on the mdkg binary"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+readme = "README.md"
+
+[dependencies]
+mdkg-coord-sqlite = { path = "../mdkg-coord-sqlite", version = "0.7.0" }
+mdkg-format = { path = "../mdkg-format", version = "0.7.0", features = ["settings-fs"] }
+mdkg-graph = { path = "../mdkg-graph", version = "0.7.0" }
+rustix = { workspace = true, features = ["process"] }
+schemars.workspace = true
+toml_edit.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

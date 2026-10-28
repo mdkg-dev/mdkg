@@ -1,0 +1,13 @@
+{
+  "oracle": "mdkg 0.6.0 (TypeScript)",
+  "args": [
+    "show",
+    "task-1",
+    "--meta"
+  ],
+  "exit_code": 0,
+  "stdout": {
+    "text": "root:task-1 | task | todo/p3 | Basic task | .mdkg/work/task-1-basic.md\ntags: alpha, beta-two\nowners: nick\nlinks: https://example.com/a\nrefs: task-2\naliases: basic\nrelates: root:task-2\n"
+  },
+  "stderr": ""
+}

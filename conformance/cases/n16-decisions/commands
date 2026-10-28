@@ -1,0 +1,3 @@
+list --json
+validate --json
+show dec-2 --json

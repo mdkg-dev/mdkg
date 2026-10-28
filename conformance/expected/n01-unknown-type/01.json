@@ -1,0 +1,12 @@
+{
+  "oracle": "mdkg 0.6.0 (TypeScript)",
+  "args": [
+    "list",
+    "--json"
+  ],
+  "exit_code": 4,
+  "stdout": {
+    "json": null
+  },
+  "stderr": "<ROOT>/.mdkg/work/x-1.md: type must be one of rule, prd, edd, dec, prop, goal, loop, epic, feat, task, bug, spike, checkpoint, test, archive, manifest, spec, work, work_order, receipt, feedback, dispute, proposal\n"
+}

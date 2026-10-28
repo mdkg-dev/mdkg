@@ -1,0 +1,4 @@
+list --json
+validate --json
+list --type task --json
+list --status todo --json

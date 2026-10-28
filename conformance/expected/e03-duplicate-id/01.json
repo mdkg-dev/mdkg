@@ -1,0 +1,12 @@
+{
+  "oracle": "mdkg 0.6.0 (TypeScript)",
+  "args": [
+    "list",
+    "--json"
+  ],
+  "exit_code": 4,
+  "stdout": {
+    "json": null
+  },
+  "stderr": "duplicate id task-1 in workspace root; use read-only identity inspection and reviewed reconciliation\n"
+}

@@ -1,0 +1,4 @@
+list --json
+validate --json
+list --ws a_b --json
+show a_b:task-1 --json

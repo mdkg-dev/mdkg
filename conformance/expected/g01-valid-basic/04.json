@@ -1,0 +1,43 @@
+{
+  "oracle": "mdkg 0.6.0 (TypeScript)",
+  "args": [
+    "show",
+    "root:task-2",
+    "--json"
+  ],
+  "exit_code": 0,
+  "stdout": {
+    "json": {
+      "command": "show",
+      "kind": "node",
+      "item": {
+        "id": "task-2",
+        "qid": "root:task-2",
+        "ws": "root",
+        "type": "task",
+        "title": "Other task",
+        "status": "backlog",
+        "created": "2026-10-18",
+        "updated": "2026-10-18",
+        "tags": [],
+        "owners": [],
+        "links": [],
+        "artifacts": [],
+        "refs": [],
+        "aliases": [],
+        "skills": [],
+        "attributes": {},
+        "path": ".mdkg/work/task-2-other.md",
+        "edges": {
+          "relates": [],
+          "blocked_by": [],
+          "blocks": [],
+          "context_refs": [],
+          "evidence_refs": []
+        },
+        "body": "# Overview\n\nBody text."
+      }
+    }
+  },
+  "stderr": ""
+}

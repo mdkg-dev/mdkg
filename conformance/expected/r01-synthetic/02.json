@@ -1,0 +1,96 @@
+{
+  "oracle": "mdkg 0.6.0 (TypeScript)",
+  "args": [
+    "validate",
+    "--json"
+  ],
+  "exit_code": 0,
+  "stdout": {
+    "json": {
+      "action": "validated",
+      "ok": true,
+      "warning_count": 3,
+      "error_count": 0,
+      "warnings": [
+        "root:edd-1: missing recommended heading \"Rollout plan\"",
+        ".agents/skills: mirror root missing; run `mdkg skill sync`",
+        ".claude/skills: mirror root missing; run `mdkg skill sync`"
+      ],
+      "warning_diagnostics": [
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:edd-1: missing recommended heading \"Rollout plan\"",
+          "qid": "root:edd-1",
+          "node_type": "edd",
+          "path": ".mdkg/design/edd-1-example.md",
+          "ref": "root:edd-1",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "skill_mirror.warning",
+          "category": "skills",
+          "severity": "warning",
+          "message": ".agents/skills: mirror root missing; run `mdkg skill sync`",
+          "remediation": "Run mdkg skill sync after reviewing managed skill mirror drift."
+        },
+        {
+          "id": "skill_mirror.warning",
+          "category": "skills",
+          "severity": "warning",
+          "message": ".claude/skills: mirror root missing; run `mdkg skill sync`",
+          "remediation": "Run mdkg skill sync after reviewing managed skill mirror drift."
+        }
+      ],
+      "warning_summary": {
+        "total": 3,
+        "emitted": 3,
+        "truncated": false,
+        "omitted_count": 0,
+        "limit": null,
+        "affected_file_count": 1,
+        "by_id": [
+          {
+            "key": "skill_mirror.warning",
+            "count": 2
+          },
+          {
+            "key": "heading.missing",
+            "count": 1
+          }
+        ],
+        "by_category": [
+          {
+            "key": "skills",
+            "count": 2
+          },
+          {
+            "key": "headings",
+            "count": 1
+          }
+        ],
+        "by_node_type": [
+          {
+            "key": "edd",
+            "count": 1
+          }
+        ],
+        "top_qids": [
+          {
+            "key": "root:edd-1",
+            "count": 1
+          }
+        ],
+        "top_paths": [
+          {
+            "key": ".mdkg/design/edd-1-example.md",
+            "count": 1
+          }
+        ]
+      },
+      "errors": []
+    }
+  },
+  "stderr": ""
+}

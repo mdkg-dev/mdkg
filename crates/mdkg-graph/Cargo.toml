@@ -1,0 +1,20 @@
+[package]
+name = "mdkg-graph"
+version = "0.7.0"
+description = "Load, index, query and validate mdkg graphs. Internal to mdkg, no stable API; depend on the mdkg binary"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+readme = "README.md"
+
+[dependencies]
+mdkg-format = { path = "../mdkg-format", version = "0.7.0", features = ["settings-fs"] }
+serde_json.workspace = true
+# Review of 13b3e6e: templates are read through folder handles opened from
+# the repository root, never through a second path lookup.
+rustix.workspace = true
+
+[lints]
+workspace = true

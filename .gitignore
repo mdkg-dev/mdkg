@@ -1,0 +1,29 @@
+# Rust
+/target/
+
+# mdkg derived and coordination state: never committed
+.mdkg/index/
+.mdkg/pack/
+.mdkg/state/
+.mdkg/db/runtime/
+.mdkg/db/**/*.sqlite
+.mdkg/db/**/*.sqlite-wal
+.mdkg/db/**/*.sqlite-shm
+.mdkg/db/**/*.sqlite-journal
+
+# Local worktrees for parallel agents
+/.worktrees/
+
+# OS and editor
+.DS_Store
+.mdkg/index/*.json
+.mdkg/index/*.tmp
+.mdkg/index/*.lock
+.mdkg/index/write.lock/
+.mdkg/index/*.sqlite-wal
+.mdkg/index/*.sqlite-shm
+.mdkg/index/*.sqlite-journal
+.mdkg/db/**/*.lock
+.mdkg/db/**/*.tmp
+.mdkg/subgraphs/
+.mdkg/archive/**/source/

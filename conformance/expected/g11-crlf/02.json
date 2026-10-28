@@ -1,0 +1,120 @@
+{
+  "oracle": "mdkg 0.6.0 (TypeScript)",
+  "args": [
+    "validate",
+    "--json"
+  ],
+  "exit_code": 0,
+  "stdout": {
+    "json": {
+      "action": "validated",
+      "ok": true,
+      "warning_count": 5,
+      "error_count": 0,
+      "warnings": [
+        "root:task-1: missing recommended heading \"Acceptance Criteria\"",
+        "root:task-1: missing recommended heading \"Files Affected\"",
+        "root:task-1: missing recommended heading \"Implementation Notes\"",
+        "root:task-1: missing recommended heading \"Test Plan\"",
+        "root:task-1: missing recommended heading \"Links / Artifacts\""
+      ],
+      "warning_diagnostics": [
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:task-1: missing recommended heading \"Acceptance Criteria\"",
+          "qid": "root:task-1",
+          "node_type": "task",
+          "path": ".mdkg/work/task-1-crlf.md",
+          "ref": "root:task-1",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:task-1: missing recommended heading \"Files Affected\"",
+          "qid": "root:task-1",
+          "node_type": "task",
+          "path": ".mdkg/work/task-1-crlf.md",
+          "ref": "root:task-1",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:task-1: missing recommended heading \"Implementation Notes\"",
+          "qid": "root:task-1",
+          "node_type": "task",
+          "path": ".mdkg/work/task-1-crlf.md",
+          "ref": "root:task-1",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:task-1: missing recommended heading \"Test Plan\"",
+          "qid": "root:task-1",
+          "node_type": "task",
+          "path": ".mdkg/work/task-1-crlf.md",
+          "ref": "root:task-1",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        },
+        {
+          "id": "heading.missing",
+          "category": "headings",
+          "severity": "warning",
+          "message": "root:task-1: missing recommended heading \"Links / Artifacts\"",
+          "qid": "root:task-1",
+          "node_type": "task",
+          "path": ".mdkg/work/task-1-crlf.md",
+          "ref": "root:task-1",
+          "remediation": "Run mdkg format --headings --dry-run to review missing heading additions, then --apply if acceptable."
+        }
+      ],
+      "warning_summary": {
+        "total": 5,
+        "emitted": 5,
+        "truncated": false,
+        "omitted_count": 0,
+        "limit": null,
+        "affected_file_count": 1,
+        "by_id": [
+          {
+            "key": "heading.missing",
+            "count": 5
+          }
+        ],
+        "by_category": [
+          {
+            "key": "headings",
+            "count": 5
+          }
+        ],
+        "by_node_type": [
+          {
+            "key": "task",
+            "count": 5
+          }
+        ],
+        "top_qids": [
+          {
+            "key": "root:task-1",
+            "count": 5
+          }
+        ],
+        "top_paths": [
+          {
+            "key": ".mdkg/work/task-1-crlf.md",
+            "count": 5
+          }
+        ]
+      },
+      "errors": []
+    }
+  },
+  "stderr": ""
+}

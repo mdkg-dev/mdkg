@@ -1,0 +1,2 @@
+show task-9 --json
+show other:task-1 --json

@@ -1,0 +1,4 @@
+list --json
+validate --json
+show edd-1 --json
+search kernel --json

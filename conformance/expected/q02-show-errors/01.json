@@ -1,0 +1,13 @@
+{
+  "oracle": "mdkg 0.6.0 (TypeScript)",
+  "args": [
+    "show",
+    "task-9",
+    "--json"
+  ],
+  "exit_code": 3,
+  "stdout": {
+    "json": null
+  },
+  "stderr": "id not found: task-9\n"
+}

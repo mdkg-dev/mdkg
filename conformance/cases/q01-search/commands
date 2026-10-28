@@ -1,0 +1,5 @@
+search frontmatter --json
+search "parser format" --json
+search FRONTMATTER --json
+search nothing-matches --json
+search frontmatter --type task --limit 1 --json
