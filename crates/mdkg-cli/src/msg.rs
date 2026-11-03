@@ -1,4 +1,4 @@
-//! `msg` and `room`: rooms and messaging, shaped like an A2A v1.0 subset,
+//! `msg` and `channel`: channels and messaging, shaped like an A2A v1.0 subset,
 //! with mailbox, membership and untrusted-body rules:
 //!
 //! - The actor reads its own mailbox plus every role it holds: a role
@@ -6,29 +6,34 @@
 //!   role:<name>`).
 //! - `human:*` is never an actor, except that a human acks their own
 //!   deliveries (`msg ack --as human:<name>`), reads their own mailbox
-//!   (`msg inbox|wait`), reads threads and leaves a room; never with
+//!   (`msg inbox|wait`), reads threads and leaves a channel; never with
 //!   `$MDKG_ACTOR` naming anyone but that human. `--as` isn't
 //!   authenticated, so a human's ack records the worktree's folder name
 //!   (the git top level of `--root`) as `ackedVia` and is never an
 //!   approval. Anyone may read a human's mailbox. A `purge_on_ack` body
 //!   waits for a human up to `coordination.messages.human_hold_days`
 //!   (default 7) after sending.
+//! - `mdkg:*` is reserved for launcher-generated records; ordinary CLI and
+//!   MCP actors cannot use it, including as an imported sender.
+//!   The sender identifies a launcher receipt, never its destination: ordinary
+//!   mail addressed to `mdkg:*` keeps its original sender and is not a receipt.
 //! - Nobody gets their own post: a send skips the sender, the writer and
 //!   every role the sender holds.
-//! - Rooms are open to join; only members add or remove others, and only
+//! - Channels are open to join; only members add or remove others, and only
 //!   the human removes a `human:*` member. This is advisory and
 //!   cooperative, not a security boundary.
 //! - Mail commands never observe main or touch the lease journal.
 //! - Bodies are untrusted data: text output prints each body inside a
 //!   boundary chosen at random per message, with the header outside it.
 
-use std::collections::BTreeSet;
+use crate::credentials::looks_secret;
 use std::hash::{BuildHasher, RandomState};
 use std::path::{Path, PathBuf};
 
 use clap::{Args, Subcommand};
 use mdkg_coord::Status;
 use mdkg_coord_sqlite::Store;
+use mdkg_coord_sqlite::ledger::{ExpiryPolicy, SendFlow};
 use mdkg_coord_sqlite::mail::{
     self, Delivery, Inbox, InboxQuery, MailError, Message, Outgoing, Retention, Room, Shown, To,
 };
@@ -46,31 +51,51 @@ use crate::output::{self, Report, rfc3339};
 #[path = "authority_decision.rs"]
 mod authority_decision;
 
+pub(crate) mod watch;
+
 /// Bodies over this many bytes (as stored) are refused.
 const MAX_BODY: u64 = 64 * 1024;
 
 #[derive(Debug, Subcommand)]
 pub enum MsgCommand {
-    /// Send a message to a room or to mailboxes.
+    /// Follow the local coordinator event stream as one JSON event per line.
+    #[command(after_help = examples!("msg watch --json", "msg watch --from-start --types 'mdkg.message.*' --json"))]
+    Watch(watch::WatchArgs),
+    /// Send a message to a channel or to mailboxes.
     #[command(after_help = examples!(
-        "msg send --room dev --kind note --text \"Tests pass on main\"",
+        "msg send --channel dev --kind note --text \"Tests pass on main\"",
         "msg send --to role:reviewer --kind review_request --text \"Please review cs-3\""
     ))]
     Send(SendArgs),
     /// Show your unacked mail (your mailbox and the roles you hold).
-    #[command(after_help = examples!("msg inbox", "msg inbox --room dev --json"))]
+    #[command(after_help = examples!("msg inbox", "msg inbox --channel dev --json", "msg inbox --from orchestrator --kind question"))]
     Inbox(InboxArgs),
     /// Wait for mail; exits 6 if none arrives before the timeout.
     #[command(after_help = examples!("msg wait --timeout 300", "msg wait --after 42 --json"))]
     Wait(WaitArgs),
     /// Ack messages delivered to you.
-    #[command(after_help = examples!("msg ack <message-id>", "msg ack <message-id> --outcome merged"))]
+    #[command(after_help = examples!(
+        "msg ack <message-id>",
+        "msg ack <message-id> --outcome merged",
+        "msg ack --through 4400 --kind note,handoff"
+    ))]
     Ack(AckArgs),
+    /// Re-send messages delivered to you, verbatim with their senders, as
+    /// one new message; then ack them.
+    ///
+    /// For a role that relays mail: an ack can purge a body, so forward it
+    /// first. The send and the acks are one step: nothing is acked unless
+    /// the forward is stored.
+    #[command(after_help = examples!(
+        "msg forward 4410 4411 --to a-mail --kind findings --text \"Reviews of 1a2b3c4\"",
+        "msg forward <message-id> --channel dev"
+    ))]
+    Forward(ForwardArgs),
     /// Show a conversation's messages, oldest first.
-    #[command(after_help = examples!("msg thread <message-id>", "msg thread --room dev --tail 20"))]
+    #[command(after_help = examples!("msg thread <message-id>", "msg thread --channel dev --tail 20"))]
     Thread(ThreadArgs),
     /// Record a read-only sender's output (a file) as its message.
-    #[command(after_help = examples!("msg import --from codex:run-7 --room dev --kind findings review.json"))]
+    #[command(after_help = examples!("msg import --from codex:run-7 --channel dev --kind findings review.json"))]
     Import(ImportArgs),
     /// List send-time decision metadata without acknowledging mail.
     /// A row does not prove human approval or launcher promotion: the launcher
@@ -90,19 +115,19 @@ pub enum MsgCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum RoomCommand {
-    /// Create a room, with you as a member.
-    #[command(after_help = examples!("room create dev"))]
+    /// Create a channel, with you as a member.
+    #[command(after_help = examples!("channel create dev"))]
     Create(RoomArgs),
-    /// Add you (or the given mailboxes) to a room.
-    #[command(after_help = examples!("room join dev"))]
+    /// Add you (or the given mailboxes) to a channel.
+    #[command(after_help = examples!("channel join dev"))]
     Join(RoomArgs),
-    /// Remove you (or the given mailboxes) from a room.
-    #[command(after_help = examples!("room leave dev"))]
+    /// Remove you (or the given mailboxes) from a channel.
+    #[command(after_help = examples!("channel leave dev"))]
     Leave(RoomArgs),
-    /// List every room, with its members and your unacked counts.
-    #[command(after_help = examples!("room list", "room list --mine --json"))]
+    /// List every channel, with its members and your unacked counts.
+    #[command(after_help = examples!("channel list", "channel list --mine --json"))]
     List {
-        /// Only rooms you're a member of.
+        /// Only channels you're a member of.
         #[arg(long)]
         mine: bool,
         /// Print JSON.
@@ -113,9 +138,11 @@ pub enum RoomCommand {
 
 #[derive(Debug, Args)]
 pub struct Target {
-    /// Post to this room's members.
-    #[arg(long, conflicts_with = "to", required_unless_present = "to")]
+    /// Post to this channel's members.
+    #[arg(long = "channel", value_name = "NAME", conflicts_with_all = ["to", "legacy_room"], required_unless_present_any = ["to", "legacy_room"])]
     room: Option<String>,
+    #[arg(long = "room", hide = true, conflicts_with_all = ["to", "room"])]
+    legacy_room: Option<String>,
     /// Send to these mailboxes (comma-separated or repeated).
     #[arg(long, value_delimiter = ',')]
     to: Vec<String>,
@@ -141,9 +168,9 @@ pub struct SendArgs {
     /// The conversation (default: the replied-to message's, else a new one).
     ///
     /// A reply joins the replied-to message's context when it goes to the
-    /// same place, room to room or direct to direct, and a direct reply's
-    /// conversation holds no room post; otherwise a room post's context is
-    /// `room:<name>`, and a direct message's its own id.
+    /// same place, channel to channel or direct to direct, and a direct reply's
+    /// conversation holds no channel post; otherwise a channel post's context is
+    /// the channel's default context, and a direct message's its own id.
     #[arg(long)]
     context: Option<String>,
     /// The id of a message this replies to (repeatable).
@@ -161,6 +188,25 @@ pub struct SendArgs {
     /// A URL part.
     #[arg(long)]
     url: Vec<String>,
+    /// A node this message is about (repeatable): an id, a qid or a
+    /// unique prefix, bound by its UUID. A review_request names exactly
+    /// one, and opens a review round on it with --range.
+    #[arg(long = "node")]
+    node: Vec<String>,
+    /// With --node on a review_request: the range under review,
+    /// `<base>..<sha>`, which the review round records.
+    #[arg(long, requires = "node")]
+    range: Option<String>,
+    /// A message of yours this one replaces (repeatable): its unacked
+    /// deliveries to this message's recipients are acked by mdkg as
+    /// superseded, so they leave inboxes and wake no one.
+    #[arg(long)]
+    supersedes: Vec<String>,
+    /// Replaces your earlier unacked messages with this slot and the same
+    /// first --node (or none), as --supersedes does: `[a-z0-9._:-]`, up to
+    /// 200 characters, such as `brief.a-mail`.
+    #[arg(long)]
+    slot: Option<String>,
     /// Print JSON.
     #[arg(long)]
     json: bool,
@@ -171,17 +217,35 @@ pub struct Filters {
     /// Read this mailbox instead (yours, a role you hold, or `human:*`).
     #[arg(long)]
     mailbox: Option<String>,
-    /// Only mail posted to this room.
-    #[arg(long)]
+    /// Only mail posted to this channel.
+    #[arg(long = "channel", value_name = "NAME", conflicts_with = "legacy_room")]
     room: Option<String>,
+    #[arg(long = "room", hide = true, conflicts_with = "room")]
+    legacy_room: Option<String>,
     /// Only these kinds: repeat the flag or separate them with commas
-    /// (`--kind question,handoff`).
+    /// (`--kind question,handoff`). Receipts are left out unless this names
+    /// `receipt`.
     #[arg(long, value_delimiter = ',')]
     kind: Vec<String>,
-    /// Room mail only of these kinds, while direct mail of every kind still
-    /// counts (`--room-kind question,handoff`): a wake hook's filter.
-    #[arg(long, value_delimiter = ',')]
+    /// Channel mail only of these kinds, while direct mail of every kind still
+    /// counts (`--channel-kind question,handoff`): a wake hook's filter.
+    #[arg(
+        long = "channel-kind",
+        value_delimiter = ',',
+        conflicts_with = "legacy_room_kind"
+    )]
     room_kind: Vec<String>,
+    #[arg(
+        long = "room-kind",
+        hide = true,
+        value_delimiter = ',',
+        conflicts_with = "room_kind"
+    )]
+    legacy_room_kind: Vec<String>,
+    /// Only mail from these senders: repeat the flag or separate them with
+    /// commas (`--from a-mail,orchestrator`).
+    #[arg(long, value_delimiter = ',')]
+    from: Vec<String>,
     /// Only mail after this cursor (the `cursor` a previous call returned).
     /// A cursor covers the mailboxes it was issued for: after taking a role,
     /// read once without `--after` to see the role's backlog.
@@ -232,8 +296,23 @@ pub struct WaitArgs {
 #[derive(Debug, Args)]
 pub struct AckArgs {
     /// Message ids, or the `#N` (or `N`) a listing shows.
-    #[arg(required = true, num_args = 1..)]
+    #[arg(
+        required_unless_present = "through",
+        conflicts_with = "through",
+        num_args = 1..
+    )]
     ids: Vec<String>,
+    /// Ack all your unacked mail numbered this or lower instead (`N` or
+    /// `#N`: a listing's number, or the `cursor` it returned).
+    ///
+    /// Findings and faults are skipped unless `--kind` names them, and so is mail
+    /// never listed to you; the result names what it skipped and why.
+    #[arg(long)]
+    through: Option<String>,
+    /// With --through: only these kinds (repeat the flag or separate them
+    /// with commas). Name `findings` to ack findings.
+    #[arg(long, value_delimiter = ',', requires = "through")]
+    kind: Vec<String>,
     /// Ack only this mailbox's deliveries (yours or a role you hold).
     #[arg(long)]
     mailbox: Option<String>,
@@ -249,16 +328,45 @@ pub struct AckArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct ForwardArgs {
+    /// Message ids, or the `#N` (or `N`) a listing shows, in the order to
+    /// forward them.
+    #[arg(required = true, num_args = 1..)]
+    ids: Vec<String>,
+    #[command(flatten)]
+    target: Target,
+    /// The new message's kind (default: the forwarded messages' kind, when
+    /// they all have one). Never `decision`.
+    #[arg(long)]
+    kind: Option<String>,
+    /// A text part to put before the forwarded messages (repeatable).
+    #[arg(long)]
+    text: Vec<String>,
+    /// Forward and ack only this mailbox's deliveries (yours or a role you
+    /// hold).
+    #[arg(long)]
+    mailbox: Option<String>,
+    /// The outcome recorded with the acks (default: `forwarded as <id>`).
+    #[arg(long)]
+    outcome: Option<String>,
+    /// Print JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
 pub struct ThreadArgs {
     /// A message id (its conversation), the `#N` a listing shows, or a
     /// context id.
-    #[arg(required_unless_present = "room", conflicts_with = "room")]
+    #[arg(required_unless_present_any = ["room", "legacy_room"], conflicts_with_all = ["room", "legacy_room"])]
     target: Option<String>,
-    /// Every message posted to this room instead, whatever its context.
-    #[arg(long)]
+    /// Every message posted to this channel instead, whatever its context.
+    #[arg(long = "channel", value_name = "NAME", conflicts_with = "legacy_room")]
     room: Option<String>,
+    #[arg(long = "room", hide = true, conflicts_with = "room")]
+    legacy_room: Option<String>,
     /// Only messages after this cursor (the `cursor` a previous call on
-    /// this thread or room returned), to page through a long one.
+    /// this thread or channel returned), to page through a long one.
     #[arg(long)]
     after: Option<u64>,
     /// At most this many messages (1 or more), the oldest first.
@@ -266,13 +374,13 @@ pub struct ThreadArgs {
     limit: Option<i64>,
     /// The newest this many messages (1 or more), listed oldest first.
     ///
-    /// For catching up on a thread's or a room's recent messages. Not with
+    /// For catching up on a thread's or a channel's recent messages. Not with
     /// --limit or --after.
     #[arg(long, allow_negative_numbers = true)]
     tail: Option<i64>,
-    /// With --room: read it only as a member (you or a role you hold),
-    /// refused with room.not_member before anything is read.
-    #[arg(long, requires = "room")]
+    /// With --channel: read it only as a member (you or a role you hold),
+    /// refused with channel.not_member before anything is read.
+    #[arg(long)]
     member: bool,
     /// List without counting as shown (see `inbox --no-mark`).
     #[arg(long)]
@@ -307,7 +415,7 @@ pub struct ImportArgs {
 
 #[derive(Debug, Args)]
 pub struct RoomArgs {
-    /// The room's name: lowercase letters, digits, `.`, `_` and `-`.
+    /// The channel's name: lowercase letters, digits, `.`, `_` and `-`.
     name: String,
     /// Mailboxes to add or remove instead of (for create: besides) you.
     #[arg(long, value_delimiter = ',')]
@@ -320,10 +428,12 @@ pub struct RoomArgs {
 impl MsgCommand {
     pub fn json(&self) -> bool {
         match self {
+            MsgCommand::Watch(a) => a.json,
             MsgCommand::Send(a) => a.json,
             MsgCommand::Inbox(a) => a.json,
             MsgCommand::Wait(a) => a.json,
             MsgCommand::Ack(a) => a.json,
+            MsgCommand::Forward(a) => a.json,
             MsgCommand::Thread(a) => a.json,
             MsgCommand::Import(a) => a.json,
             MsgCommand::Decisions { json, .. } => *json,
@@ -333,10 +443,12 @@ impl MsgCommand {
     /// The command's schema name (`mdkg.<name>.v1`).
     pub fn name(&self) -> &'static str {
         match self {
+            MsgCommand::Watch(_) => "msg.watch",
             MsgCommand::Send(_) => "msg.send",
             MsgCommand::Inbox(_) => "msg.inbox",
             MsgCommand::Wait(_) => "msg.wait",
             MsgCommand::Ack(_) => "msg.ack",
+            MsgCommand::Forward(_) => "msg.forward",
             MsgCommand::Thread(_) => "msg.thread",
             MsgCommand::Import(_) => "msg.import",
             MsgCommand::Decisions { .. } => "msg.decisions",
@@ -349,6 +461,15 @@ impl RoomCommand {
         match self {
             RoomCommand::Create(a) | RoomCommand::Join(a) | RoomCommand::Leave(a) => a.json,
             RoomCommand::List { json, .. } => *json,
+        }
+    }
+
+    pub fn channel_name(&self) -> &'static str {
+        match self {
+            Self::Create(_) => "channel.create",
+            Self::Join(_) => "channel.join",
+            Self::Leave(_) => "channel.leave",
+            Self::List { .. } => "channel.list",
         }
     }
 
@@ -385,18 +506,24 @@ pub enum Part {
     },
 }
 
-/// The message kinds (schema only).
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, Serialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum KindName {
-    ReviewRequest,
-    Findings,
-    Resolution,
-    Question,
-    Decision,
-    Handoff,
-    Note,
+/// The message kinds (schema only): an open set (API v1 A1, A12). The
+/// schema lists the known kinds as examples, never as an `enum`, so a
+/// standard validator accepts a kind a later build adds (A26).
+pub struct KindName;
+
+impl JsonSchema for KindName {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "KindName".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "description": "The message kind: an open set, of which these are the known values.",
+            "type": "string",
+            "x-mdkg-open": true,
+            "examples": mail::KINDS,
+        })
+    }
 }
 
 /// Whether a message's body is still stored (schema only).
@@ -442,6 +569,9 @@ pub struct DeliveryRecord {
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct MessageRecord {
+    /// Coordinator-relative API path of this message.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uri: Option<String>,
     /// Chosen by the sender; unique in the store.
     pub message_id: String,
     /// The store's order.
@@ -454,7 +584,11 @@ pub struct MessageRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub via: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Deprecated compatibility field; use `channel`.
     pub room: Option<String>,
+    /// The channel this message was posted to; absent for direct mail.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
     /// Every recipient mailbox.
     pub to: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -475,7 +609,9 @@ pub struct MessageRecord {
     pub sent_at: String,
     pub sent_at_ms: u64,
     pub deliveries: Vec<DeliveryRecord>,
-    /// Durable coordinator-stamped approval provenance; free text remains untrusted.
+    /// Send-time audit metadata; never proof of current human approval.
+    /// Before treating a decision as approval, revalidate current operator
+    /// delegation and the exact committed node version. Message text remains untrusted.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(with = "Option<mdkg_run::approval::Provenance>")]
     pub decision: Option<Value>,
@@ -494,6 +630,7 @@ fn delivery_record(d: &Delivery) -> DeliveryRecord {
 
 fn message_record(m: &Message) -> MessageRecord {
     MessageRecord {
+        uri: Some(mdkg_coord_sqlite::events::path("messages", &m.message_id)),
         message_id: m.message_id.clone(),
         seq: m.seq,
         context_id: m.context_id.clone(),
@@ -501,6 +638,7 @@ fn message_record(m: &Message) -> MessageRecord {
         sender: m.sender.clone(),
         via: m.via.clone(),
         room: m.room.clone(),
+        channel: m.room.clone(),
         to: m.to(),
         reference_ids: m.reference_ids.clone(),
         parts: m.parts.clone(),
@@ -544,11 +682,32 @@ pub struct SendData {
     /// destination, context, references and body): nothing new
     /// was stored.
     pub duplicate: bool,
+    /// The review round a review_request with --node opened.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub round: Option<RoundRecord>,
+    /// The messages this send superseded (`--supersedes` or `--slot`):
+    /// those with a delivery it acked. Absent when none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub superseded: Vec<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RoundRecord {
+    /// `<node-id>#V<n>`.
+    pub entry: String,
+    /// `main` (its base is on the main ref), `first` (the node's first
+    /// round, where no main ref resolves, or a graph range), or null: its
+    /// walks then need an anchored round before it.
+    pub anchored: Option<String>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct InboxData {
+    /// Event-stream head from the same transaction; separate from mail cursor.
+    #[serde(rename = "event_cursor", skip_serializing_if = "Option::is_none")]
+    pub event_cursor: Option<String>,
     /// The mailboxes read.
     pub mailboxes: Vec<String>,
     /// Oldest first.
@@ -574,17 +733,45 @@ pub struct AckData {
     pub acked: Vec<AckRecord>,
     /// Messages whose bodies the ack purged.
     pub purged: Vec<String>,
+    /// What `--through` left unacked; empty for an ack by id.
+    pub skipped: Vec<SkippedRecord>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ForwardData {
+    /// The new message.
+    pub message: MessageRecord,
+    /// The forwarded messages' deliveries, now acked.
+    pub acked: Vec<AckRecord>,
+    /// Forwarded messages whose bodies the ack purged.
+    pub purged: Vec<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SkippedRecord {
+    pub message_id: String,
+    pub seq: u64,
+    pub mailbox: String,
+    pub kind: String,
+    /// `findings`: findings are acked only when `--kind` names them.
+    /// `fault`: so are faults, which a bulk ack never clears (A26).
+    /// `not_shown`: never listed to that mailbox; read your inbox first.
+    pub reason: String,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadData {
+    #[serde(rename = "event_cursor", skip_serializing_if = "Option::is_none")]
+    pub event_cursor: Option<String>,
     pub context_id: String,
     /// Oldest first.
     pub messages: Vec<MessageRecord>,
     /// The last message's position in the store (a store-wide seq), or the
     /// `--after` given (0 without one) when none came: pass it back as
-    /// `--after` on the same thread or room for what came next.
+    /// `--after` on the same thread or channel for what came next.
     pub cursor: u64,
     /// More messages than `--limit` allowed came after these. Always
     /// false with `--tail`, which reads up to the newest.
@@ -597,12 +784,21 @@ pub struct ThreadData {
 #[derive(Debug, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RoomRecord {
+    /// Coordinator-relative API path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uri: Option<String>,
+    /// Opaque context used by a post with no explicit context.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_context: Option<String>,
+    /// A mail position, separate from the event stream cursor.
+    #[serde(rename = "last_seq", skip_serializing_if = "Option::is_none")]
+    pub last_seq: Option<u64>,
     pub name: String,
     pub created_by: String,
     /// RFC 3339 UTC.
     pub created_at: String,
     pub members: Vec<String>,
-    /// Unacked deliveries of this room's mail to your mailboxes (in `room
+    /// Unacked deliveries of this channel's mail to your mailboxes (in `channel
     /// list`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unacked: Option<u64>,
@@ -617,17 +813,107 @@ pub struct RoomData {
 #[derive(Debug, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RoomListData {
+    #[serde(rename = "event_cursor", skip_serializing_if = "Option::is_none")]
+    pub event_cursor: Option<String>,
     pub rooms: Vec<RoomRecord>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelRecord {
+    /// Coordinator-relative API path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uri: Option<String>,
+    /// Opaque context used by a post with no explicit context.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_context: Option<String>,
+    /// A mail position, separate from the event stream cursor.
+    #[serde(rename = "last_seq", skip_serializing_if = "Option::is_none")]
+    pub last_seq: Option<u64>,
+    pub name: String,
+    pub created_by: String,
+    pub created_at: String,
+    pub members: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unacked: Option<u64>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ChannelData {
+    pub channel: ChannelRecord,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ChannelListData {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_cursor: Option<String>,
+    pub channels: Vec<ChannelRecord>,
 }
 
 fn room_record(r: &Room, unacked: Option<u64>) -> RoomRecord {
     RoomRecord {
+        uri: Some(mdkg_coord_sqlite::events::path("channels", &r.name)),
+        default_context: Some(format!("room:{}", r.name)),
+        last_seq: Some(r.last_seq),
         name: r.name.clone(),
         created_by: r.created_by.clone(),
         created_at: rfc3339(r.created_ms),
         members: r.members.clone(),
         unacked,
     }
+}
+
+fn deprecated(old: &str, new: &str) {
+    output::notice(Diagnostic::warning(
+        Code::UsageDeprecated,
+        format!("`{old}` is deprecated; use `{new}`; the alias goes away in 0.8"),
+    ));
+}
+
+fn normalize_channel(room: &mut Option<String>, legacy: &Option<String>) -> bool {
+    if let Some(value) = legacy {
+        *room = Some(value.clone());
+        deprecated("--room", "--channel");
+        true
+    } else {
+        false
+    }
+}
+
+impl MsgCommand {
+    fn prepare(&mut self) -> bool {
+        match self {
+            Self::Send(a) => normalize_channel(&mut a.target.room, &a.target.legacy_room),
+            Self::Forward(a) => normalize_channel(&mut a.target.room, &a.target.legacy_room),
+            Self::Import(a) => normalize_channel(&mut a.target.room, &a.target.legacy_room),
+            Self::Thread(a) => normalize_channel(&mut a.room, &a.legacy_room),
+            Self::Inbox(InboxArgs { filters, .. }) | Self::Wait(WaitArgs { filters, .. }) => {
+                let mut legacy = normalize_channel(&mut filters.room, &filters.legacy_room);
+                if !filters.legacy_room_kind.is_empty() {
+                    filters.room_kind.clone_from(&filters.legacy_room_kind);
+                    deprecated("--room-kind", "--channel-kind");
+                    legacy = true;
+                }
+                legacy
+            }
+            _ => false,
+        }
+    }
+}
+
+fn compatibility<T>(mut report: Report<T>, legacy: bool) -> Report<T> {
+    if legacy {
+        for d in &mut report.diagnostics {
+            d.code = match d.code {
+                Code::ChannelUnknown => Code::RoomUnknown,
+                Code::ChannelExists => Code::RoomExists,
+                Code::ChannelNotMember => Code::RoomNotMember,
+                Code::ChannelHumanMember => Code::RoomHumanMember,
+                code => code,
+            };
+        }
+    }
+    report
 }
 
 // ---------------------------------------------------------------- helpers
@@ -641,41 +927,49 @@ fn mail_error(e: MailError) -> GraphError {
     // room name never reaches the message, whatever the store says.
     let message = match &e {
         MailError::IdReused(_) => "that id is taken by another message or conversation".to_string(),
-        MailError::RoomExists(_) => "a room has that name already".to_string(),
-        MailError::HumanMember(_) => "only that human removes themselves from a room".to_string(),
-        MailError::UnknownRoom(_) => "no room has that name".to_string(),
+        MailError::RoomExists(_) => "a channel has that name already".to_string(),
+        MailError::HumanMember(_) => {
+            "only that human removes themselves from a channel".to_string()
+        }
+        MailError::UnknownRoom(_) => "no channel has that name".to_string(),
         MailError::UnknownMessage(_) => "no message has that id".to_string(),
         MailError::UnknownContext(_) => "no message or context has that id".to_string(),
-        MailError::NotMember { .. } => "you aren't a member of that room".to_string(),
-        MailError::Absent { .. } => "that mailbox isn't a member of the room".to_string(),
+        MailError::NotMember { .. } => "you aren't a member of that channel".to_string(),
+        MailError::Absent { .. } => "that mailbox isn't a member of the channel".to_string(),
         MailError::NotHolder(_) => "none of your mailboxes received that message".to_string(),
+        MailError::MailboxNotHeld { .. } => "you don't hold that mailbox".to_string(),
         MailError::NotShown(_) => {
             "that message hasn't been shown to you yet, so it isn't acked".to_string()
         }
+        MailError::Integrity(_) => "a message under a fault's id isn't that fault".to_string(),
         other => other.to_string(),
     };
     match e {
+        MailError::MailboxNotHeld { role } => GraphError::conflict(Code::MsgNotHolder, message).with_hint(
+            if role { format!("take the role with `{BIN} claim role:<name>`") }
+            else { "read your own mailbox, a role you hold, or a human's".to_string() }
+        ),
         MailError::IdReused(_) => GraphError::conflict(Code::MsgIdReused, message)
             .with_hint(
                 "a retry must repeat the message exactly (kind, destination, context, references, body), and an id can't name a conversation in use; otherwise use a new id",
             ),
-        MailError::UnknownRoom(_) => GraphError::not_found(Code::RoomUnknown, message)
-            .with_hint(format!("see rooms with `{BIN} room list`")),
+        MailError::UnknownRoom(_) => GraphError::not_found(Code::ChannelUnknown, message)
+            .with_hint(format!("see channels with `{BIN} channel list`")),
         MailError::UnknownMessage(_) => GraphError::not_found(Code::MsgUnknownMessage, message)
             .with_hint(format!("see your mail, acked too, with `{BIN} msg inbox --all`")),
         MailError::UnknownContext(_) => GraphError::not_found(Code::MsgUnknownContext, message)
             .with_hint(format!(
                 "give a message id, or a contextId from `{BIN} msg inbox --json`"
             )),
-        MailError::RoomExists(_) => GraphError::conflict(Code::RoomExists, message)
-            .with_hint(format!("join it with `{BIN} room join <room>`")),
-        MailError::NotMember { .. } => GraphError::conflict(Code::RoomNotMember, message)
+        MailError::RoomExists(_) => GraphError::conflict(Code::ChannelExists, message)
+            .with_hint(format!("join it with `{BIN} channel join <channel>`")),
+        MailError::NotMember { .. } => GraphError::conflict(Code::ChannelNotMember, message)
             .with_hint(format!(
-                "only members post, add or remove others: `{BIN} room join <room>`"
+                "only members post, add or remove others: `{BIN} channel join <channel>`"
             )),
-        MailError::Absent { .. } => GraphError::conflict(Code::RoomNotMember, message)
+        MailError::Absent { .. } => GraphError::conflict(Code::ChannelNotMember, message)
             .with_hint(format!(
-                "check the name: see the room's members with `{BIN} room list`"
+                "check the name: see the channel's members with `{BIN} channel list`"
             )),
         MailError::NotHolder(_) => GraphError::conflict(Code::MsgNotHolder, message)
             .with_hint("ack only mail delivered to you or to a role you hold"),
@@ -687,11 +981,33 @@ fn mail_error(e: MailError) -> GraphError {
         ),
         MailError::NoRecipients => GraphError::usage(Code::MsgNoRecipients, message)
             .with_hint("a send skips its sender, its writer and the roles they hold"),
+        MailError::Integrity(_) => GraphError::failure(Code::StoreIntegrity, message).with_hint(
+            "a row under a fault's id isn't that fault: back up the store and report it; nothing was sent",
+        ),
+        MailError::ReservedId => GraphError::usage(Code::MsgReservedId, message)
+            .with_hint("leave out --id to mint one, or choose another prefix"),
         MailError::NotInConversation => GraphError::conflict(Code::MsgUnknownContext, message)
             .with_hint("reply to mail you sent or received, or start a new conversation"),
-        MailError::HumanMember(_) => GraphError::conflict(Code::RoomHumanMember, message)
-            .with_hint("ask the human to leave the room themselves"),
+        MailError::HumanMember(_) => GraphError::conflict(Code::ChannelHumanMember, message)
+            .with_hint("ask the human to leave the channel themselves"),
         MailError::Store(e) => store_error(e),
+        MailError::Ledger(e) => ledger_error(e),
+    }
+}
+
+/// A send's flow refused (A23 to A25).
+fn ledger_error(e: mdkg_coord_sqlite::ledger::LedgerError) -> GraphError {
+    use mdkg_coord_sqlite::ledger::LedgerError;
+    let message = e.to_string();
+    match e {
+        LedgerError::Store(e) => store_error(e),
+        LedgerError::BadNode(_) => GraphError::usage(Code::NodeNotFound, message),
+        LedgerError::UnknownMessage(_) => GraphError::not_found(Code::MsgUnknownMessage, message),
+        LedgerError::NotSender(_) => GraphError::conflict(Code::MsgNotSender, message)
+            .with_hint("supersede only messages you sent; nothing was sent"),
+        LedgerError::BadEntry(_) | LedgerError::BadSlot(_) | LedgerError::BadExpiry(_) => {
+            GraphError::usage(Code::UsageInvalidArguments, message)
+        }
     }
 }
 
@@ -751,13 +1067,12 @@ fn message_handle(store: &Store, typed: &str, contexts: bool) -> Result<String, 
 }
 
 fn check_message_id(id: &str) -> Result<(), GraphError> {
-    // `room:` belongs to room conversations, so no id can stand for one.
-    if has_prefix(id, "room:") {
+    if has_prefix(id, "room:") || has_prefix(id, "channel:") {
         return Err(usage(
             Code::MsgBadId,
-            "a message id or context can't start with `room:`",
+            "a message id or context can't use a reserved channel prefix",
         )
-        .with_hint("post to the room with --room; its conversation is room:<name>"));
+        .with_hint("post with --channel; read its default conversation through the channel"));
     }
     if is_name(id, 128, |c| {
         c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-')
@@ -825,12 +1140,27 @@ fn check_room(name: &str) -> Result<(), GraphError> {
     {
         Ok(())
     } else {
-        Err(usage(Code::MsgBadId, "that isn't a valid room name").with_hint(
-            "a room name is 1 to 64 of a-z, 0-9, `.`, `_` and `-`, starting with a letter or digit",
+        Err(usage(Code::MsgBadId, "that isn't a valid channel name").with_hint(
+            "a channel name is 1 to 64 of a-z, 0-9, `.`, `_` and `-`, starting with a letter or digit",
         ))
     }
 }
 
+/// Checks a sender a filter names: a name as a mailbox has, never echoed.
+/// Senders aren't only mailboxes (an import's `codex:<run>`), so no prefix
+/// is refused.
+fn check_sender(sender: &str) -> Result<(), GraphError> {
+    if is_name(sender, 128, |c| {
+        c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '@' | '-')
+    }) {
+        Ok(())
+    } else {
+        Err(usage(Code::MsgBadId, "that isn't a valid sender name")
+            .with_hint("a sender is 1 to 128 of A-Z, a-z, 0-9, `.`, `_`, `:`, `@` and `-`"))
+    }
+}
+
+/// A kind a filter names: any known kind, mdkg's own included.
 fn check_kind(kind: &str) -> Result<(), GraphError> {
     if mail::KINDS.contains(&kind) {
         Ok(())
@@ -838,6 +1168,50 @@ fn check_kind(kind: &str) -> Result<(), GraphError> {
         Err(usage(Code::MsgBadKind, "unknown message kind")
             .with_hint(format!("use one of: {}", mail::KINDS.join(", "))))
     }
+}
+
+/// A kind `sender` sends: `receipt` and `fault` only from an `mdkg:` actor
+/// (A26, R7). It protects a signal, not a role. `decisions` says whether
+/// this path takes decision mail at all (`msg send`, from the delegate
+/// outside a turn); forward and import never do.
+fn check_sent_kind(kind: &str, sender: &str, decisions: bool) -> Result<(), GraphError> {
+    let mdkg = has_prefix(sender, "mdkg:");
+    if !mail::KINDS.contains(&kind) {
+        // Only the kinds this path and sender may send (e2e UX; reviews of
+        // 562a74e3): never receipt or fault, and decision only where it
+        // can go, with its condition.
+        let sendable: Vec<&str> = mail::KINDS
+            .iter()
+            .copied()
+            .filter(|k| (mdkg || !mail::RESERVED_KINDS.contains(k)) && *k != "decision")
+            .collect();
+        let decision = if decisions {
+            "; decision mail only from its delegate, outside a turn"
+        } else {
+            ""
+        };
+        return Err(usage(Code::MsgBadKind, "unknown message kind")
+            .with_hint(format!("use one of: {}{decision}", sendable.join(", "))));
+    }
+    if mail::RESERVED_KINDS.contains(&kind) && !mdkg {
+        return Err(usage(Code::MsgBadKind, "only mdkg sends that kind")
+            .with_hint("receipts and faults come from the launcher; send a note or a question"));
+    }
+    Ok(())
+}
+
+/// A message id `sender` sends under: `fault.` ids only from an `mdkg:`
+/// actor, so ordinary mail can't preclaim a fault's copy (A26).
+fn check_sent_id(id: &str, sender: &str) -> Result<(), GraphError> {
+    check_message_id(id)?;
+    if has_prefix(id, mail::FAULT_ID_PREFIX) && !has_prefix(sender, "mdkg:") {
+        return Err(usage(
+            Code::MsgReservedId,
+            "message ids beginning `fault.` are reserved to mdkg",
+        )
+        .with_hint("leave out --id to mint one, or choose another prefix"));
+    }
+    Ok(())
 }
 
 fn has_prefix(m: &str, prefix: &str) -> bool {
@@ -854,7 +1228,7 @@ pub(crate) fn is_human_name(m: &str) -> bool {
     is_human(m)
 }
 
-/// Refuses an actor named like a human, a role or a turn (in any case):
+/// Refuses an actor named like a human, a role, a turn or mdkg (in any case):
 /// a role is read only by holding its lease, and nobody acts as a human.
 pub(crate) fn check_actor(actor: &str) -> Result<(), GraphError> {
     if is_human(actor) {
@@ -864,8 +1238,15 @@ pub(crate) fn check_actor(actor: &str) -> Result<(), GraphError> {
         )
         .with_hint(
             "an agent acts as itself, and a human's answer goes in a `decision` it sends; \
-             a human may only ack, read (`msg inbox|wait|thread`) and leave a room",
+             a human may only ack, read (`msg inbox|wait|thread`) and leave a channel",
         ));
+    }
+    if has_prefix(actor, "mdkg:") {
+        return Err(usage(
+            Code::MsgReservedActor,
+            "mdkg:* is reserved for launcher-generated records",
+        )
+        .with_hint("act as yourself; only the launcher writes receipt mail"));
     }
     if has_prefix(actor, "role:") || has_prefix(actor, "run:") {
         return Err(usage(
@@ -889,7 +1270,7 @@ fn agent(repo: &Repo, flag: Option<String>) -> Result<String, GraphError> {
 }
 
 /// A human acting for themselves, where that's allowed: acking their own
-/// mail, reading their own mailbox, `msg thread`, and leaving a room
+/// mail, reading their own mailbox, `msg thread`, and leaving a channel
 /// (orchestrator, 2026-10-21, D2 and the answers to round 1 of 585b125).
 /// Returns the human's mailbox and the worktree's folder name (the git top
 /// level of `--root`), recorded on an ack since `--as` isn't
@@ -1022,13 +1403,36 @@ fn read_mailboxes(
     }
 }
 
+/// The committed `.mdkg/config.json` the mail settings come from: the
+/// authority `config show` reports (the graph ref in ref mode; the
+/// registered graph checkout's `HEAD`, or this checkout's, in checkout
+/// mode), never a working-tree file, so an uncommitted edit in any
+/// worktree changes nothing (e2e 0.7.1 B3). `null`, keeping every
+/// default, while the checkout commits no graph yet; a committed config
+/// that can't be read refuses. Only the config is read, so an invalid
+/// agent definition doesn't refuse mail or claims (#15433).
+///
+/// Read once per `Repo` (a command's), reusing the checkout check its
+/// open made; a read that fails isn't kept.
+pub(crate) fn committed_config(repo: &Repo) -> Result<Value, GraphError> {
+    if let Some(config) = repo.committed.get() {
+        return Ok(config.clone());
+    }
+    let root = if repo.mode.is_some() {
+        &repo.top
+    } else {
+        &repo.root
+    };
+    let config = mdkg_run::orchestration::config_authority_or_absent_checked(root)
+        .map_err(crate::run::graph_error)?
+        .map_or(Value::Null, |authority| authority.config);
+    Ok(repo.committed.get_or_init(|| config).clone())
+}
+
 /// The retention new messages get: `coordination.messages.retention` in
 /// the config, default `purge_on_ack`.
-fn retention(root: &Path) -> Result<Retention, GraphError> {
-    let path = root.join(config::CONFIG_PATH);
-    let text = std::fs::read_to_string(&path).unwrap_or_default();
-    let value: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-    match value.pointer("/coordination/messages/retention") {
+fn retention(config: &Value) -> Result<Retention, GraphError> {
+    match config.pointer("/coordination/messages/retention") {
         None => Ok(Retention::PurgeOnAck),
         Some(v) => v.as_str().and_then(Retention::parse).ok_or_else(|| {
             GraphError::failure(
@@ -1044,11 +1448,8 @@ fn retention(root: &Path) -> Result<Retention, GraphError> {
 /// recipient (once every other delivery is acked):
 /// `coordination.messages.human_hold_days` in the config, default 7
 /// (orchestrator, 2026-10-21, D2).
-fn human_hold_days(root: &Path) -> Result<u32, GraphError> {
-    let path = root.join(config::CONFIG_PATH);
-    let text = std::fs::read_to_string(&path).unwrap_or_default();
-    let value: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-    match value.pointer("/coordination/messages/human_hold_days") {
+fn human_hold_days(config: &Value) -> Result<u32, GraphError> {
+    match config.pointer("/coordination/messages/human_hold_days") {
         None => Ok(7),
         Some(v) => v
             .as_u64()
@@ -1062,6 +1463,44 @@ fn human_hold_days(root: &Path) -> Result<u32, GraphError> {
                 .at(config::CONFIG_PATH, None)
             }),
     }
+}
+
+/// `coordination.messages.ack_grace_days` when the config doesn't set it.
+pub(crate) const DEFAULT_ACK_GRACE_DAYS: u32 = 7;
+
+/// How many days an acked `purge_on_ack` body stays readable (by `msg
+/// thread`) before it's purged: `coordination.messages.ack_grace_days`
+/// in the config, default 7, and 0 purges at the ack (friction item 72).
+/// A human hold or a TTL keeps its own time.
+pub(crate) fn ack_grace_days(config: &Value) -> Result<u32, GraphError> {
+    match config.pointer("/coordination/messages/ack_grace_days") {
+        None => Ok(DEFAULT_ACK_GRACE_DAYS),
+        Some(v) => v
+            .as_u64()
+            .filter(|d| *d <= 3650)
+            .and_then(|d| u32::try_from(d).ok())
+            .ok_or_else(|| {
+                GraphError::failure(
+                    Code::ConfigInvalid,
+                    "coordination.messages.ack_grace_days must be a whole number of days from 0 to 3650",
+                )
+                .at(config::CONFIG_PATH, None)
+            }),
+    }
+}
+
+/// The `coordination.messages` settings in `config` that refuse every
+/// send and ack, so `doctor` and `validate` report a config the mail
+/// commands won't run with (e2e 0.7.1 B13).
+pub(crate) fn mail_settings_errors(config: &Value) -> Vec<GraphError> {
+    [
+        retention(config).err(),
+        human_hold_days(config).err(),
+        ack_grace_days(config).err(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 /// A process-local random number: ids and text boundaries, not secrets.
@@ -1140,156 +1579,6 @@ fn check_outcome(outcome: &str) -> Result<(), GraphError> {
         .with_hint("never send keys or tokens; refer to where they're kept instead"));
     }
     Ok(())
-}
-
-/// High-confidence credential shapes: a private key block, a known token
-/// prefix followed by a long token, a JWT, or a URL with a password.
-pub(crate) fn looks_secret(text: &str) -> bool {
-    if text.contains("-----BEGIN") && text.contains("PRIVATE KEY-----") {
-        return true;
-    }
-    if has_jwt(text) || has_url_password(text) || has_exact_token(text) {
-        return true;
-    }
-    const PREFIXES: &[(&str, usize)] = &[
-        ("sk-ant-", 20),
-        ("sk-proj-", 20),
-        ("ghp_", 30),
-        ("gho_", 30),
-        ("ghs_", 30),
-        ("github_pat_", 30),
-        ("xoxb-", 20),
-        ("xoxp-", 20),
-        ("AIza", 30),
-        ("glpat-", 20),
-    ];
-    let token = |s: &str| {
-        s.chars()
-            .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
-            .count()
-    };
-    PREFIXES.iter().any(|(prefix, min)| {
-        text.match_indices(prefix).any(|(i, _)| {
-            let before = text[..i].chars().next_back();
-            let boundary = before.is_none_or(|c| !c.is_ascii_alphanumeric());
-            boundary && token(&text[i + prefix.len()..]) >= *min
-        })
-    })
-}
-
-/// Whether `c` can be in a token: base64url's alphabet.
-fn token_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || matches!(c, '-' | '_')
-}
-
-/// Tokens with an exact shape, so an ordinary identifier that merely
-/// starts like one (`ASIA_PACIFIC_…`, `npm_config_…`,
-/// `is_sk_live_mode`) isn't one: an AWS key id (`AKIA`/`ASIA` and exactly
-/// 16 of A-Z, 0-9), an npm token (`npm_` and exactly 36 of A-Z, a-z,
-/// 0-9) or a Stripe live key (`sk_live_` and 24 or more of them), with
-/// no letter or digit right before or after.
-fn has_exact_token(text: &str) -> bool {
-    type Shape = (&'static str, usize, bool, fn(char) -> bool);
-    const SHAPES: &[Shape] = &[
-        ("AKIA", 16, true, |c| {
-            c.is_ascii_uppercase() || c.is_ascii_digit()
-        }),
-        ("ASIA", 16, true, |c| {
-            c.is_ascii_uppercase() || c.is_ascii_digit()
-        }),
-        ("npm_", 36, true, |c| c.is_ascii_alphanumeric()),
-        ("sk_live_", 24, false, |c| c.is_ascii_alphanumeric()),
-    ];
-    SHAPES.iter().any(|(prefix, len, exact, allowed)| {
-        text.match_indices(prefix).any(|(i, _)| {
-            let before = text[..i].chars().next_back();
-            let rest = &text[i + prefix.len()..];
-            let n = rest.chars().take_while(|&c| allowed(c)).count();
-            let after = rest.chars().nth(n);
-            before.is_none_or(|c| !c.is_ascii_alphanumeric())
-                && if *exact { n == *len } else { n >= *len }
-                && after.is_none_or(|c| !c.is_ascii_alphanumeric())
-        })
-    })
-}
-
-/// A JWT: three dot-separated base64url parts of at least 10 characters,
-/// the first a JSON header (`eyJ`). One pass over the text's words.
-fn has_jwt(text: &str) -> bool {
-    text.split(|c: char| !(token_char(c) || c == '.'))
-        .any(|word| {
-            let parts: Vec<&str> = word.split('.').collect();
-            parts
-                .windows(3)
-                .any(|w| w[0].starts_with("eyJ") && w.iter().all(|p| p.len() >= 10))
-        })
-}
-
-/// A URL with a password in it: `scheme://user:password@host` (the user
-/// may be empty, `@` written either way). Placeholders (`$VAR`, `<pw>`,
-/// `{pw}`) and a password that only repeats the user (`guest:guest`, a
-/// local default) aren't credentials.
-fn has_url_password(text: &str) -> bool {
-    // What a URL's user and password can hold, unencoded (RFC 3986).
-    let userinfo = |c: char| {
-        c.is_ascii_alphanumeric()
-            || matches!(
-                c,
-                '-' | '.' | '_' | '~' | '!' | '$' | '&' | '\'' | '(' | ')' | '*' | '+'
-            )
-            || matches!(c, ',' | ';' | '=' | ':' | '%' | '@' | '\u{FF20}')
-    };
-    // `host:8080,` or `host:8000'`: a port that prose or code goes on
-    // from, not a password.
-    // Only after a host (`localhost`, a dotted name or address).
-    let port_then_text = |user: &str, p: &str| {
-        let host = user == "localhost" || user.contains('.');
-        let digits = p.chars().take_while(char::is_ascii_digit).count();
-        host && digits > 0 && matches!(p[digits..].chars().next(), Some(',' | ';' | '\''))
-    };
-    // A variable, not a password: `$NAME` (an environment variable), or
-    // `$name` when the user is empty or a variable too, as code templates
-    // write them (PHP, Perl, shell). `$hunter2` after a plain user, or
-    // `$Zx9k…`, may well be a password.
-    let ident = |r: &str| {
-        r.chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-            && r.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-    };
-    let variable = |user: &str, p: &str| {
-        p.strip_prefix('$').is_some_and(|r| {
-            let upper = ident(r) && r.chars().all(|c| !c.is_ascii_lowercase());
-            let lower = ident(r)
-                && r.chars().all(|c| !c.is_ascii_uppercase())
-                && (user.is_empty() || user.strip_prefix('$').is_some_and(ident));
-            upper || lower
-        })
-    };
-    // A mask or a stand-in, as docs and log redaction write them.
-    let stand_in = |p: &str| {
-        p.chars().all(|c| c == '*')
-            || p.chars().all(|c| c == 'x' || c == 'X')
-            || [
-                "password", "pass", "passwd", "pwd", "secret", "redacted", "changeme",
-            ]
-            .contains(&p.to_ascii_lowercase().as_str())
-    };
-    text.match_indices("://").any(|(i, _)| {
-        let authority: String = text[i + 3..].chars().take_while(|&c| userinfo(c)).collect();
-        let Some(at) = authority.rfind(['@', '\u{FF20}']) else {
-            return false;
-        };
-        authority[..at]
-            .split_once(':')
-            .is_some_and(|(user, password)| {
-                !password.is_empty()
-                    && !variable(user, password)
-                    && !stand_in(password)
-                    && !port_then_text(user, password)
-                    && password != user
-            })
-    })
 }
 
 /// Every string in a body, unescaped: text, URLs and the strings inside
@@ -1395,7 +1684,7 @@ fn destination(t: &Target) -> Result<To, GraphError> {
 fn print_message(m: &MessageRecord) {
     let to = m.room.as_ref().map_or_else(
         || m.to.join(", "),
-        |r| format!("room {r} ({})", m.to.join(", ")),
+        |r| format!("channel {r} ({})", m.to.join(", ")),
     );
     let via = m
         .via
@@ -1453,10 +1742,184 @@ fn print_message(m: &MessageRecord) {
 
 // ---------------------------------------------------------------- commands
 
+/// The store for reading mail: a bad `ack_grace_days` never keeps
+/// anyone from their mail ([`Repo::store`] falls back to the default).
 fn open(root: &Path) -> Result<(Repo, Store), GraphError> {
     let repo = Repo::open(root)?;
     let store = repo.store()?;
     Ok((repo, store))
+}
+
+/// The store for commands that ack or send (and so may end a body):
+/// [`mail_store`], which checks the grace, like `human_hold_days`.
+fn open_writer(root: &Path) -> Result<(Repo, Store), GraphError> {
+    let repo = Repo::open(root)?;
+    let store = mail_store(&repo)?;
+    Ok((repo, store))
+}
+
+/// The coordinator store, keeping acked bodies for the configured grace.
+fn mail_store(repo: &Repo) -> Result<Store, GraphError> {
+    let mut store = repo.store()?;
+    store.set_ack_grace_days(ack_grace_days(&committed_config(repo)?)?);
+    Ok(store)
+}
+
+// Installed launcher only: no public command or MCP handler routes here.
+// Explicit pins surround the whole synchronous repository/store operation.
+fn receipt_operation<T>(
+    mail: &mdkg_run::CliMail,
+    f: impl FnOnce() -> Result<T, GraphError>,
+) -> Result<T, mdkg_run::RunError> {
+    if mail.trusted_common.is_none() || mail.trusted_worktree.is_none() {
+        return Err(mdkg_run::RunError::failure(
+            mdkg_run::error::CODE_MAIL_FAILED,
+            "receipt delivery refused: launcher repository pins are missing",
+        ));
+    }
+    let trust = mdkg_coord_sqlite::git::WorktreeTrust {
+        common: mail.trusted_common.clone(),
+        worktree: mail.trusted_worktree.clone(),
+    };
+    mdkg_coord_sqlite::git::with_worktree_trust(&trust, f)
+        .map_err(|e| mdkg_run::RunError::failure(e.code().as_str(), e.diagnostic.message.clone()))
+}
+
+pub(crate) fn receipt_baseline(
+    mail: &mdkg_run::CliMail,
+) -> Result<mdkg_coord_sqlite::ActivityCursor, mdkg_run::RunError> {
+    receipt_operation(mail, || {
+        let (_, store) = open(&mail.root)?;
+        store
+            .activity_cursor()
+            .map_err(|e| GraphError::failure(Code::CoordStoreFailed, e.to_string()))
+    })
+}
+
+pub(crate) fn receipt_activity(
+    mail: &mdkg_run::CliMail,
+    cursor: &mdkg_coord_sqlite::ActivityCursor,
+    actor: &str,
+) -> Result<mdkg_coord_sqlite::ActivitySnapshot, mdkg_run::RunError> {
+    receipt_operation(mail, || {
+        check_actor(actor)?;
+        let (_, store) = open(&mail.root)?;
+        store
+            .activity_since(cursor, actor, now_ms())
+            .map_err(|e| GraphError::failure(Code::CoordStoreFailed, e.to_string()))
+    })
+}
+
+pub(crate) fn deliver_receipt(
+    mail: &mdkg_run::CliMail,
+    receipt: &mdkg_run::mail::Receipt<'_>,
+) -> Result<String, mdkg_run::RunError> {
+    mdkg_run::state::check_reports_to(receipt.agent, receipt.to)?;
+    receipt_operation(mail, || {
+        check_actor(receipt.agent)?;
+        check_message_id(receipt.id)?;
+        not_an_import(receipt.id)?;
+        let parts = json!([{"kind":"text","text":receipt.body}]);
+        check_body(&parts)?;
+        let (repo, mut store) = open_writer(&mail.root)?;
+        let (message, _) = store
+            .send(&Outgoing {
+                message_id: receipt.id.into(),
+                context_id: None,
+                kind: "receipt".into(),
+                sender: "mdkg:receipts".into(),
+                via: None,
+                sender_mailboxes: vec![],
+                to: To::Mailboxes(vec![receipt.to.into()]),
+                reference_ids: vec![],
+                parts,
+                // A day: the retained receipt file is the lasting record
+                // (A25, A26). Its delivery's one-day expiry is a-flow's.
+                retention: Retention::Ttl(1),
+                human_hold_days: human_hold_days(&committed_config(&repo)?)?,
+                now_ms: now_ms(),
+            })
+            .map_err(mail_error)?;
+        Ok(message.message_id)
+    })
+}
+
+/// Sends one fault occurrence from `mdkg:supervisor` (A26), through the
+/// store's fault path: numbered copy, direct dedupe and supersession, and
+/// a resend that stops at the store's copy.
+pub(crate) fn deliver_fault(
+    mail: &mdkg_run::CliMail,
+    fault: &mdkg_run::fault::Fault,
+) -> Result<mdkg_run::mail::FaultSent, mdkg_run::RunError> {
+    mdkg_run::state::check_name(&fault.agent)?;
+    receipt_operation(mail, || {
+        check_actor(&fault.agent)?;
+        if fault.to.is_empty() {
+            return Err(usage(Code::MsgNoRecipients, "a fault needs a recipient"));
+        }
+        for to in &fault.to {
+            check_mailbox(to)?;
+        }
+        if uuid::Uuid::parse_str(&fault.fault_id).is_err() {
+            return Err(usage(Code::MsgBadId, "that isn't a fault id"));
+        }
+        // The body is mdkg's own; checked like any other before anything is
+        // stored. The store's tally only changes two numbers in it.
+        check_body(&fault.parts(1, "1970-01-01T00:00:00.000Z"))?;
+        let (repo, mut store) = open(&mail.root)?;
+        let sent = store
+            .send_fault(
+                &mail::FaultOut {
+                    fault_id: &fault.fault_id,
+                    agent: &fault.agent,
+                    code: &fault.code,
+                    to: &fault.to,
+                    human_hold_days: human_hold_days(&committed_config(&repo)?)?,
+                    now_ms: now_ms(),
+                },
+                |tally| fault.parts(tally.count, &tally.first_at),
+            )
+            .map_err(mail_error)?;
+        Ok(match sent {
+            mail::FaultSent::Sent { message, .. } => {
+                mdkg_run::mail::FaultSent::Sent(message.message_id)
+            }
+            mail::FaultSent::Stood(message) => mdkg_run::mail::FaultSent::Stood(message.message_id),
+            mail::FaultSent::Cleared => mdkg_run::mail::FaultSent::Cleared,
+        })
+    })
+}
+
+/// Clears `agent`'s faults reporting `condition`, seen to end (A26).
+pub(crate) fn clear_faults(
+    mail: &mdkg_run::CliMail,
+    agent: &str,
+    condition: &str,
+) -> Result<Vec<String>, mdkg_run::RunError> {
+    mdkg_run::state::check_name(agent)?;
+    receipt_operation(mail, || {
+        check_actor(agent)?;
+        check_outcome(condition)?;
+        let (_, mut store) = open(&mail.root)?;
+        let cleared = store
+            .clear_faults(agent, condition, now_ms())
+            .map_err(mail_error)?;
+        Ok(cleared.into_iter().map(|c| c.fault_id).collect())
+    })
+}
+
+/// How many occurrences of `agent`'s `code` were cleared: a login fault's
+/// occurrence counter (A26).
+pub(crate) fn fault_clears(
+    mail: &mdkg_run::CliMail,
+    agent: &str,
+    code: &str,
+) -> Result<u64, mdkg_run::RunError> {
+    mdkg_run::state::check_name(agent)?;
+    receipt_operation(mail, || {
+        let (_, store) = open(&mail.root)?;
+        store.fault_clears(agent, code).map_err(mail_error)
+    })
 }
 
 fn send_report(
@@ -1466,10 +1929,15 @@ fn send_report(
 ) -> Result<Report<SendData>, GraphError> {
     let repo = Repo::open(root)?;
     let sender = agent(&repo, actor)?;
-    check_kind(&a.kind)?;
+    check_sent_kind(&a.kind, &sender, true)?;
     let (decision, warnings) = if a.kind == "decision" {
-        let (grant, warnings) =
-            authority_decision::grant(&repo, &sender, a.action.as_deref(), a.node_ref.as_deref())?;
+        let (grant, warnings) = authority_decision::grant(
+            &repo,
+            &sender,
+            a.action.as_deref(),
+            a.node_ref.as_deref(),
+            !a.reply_to.is_empty(),
+        )?;
         (Some(grant), warnings)
     } else {
         if a.action.is_some() || a.node_ref.is_some() {
@@ -1487,6 +1955,12 @@ fn send_report(
     for r in &a.reply_to {
         check_message_id(r)?;
     }
+    for r in &a.supersedes {
+        check_message_id(r)?;
+    }
+    if let Some(slot) = &a.slot {
+        mdkg_coord_sqlite::ledger::check_slot(slot, &sender).map_err(ledger_error)?;
+    }
     let mut parts = parts_from(a)?;
     if decision.is_some() && parts.as_array().is_some_and(Vec::is_empty) {
         // Keep ordinary body's required-part and purge semantics; this fixed
@@ -1497,13 +1971,48 @@ fn send_report(
     let now = now_ms();
     let message_id = match &a.id {
         Some(id) => {
-            check_message_id(id)?;
+            check_sent_id(id, &sender)?;
             not_an_import(id)?;
             id.clone()
         }
         None => mint_id(now),
     };
-    let mut store = repo.store()?;
+    // The nodes it's about (A23), and a review request's round (A27
+    // rule 8): refused whole, with nothing sent, before the store is
+    // written.
+    let nodes = crate::entry::send_nodes(&repo, &a.node)?;
+    if a.range.is_some() && a.kind != "review_request" {
+        return Err(usage(
+            Code::UsageInvalidArguments,
+            "--range belongs only to a review_request",
+        ));
+    }
+    let mut round = None;
+    if a.kind == "review_request" && !nodes.is_empty() {
+        if nodes.len() > 1 {
+            return Err(usage(
+                Code::MsgReviewMultiNode,
+                "a review request names exactly one node",
+            )
+            .with_hint("a review covering several nodes is several requests, one per node"));
+        }
+        let Some(range) = &a.range else {
+            return Err(usage(
+                Code::MsgReviewUnranged,
+                "a review request with --node needs --range <base>..<sha>",
+            )
+            .with_hint("give the range under review, or send without --node"));
+        };
+        let title = parts_title(&parts);
+        round = Some(crate::entry::SendRound::new(
+            &repo,
+            nodes[0].clone(),
+            range,
+            &title,
+        )?);
+    }
+    let mut store = mail_store(&repo)?;
+    let config = committed_config(&repo)?;
     let out = Outgoing {
         message_id,
         context_id: a.context.clone(),
@@ -1514,20 +2023,108 @@ fn send_report(
         to,
         reference_ids: a.reply_to.clone(),
         parts,
-        retention: retention(root)?,
-        human_hold_days: human_hold_days(root)?,
+        retention: retention(&config)?,
+        human_hold_days: human_hold_days(&config)?,
         now_ms: now,
     };
-    let (message, duplicate) = match decision {
-        Some(grant) => store.send_decision(&out, &grant),
-        None => store.send(&out),
+    let flow = SendFlow {
+        nodes,
+        range: round.as_ref().map(crate::entry::SendRound::range),
+        supersedes: a.supersedes.clone(),
+        slot: a.slot.clone(),
+        ..SendFlow::default()
+    };
+    // A review request's round opens inside the send's transaction.
+    let mut then = |tx: &rusqlite::Transaction<'_>, message: &Message| {
+        round.as_mut().map_or(Ok(()), |r| r.open_in(tx, message))
+    };
+    let sent = match decision {
+        Some(_) if !flow.nodes.is_empty() => {
+            return Err(usage(
+                Code::UsageInvalidArguments,
+                "--node doesn't go with decision mail",
+            ));
+        }
+        Some(_) if !flow.supersedes.is_empty() || flow.slot.is_some() => {
+            return Err(usage(
+                Code::UsageInvalidArguments,
+                "--supersedes and --slot don't go with decision mail",
+            ));
+        }
+        Some(grant) => store
+            .send_decision(&out, &grant)
+            .map(|(message, duplicate)| (message, duplicate, Vec::new())),
+        None => store
+            .send_flow(&out, &flow, &ExpiryPolicy::default(), &mut then)
+            .map(|(message, duplicate, effects)| (message, duplicate, effects.superseded)),
+    };
+    let (message, duplicate, superseded) = match sent {
+        Ok(s) => s,
+        Err(e) => {
+            // A send never reaches its sender, so the ids --supersedes takes
+            // show in the threads they went to, not in the sender's inbox.
+            let unknown_superseded = !a.supersedes.is_empty()
+                && matches!(
+                    e,
+                    MailError::Ledger(mdkg_coord_sqlite::ledger::LedgerError::UnknownMessage(_))
+                );
+            let refused = round
+                .as_mut()
+                .and_then(|r| r.refusal())
+                .unwrap_or_else(|| mail_error(e));
+            return Err(if unknown_superseded {
+                refused.with_hint(format!(
+                    "--supersedes names a message you sent; find its id in the thread it went \
+                     to (`{BIN} msg thread <id or context>`, or `--channel <name>`)"
+                ))
+            } else {
+                refused
+            });
+        }
+    };
+    let round = round.as_ref().and_then(|r| r.opened());
+    let mut hints = Vec::new();
+    if let Some((entry, None)) = &round {
+        hints.push(
+            Diagnostic::warning(
+                Code::EntryRoundUnanchored,
+                format!(
+                    "{} is unanchored: its walks need an anchored round before it",
+                    output::shown(entry)
+                ),
+            )
+            .with_hint(
+                "chain it onto an earlier round's head (--range <that head>..<sha>), or request \
+                 from a base the main ref holds",
+            ),
+        );
     }
-    .map_err(mail_error)?;
     Ok(Report::ok(SendData {
         message: message_record(&message),
         duplicate,
+        round: round.map(|(entry, anchored)| RoundRecord {
+            entry,
+            anchored: anchored.map(str::to_string),
+        }),
+        superseded,
     })
-    .with(warnings))
+    .with(warnings)
+    .with(hints))
+}
+
+/// A review round's title: the request's first text line, or `review`.
+fn parts_title(parts: &Value) -> String {
+    parts
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|p| p["kind"] == "text")
+        .filter_map(|p| p["text"].as_str())
+        .flat_map(str::lines)
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("review")
+        .to_string()
 }
 
 fn print_sent(d: &SendData) {
@@ -1538,11 +2135,12 @@ fn print_sent(d: &SendData) {
         d.message.seq,
         d.message.to.join(", ")
     );
+    if !d.superseded.is_empty() {
+        println!("superseded {}", d.superseded.join(", "));
+    }
 }
 
 fn inbox_query(
-    store: &Store,
-    actor: &str,
     f: &Filters,
     limit: Option<usize>,
     all: bool,
@@ -1551,11 +2149,20 @@ fn inbox_query(
     if let Some(r) = &f.room {
         check_room(r)?;
     }
+    if let Some(mailbox) = &f.mailbox {
+        check_mailbox(mailbox)?;
+    }
     for k in f.kind.iter().chain(&f.room_kind) {
         check_kind(k)?;
     }
+    for s in &f.from {
+        check_sender(s)?;
+    }
+    // An empty kind list leaves receipts out and keeps every other kind,
+    // known to this build or not (InboxQuery::kinds). `msg watch` is the
+    // event stream, and hides nothing.
     Ok(InboxQuery {
-        mailboxes: read_mailboxes(store, actor, f.mailbox.as_deref(), now)?,
+        mailboxes: Vec::new(),
         room: f.room.clone(),
         kinds: f.kind.clone(),
         room_kinds: f.room_kind.clone(),
@@ -1568,6 +2175,7 @@ fn inbox_query(
 
 fn inbox_data(q: &InboxQuery, inbox: &Inbox) -> InboxData {
     InboxData {
+        event_cursor: Some(inbox.event_cursor.clone()),
         mailboxes: q.mailboxes.clone(),
         messages: inbox.messages.iter().map(message_record).collect(),
         cursor: inbox.cursor,
@@ -1594,8 +2202,9 @@ fn inbox_report(
     let limit = check_limit(a.filters.limit)?;
     let (repo, mut store) = open(root)?;
     let actor = reader(&repo, actor, a.filters.mailbox.as_deref())?;
-    let q = inbox_query(&store, &actor, &a.filters, limit, a.all, now_ms())?;
+    let mut q = inbox_query(&a.filters, limit, a.all, now_ms())?;
     if !a.mark_shown.is_empty() {
+        q.mailboxes = read_mailboxes(&store, &actor, a.filters.mailbox.as_deref(), q.now_ms)?;
         let listed = a
             .mark_shown
             .iter()
@@ -1612,13 +2221,23 @@ fn inbox_report(
             .mark_shown(&listed, &q.mailboxes, q.now_ms)
             .map_err(mail_error)?;
         return Ok(Report::ok(InboxData {
+            event_cursor: None,
             mailboxes: q.mailboxes.clone(),
             messages: Vec::new(),
             cursor: q.after.unwrap_or(0),
             more: false,
         }));
     }
-    let inbox = store.inbox(&q).map_err(mail_error)?;
+    let (inbox, mailboxes) = store
+        .inbox_from_for_actor(
+            &q,
+            &a.filters.from,
+            &actor,
+            a.filters.mailbox.as_deref(),
+            now_ms,
+        )
+        .map_err(mail_error)?;
+    q.mailboxes = mailboxes;
     Ok(Report::ok(inbox_data(&q, &inbox)))
 }
 
@@ -1646,8 +2265,17 @@ fn wait_report(
         // role taken while waiting counts for mail newer than the cursor. A
         // cursor covers the mailboxes it was issued for: after taking a
         // role, run `inbox` without `--after` to see its backlog.
-        let q = inbox_query(&store, &actor, &a.filters, most, false, now_ms())?;
-        let inbox = store.inbox(&q).map_err(mail_error)?;
+        let mut q = inbox_query(&a.filters, most, false, now_ms())?;
+        let (inbox, mailboxes) = store
+            .inbox_from_for_actor(
+                &q,
+                &a.filters.from,
+                &actor,
+                a.filters.mailbox.as_deref(),
+                now_ms,
+            )
+            .map_err(mail_error)?;
+        q.mailboxes = mailboxes;
         if !inbox.messages.is_empty() {
             return Ok(Report::ok(inbox_data(&q, &inbox)));
         }
@@ -1684,7 +2312,20 @@ fn ack_report(
             check_message_id(id)?;
         }
     }
-    let (repo, mut store) = open(root)?;
+    let through = match a.through.as_deref() {
+        Some(t) => Some(number_handle(t).map(|(n, _)| n).ok_or_else(|| {
+            usage(
+                Code::UsageInvalidArguments,
+                "--through takes a message number (`N` or `#N`)",
+            )
+            .with_hint("use a listing's #N or the cursor it returned")
+        })?),
+        None => None,
+    };
+    for k in &a.kind {
+        check_kind(k)?;
+    }
+    let (repo, mut store) = open_writer(root)?;
     let now = now_ms();
     if let Some(m) = a.mailbox.as_deref() {
         check_mailbox(m)?;
@@ -1709,15 +2350,193 @@ fn ack_report(
         let mailboxes = read_mailboxes(&store, &actor, a.mailbox.as_deref(), now)?;
         (actor, mailboxes)
     };
-    let ids = a
-        .ids
-        .iter()
-        .map(|id| message_handle(&store, id, false))
-        .collect::<Result<Vec<_>, _>>()?;
-    let acked = store
-        .ack(&ids, &mailboxes, &actor, via.as_deref(), outcome, now)
-        .map_err(mail_error)?;
+    let (acked, skipped) = match &through {
+        Some(seq) => store
+            .ack_through(
+                *seq,
+                &a.kind,
+                &mailboxes,
+                &actor,
+                via.as_deref(),
+                outcome,
+                now,
+            )
+            .map_err(mail_error)?,
+        None => {
+            let ids = a
+                .ids
+                .iter()
+                .map(|id| message_handle(&store, id, false))
+                .collect::<Result<Vec<_>, _>>()?;
+            let acked = store
+                .ack(&ids, &mailboxes, &actor, via.as_deref(), outcome, now)
+                .map_err(mail_error)?;
+            (acked, Vec::new())
+        }
+    };
     Ok(Report::ok(AckData {
+        acked: acked
+            .acked
+            .into_iter()
+            .map(|(message_id, mailbox)| AckRecord {
+                message_id,
+                mailbox,
+            })
+            .collect(),
+        purged: acked.purged,
+        skipped: skipped
+            .into_iter()
+            .map(|s| SkippedRecord {
+                message_id: s.message_id,
+                seq: s.seq,
+                mailbox: s.mailbox,
+                kind: s.kind,
+                reason: s.reason.to_string(),
+            })
+            .collect(),
+    }))
+}
+
+/// The text part that heads a forwarded message's own parts. Every value
+/// in it is the store's, and a sender or id is a checked name.
+fn forwarded_header(m: &Message) -> Value {
+    let via = m
+        .via
+        .as_ref()
+        .map_or_else(String::new, |v| format!(" via {v}"));
+    let room = m
+        .room
+        .as_ref()
+        .map_or_else(String::new, |r| format!(" in channel {r}"));
+    json!({
+        "kind": "text",
+        "text": format!(
+            "--- forwarded: #{} {} from {}{via}{room}, sent {} (message {}) ---",
+            m.seq,
+            m.kind,
+            m.sender,
+            rfc3339(m.sent_ms),
+            m.message_id
+        ),
+    })
+}
+
+fn forward_report(
+    root: &Path,
+    actor: Option<String>,
+    a: &ForwardArgs,
+) -> Result<Report<ForwardData>, GraphError> {
+    let outcome = a.outcome.as_deref().filter(|o| !o.trim().is_empty());
+    if let Some(outcome) = outcome {
+        check_outcome(outcome)?;
+    }
+    for id in &a.ids {
+        if number_handle(id).is_none() {
+            check_message_id(id)?;
+        }
+    }
+    if let Some(k) = &a.kind {
+        check_kind(k)?;
+    }
+    if let Some(m) = a.mailbox.as_deref() {
+        check_mailbox(m)?;
+    }
+    let to = destination(&a.target)?;
+    let (repo, mut store) = open_writer(root)?;
+    // A forward sends, so a human can't (they ack and read only).
+    let actor = agent(&repo, actor)?;
+    let now = now_ms();
+    let mailboxes = read_mailboxes(&store, &actor, a.mailbox.as_deref(), now)?;
+    let not_forwardable = || {
+        GraphError::conflict(
+            Code::MsgNotHolder,
+            "only mail delivered to you, unacked, with its body, can be forwarded",
+        )
+        .with_hint("read your inbox for what you can forward; nothing was sent or acked")
+    };
+    let mut ids: Vec<String> = Vec::new();
+    for typed in &a.ids {
+        let id = message_handle(&store, typed, false)?;
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    let mut parts: Vec<Value> = a
+        .text
+        .iter()
+        .map(|t| json!({"kind": "text", "text": t}))
+        .collect();
+    let mut sources = Vec::new();
+    let mut kinds: Vec<String> = Vec::new();
+    for id in &ids {
+        let m = store.message(id, now).map_err(mail_error)?;
+        // Read only what's yours: another's mail is refused unread.
+        let yours = m
+            .deliveries
+            .iter()
+            .any(|d| mailboxes.contains(&d.mailbox) && d.state != "acked");
+        let Some(body) = m.parts.as_ref().filter(|_| yours) else {
+            return Err(not_forwardable());
+        };
+        parts.push(forwarded_header(&m));
+        parts.extend(body.as_array().into_iter().flatten().cloned());
+        if !kinds.contains(&m.kind) {
+            kinds.push(m.kind.clone());
+        }
+        sources.push((m.message_id.clone(), m.digest.clone()));
+    }
+    let kind = match (&a.kind, kinds.as_slice()) {
+        (Some(k), _) => k.clone(),
+        (None, [one]) => one.clone(),
+        (None, _) => {
+            return Err(usage(
+                Code::UsageInvalidArguments,
+                "the forwarded messages have different kinds",
+            )
+            .with_hint("name the new message's kind with --kind"));
+        }
+    };
+    if kind == "decision" {
+        return Err(authority_decision::refused(
+            "a forward is never a decision: decisions come only from the human's channel",
+        ));
+    }
+    // A forwarded receipt or fault would be a forged one: name another kind.
+    check_sent_kind(&kind, &actor, false)?;
+    let parts = Value::Array(parts);
+    check_body(&parts)?;
+    let message_id = mint_id(now);
+    let default_outcome = format!("forwarded as {message_id}");
+    let config = committed_config(&repo)?;
+    let out = Outgoing {
+        message_id,
+        context_id: None,
+        kind,
+        sender_mailboxes: own_mailboxes(&store, &actor, now)?,
+        sender: actor.clone(),
+        via: None,
+        to,
+        reference_ids: Vec::new(),
+        parts,
+        retention: retention(&config)?,
+        human_hold_days: human_hold_days(&config)?,
+        now_ms: now,
+    };
+    let (message, acked) = store
+        .forward(
+            &out,
+            &sources,
+            &mailboxes,
+            &actor,
+            Some(outcome.unwrap_or(&default_outcome)),
+            now,
+        )
+        .map_err(|e| match e {
+            MailError::NotHolder(_) => not_forwardable(),
+            other => mail_error(other),
+        })?;
+    Ok(Report::ok(ForwardData {
+        message: message_record(&message),
         acked: acked
             .acked
             .into_iter()
@@ -1760,7 +2579,7 @@ fn thread_report(
     if a.member && a.room.is_none() {
         return Err(usage(
             Code::UsageInvalidArguments,
-            "--member reads a room: give --room",
+            "--member reads a channel: give --channel",
         ));
     }
     // Unasked, a page is the newest messages, so a fresh read sees the
@@ -1773,43 +2592,51 @@ fn thread_report(
     // through to here).
     human_actor(&repo, &actor)?;
     let readers = if a.member {
-        let me = repo.actor(actor.clone());
-        Some(own_mailboxes(&store, &me, now_ms())?)
+        Some(repo.actor(actor.clone()))
     } else {
         None
     };
     // One more than the limit tells whether more came after.
     let ask = limit.map(|l| l.saturating_add(1));
-    let (context_id, mut messages) = match (&a.target, &a.room) {
+    let (context_id, mut messages, event_cursor) = match (&a.target, &a.room) {
         (_, Some(room)) => {
             check_room(room)?;
-            let messages = match &readers {
-                Some(mine) => {
-                    store.member_room_messages(room, mine, page(a.after, ask, tail_ask), now_ms())
+            let (messages, event_cursor) = match &readers {
+                Some(actor) => store.member_room_messages_for_actor_with_cursor(
+                    room,
+                    actor,
+                    page(a.after, ask, tail_ask),
+                    now_ms,
+                ),
+                None => {
+                    store.channel_messages_with_cursor(room, page(a.after, ask, tail_ask), now_ms)
                 }
-                None => store.room_messages(room, page(a.after, ask, tail_ask), now_ms()),
             }
             .map_err(mail_error)?;
-            (format!("room:{room}"), messages)
+            (format!("room:{room}"), messages, event_cursor)
         }
         // Don't echo typed text, which may contain secrets.
-        (Some(target), None) if has_prefix(target, "room:") => {
+        (Some(target), None) if (has_prefix(target, "room:") || has_prefix(target, "channel:")) => {
             return Err(usage(
                 Code::UsageInvalidArguments,
-                "that names a room, not a message or a context",
+                "that names a channel, not a message or a context",
             )
-            .with_hint(format!("read a room with `{BIN} msg thread --room <room>`")));
+            .with_hint(format!(
+                "read a channel with `{BIN} msg thread --channel <channel>`"
+            )));
         }
-        (Some(target), None) => {
-            let target = message_handle(&store, target, true)?;
-            store
-                .thread(&target, page(a.after, ask, tail_ask), now_ms())
-                .map_err(mail_error)?
-        }
+        (Some(target), None) => store
+            .thread_handle_with_cursor(
+                target,
+                number_handle(target),
+                page(a.after, ask, tail_ask),
+                now_ms,
+            )
+            .map_err(mail_error)?,
         (None, None) => {
             return Err(usage(
                 Code::UsageInvalidArguments,
-                "name a message, a context or --room",
+                "name a message, a context or --channel",
             ));
         }
     };
@@ -1824,6 +2651,7 @@ fn thread_report(
     }
     let cursor = messages.last().map_or(a.after.unwrap_or(0), |m| m.seq);
     Ok(Report::ok(ThreadData {
+        event_cursor: Some(event_cursor),
         context_id,
         messages: messages.iter().map(message_record).collect(),
         cursor,
@@ -1837,9 +2665,11 @@ fn import_report(
     actor: Option<String>,
     a: &ImportArgs,
 ) -> Result<Report<SendData>, GraphError> {
-    let (repo, mut store) = open(root)?;
+    let (repo, mut store) = open_writer(root)?;
     let writer = agent(&repo, actor)?;
-    check_kind(&a.kind)?;
+    // Import makes a message, so only kinds it can make (review of
+    // 562a74e3), not every kind a filter names.
+    check_sent_kind(&a.kind, &a.from, false)?;
     check_mailbox(&a.from)?;
     if is_human(&a.from) {
         return Err(
@@ -1848,6 +2678,7 @@ fn import_report(
         );
     }
     check_actor(&a.from)?;
+    check_sent_kind(&a.kind, &a.from, false)?;
     if a.kind == "decision" {
         return Err(authority_decision::refused(
             "decision mail cannot be imported; use the outside-turn delegate send path",
@@ -1868,6 +2699,7 @@ fn import_report(
     };
     let parts = Value::Array(vec![part]);
     check_body(&parts)?;
+    let config = committed_config(&repo)?;
     let mut out = Outgoing {
         message_id: String::new(),
         context_id: a.context.clone(),
@@ -1888,8 +2720,8 @@ fn import_report(
         to,
         reference_ids: a.reply_to.iter().cloned().collect(),
         parts,
-        retention: retention(root)?,
-        human_hold_days: human_hold_days(root)?,
+        retention: retention(&config)?,
+        human_hold_days: human_hold_days(&config)?,
         now_ms: now_ms(),
     };
     // The id is the request's digest, so re-importing the same output for
@@ -1901,13 +2733,18 @@ fn import_report(
     Ok(Report::ok(SendData {
         message: message_record(&message),
         duplicate,
+        round: None,
+        superseded: Vec::new(),
     }))
 }
 
-pub fn run(root: &Path, actor: Option<String>, cmd: &MsgCommand) -> u8 {
+pub fn run(root: &Path, actor: Option<String>, cmd: &mut MsgCommand) -> u8 {
+    let legacy = cmd.prepare();
+    let cmd = &*cmd;
     let json = cmd.json();
     let name = cmd.name();
     match cmd {
+        MsgCommand::Watch(args) => watch::run(root, args),
         MsgCommand::Decisions {
             after,
             limit,
@@ -1929,7 +2766,7 @@ pub fn run(root: &Path, actor: Option<String>, cmd: &MsgCommand) -> u8 {
                 Ok(Report::ok(DecisionsData { decisions }))
             })()
             .unwrap_or_else(Report::failed);
-            output::emit(name, json, r, |d| {
+            output::emit(name, json, compatibility(r, legacy), |d| {
                 println!(
                     "Send-time decision records only; human approval and launcher promotion are not verified here."
                 );
@@ -1940,16 +2777,16 @@ pub fn run(root: &Path, actor: Option<String>, cmd: &MsgCommand) -> u8 {
         }
         MsgCommand::Send(a) => {
             let r = send_report(root, actor, a).unwrap_or_else(Report::failed);
-            output::emit(name, json, r, print_sent)
+            output::emit(name, json, compatibility(r, legacy), print_sent)
         }
         MsgCommand::Import(a) => {
             let r = import_report(root, actor, a).unwrap_or_else(Report::failed);
-            output::emit(name, json, r, print_sent)
+            output::emit(name, json, compatibility(r, legacy), print_sent)
         }
         MsgCommand::Inbox(a) => {
             let r = inbox_report(root, actor, a).unwrap_or_else(Report::failed);
             let listed = listed_in(&r);
-            let code = output::emit(name, json, r, print_inbox);
+            let code = output::emit(name, json, compatibility(r, legacy), print_inbox);
             if !a.no_mark && a.mark_shown.is_empty() {
                 mark_listed(root, listed);
             }
@@ -1958,7 +2795,7 @@ pub fn run(root: &Path, actor: Option<String>, cmd: &MsgCommand) -> u8 {
         MsgCommand::Wait(a) => {
             let r = wait_report(root, actor, a).unwrap_or_else(Report::failed);
             let listed = listed_in(&r);
-            let code = output::emit(name, json, r, print_inbox);
+            let code = output::emit(name, json, compatibility(r, legacy), print_inbox);
             if !a.no_mark {
                 mark_listed(root, listed);
             }
@@ -1966,7 +2803,35 @@ pub fn run(root: &Path, actor: Option<String>, cmd: &MsgCommand) -> u8 {
         }
         MsgCommand::Ack(a) => {
             let r = ack_report(root, actor, a).unwrap_or_else(Report::failed);
-            output::emit(name, json, r, |d| {
+            output::emit(name, json, compatibility(r, legacy), |d| {
+                for x in &d.acked {
+                    println!("acked {} for {}", x.message_id, x.mailbox);
+                }
+                for x in &d.skipped {
+                    let why = match x.reason.as_str() {
+                        "findings" => "findings (name --kind findings to ack them)",
+                        "fault" => "a fault (name --kind fault to ack it)",
+                        _ => "never listed to you (read your inbox first)",
+                    };
+                    println!(
+                        "skipped #{} {} ({}) for {}: {why}",
+                        x.seq, x.message_id, x.kind, x.mailbox
+                    );
+                }
+                if !d.purged.is_empty() {
+                    println!("bodies purged: {}", d.purged.join(", "));
+                }
+            })
+        }
+        MsgCommand::Forward(a) => {
+            let r = forward_report(root, actor, a).unwrap_or_else(Report::failed);
+            output::emit(name, json, compatibility(r, legacy), |d| {
+                println!(
+                    "forwarded as {} #{} to {}",
+                    d.message.message_id,
+                    d.message.seq,
+                    d.message.to.join(", ")
+                );
                 for x in &d.acked {
                     println!("acked {} for {}", x.message_id, x.mailbox);
                 }
@@ -1989,7 +2854,7 @@ pub fn run(root: &Path, actor: Option<String>, cmd: &MsgCommand) -> u8 {
                     mark_read(root, actor, listed);
                 }
             };
-            let code = output::emit(name, json, r, |d| {
+            let code = output::emit(name, json, compatibility(r, legacy), |d| {
                 println!("context {}", d.context_id);
                 for m in &d.messages {
                     print_message(m);
@@ -2051,7 +2916,7 @@ fn mark_listed(root: &Path, listed: Option<Listed>) {
     }
 }
 
-/// [`mark_listed`] for a thread or room read: the reader's own mailboxes
+/// [`mark_listed`] for a thread or channel read: the reader's own mailboxes
 /// (a human's own, or an agent's and the roles it holds).
 fn mark_read(root: &Path, actor: Option<String>, seqs: Vec<Shown>) {
     let Ok((repo, mut store)) = open(root) else {
@@ -2084,9 +2949,16 @@ fn room_members(
     Ok((actor, members))
 }
 
-pub fn room(root: &Path, actor: Option<String>, cmd: &RoomCommand) -> u8 {
+pub fn room(root: &Path, actor: Option<String>, cmd: &RoomCommand, legacy: bool) -> u8 {
+    if legacy {
+        deprecated("room", "channel");
+    }
     let json = cmd.json();
-    let name = cmd.name();
+    let name = if legacy {
+        cmd.name()
+    } else {
+        cmd.channel_name()
+    };
     let report = (|| -> Result<Report<Value>, GraphError> {
         let (repo, mut store) = open(root)?;
         let now = now_ms();
@@ -2123,7 +2995,7 @@ pub fn room(root: &Path, actor: Option<String>, cmd: &RoomCommand) -> u8 {
                         if a.member.iter().any(|m| *m != human) {
                             return Err(usage(
                                 Code::MsgHumanActor,
-                                "a human leaves a room only as themselves",
+                                "a human leaves a channel only as themselves",
                             )
                             .with_hint("drop --member"));
                         }
@@ -2141,16 +3013,16 @@ pub fn room(root: &Path, actor: Option<String>, cmd: &RoomCommand) -> u8 {
                     .map_err(mail_error)?;
                 if !absent.is_empty() {
                     let hint = if is_human(&actor) {
-                        "nothing to do: you aren't in this room".to_string()
+                        "nothing to do: you aren't in this channel".to_string()
                     } else {
                         format!(
-                            "to leave as a role or another mailbox, pass --member <mailbox>; see the members with `{BIN} room list`"
+                            "to leave as a role or another mailbox, pass --member <mailbox>; see the members with `{BIN} channel list`"
                         )
                     };
                     warnings.push(
                         Diagnostic::warning(
-                            Code::RoomNotMember,
-                            "you aren't a member of that room; nothing to leave",
+                            Code::ChannelNotMember,
+                            "you aren't a member of that channel; nothing to leave",
                         )
                         .with_hint(hint),
                     );
@@ -2161,39 +3033,38 @@ pub fn room(root: &Path, actor: Option<String>, cmd: &RoomCommand) -> u8 {
             }
             RoomCommand::List { mine, .. } => {
                 let actor = agent(&repo, actor)?;
-                let own = own_mailboxes(&store, &actor, now)?;
-                let own_set: BTreeSet<&String> = own.iter().collect();
                 let mut rooms = Vec::new();
-                for r in store.rooms().map_err(mail_error)? {
-                    if *mine && !r.members.iter().any(|m| own_set.contains(m)) {
-                        continue;
-                    }
-                    let unread = store
-                        .inbox(&InboxQuery {
-                            mailboxes: own.clone(),
-                            room: Some(r.name.clone()),
-                            now_ms: now,
-                            ..InboxQuery::default()
-                        })
-                        .map_err(mail_error)?
-                        .messages
-                        .len() as u64;
+                let (channels, event_cursor) = store.channels_for_actor_with_cursor(&actor, *mine, now_ms).map_err(mail_error)?;
+                for (r, unread) in channels {
                     rooms.push(room_record(&r, Some(unread)));
                 }
-                serde_json::to_value(RoomListData { rooms })
+                serde_json::to_value(RoomListData { event_cursor: Some(event_cursor), rooms })
             }
         }
         .map_err(|e| GraphError::failure(Code::CoordStoreFailed, e.to_string()))?;
         Ok(Report::ok(data).with(warnings))
     })()
     .unwrap_or_else(Report::failed);
+    let mut report = compatibility(report, legacy);
+    if !legacy && let Some(data) = report.data.as_mut() {
+        if let Some(room) = data.as_object_mut().and_then(|d| d.remove("room")) {
+            data["channel"] = room;
+        }
+        if let Some(rooms) = data.as_object_mut().and_then(|d| d.remove("rooms")) {
+            data["channels"] = rooms;
+        }
+    }
     output::emit(name, json, report, |d| {
-        let rooms: Vec<&Value> = match d.get("rooms") {
+        let rooms: Vec<&Value> = match d.get("channels").or_else(|| d.get("rooms")) {
             Some(Value::Array(rooms)) => rooms.iter().collect(),
-            _ => d.get("room").into_iter().collect(),
+            _ => d
+                .get("channel")
+                .or_else(|| d.get("room"))
+                .into_iter()
+                .collect(),
         };
         if rooms.is_empty() {
-            println!("no rooms");
+            println!("no channels");
         }
         for r in rooms {
             let members: Vec<&str> = r["members"]
@@ -2206,7 +3077,7 @@ pub fn room(root: &Path, actor: Option<String>, cmd: &RoomCommand) -> u8 {
                 .as_u64()
                 .map_or_else(String::new, |n| format!(", {n} unacked"));
             println!(
-                "room {}: {}{unacked}",
+                "channel {}: {}{unacked}",
                 r["name"].as_str().unwrap_or_default(),
                 members.join(", ")
             );
@@ -2215,11 +3086,77 @@ pub fn room(root: &Path, actor: Option<String>, cmd: &RoomCommand) -> u8 {
 }
 
 /// Unacked mail for the actor, for `status`.
-pub fn unacked(store: &Store, actor: &str, now: u64) -> Vec<(String, u64)> {
-    own_mailboxes(store, actor, now)
-        .ok()
-        .and_then(|own| store.unacked(&own).ok())
-        .unwrap_or_default()
+pub fn unacked(store: &Store, actor: &str, now: u64) -> Result<Vec<(String, u64)>, GraphError> {
+    let own = own_mailboxes(store, actor, now)?;
+    store.unacked(&own).map_err(mail_error)
+}
+
+/// Direct mail another command sends (`lease request`): `send_report`'s
+/// steps for a message to mailboxes, with its parts given as data, in
+/// `context`. Never a decision, a review round or node-bound mail.
+pub(crate) fn send_direct(
+    root: &Path,
+    actor: Option<String>,
+    to: Vec<String>,
+    kind: &str,
+    context: &str,
+    parts: Value,
+) -> Result<Report<SendData>, GraphError> {
+    let repo = Repo::open(root)?;
+    let sender = agent(&repo, actor)?;
+    check_kind(kind)?;
+    // Only the kinds agents send to each other: decision mail has its own
+    // path, and kinds mdkg reserves to itself never go out from here.
+    if !matches!(
+        kind,
+        "question" | "note" | "handoff" | "findings" | "resolution" | "review_request"
+    ) {
+        return Err(usage(
+            Code::MsgBadKind,
+            "only the kinds agents send to each other go out here",
+        )
+        .with_hint("decision mail goes through `msg send --kind decision`"));
+    }
+    for m in &to {
+        check_mailbox(m)?;
+    }
+    let to = To::Mailboxes(to);
+    check_message_id(context)?;
+    not_an_import(context)?;
+    check_body(&parts)?;
+    let now = now_ms();
+    // The validated grace: a committed value mail refuses refuses this
+    // send too (review of 9b00cc5d).
+    let mut store = mail_store(&repo)?;
+    let config = committed_config(&repo)?;
+    let out = Outgoing {
+        message_id: mint_id(now),
+        context_id: Some(context.to_string()),
+        kind: kind.to_string(),
+        sender_mailboxes: own_mailboxes(&store, &sender, now)?,
+        sender,
+        via: None,
+        to,
+        reference_ids: Vec::new(),
+        parts,
+        retention: retention(&config)?,
+        human_hold_days: human_hold_days(&config)?,
+        now_ms: now,
+    };
+    let (message, duplicate, _) = store
+        .send_flow(
+            &out,
+            &SendFlow::default(),
+            &ExpiryPolicy::default(),
+            &mut |_, _| Ok(()),
+        )
+        .map_err(mail_error)?;
+    Ok(Report::ok(SendData {
+        message: message_record(&message),
+        duplicate,
+        round: None,
+        superseded: Vec::new(),
+    }))
 }
 
 #[cfg(test)]
@@ -2227,109 +3164,125 @@ mod tests {
     use super::*;
 
     #[test]
-    fn secrets_are_recognised_without_tripping_on_ordinary_text() {
-        assert!(looks_secret(
-            "-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----"
-        ));
-        assert!(looks_secret(
-            "token: ghp_abcdefghijklmnopqrstuvwxyz0123456789"
-        ));
-        assert!(looks_secret("key=AKIAIOSFODNN7EXAMPLE"));
-        // Task-36: more prefixes, JWTs and URLs with a password.
-        for secret in [
-            "ASIAIOSFODNN7EXAMPLE",
-            concat!("sk_", "live_", "abcdefghijklmnopqrstuvwx"),
-            "npm_abcdefghijklmnopqrstuvwxyz0123456789",
-            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.abcdefghijklmnop",
-            "DATABASE_URL=postgres://app:hunter2@db.internal:5432/x",
-            "postgres://app:hunter2\u{FF20}db.internal",
+    fn fault_delivery_refuses_a_bad_recipient_or_fault_id_before_the_store() {
+        let root = std::env::temp_dir().join(format!("mdkg-fault-guards-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir(&root).unwrap();
+        let mut mail =
+            mdkg_run::CliMail::new(PathBuf::from("unused"), root.clone(), "orchestrator".into());
+        mail.trusted_common = Some(root.join(".git"));
+        mail.trusted_worktree = Some(root.clone());
+        let good = mdkg_run::fault::Fault::new(
+            "worker",
+            "run.agent_failed",
+            "turn",
+            vec!["orchestrator".into()],
+            mdkg_run::fault::CLEARS_TURN,
+            "none".into(),
+        );
+        for (fault, expected) in [
+            (
+                mdkg_run::fault::Fault {
+                    to: vec![],
+                    ..good.clone()
+                },
+                "msg.no_recipients",
+            ),
+            (
+                mdkg_run::fault::Fault {
+                    to: vec!["run:worker".into()],
+                    ..good.clone()
+                },
+                "msg.bad_id",
+            ),
+            (
+                mdkg_run::fault::Fault {
+                    fault_id: "not-a-uuid".into(),
+                    ..good.clone()
+                },
+                "msg.bad_id",
+            ),
         ] {
-            assert!(looks_secret(secret), "{secret}");
+            assert_eq!(deliver_fault(&mail, &fault).unwrap_err().code, expected);
         }
-        assert!(looks_secret("redis://:hunter2@cache:6379"));
-        assert!(looks_secret(&format!("x {}", ".eyJabcdefghij".repeat(3))));
-        // Review round 2 of audit-core.
-        for secret in [
-            "key_AKIAIOSFODNN7EXAMPLE",
-            "AKIAIOSFODNN7EXAMPLE_backup",
-            "postgres://app:$Zx9kq2LmQ7@db.prod",
-            concat!("sk_", "live_", "abcdefghijklmnopqrstuvwx"),
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn private_receipt_seam_keeps_body_and_recipient_guards() {
+        let root =
+            std::env::temp_dir().join(format!("mdkg-receipt-guards-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir(&root).unwrap();
+        let mut mail =
+            mdkg_run::CliMail::new(PathBuf::from("unused"), root.clone(), "orchestrator".into());
+        mail.trusted_common = Some(root.join(".git"));
+        mail.trusted_worktree = Some(root.clone());
+        let id = uuid::Uuid::now_v7().to_string();
+        for (body, expected) in [
+            (
+                "x".repeat((MAX_BODY + 1).try_into().unwrap()),
+                "msg.too_large",
+            ),
+            (
+                concat!("token: ghp_", "abcdefghijklmnopqrstuvwxyz0123456789").into(),
+                "msg.secret_refused",
+            ),
         ] {
-            assert!(looks_secret(secret), "{secret}");
+            let request = mdkg_run::mail::Receipt {
+                id: &id,
+                agent: "worker",
+                to: "orchestrator",
+                body: &body,
+            };
+            assert_eq!(deliver_receipt(&mail, &request).unwrap_err().code, expected);
         }
-        for ordinary in [
-            "postgresql://scott:***@db/x",
-            "amqp://guest:**@localhost:5672//",
-            "redis://:****@cache",
-            "postgres://user:password@localhost/x",
-            "USER:PASSWORD@HOST via mysql://USER:PASSWORD@HOST/db",
-            "postgres://app:REDACTED@db",
-            "postgres://app:xxxxx@db",
-            "{'url':'http://localhost:8000','user':'bot@example.com'}",
-            "see http://localhost:8080,ops@example.com",
-            "is_sk_live_mode_enabled_for_this_account",
-        ] {
-            assert!(!looks_secret(ordinary), "{ordinary}");
+        for to in ["worker", "mdkg:receipts"] {
+            assert!(
+                deliver_receipt(
+                    &mail,
+                    &mdkg_run::mail::Receipt {
+                        id: &id,
+                        agent: "worker",
+                        to,
+                        body: "receipt"
+                    }
+                )
+                .is_err()
+            );
         }
-        // Review round 4 of audit-core.
-        for secret in [
-            "postgres://app:$ecretsauce@db.prod",
-            "postgres://app:$hunter2@db.prod",
-            "postgres://app:2024;Spring!@db.prod",
-            "redis://:1;Zx9kq2Lm@cache",
-        ] {
-            assert!(looks_secret(secret), "{secret}");
-        }
-        assert!(!looks_secret("see http://example.com:8080;admin@corp"));
+        mail.trusted_common = None;
+        assert!(
+            receipt_baseline(&mail)
+                .unwrap_err()
+                .message
+                .contains("pins are missing")
+        );
+        assert_eq!(
+            std::fs::read_dir(&root).unwrap().count(),
+            0,
+            "validation must not open or create a store"
+        );
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn mail_validation_and_decoded_strings_are_checked() {
         assert_eq!(
             crate::output::shown_body("a\r\nb\rc\u{9b}2K\u{202e}"),
             "a\r\nb\\u{d}c\\u{9b}2K\\u{202e}"
         );
-        // Review round 3 of audit-core.
-        for secret in [
-            "postgres://app:pa;ss9Zk2@db.prod",
-            "postgres://app:Zx9,kq2Lm@db.prod",
-            "redis://:a1b2;c3d4@cache",
-        ] {
-            assert!(looks_secret(secret), "{secret}");
-        }
-        for ordinary in [
-            r#"$dsn = "mysql://$user:$pass@$host/$db";"#,
-            "DATABASE_URL=postgres://$db_user:$db_password@$db_host:5432/app",
-            "redis://:$redis_pass@cache:6379",
-        ] {
-            assert!(!looks_secret(ordinary), "{ordinary}");
-        }
         assert!(not_an_import("import:abc").is_err());
-        // Review round 1 of audit-core: ordinary text stays sendable.
-        for ordinary in [
-            "ssh://git@github.com/x/y",
-            "https://example.com/a:b@c",
-            "see eyJ for the header",
-            "http://user:@host",
-            "AWS_REGION_ASIA_PACIFIC_SOUTHEAST_1",
-            "ASIA_PACIFIC_NORTHEAST",
-            "npm_config_strict_peer_dependencies=false",
-            "npm_package_dependencies_typescript_version",
-            "postgres://postgres:postgres@localhost:5432/app",
-            "postgres://$POSTGRES_USER:$POSTGRES_PASSWORD@db:5432/app",
-            "mongodb://<username>:<password>@cluster0.example.net",
-            "amqp://guest:guest@localhost:5672/",
-            r#"{"url":"https://example.com","user":"bot@example.com"}"#,
-        ] {
-            assert!(!looks_secret(ordinary), "{ordinary}");
-        }
         assert!(
-            check_message_id("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.abcdefghijklmnop").is_err()
+            check_message_id(concat!(
+                "eyJhbGciOiJIUzI1NiJ9.",
+                "eyJzdWIiOiIxMjM0In0.abcdefghijklmnop"
+            ))
+            .is_err()
         );
-        assert!(!looks_secret("the ghp_ prefix marks GitHub tokens"));
-        assert!(!looks_secret("secret = os.environ['X']"));
-        assert!(!looks_secret("MASKIAIOSFODNN7EXAMPLEX is not an AWS key"));
         // Scanned as typed, not as escaped JSON (review of a76dd2c).
         let mut strings = Vec::new();
         let parts = json!([
-            {"kind": "text", "text": "here:\nghp_abcdefghijklmnopqrstuvwxyz0123456789"},
-            {"kind": "data", "data": {"k": "\tAKIAIOSFODNN7EXAMPLE"}}
+            {"kind": "text", "text": concat!("here:\nghp_", "abcdefghijklmnopqrstuvwxyz0123456789")},
+            {"kind": "data", "data": {"k": concat!("\tAKIA", "IOSFODNN7EXAMPLE")}}
         ]);
         strings_in(&parts, &mut strings);
         assert_eq!(strings.iter().filter(|s| looks_secret(s)).count(), 2);

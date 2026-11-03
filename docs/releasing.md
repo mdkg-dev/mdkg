@@ -12,9 +12,13 @@ maintainer gives.
 | GitHub Release (archives, `sha256.sum`, installers) | `release.yml` (cargo-dist), on a `v*` tag | the same workflow | nothing beyond `GITHUB_TOKEN` |
 | Shell installer | `release.yml` | attached to the GitHub Release | — |
 | Homebrew (`mdkg-dev/homebrew-tap`) | `release.yml` | its `publish-homebrew-formula` job | secret `HOMEBREW_TAP_TOKEN` |
-| npm `mdkg` | `release.yml` | its `publish-npm` job | secret `NPM_TOKEN` |
+| npm `mdkg` | `release.yml` (attached to the GitHub Release) | `publish.yml`'s `npm` job, on the same tag, after approval | the `npm` environment and npm trusted publishing |
 | PyPI `mdkg` | `pypi.yml` (maturin), on the same tag | its `publish` job, after approval | the `pypi` environment and PyPI trusted publishing |
-| crates.io `mdkg` and its library crates | — | the maintainer, by hand (step 5) | `cargo login` on the maintainer's machine |
+| crates.io `mdkg` and its library crates | `publish.yml`'s `crates-verify` job, on the same tag | its `crates-io` job, after approval | the `crates-io` environment and crates.io trusted publishing |
+
+No registry token is stored: npm, PyPI and crates.io each exchange the
+job's GitHub OIDC token for a short-lived one. Only `HOMEBREW_TAP_TOKEN`
+remains a long-lived secret.
 
 Targets: macOS arm64 and x86_64, and Linux x86_64 and arm64, each with
 glibc and musl. Windows and the PowerShell installer are not built yet
@@ -27,23 +31,44 @@ glibc and musl. Windows and the PowerShell installer are not built yet
 2. **`HOMEBREW_TAP_TOKEN`:** a fine-grained personal access token with
    access to `mdkg-dev/homebrew-tap` only, Contents read and write. Store
    it as an Actions secret on `mdkg-dev/mdkg`.
-3. **`NPM_TOKEN`:** an npm granular access token that can publish the
-   `mdkg` package and bypasses two-factor authentication, since CI can't
-   answer a prompt. Store it as an Actions secret on `mdkg-dev/mdkg`.
+3. **npm:**
+   - On npmjs.com, in the `mdkg` package's settings, add a trusted
+     publisher: GitHub Actions, organization `mdkg-dev`, repository
+     `mdkg`, workflow `publish.yml`, environment `npm`, with direct
+     publishing (`npm publish`) allowed, not only staged publishing.
+     Then, under publishing access, require two-factor authentication
+     and disallow tokens; trusted publishing still works.
+   - On GitHub, create the environment `npm` on `mdkg-dev/mdkg`, as for
+     `pypi` below.
+   - Delete any `NPM_TOKEN` Actions secret, and revoke every npm token
+     that can publish `mdkg`.
 4. **PyPI:**
    - On pypi.org, add a trusted publisher to the `mdkg` project: owner
      `mdkg-dev`, repository `mdkg`, workflow `pypi.yml`, environment
      `pypi`. If the project doesn't exist yet, add it as a *pending*
      publisher. No token is stored.
    - On GitHub, create the environment `pypi` on `mdkg-dev/mdkg` with
-     yourself as a required reviewer. Every PyPI upload then waits for
-     your approval.
-5. **crates.io:** run `cargo login` on your machine with a token that can
-   publish `mdkg` and its library crates (mdkg-format, mdkg-log,
-   mdkg-graph, mdkg-index, mdkg-coord, mdkg-coord-sqlite, mdkg-run): scopes
-   `publish-new` and `publish-update`, crate pattern `mdkg*`. Check that
-   crates.io lists you as an owner of each crate that already exists; the
-   first publish creates the rest.
+     yourself as a required reviewer, and deployments limited to tags
+     matching `v*`. Every PyPI upload then waits for your approval.
+5. **crates.io:** trusted publishing works only for a crate that exists,
+   so the first version of a new crate is published by hand (`cargo
+   login` with a short-lived token, `cargo publish -p <crate> --locked`,
+   then revoke the token).
+   - On crates.io, in the settings of all thirteen publishable crates,
+     in the order derived by `scripts/publish-crates.py`: mdkg-format,
+     mdkg-git, mdkg-graph, mdkg-index, mdkg-log, mdkg-coord,
+     mdkg-coord-sqlite, mdkg-ops, mdkg-run, mdkg-wire, mdkg-presence,
+     mdkg-serve, mdkg, add a trusted publisher: GitHub, owner `mdkg-dev`,
+     repository `mdkg`, workflow `publish.yml`, environment `crates-io`.
+   - On GitHub, create the environment `crates-io` on `mdkg-dev/mdkg`, as
+     for `pypi`.
+   - For 0.7.1, the five new crate names (mdkg-git, mdkg-ops,
+     mdkg-presence, mdkg-serve and mdkg-wire) were created as 0.0.1
+     placeholders on 2026-11-02. Set up all thirteen trusted publishers
+     before approving the 0.7.1 job; no local publication is needed.
+   - After all thirteen entries are configured, delete any
+     `CARGO_REGISTRY_TOKEN` secret, run `cargo logout` and revoke the
+     local API tokens that can publish these crates.
 6. Optionally, protect `main` and require the CI workflow's checks.
 
 ## Gates before a release
@@ -61,16 +86,33 @@ glibc and musl. Windows and the PowerShell installer are not built yet
 
 For an offline preparation run, install the pinned cargo-dist version and
 a maturin version satisfying `pyproject.toml` beforehand, and populate
-the dependency caches. Then, without any login or upload:
+the dependency caches. Work in a **clean exported checkout outside the
+active development checkout**: internally, `scripts/export-public.sh <out>`
+creates the export described in the release checklist; for a public-source
+rehearsal, use a separate clean checkout of the release source. The export
+must contain the committed release changes, and have its own clean Git
+commit before building, so the binary records that source's commit.
+No login, upload or registry access is part of local preparation.
+
+From that exported checkout, explicitly set `CARGO_TARGET_DIR` to its own
+`target/`, overriding any user Cargo `build.target-dir` setting. cargo-dist
+0.32.0 writes `target/distrib` there even with a target-dir override and may
+replace its previous artifacts.
+The channel acceptance runner also reads `target/distrib`, `target/package`
+and `target/wheels` from this checkout; do not mix artifacts from another
+source or redirect just part of the preparation:
 
 ```sh
-export CARGO_BUILD_JOBS=4 CARGO_NET_OFFLINE=true
+cd <out>
+export CARGO_TARGET_DIR="$PWD/target" CARGO_NET_OFFLINE=true
+# Keep the machine's CARGO_BUILD_JOBS setting; run one Cargo command at a time.
 cargo build --release --locked --offline -p mdkg
+target/release/mdkg --version
 dist plan
 dist generate --check
 dist build --artifacts=all --target aarch64-apple-darwin
 cargo package --workspace --locked --offline
-maturin build --release --locked --offline --jobs 4 --out target/wheels
+maturin build --release --locked --offline --jobs "${CARGO_BUILD_JOBS:-4}" --out target/wheels
 maturin sdist --out target/wheels
 ```
 
@@ -110,12 +152,13 @@ released.
    library crates are internal to mdkg, with no stable API. If this step
    fails, fix it before tagging.
 
-2. **Tag the release.** This publishes the GitHub Release, Homebrew and
-   npm, and starts the PyPI build:
+2. **Tag the release.** This publishes the GitHub Release and Homebrew,
+   starts the PyPI build, and starts the `Publish` workflow, which waits
+   for the GitHub Release:
 
    ```sh
-   git tag -a v0.7.0 -m "mdkg 0.7.0"
-   git push origin v0.7.0
+   git tag -a v0.7.1 -m "mdkg 0.7.1"
+   git push origin v0.7.1
    ```
 
    Watch the `Release` workflow:
@@ -123,56 +166,68 @@ released.
      create the GitHub Release.
    - **publish-homebrew-formula:** this pushes `Formula/mdkg.rb` to the
      tap.
-   - **publish-npm:** this publishes `mdkg@0.7.0`, which becomes npm's
-     `latest`.
 
    If a publish job fails after `host`, rerun the failed jobs from the
    workflow page; once the GitHub Release exists, never re-tag. If a build
    fails before `host`, nothing is published yet:
-   1. Cancel the tag's `PyPI` run, which is waiting for approval, so its
-      wheels of the bad tag are never uploaded.
-   2. Delete the tag: `git push origin :v0.7.0`, then `git tag -d v0.7.0`.
+   1. Cancel the tag's `PyPI` and `Publish` runs, which are waiting, so
+      nothing of the bad tag is uploaded.
+   2. Delete the tag: `git push origin :v0.7.1`, then `git tag -d v0.7.1`.
    3. Fix the problem and tag again.
 
-3. **PyPI:** the `PyPI` workflow builds the wheels and the sdist, then
-   waits at `publish`. Approve it only after the `Release` workflow has
-   published the GitHub Release and npm.
+3. **npm:** once the GitHub Release exists, the `Publish` workflow's
+   `npm` job waits for approval in the `npm` environment. Approved, it
+   checks that the release's `mdkg-npm-package.tar.gz` is the one the
+   tag's `Release` run built, then publishes it with provenance, and
+   it becomes npm's `latest` (a pre-release goes to `next`). Check it:
+   `npm view mdkg version`. A rerun skips a version already on npm.
 
-4. **The previous major's users:** retire the old npm versions as the
+4. **PyPI:** the `PyPI` workflow builds the wheels and the sdist, then
+   waits at `publish`. Approve it only after the GitHub Release and npm
+   are out.
+
+5. **The previous major's users:** retire the old npm versions as the
    release plan says, for example `npm deprecate mdkg@"<0.7.0" "<message>"`.
    It's safe only once the new version is live.
 
-5. **crates.io**, from the tagged checkout:
-
-   ```sh
-   cargo publish --workspace --locked
-   ```
-
-   Cargo publishes the workspace's publishable crates in dependency order:
+6. **crates.io:** the `Publish` workflow's `crates-verify` job packages
+   and verifies every crate (`cargo publish --workspace --dry-run
+   --locked`); then its `crates-io` job waits for approval in the
+   `crates-io` environment. Approved, it gets a 30-minute token from
+   crates.io and runs `scripts/publish-crates.py`, which publishes one
+   crate at a time in dependency order:
 
    1. `mdkg-format`
-   2. `mdkg-log`
+   2. `mdkg-git`
    3. `mdkg-graph`
    4. `mdkg-index`
-   5. `mdkg-coord`
-   6. `mdkg-coord-sqlite`
-   7. `mdkg-run`
-   8. `mdkg` (the binary)
+   5. `mdkg-log`
+   6. `mdkg-coord`
+   7. `mdkg-coord-sqlite`
+   8. `mdkg-ops`
+   9. `mdkg-run`
+   10. `mdkg-wire`
+   11. `mdkg-presence`
+   12. `mdkg-serve`
+   13. `mdkg` (the binary)
 
    The libraries are internal to mdkg, with no stable API: each one's
-   description and README say so, and point at the `mdkg` binary. If
-   `--workspace` stops part way (a network error), don't rerun it: it may
-   refuse the versions already there. Publish each remaining crate in this
-   order with `cargo publish -p <crate> --locked`. `cargo search <crate>`
-   shows which are up.
+   description and README say so, and point at the `mdkg` binary. A crate
+   whose version is already there is skipped, so if the job stops part
+   way, rerun it. When crates.io rate-limits a publish (HTTP 429), the
+   script waits until the time crates.io names, if that's within 25
+   minutes of the job's start (the token lasts 30); a longer wait fails
+   the job with the time to rerun after. `scripts/publish-crates.py
+   --plan` prints the order locally and publishes nothing; only
+   `--publish` publishes.
 
-6. **Verify each channel on a clean machine or container.** Each one must
+7. **Verify each channel on a clean machine or container.** Each one must
    print the new version, then read a graph from the previous release:
 
    ```sh
    brew install mdkg-dev/tap/mdkg
    npm install --global mdkg
-   curl --proto '=https' --tlsv1.2 -LsSf https://github.com/mdkg-dev/mdkg/releases/download/v0.7.0/mdkg-installer.sh | sh
+   curl --proto '=https' --tlsv1.2 -LsSf https://github.com/mdkg-dev/mdkg/releases/download/v0.7.1/mdkg-installer.sh | sh
    cargo install mdkg --locked
    pipx install mdkg
    ```
@@ -211,6 +266,15 @@ released.
 
 ## Changing the pipeline
 
+- **`publish.yml` and `pypi.yml` are written by hand,** and pinned by the
+  same script. `publish.yml` names the two jobs that can publish; only
+  they have `id-token: write`, each behind its environment. The npm
+  trusted publisher and each crate's name `publish.yml`, so renaming it
+  means changing those entries first. npm publishes from it rather than
+  from `release.yml` because cargo-dist 0.32's npm job reads an
+  `NPM_TOKEN` secret, with no environment or OIDC option, so
+  `dist-workspace.toml` leaves npm out of `publish-jobs`. It still builds
+  the npm package, which the GitHub Release carries.
 - **`release.yml` is generated, then pinned.** cargo-dist writes it with
   actions pinned by tag and dist installed by `curl | sh`;
   `scripts/pin-workflows.py` pins every action by commit and installs dist

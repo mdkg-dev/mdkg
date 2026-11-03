@@ -1,0 +1,249 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "mdkg.api.turn.v1",
+  "description": "Draft (mdkg API v1; see docs/api.md). May change until the release that first emits it. One harness run for an agent (A7). Its receipt is `mdkg.turn.receipt.v1`, unchanged.",
+  "x-mdkg-status": "draft",
+  "type": "object",
+  "properties": {
+    "schema": {
+      "const": "mdkg.api.turn.v1"
+    },
+    "ok": {
+      "type": "boolean",
+      "description": "False exactly when there is an error diagnostic."
+    },
+    "data": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Turn"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "diagnostics": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/DiagnosticOut"
+      }
+    }
+  },
+  "required": [
+    "schema",
+    "ok",
+    "diagnostics"
+  ],
+  "$defs": {
+    "Turn": {
+      "type": "object",
+      "properties": {
+        "uri": {
+          "type": "string",
+          "description": "The resource's path at its coordinator, beginning `/v1/`."
+        },
+        "turn_id": {
+          "type": "string",
+          "description": "UUIDv7, minted by the launcher before spawn and kept in the turn index."
+        },
+        "number": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "agent": {
+          "type": "string",
+          "description": "The resource's path at its coordinator, beginning `/v1/`."
+        },
+        "harness": {
+          "type": "string",
+          "description": "A harness id. An open set: accept values not listed.",
+          "x-mdkg-open": true,
+          "examples": [
+            "claude",
+            "codex",
+            "opencode"
+          ]
+        },
+        "session": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "supervisor": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "A resource path, or null."
+        },
+        "machine": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "A resource path, or null."
+        },
+        "state": {
+          "type": "string",
+          "description": "The turn's state. An open set: accept values not listed.",
+          "x-mdkg-open": true,
+          "examples": [
+            "running",
+            "ended",
+            "interrupted"
+          ]
+        },
+        "started_at": {
+          "type": "string",
+          "description": "RFC 3339 UTC to the millisecond."
+        },
+        "ended_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "RFC 3339 UTC to the millisecond, or null."
+        },
+        "outcome": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-mdkg-open": true,
+          "examples": [
+            "replied",
+            "ran",
+            "idle",
+            "dry_run",
+            "failed",
+            "interrupted",
+            "not_started"
+          ],
+          "description": "Null while running. `failed` is added by the API for a harness error. An open set."
+        },
+        "needs_recovery": {
+          "type": "boolean",
+          "description": "True while D6 still holds an interrupted turn: run `agents resume`."
+        },
+        "start_head": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "end_head": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "shown": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "description": "The resource's path at its coordinator, beginning `/v1/`."
+          }
+        },
+        "reply": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "A resource path, or null."
+        },
+        "usage": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "receipt": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "A resource path, or null."
+        },
+        "output": {
+          "type": "string",
+          "description": "The resource's path at its coordinator, beginning `/v1/`."
+        }
+      },
+      "required": [
+        "uri",
+        "turn_id",
+        "number",
+        "agent",
+        "harness",
+        "state",
+        "started_at",
+        "output"
+      ]
+    },
+    "DiagnosticOut": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string",
+          "description": "A stable diagnostic code."
+        },
+        "severity": {
+          "type": "string",
+          "description": "Severity.",
+          "enum": [
+            "error",
+            "warning",
+            "info"
+          ]
+        },
+        "path": {
+          "type": "string"
+        },
+        "line": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "node": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "hint": {
+          "type": "string"
+        },
+        "holders": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "related": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string"
+              },
+              "line": {
+                "type": "integer",
+                "minimum": 0
+              }
+            },
+            "required": [
+              "path"
+            ]
+          }
+        }
+      },
+      "required": [
+        "code",
+        "severity",
+        "message"
+      ],
+      "description": "A diagnostic, as every command's envelope writes it."
+    }
+  }
+}

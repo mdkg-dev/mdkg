@@ -54,6 +54,195 @@ fn claim(owner: &str, scope: &str, now: u64) -> Command {
 }
 
 #[test]
+fn read_only_open_never_creates_or_writes_the_store() {
+    let dir = Scratch::new("read-only");
+    assert!(Store::open_read_only(&dir.db()).unwrap().is_none());
+    assert!(!dir.db().parent().unwrap().exists());
+    let mut writer = allowing(&dir.db(), 100).unwrap();
+    writer.execute(&register("w/a")).unwrap();
+    let before = writer.coordinator().unwrap();
+    let journal = writer.journal().unwrap();
+    let mut reader = Store::open_read_only(&dir.db()).unwrap().unwrap();
+    assert_eq!(reader.ttl(), 100);
+    assert_eq!(reader.coordinator().unwrap(), before);
+    assert!(matches!(
+        reader.execute(&register("w/b")),
+        Err(StoreError::Sqlite(_))
+    ));
+    assert_eq!(writer.journal().unwrap(), journal);
+    writer.execute(&register("w/c")).unwrap();
+    assert_eq!(reader.coordinator().unwrap(), writer.coordinator().unwrap());
+}
+
+#[test]
+fn read_only_open_refuses_an_old_schema_without_upgrading_it() {
+    let dir = Scratch::new("read-only-old");
+    drop(allowing(&dir.db(), 100).unwrap());
+    let conn = rusqlite::Connection::open(dir.db()).unwrap();
+    conn.execute("UPDATE meta SET value = '3' WHERE key = 'schema'", [])
+        .unwrap();
+    assert!(Store::open_read_only(&dir.db()).is_err());
+    let schema: String = conn
+        .query_row("SELECT value FROM meta WHERE key = 'schema'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(schema, "3");
+    assert_eq!(
+        std::fs::read_dir(dir.db().parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().contains(".pre-"))
+            .count(),
+        0
+    );
+}
+
+#[test]
+fn observation_recording_is_zero_wait_and_never_upgrades() {
+    let dir = Scratch::new("observation-write");
+    let store = allowing(&dir.db(), 100).unwrap();
+    let observation = mdkg_coord::Observation {
+        read_generation: store.coordinator().unwrap().generation(),
+        leaves: Default::default(),
+        merged: Default::default(),
+        prefix: None,
+    };
+    let conn = rusqlite::Connection::open(dir.db()).unwrap();
+    conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+    assert_eq!(
+        Store::try_record_observation(&dir.db(), &observation).unwrap(),
+        Some("store busy")
+    );
+    conn.execute_batch("ROLLBACK; UPDATE meta SET value = '3' WHERE key = 'schema';")
+        .unwrap();
+    assert_eq!(
+        Store::try_record_observation(&dir.db(), &observation).unwrap(),
+        Some("schema not current")
+    );
+    let schema: String = conn
+        .query_row("SELECT value FROM meta WHERE key = 'schema'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(schema, "3");
+    let missing = dir.0.join("missing.sqlite");
+    assert!(Store::try_record_observation(&missing, &observation).is_err());
+    assert!(!missing.exists());
+    assert_eq!(
+        std::fs::read_dir(dir.db().parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().contains(".pre-"))
+            .count(),
+        0
+    );
+}
+
+#[test]
+fn observation_recording_leaves_a_newer_coordinator_and_its_records_untouched() {
+    let dir = Scratch::new("observation-raced");
+    let mut writer = allowing(&dir.db(), 100).unwrap();
+    writer.execute(&register("w/a")).unwrap();
+    let slow = mdkg_coord::Observation {
+        read_generation: writer.coordinator().unwrap().generation(),
+        leaves: [(Scope::new("w/a"), "slow".into())].into(),
+        ..Default::default()
+    };
+    writer
+        .execute(&Command::ObserveMain {
+            observation: mdkg_coord::Observation {
+                leaves: [(Scope::new("w/a"), "newer".into())].into(),
+                ..slow.clone()
+            },
+        })
+        .unwrap();
+    let state = writer.coordinator().unwrap();
+    let journal = writer.journal().unwrap();
+    let log = writer.log_texts().unwrap();
+    let log_head = writer.log_head().unwrap();
+    assert_eq!(
+        Store::try_record_observation(&dir.db(), &slow).unwrap(),
+        Some("coordinator changed")
+    );
+    assert_eq!(writer.coordinator().unwrap(), state);
+    assert_eq!(writer.journal().unwrap(), journal);
+    assert_eq!(writer.log_texts().unwrap(), log);
+    assert_eq!(writer.log_head().unwrap(), log_head);
+    writer.verify().unwrap();
+}
+
+#[test]
+fn an_old_observation_cannot_settle_an_unlanded_revert() {
+    let dir = Scratch::new("observation-revert-race");
+    let mut store = allowing(&dir.db(), 100).unwrap();
+    store.execute(&register("w/a")).unwrap();
+    let mut commit = |owner: &str, content: &str, now| {
+        let lease = match store.execute(&claim(owner, "w/a", now)).unwrap() {
+            Outcome::Lease { lease } => lease,
+            other => panic!("{other:?}"),
+        };
+        match store
+            .execute(&Command::Commit {
+                owner: owner.into(),
+                lease,
+                changes: [(Scope::new("w/a"), Some(content.into()))].into(),
+                source: None,
+                now: now + 1,
+                landed: false,
+            })
+            .unwrap()
+        {
+            Outcome::Committed { changeset } => changeset,
+            other => panic!("{other:?}"),
+        }
+    };
+    let c = commit("c", "B", 0);
+    let d = commit("d", "w/a@0", 2);
+    let slow = mdkg_coord::Observation {
+        read_generation: store.coordinator().unwrap().generation(),
+        leaves: [(Scope::new("w/a"), "w/a@0".into())].into(),
+        ..Default::default()
+    };
+    // C lands after status's snapshot; D's revert has never landed.
+    store
+        .execute(&Command::ObserveMain {
+            observation: mdkg_coord::Observation {
+                leaves: [(Scope::new("w/a"), "B".into())].into(),
+                ..slow.clone()
+            },
+        })
+        .unwrap();
+    let before = store.coordinator().unwrap();
+    assert_eq!(
+        before.changeset(c).unwrap().state,
+        mdkg_coord::Settlement::Committed
+    );
+    assert_eq!(
+        before.changeset(d).unwrap().state,
+        mdkg_coord::Settlement::Sequenced
+    );
+    let mut unsafe_projection = before.clone();
+    unsafe_projection.apply(&Command::ObserveMain {
+        observation: slow.clone(),
+    });
+    assert_eq!(
+        unsafe_projection.changeset(d).unwrap().state,
+        mdkg_coord::Settlement::Committed,
+        "the kernel's External-only guard does not protect this Settle action"
+    );
+    let journal = store.journal().unwrap();
+    let log = store.log_head().unwrap();
+    assert_eq!(
+        Store::try_record_observation(&dir.db(), &slow).unwrap(),
+        Some("coordinator changed")
+    );
+    assert_eq!(store.coordinator().unwrap(), before);
+    assert_eq!(store.journal().unwrap(), journal);
+    assert_eq!(store.log_head().unwrap(), log);
+}
+
+#[test]
 fn state_survives_reopening() {
     let dir = Scratch::new("reopen");
     let mut store = Store::open(&dir.db(), 100).unwrap();
@@ -252,8 +441,9 @@ fn set_schema(db: &std::path::Path, version: &str) {
         .expect("store");
 }
 
-/// Leases carry a mode since schema "2" (task-14), and every write a
-/// record since "3" (task-39). A "1" store upgrades in
+/// Leases carry a mode since schema "2" (task-14), every write a record
+/// since "3" (task-39), and the flow tables since "4" (edd-01a1878e). A
+/// "1" store upgrades in
 /// place and keeps its state; any other version is refused, as an older
 /// binary refuses "2".
 #[test]
@@ -264,7 +454,7 @@ fn a_schema_1_store_upgrades_in_place_and_others_are_refused() {
     store.execute(&claim("x", "w/a", 0)).unwrap();
     let before = store.coordinator().unwrap();
     drop(store);
-    assert_eq!(schema_of(&dir.db()), "3");
+    assert_eq!(schema_of(&dir.db()), "4");
 
     // A store as a pre-mode binary left it: schema "1", leases without a
     // mode field.
@@ -309,12 +499,12 @@ fn a_schema_1_store_upgrades_in_place_and_others_are_refused() {
     assert_eq!(store.coordinator().unwrap(), before);
     store.verify().unwrap();
     drop(store);
-    assert_eq!(schema_of(&dir.db()), "3", "upgraded in place");
+    assert_eq!(schema_of(&dir.db()), "4", "upgraded in place");
 
-    set_schema(&dir.db(), "4");
+    set_schema(&dir.db(), "5");
     assert!(matches!(
         allowing(&dir.db(), 100),
-        Err(StoreError::Schema(v)) if v == "4"
+        Err(StoreError::Schema(v)) if v == "5"
     ));
     // Review round 3 of 1bca39d: a value no build wrote is damage, not a
     // newer build's store.
@@ -334,10 +524,10 @@ fn a_handle_opened_before_an_upgrade_refuses_to_write() {
     let dir = Scratch::new("schema-race");
     let mut store = allowing(&dir.db(), 100).unwrap();
     store.execute(&register("w/a")).unwrap();
-    set_schema(&dir.db(), "4");
+    set_schema(&dir.db(), "5");
     assert!(matches!(
         store.execute(&claim("x", "w/a", 0)),
-        Err(StoreError::Schema(v)) if v == "4"
+        Err(StoreError::Schema(v)) if v == "5"
     ));
     assert!(matches!(store.coordinator(), Err(StoreError::Schema(_))));
     assert!(matches!(store.rebuild(), Err(StoreError::Schema(_))));
@@ -373,7 +563,7 @@ fn an_upgrade_copies_the_store_first_or_not_at_all() {
     let before = schema_1_store(&dir);
     let copy = dir
         .db()
-        .with_file_name("coord.sqlite.pre-1+msg5-to-3+msg5.sqlite");
+        .with_file_name("coord.sqlite.pre-1+msg5-to-4+msg5.sqlite");
 
     // The copy can't be written (its folder takes no new files, while a
     // held connection keeps the WAL the store itself writes to): nothing
@@ -400,7 +590,7 @@ fn an_upgrade_copies_the_store_first_or_not_at_all() {
     assert_eq!(store.backup(), Some(copy.as_path()));
     assert_eq!(store.coordinator().unwrap(), before);
     drop(store);
-    assert_eq!(schema_of(&dir.db()), "3");
+    assert_eq!(schema_of(&dir.db()), "4");
     assert_eq!(schema_of(&copy), "1", "the copy is the store as it was");
     assert_eq!(
         meta_of(&copy, "backup_of").as_deref(),
@@ -437,7 +627,7 @@ fn a_restore_lands_whole_and_refuses_what_it_cant_trust() {
         "{refused:?}"
     );
     drop(held);
-    assert_eq!(schema_of(&dir.db()), "3");
+    assert_eq!(schema_of(&dir.db()), "4");
 
     // A WAL left behind with a write in it, and nothing holding it.
     let db = dir.db();
@@ -463,7 +653,7 @@ fn a_restore_lands_whole_and_refuses_what_it_cant_trust() {
     let restored = mdkg_coord_sqlite::restore(&dir.db(), &copy).unwrap();
     assert_eq!(
         (restored.replaced.as_str(), restored.restored.as_str()),
-        ("3+msg5", "1+msg5")
+        ("4+msg5", "1+msg5")
     );
     assert!(!wal.exists(), "no WAL left behind");
     assert_eq!(schema_of(&dir.db()), "1");
@@ -504,7 +694,7 @@ fn a_restore_lands_whole_and_refuses_what_it_cant_trust() {
         matches!(&refused, Err(StoreError::Restore(m)) if m.contains("isn't a copy")),
         "{refused:?}"
     );
-    assert_eq!(schema_of(&dir.db()), "3", "none of them changed the store");
+    assert_eq!(schema_of(&dir.db()), "4", "none of them changed the store");
 }
 
 fn copies_of(db: &std::path::Path) -> Vec<String> {
@@ -513,6 +703,8 @@ fn copies_of(db: &std::path::Path) -> Vec<String> {
         .filter_map(Result::ok)
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .filter(|n| n.contains(".pre-"))
+        // A copy's proof of its final barrier sits beside it.
+        .filter(|n| !n.ends_with(".synced"))
         .collect();
     names.sort();
     names
@@ -533,7 +725,7 @@ fn every_upgrade_copies_and_a_failed_one_leaves_nothing() {
     assert!(
         store
             .backup()
-            .is_some_and(|b| b.ends_with("coord.sqlite.pre-3+msg2-to-3+msg5.sqlite")),
+            .is_some_and(|b| b.ends_with("coord.sqlite.pre-4+msg2-to-4+msg5.sqlite")),
         "{:?}",
         store.backup()
     );
@@ -543,8 +735,11 @@ fn every_upgrade_copies_and_a_failed_one_leaves_nothing() {
     drop(allowing(&dir.db(), 100).unwrap());
     {
         let conn = rusqlite::Connection::open(dir.db()).unwrap();
+        // Remove mail tables only; schema 4's flow tables also use msg_
+        // names and must remain present for a mail-only upgrade fixture.
         let tables: Vec<String> = conn
-            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'msg_%'")
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN \
+                ('msg_rooms','msg_members','msg_messages','msg_bodies','msg_deliveries','msg_decisions')")
             .unwrap()
             .query_map([], |r| r.get(0))
             .unwrap()
@@ -560,7 +755,7 @@ fn every_upgrade_copies_and_a_failed_one_leaves_nothing() {
     assert!(
         store
             .backup()
-            .is_some_and(|b| b.ends_with("coord.sqlite.pre-3-to-3+msg5.sqlite")),
+            .is_some_and(|b| b.ends_with("coord.sqlite.pre-4-to-4+msg5.sqlite")),
         "{:?}",
         store.backup()
     );
@@ -568,10 +763,10 @@ fn every_upgrade_copies_and_a_failed_one_leaves_nothing() {
     // Listing reads a copy without leaving a WAL beside it.
     let listed = mdkg_coord_sqlite::backups(&dir.db()).unwrap();
     assert_eq!(listed.len(), 1);
-    assert_eq!(listed[0].schema.as_deref(), Some("3"));
+    assert_eq!(listed[0].schema.as_deref(), Some("4"));
     assert_eq!(
         copies_of(&dir.db()),
-        vec!["coord.sqlite.pre-3-to-3+msg5.sqlite"]
+        vec!["coord.sqlite.pre-4-to-4+msg5.sqlite"]
     );
 
     // The upgrade fails after the copy (a damaged ttl): nothing is left,
@@ -680,14 +875,14 @@ fn a_build_folder_binary_refuses_to_upgrade_a_store() {
     // A new store is no upgrade.
     let fresh = Scratch::new("guard-new");
     drop(Store::open(&fresh.db(), 100).expect("a new store"));
-    assert_eq!(schema_of(&fresh.db()), "3");
+    assert_eq!(schema_of(&fresh.db()), "4");
 
     let dir = Scratch::new("guard");
     let before = schema_1_store(&dir);
     for _ in 0..2 {
         match Store::open(&dir.db(), 100) {
             Err(StoreError::UpgradeRefused { from, to }) => {
-                assert_eq!((from.as_str(), to.as_str()), ("1+msg5", "3+msg5"));
+                assert_eq!((from.as_str(), to.as_str()), ("1+msg5", "4+msg5"));
             }
             other => panic!("not refused: {other:?}"),
         }
@@ -877,5 +1072,60 @@ fn a_chained_command_is_recorded_with_the_first_or_neither_is() {
         .expect("chained");
     assert!(chained.recorded && chained.second.is_none());
     assert_eq!(store.journal().expect("journal").len(), before + 3);
+    store.verify().expect("the journal replays to the state");
+}
+
+/// A check before commit (`done`'s settle, A29 step 4) sees the chain's
+/// writes and, refusing, rolls every command back.
+#[test]
+fn a_refused_check_before_commit_rolls_the_chain_back() {
+    let dir = Scratch::new("checked");
+    let mut store = Store::open(&dir.db(), 1_000).expect("open");
+    store.execute(&register("w/a")).expect("register");
+    let before = store.journal().expect("journal").len();
+    let mut saw = 0;
+    let mut refuse = |tx: &rusqlite::Connection| -> Result<bool, mdkg_coord_sqlite::StoreError> {
+        saw = tx.query_row("SELECT MAX(seq) FROM journal", [], |r| r.get::<_, i64>(0))?;
+        Ok(false)
+    };
+    let chained = store
+        .execute_then_checked(
+            &claim("x", "w/a", 1),
+            |_, outcome| matches!(outcome, Outcome::Lease { .. }).then(|| register("w/b")),
+            Some(&mut refuse),
+        )
+        .expect("chained");
+    assert!(!chained.recorded && !chained.checked);
+    assert_eq!(saw as usize, before + 2, "the check saw both commands");
+    assert_eq!(store.journal().expect("journal").len(), before);
+    assert!(
+        store
+            .coordinator()
+            .expect("state")
+            .leaf(&Scope::new("w/b"))
+            .is_none()
+    );
+    let mut pass =
+        |_: &rusqlite::Connection| -> Result<bool, mdkg_coord_sqlite::StoreError> { Ok(true) };
+    let chained = store
+        .execute_then_checked(&register("w/b"), |_, _| None, Some(&mut pass))
+        .expect("chained");
+    assert!(chained.recorded && chained.checked);
+    assert_eq!(store.journal().expect("journal").len(), before + 1);
+    // A local completion refused by its check journals nothing.
+    let mut refuse =
+        |_: &rusqlite::Connection| -> Result<bool, mdkg_coord_sqlite::StoreError> { Ok(false) };
+    let done = store
+        .complete_local_checked(
+            &Scope::new("w/b"),
+            "g#w/b",
+            "alice",
+            "sha256:r",
+            3,
+            Some(&mut refuse),
+        )
+        .expect("complete");
+    assert!(!done.recorded && !done.checked);
+    assert_eq!(store.journal().expect("journal").len(), before + 1);
     store.verify().expect("the journal replays to the state");
 }

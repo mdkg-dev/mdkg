@@ -476,6 +476,19 @@ pub fn create_file(dir: &OwnedFd, name: &OsStr) -> io::Result<File> {
     Ok(File::from(fd))
 }
 
+/// A new file `name` in `dir` that a repository commits (0666 before the
+/// umask, as git and an editor make them), never through a link. A
+/// private file uses [`create_file`] (e2e S7).
+pub fn create_public_file(dir: &OwnedFd, name: &OsStr) -> io::Result<File> {
+    let fd = rustix::fs::openat(
+        dir,
+        name,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o666),
+    )?;
+    Ok(File::from(fd))
+}
+
 /// The file `name` in `dir`, for reading, never through a link. Opened
 /// without blocking, so a FIFO put there can't hang install, and refused
 /// unless it's a regular file (a folder is `IsADirectory`); then reads

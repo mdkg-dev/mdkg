@@ -96,15 +96,16 @@ pub enum Retry {
     Later(Later),
 }
 
-/// Which account an agent's turns bill: its harness's subscription login
-/// first, and an API key from the Keychain only when `api_key_fallback` is
-/// on.
+/// Which account an agent's turns bill: its harness's subscription login,
+/// and an API key from the Keychain only for a turn `mdkg agents use-key`
+/// marks, which `api_key_fallback` permits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, schemars::JsonSchema)]
 pub struct Auth {
     /// Always `subscription` in 0.7.0.
     pub prefer: Prefer,
-    /// Use the key when the harness isn't logged in, or once when the
-    /// subscription hits its usage limit.
+    /// Permits `mdkg agents use-key`, which bills one turn on the key. It
+    /// never uses the key automatically: not for a harness that isn't
+    /// logged in, and not after a usage limit (decided 2026-10-29).
     pub api_key_fallback: bool,
 }
 

@@ -18,17 +18,25 @@ use mdkg_coord::{
     ChangesetId, Command, Coordinator, EntryState, Error as CoordError, Lease, LeaseId, Mode,
     Outcome, Scope, Settlement, Status,
 };
-use mdkg_coord_sqlite::{Store, git};
+use mdkg_coord_sqlite::Store;
 use mdkg_format::{Code, Diagnostic, Severity};
 use mdkg_graph::resolve::{Resolution, resolve_error, resolve_qid};
-use mdkg_graph::{ErrorKind, GraphError, config, index};
+use mdkg_graph::{ErrorKind, GraphError, IndexNode, config, index};
 use mdkg_index::resolve::{handle_error, resolve_noted};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::authority;
+use crate::coord::graph_git::{GraphGit, RefMode, git};
 use crate::output::{self, CoordinationRecord, LeaseBrief, PendingBrief, Report, rfc3339};
 use mdkg_format::program::BIN;
+
+// Declared here until `main.rs` is free to declare it (ref mode's seam,
+// edd-01a18867); `crate::coord::graph_git`.
+#[path = "graph_git.rs"]
+pub(crate) mod graph_git;
+#[path = "node_edit.rs"]
+pub(crate) mod node_edit;
 
 const DEFAULT_TTL_MS: u64 = 2 * 60 * 60 * 1000;
 
@@ -48,7 +56,7 @@ pub(crate) fn now_ms() -> u64 {
         .unwrap_or_default()
 }
 
-fn ttl_ms() -> u64 {
+pub(crate) fn ttl_ms() -> u64 {
     std::env::var("MDKG_LEASE_TTL_MS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -66,16 +74,38 @@ pub(crate) fn git_error(e: std::io::Error) -> GraphError {
     GraphError::failure(Code::IoGitFailed, e.to_string())
 }
 
+/// The clone's store, opened one way for every caller (#14475): never past
+/// a link to a store that isn't there, where SQLite would start an empty
+/// one, and an upgrade says so.
+pub(crate) fn store_for(top: &Path) -> Result<Store, GraphError> {
+    let path = git::store_path(top).map_err(git_error)?;
+    unreachable_store(&path)?;
+    let store = Store::open_for_repo(top, ttl_ms()).map_err(store_error)?;
+    upgraded(&store);
+    Ok(store)
+}
+
 /// Says so when opening the store just upgraded it, with where the copy
 /// of it as it was went.
-fn upgraded(store: &Store) {
+pub(crate) fn upgraded(store: &Store) {
     if let Some(copy) = store.backup() {
+        // The override's weaker guarantee, which the upgraded store also
+        // records as `meta.upgrade_barrier` (Terra's code review #5973,
+        // finding 5).
+        let weak = if store.backup_weak() {
+            format!(
+                ", synced with a plain fsync only ({}=1), a weaker guarantee than the full barrier",
+                mdkg_coord_sqlite::PLAIN_FSYNC_ENV
+            )
+        } else {
+            String::new()
+        };
         crate::output::notice(
             Diagnostic::warning(
                 Code::CoordStoreUpgraded,
                 format!(
                     "the coordinator store was upgraded to this build's schema; a copy of it as it \
-                     was is at {}",
+                     was is at {}{weak}",
                     copy.display()
                 ),
             )
@@ -90,8 +120,11 @@ fn upgraded(store: &Store) {
 pub(crate) fn store_error(e: mdkg_coord_sqlite::StoreError) -> GraphError {
     let newer = matches!(e, mdkg_coord_sqlite::StoreError::Schema(_));
     let refused = matches!(e, mdkg_coord_sqlite::StoreError::UpgradeRefused { .. });
+    let read_upgrade = matches!(e, mdkg_coord_sqlite::StoreError::ReadUpgradeRequired { .. });
     let error = GraphError::failure(Code::CoordStoreFailed, e.to_string());
-    if refused {
+    if read_upgrade {
+        error.with_hint(format!("use the installed `{BIN} renew` to upgrade the store (it is copied first), then retry this read"))
+    } else if refused {
         error.with_hint(
             "use the installed mdkg; pass --allow-store-upgrade only for a scratch or test \
              store (it is copied first)",
@@ -116,9 +149,15 @@ pub(crate) struct Repo {
     folders: std::cell::OnceCell<(Vec<String>, Vec<Scope>)>,
     /// Under `work.committed: none`, the store's work folder.
     store_work: std::cell::OnceCell<Option<PathBuf>>,
+    /// The committed config [`crate::msg::committed_config`] reads, once
+    /// per command (each read asks git for the repository's folders).
+    pub(crate) committed: std::cell::OnceCell<serde_json::Value>,
     /// Each store-folder node file's UUID, read once per command;
     /// `None` for a file that names no id.
     store_ids: std::cell::RefCell<std::collections::HashMap<PathBuf, Option<String>>>,
+    /// Ref mode: the graph is the graph ref, read from the cache (`root`),
+    /// and `top` is the invoking checkout, for code paths and the store.
+    pub(crate) mode: Option<std::sync::Arc<RefMode>>,
 }
 
 /// Each graph root `Repo::open` checked in this process, by its canonical
@@ -354,6 +393,20 @@ fn seen(_root: &Path) -> Option<Seen> {
 
 impl Repo {
     pub(crate) fn open(root: &Path) -> Result<Self, GraphError> {
+        // Ref mode: the root `bind` handed the command is the cache, which
+        // no git check applies to; its checkout was checked when bound.
+        if let Some(mode) = graph_git::for_root(root) {
+            return Ok(Self {
+                root: mode.root().to_path_buf(),
+                top: mode.checkout.clone(),
+                prefix: String::new(),
+                folders: std::cell::OnceCell::new(),
+                store_work: std::cell::OnceCell::new(),
+                committed: std::cell::OnceCell::new(),
+                store_ids: Default::default(),
+                mode: Some(mode),
+            });
+        }
         let trust = git::WorktreeTrust::current();
         let Ok(canonical) = std::fs::canonicalize(root) else {
             return Ok(Self::check(root)?.0);
@@ -377,7 +430,9 @@ impl Repo {
                 prefix,
                 folders: std::cell::OnceCell::new(),
                 store_work: std::cell::OnceCell::new(),
+                committed: std::cell::OnceCell::new(),
                 store_ids: Default::default(),
+                mode: None,
             });
         }
         let (repo, git_dir) = Self::check(root)?;
@@ -488,7 +543,9 @@ impl Repo {
                 prefix,
                 folders: std::cell::OnceCell::new(),
                 store_work: std::cell::OnceCell::new(),
+                committed: std::cell::OnceCell::new(),
                 store_ids: Default::default(),
+                mode: None,
             },
             git_dir,
         ))
@@ -626,13 +683,18 @@ impl Repo {
         // As the disk spells it: scopes ignore case, a case-sensitive disk
         // doesn't.
         let spelled = self.on_disk(target.scope.as_str());
-        let on_disk = self.top.join(&spelled);
+        let on_disk = self.disk_base(&spelled).join(&spelled);
         // Node folders of this graph and of every graph above the scope.
         let mut folders: Vec<Scope> = self.node_folders().1.clone();
         let parts: Vec<&str> = spelled.split('/').collect();
         for i in 0..parts.len() {
             let dir = parts[..i].join("/");
-            if self.top.join(&dir).join(config::CONFIG_PATH).is_file() {
+            if self
+                .disk_base(&dir)
+                .join(&dir)
+                .join(config::CONFIG_PATH)
+                .is_file()
+            {
                 folders.extend(self.nested(&dir).node_folders().1.iter().cloned());
             }
         }
@@ -663,7 +725,12 @@ impl Repo {
         if on_disk.join(config::CONFIG_PATH).is_file() {
             return Ok(true);
         }
-        let files = git::files_under(&self.top, &spelled).map_err(git_error)?;
+        let files = if self.mode.as_ref().is_some_and(|m| m.holds(&spelled)) {
+            self.graph_git().files_under(&spelled)
+        } else {
+            git::files_under(&self.top, &spelled)
+        }
+        .map_err(git_error)?;
         Ok(files.iter().any(|f| {
             let f = f.to_lowercase();
             f == config::CONFIG_PATH || f.ends_with(&format!("/{}", config::CONFIG_PATH))
@@ -681,7 +748,10 @@ impl Repo {
             scope: scope.clone(),
             label: String::new(),
             missing: false,
-            folder: self.top.join(self.on_disk(scope.as_str())).is_dir(),
+            folder: {
+                let spelled = self.on_disk(scope.as_str());
+                self.disk_base(&spelled).join(&spelled).is_dir()
+            },
             node: None,
             qid: None,
             node_key: None,
@@ -697,7 +767,7 @@ impl Repo {
     /// no git call.
     fn nested(&self, dir: &str) -> Repo {
         Repo {
-            root: self.top.join(dir),
+            root: self.disk_base(dir).join(dir),
             top: self.top.clone(),
             prefix: if dir.is_empty() {
                 String::new()
@@ -706,14 +776,35 @@ impl Repo {
             },
             folders: std::cell::OnceCell::new(),
             store_work: std::cell::OnceCell::new(),
+            committed: std::cell::OnceCell::new(),
             store_ids: Default::default(),
+            mode: self.mode.clone(),
+        }
+    }
+
+    /// The seam every graph-file git question goes through: the cache and
+    /// its commit in ref mode, the checkout and its HEAD otherwise.
+    pub(crate) fn graph_git(&self) -> GraphGit<'_> {
+        match &self.mode {
+            Some(mode) => GraphGit::Ref { mode },
+            None => GraphGit::Checkout { top: &self.top },
+        }
+    }
+
+    /// Where repository-relative `rel` is on disk: in ref mode, a graph
+    /// path is in the cache, which mirrors the repository's layout; any
+    /// other path is in the checkout.
+    pub(crate) fn disk_base(&self, rel: &str) -> &Path {
+        match &self.mode {
+            Some(mode) if mode.holds(rel) => mode.root(),
+            _ => &self.top,
         }
     }
 
     /// `rel` (from the repository's top) as the disk spells it: each
     /// existing segment matched in any letter case, the rest as given.
     fn on_disk(&self, rel: &str) -> String {
-        let mut here = self.top.clone();
+        let mut here = self.disk_base(rel).to_path_buf();
         let mut out: Vec<String> = Vec::new();
         let mut parts = rel.split('/').filter(|p| !p.is_empty()).peekable();
         while let Some(part) = parts.next() {
@@ -757,7 +848,12 @@ impl Repo {
                 }
                 continue;
             }
-            if self.top.join(&dir).join(config::CONFIG_PATH).is_file() {
+            if self
+                .disk_base(&dir)
+                .join(&dir)
+                .join(config::CONFIG_PATH)
+                .is_file()
+            {
                 let graph = self.nested(&dir);
                 if graph.node_file(scope) {
                     return Ok(Some(graph));
@@ -768,26 +864,28 @@ impl Repo {
     }
 
     /// The node folders, by folder name (lowercase) and by scope: this
-    /// graph's `.mdkg` and each workspace's (`.` is the graph root's own).
-    /// A config that can't be read gives this graph's `.mdkg` alone.
+    /// graph's `.mdkg` and each workspace's (`.` is the graph root's own),
+    /// the lease-key input. The workspaces are the graph ref's committed
+    /// config's, the list the gate reads a node's leases by, never the
+    /// checkout's own edit (Terra's code review #10490, the major; #6919
+    /// call 2); the checkout's config only where no graph-ref config
+    /// resolves ([`crate::entry::graph_ref_workspaces`], a residual the
+    /// edd names). A config that can't be read gives this graph's `.mdkg`
+    /// alone.
     fn node_folders(&self) -> &(Vec<String>, Vec<Scope>) {
         self.folders.get_or_init(|| {
             let mut names = vec![".mdkg".to_string()];
             let mut folders = vec![self.graph_scope()];
-            for w in config::load(&self.root)
-                .map(|c| c.workspaces)
-                .unwrap_or_default()
-            {
+            let workspaces = crate::entry::graph_ref_workspaces(self).unwrap_or_else(|| {
+                config::load(&self.root)
+                    .map(|c| c.workspaces)
+                    .unwrap_or_default()
+            });
+            for w in workspaces {
                 if let Some(name) = w.mdkg_dir.trim_matches('/').rsplit('/').next() {
                     names.push(name.to_lowercase());
                 }
-                let dir: Vec<&str> = w
-                    .path
-                    .split('/')
-                    .chain(w.mdkg_dir.split('/'))
-                    .filter(|p| !p.is_empty() && *p != ".")
-                    .collect();
-                folders.push(self.scope_for(&dir.join("/")));
+                folders.push(self.scope_for(&workspace_folder(&w)));
             }
             (names, folders)
         })
@@ -795,11 +893,7 @@ impl Repo {
 
     /// The node folder holding `scope`, the innermost if folders nest.
     fn node_folder_of(&self, scope: &Scope) -> Option<&Scope> {
-        self.node_folders()
-            .1
-            .iter()
-            .filter(|f| f.contains(scope) && *f != scope)
-            .max_by_key(|f| f.as_str().len())
+        innermost_node_folder(&self.node_folders().1, scope)
     }
 
     /// The key a node's lease is held under: the node folder holding its
@@ -828,12 +922,15 @@ impl Repo {
     }
 
     pub(crate) fn store(&self) -> Result<Store, GraphError> {
-        // SQLite would follow a dangling link and start an empty store
-        // where it points: never write past one.
-        let path = git::store_path(&self.top).map_err(git_error)?;
-        unreachable_store(&path)?;
-        let store = Store::open_for_repo(&self.top, ttl_ms()).map_err(store_error)?;
-        upgraded(&store);
+        let mut store = store_for(&self.top)?;
+        // Acked mail stays readable for the configured grace whatever
+        // command acks it (friction item 72). The mail commands that ack or
+        // send refuse a bad value; elsewhere it falls back to the default.
+        store.set_ack_grace_days(
+            crate::msg::committed_config(self)
+                .and_then(|config| crate::msg::ack_grace_days(&config))
+                .unwrap_or(crate::msg::DEFAULT_ACK_GRACE_DAYS),
+        );
         Ok(store)
     }
 
@@ -865,13 +962,28 @@ impl Repo {
     }
 
     fn observe_main(&self, store: &mut Store) -> Result<(), GraphError> {
+        let Some(main) = self.observation_ref()? else {
+            return Ok(());
+        };
+        store
+            .observe_main(&self.top, &main, &self.graph_scope().to_string())
+            .map(drop)
+            .map_err(store_error)
+    }
+
+    /// The ref both writers and status observe. Resolving it runs no store IO.
+    fn observation_ref(&self) -> Result<Option<String>, GraphError> {
+        // Ref mode: the graph ref wins (G5). It was checked when bound.
+        if let Some(mode) = &self.mode {
+            return Ok(Some(mode.graph.name.clone()));
+        }
         let main = main_ref(&self.top);
         // A repository with no commit yet: main is unborn and holds
         // nothing, so there's nothing to observe, and work goes on before
         // the first commit. A missing main beside other branches is still
         // a misnamed one.
         if !git::has_ref(&self.top, &main) && git::no_commits(&self.top).map_err(git_error)? {
-            return Ok(());
+            return Ok(None);
         }
         if !git::has_ref(&self.top, &main) {
             return Err(GraphError::failure(
@@ -880,11 +992,7 @@ impl Repo {
             )
             .with_hint("set it with `git config mdkg.mainRef <branch>` (or $MDKG_MAIN_REF)"));
         }
-        let prefix = self.graph_scope().to_string();
-        match store.observe_main(&self.top, &main, &prefix) {
-            Ok(_) => Ok(()),
-            Err(e) => Err(store_error(e)),
-        }
+        Ok(Some(main))
     }
 
     /// The actor a worktree names by default, its folder's name, with no
@@ -1006,6 +1114,19 @@ impl Repo {
     ///   `node.resolved` note (id and title), so the actor sees what was
     ///   claimed.
     pub(crate) fn resolve_handle_target(&self, target: &str) -> Result<Target, GraphError> {
+        self.resolve_handle(target, false)
+    }
+
+    /// [`Repo::resolve_handle_target`] for a claim: a name that's no node
+    /// and no path in any worktree (and has no `/` to read as one) is
+    /// refused as a missing path, whose hint names `--new` and a trailing
+    /// `/`, since the claimer most likely means a path it's about to
+    /// create.
+    pub(crate) fn resolve_claim_target(&self, target: &str) -> Result<Target, GraphError> {
+        self.resolve_handle(target, true)
+    }
+
+    fn resolve_handle(&self, target: &str, claim: bool) -> Result<Target, GraphError> {
         refuse_hidden(target)?;
         let named = ["role:", "run:"].iter().any(|p| {
             target
@@ -1062,6 +1183,7 @@ impl Repo {
             }
             // A path that doesn't exist yet, as `resolve` reads one.
             Resolution::Missing(_) if target.contains('/') => self.path_target(target),
+            Resolution::Missing(_) if claim => Err(missing_claim()),
             other => Err(handle_error(&index, "id", target, &other, None)),
         }
     }
@@ -1222,7 +1344,8 @@ impl Repo {
             ));
         }
         let rel = target.trim_end_matches('/');
-        let missing = !self.top.join(rel).exists() && self.in_other_worktree(rel).is_none();
+        let missing =
+            !self.disk_base(rel).join(rel).exists() && self.in_other_worktree(rel).is_none();
         let scope = Scope::new(rel);
         // The node, where the graph holding the scope has it, is here under
         // its own path: a worker's copy renamed in its worktree names
@@ -1236,7 +1359,7 @@ impl Repo {
             scope,
             label: rel.to_string(),
             missing,
-            folder: target.ends_with('/') || self.top.join(rel).is_dir(),
+            folder: target.ends_with('/') || self.disk_base(rel).join(rel).is_dir(),
             node: node.map(|_| false),
             qid,
             node_key,
@@ -1258,15 +1381,32 @@ impl Repo {
             )
             .with_hint("claim paths inside the worktree you edit")
         };
-        let root = std::fs::canonicalize(&self.root).unwrap_or_else(|_| self.root.clone());
         let raw = Path::new(target);
+        // Ref mode: the graph root is the cache, which mirrors the
+        // repository; a relative path outside the graph folders is a code
+        // path, from the checkout's top.
+        let root = match &self.mode {
+            Some(m) if !m.holds(target) => self.top.clone(),
+            _ => std::fs::canonicalize(&self.root).unwrap_or_else(|_| self.root.clone()),
+        };
         let joined = if raw.is_absolute() {
             raw.to_path_buf()
         } else {
             root.join(raw)
         };
         let resolved = true_path(&normalize(&joined));
-        let rel = resolved.strip_prefix(&self.top).map_err(|_| outside())?;
+        let base = match &self.mode {
+            Some(m) => {
+                let cache = std::fs::canonicalize(m.root()).unwrap_or_else(|_| m.root().into());
+                if resolved.starts_with(&cache) {
+                    cache
+                } else {
+                    self.top.clone()
+                }
+            }
+            None => self.top.clone(),
+        };
+        let rel = resolved.strip_prefix(&base).map_err(|_| outside())?;
         let rel = rel.to_string_lossy();
         let rel = if cfg!(windows) {
             rel.replace('\\', "/")
@@ -1362,6 +1502,16 @@ impl Repo {
     }
 }
 
+/// `coordination.leases` in the committed config `config show` reports,
+/// never a working-tree file; the default policy while the checkout
+/// commits no graph yet.
+fn committed_lease_policy(repo: &Repo) -> Result<config::LeasePolicy, GraphError> {
+    match crate::msg::committed_config(repo)? {
+        serde_json::Value::Null => Ok(config::LeasePolicy::default()),
+        committed => Ok(config::from_snapshot(committed)?.leases),
+    }
+}
+
 /// Whether a coordinator store may sit in a `.git` entry of `root` or a
 /// folder above it. Decided by the store, not by git: an entry that can't
 /// be read, or a worktree whose repository has moved, may hold one, so it
@@ -1437,7 +1587,7 @@ fn dangling(p: &Path) -> bool {
 
 /// Refuses a store path behind a dangling link (`mdkg/` or the store itself
 /// pointing at a disk that isn't mounted): its store may be there.
-fn unreachable_store(path: &Path) -> Result<(), GraphError> {
+pub(crate) fn unreachable_store(path: &Path) -> Result<(), GraphError> {
     if dangling(path) || path.parent().is_some_and(dangling) {
         return Err(GraphError::failure(
             Code::CoordStoreFailed,
@@ -1730,6 +1880,21 @@ pub(crate) fn no_node_matches() -> GraphError {
     ))
 }
 
+/// A claim of a name that's no node and no path yet: what was typed is
+/// never quoted.
+fn missing_claim() -> GraphError {
+    GraphError::not_found(
+        Code::CoordPathMissing,
+        "no node matches that handle, and no worktree has that path",
+    )
+    .with_hint(format!(
+        "to claim a file or folder you're about to create, claim it with `{bin} claim --new \
+         <path>` (MCP: lease_claim with `new: true`), or end a folder's name with `/`; to find \
+         a node, `{bin} search <words>`",
+        bin = crate::BIN
+    ))
+}
+
 /// A coordinator refusal as an error with its exit class.
 pub(crate) fn refusal(e: &CoordError) -> GraphError {
     let (kind, code) = match e {
@@ -1757,12 +1922,12 @@ pub(crate) fn refusal(e: &CoordError) -> GraphError {
     let bin = crate::BIN;
     let hint = match e {
         CoordError::Held(_) => Some(format!(
-            "pick other work, or see who holds what with `{bin} status --all`"
+            "pick other work, or see who holds what with `{bin} status`"
         )),
         CoordError::CasFailed => Some("someone changed it first; run the command again".into()),
         CoordError::PastDeadline => Some("the lease ended; claim it again".into()),
         CoordError::NotOwner => Some(format!(
-            "only the lease's owner can do that; see who holds what with `{bin} status --all`"
+            "only the lease's owner can do that; see who holds what with `{bin} status`"
         )),
         CoordError::NotActive | CoordError::NotConfirmed => {
             Some("that lease isn't active; claim it again".into())
@@ -1874,6 +2039,12 @@ pub struct LeaseRecord {
     /// it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expiring: Option<bool>,
+    /// In `status`: true for a path lease with no changes in its owner's
+    /// worktree, past the first quarter of its term, while no
+    /// turn of the owner's (`run:<owner>`) runs. `mdkg renew` won't keep
+    /// it, and its owner can give it up with `mdkg release <path>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle: Option<bool>,
 }
 
 fn status_name(s: Status) -> &'static str {
@@ -1900,6 +2071,7 @@ pub(crate) fn lease_record(l: &Lease) -> LeaseRecord {
         changeset: l.changeset.map(|c| c.to_string()),
         mine: None,
         expiring: None,
+        idle: None,
     }
 }
 
@@ -2035,15 +2207,28 @@ pub(crate) fn missing_versions(
         if e.state != EntryState::Pending {
             continue;
         }
-        let in_history = match &e.source {
-            Some(s) => git::is_ancestor(&repo.top, &s.commit).unwrap_or(false),
-            None => false,
+        // Ref mode: a graph file's version is held when the graph ref has
+        // its commit, or the cache its content.
+        let graph = repo.mode.as_ref().filter(|m| m.holds(e.leaf.as_str()));
+        let in_history = match (&e.source, graph) {
+            (Some(s), Some(m)) => {
+                git::is_ancestor_of(&repo.top, &s.commit, &m.graph.name).unwrap_or(false)
+            }
+            (Some(s), None) => git::is_ancestor(&repo.top, &s.commit).unwrap_or(false),
+            (None, _) => false,
         };
         if in_history {
             continue;
         }
-        let path = git::disk_spelling(&repo.top, e.leaf.as_str());
-        let have = git::file_digest(&repo.top, &path).map_err(git_error)?;
+        let have = if graph.is_some() {
+            let seam = repo.graph_git();
+            let path = seam.disk_spelling(e.leaf.as_str());
+            seam.file_digest(&path)
+        } else {
+            let path = git::disk_spelling(&repo.top, e.leaf.as_str());
+            git::file_digest(&repo.top, &path)
+        }
+        .map_err(git_error)?;
         if have != e.content {
             out.push(FileRecord {
                 path: e.leaf.to_string(),
@@ -2334,7 +2519,11 @@ fn plan_claim(
         // Nothing hidden reaches a message, even a refusal's.
         refuse_hidden(target)?;
         let repo = Repo::open(root)?;
-        let config = config::load(root)?;
+        let mut config = config::load(root)?;
+        // Which paths are shared is committed authority: an uncommitted
+        // edit can't share a path someone holds exclusively (orchestrator,
+        // 2026-11-02, #15277).
+        config.leases = committed_lease_policy(&repo)?;
         // A role or a turn is a name, never a path; read as a path under a
         // subfolder root it would quietly become `sub/run:x`.
         if opts.new && aliases_named(target) {
@@ -2376,7 +2565,7 @@ fn plan_claim(
         } else if opts.exact {
             repo.resolve(target)?
         } else {
-            repo.resolve_handle_target(target)?
+            repo.resolve_claim_target(target)?
         };
         // A path that is a node's file holds that node: its lease is keyed
         // on the node's id too.
@@ -3298,14 +3487,32 @@ pub enum ReleaseOutput {
 /// `release --all` on this store's leases: each release in its own
 /// transaction, as `release <id>` is, so a crash or a failed write leaves
 /// the rest released or not, and running it again finishes the job.
-fn release_all_local(repo: &Repo, actor: &str) -> Result<Report<ReleaseManyData>, GraphError> {
+fn release_all_local(
+    repo: &Repo,
+    actor: &str,
+    clean: bool,
+) -> Result<Report<ReleaseManyData>, GraphError> {
     let mut store = repo.store()?;
     let now = now_ms();
     repo.observe(&mut store, now)?;
     let state = store.coordinator().map_err(store_error)?;
+    // `--clean`: only path leases renew wouldn't extend, by its own test
+    // (a file lease protects uncommitted edits only, #11980): no changes,
+    // staged or not, in this worktree (or the one that has the path), and
+    // not claimed in the first quarter of the term. Never a node's, a
+    // role's or a turn's; when git can't say, the lease is kept.
+    let mut changes = Changes::default();
     let mine: Vec<Lease> = state
         .leases()
         .filter(|l| l.owner == actor && l.status == Status::Active)
+        .filter(|l| {
+            !clean
+                || (l.confirmed
+                    && l.deadline > now
+                    && is_path_lease(l)
+                    && !just_claimed(&state, l, now)
+                    && changes.of(&repo.top, l) == Some(false))
+        })
         .cloned()
         .collect();
     let mut released = Vec::new();
@@ -3375,15 +3582,17 @@ fn release_all_local(repo: &Repo, actor: &str) -> Result<Report<ReleaseManyData>
     })
 }
 
-/// `release --all`. Beside a lease authority, only this store's leases
-/// (roles, turns, profile C nodes) are released here: the lease-authority
-/// contract has no call that lists yours there, so those are released by
-/// path.
-pub fn release_all(root: &Path, actor: Option<String>, json: bool) -> u8 {
+/// `release --all`, or with `clean`, `release --clean`: the path leases
+/// whose paths have no uncommitted changes and weren't just claimed (the
+/// launcher runs it as the agent after every turn). Beside a lease
+/// authority, only this store's leases (roles, turns, profile C nodes)
+/// are released here: the lease-authority contract has no call that lists
+/// yours there, so those are released by path.
+pub fn release_all(root: &Path, actor: Option<String>, clean: bool, json: bool) -> u8 {
     let report = (|| {
         let repo = Repo::open(root)?;
         let actor = repo.actor(actor);
-        let report = release_all_local(&repo, &actor)?;
+        let report = release_all_local(&repo, &actor, clean)?;
         let beside = match authority::find(&repo) {
             Ok(None) => None,
             Ok(Some(_)) | Err(_) => Some(
@@ -3401,7 +3610,11 @@ pub fn release_all(root: &Path, actor: Option<String>, json: bool) -> u8 {
     .with(authority::committed_key_warning(root));
     output::emit("release", json, report, |d| {
         if d.released.is_empty() && d.failed.is_empty() {
-            println!("no active leases to release");
+            if clean {
+                println!("no clean leases to release");
+            } else {
+                println!("no active leases to release");
+            }
         }
         for l in &d.released {
             println!(
@@ -3427,6 +3640,16 @@ pub struct RenewData {
     /// claimed again: renewing can't revive them, claiming again can.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub expired: Vec<LeaseRecord>,
+    /// Path leases whose path has no changes in this worktree, past the
+    /// first quarter of their term (30 minutes by default): not renewed,
+    /// so they lapse at their deadline. Claiming one again keeps it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_renewed: Vec<LeaseRecord>,
+    /// Path leases with no changes in this worktree, still in the first
+    /// quarter of their term: not renewed, and they keep their time. A
+    /// renew once their path has changes extends them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kept: Vec<LeaseRecord>,
 }
 
 fn renew_local(
@@ -3450,11 +3673,28 @@ fn renew_local(
         } else {
             repo.observe(&mut store, now)?;
         }
-        let ids: Vec<LeaseId> = store
-            .coordinator()
-            .map_err(store_error)?
+        let before = store.coordinator().map_err(store_error)?;
+        // A file lease protects uncommitted edits only (decided 2026-10-30,
+        // #11980; friction items 70 and 75): renew extends a path lease
+        // while its path has changes in this worktree (or in the one that
+        // has the path). A clean one, committed work included, keeps its
+        // time and lapses at its deadline; claiming it again keeps it.
+        // When git can't say, the lease is renewed, as before.
+        let clean: Vec<LeaseId> = if named_only {
+            Vec::new()
+        } else {
+            let mut changes = Changes::default();
+            before
+                .leases()
+                .filter(|l| l.owner == actor && l.confirmed && l.status == Status::Active)
+                .filter(|l| is_path_lease(l) && changes.of(&repo.top, l) == Some(false))
+                .map(|l| l.id.clone())
+                .collect()
+        };
+        let ids: Vec<LeaseId> = before
             .leases()
             .filter(|l| l.owner == actor && l.confirmed && l.status == Status::Active)
+            .filter(|l| !clean.contains(&l.id))
             .filter(|l| !named_only || is_named_scope(&l.scope))
             .filter(|l| only_turn.is_none_or(|scope| l.scope.as_str() == scope))
             .filter(|l| repo.lease_still_granted(&l.scope))
@@ -3528,9 +3768,42 @@ fn renew_local(
                 .with_hint("claim them again to keep working on them"),
             );
         }
+        let (kept, not_renewed): (Vec<&Lease>, Vec<&Lease>) = clean
+            .iter()
+            .filter_map(|id| state.lease(id))
+            .partition(|l| just_claimed(&state, l, now));
+        let kept: Vec<LeaseRecord> = kept
+            .into_iter()
+            .map(|l| lease_record_in(&state, l))
+            .collect();
+        let not_renewed: Vec<LeaseRecord> = not_renewed
+            .into_iter()
+            .map(|l| lease_record_in(&state, l))
+            .collect();
+        if !not_renewed.is_empty() {
+            diagnostics.push(
+                Diagnostic::warning(
+                    Code::CoordNotActive,
+                    format!(
+                        "not renewed, so they'll lapse: {} (no changes in this worktree)",
+                        not_renewed
+                            .iter()
+                            .map(|l| l.id.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                )
+                .with_hint(format!(
+                    "give them up now with `{BIN} release <path>`; to keep one while you edit it, \
+                     claim it again"
+                )),
+            );
+        }
         Ok(Report::ok(RenewData {
             renewed,
             expired: expired.into_iter().map(lease_record).collect(),
+            not_renewed,
+            kept,
         })
         .with(diagnostics))
     }
@@ -3636,7 +3909,7 @@ pub fn renew(root: &Path, actor: Option<String>, json: bool, local_turn: Option<
     .unwrap_or_else(Report::failed)
     .with(authority::committed_key_warning(root));
     output::emit("renew", json, report, |d| {
-        if d.renewed.is_empty() {
+        if d.renewed.is_empty() && d.not_renewed.is_empty() && d.kept.is_empty() {
             println!("no active leases to renew");
         }
         for l in &d.renewed {
@@ -3645,15 +3918,307 @@ pub fn renew(root: &Path, actor: Option<String>, json: bool, local_turn: Option<
                 output::shown(&format!("renewed {} until {} ({})", l.scope, l.until, l.id))
             );
         }
+        for l in &d.not_renewed {
+            println!(
+                "{}",
+                output::shown(&format!(
+                    "not renewed {} (no changes here) until {} ({})",
+                    l.scope, l.until, l.id
+                ))
+            );
+        }
+        for l in &d.kept {
+            println!(
+                "{}",
+                output::shown(&format!(
+                    "kept {} until {} ({}): just claimed, renewed once it has changes",
+                    l.scope, l.until, l.id
+                ))
+            );
+        }
     })
+}
+
+/// `mdkg lease`: asking about leases other actors hold.
+#[derive(Debug, clap::Subcommand)]
+pub enum LeaseCommand {
+    /// Ask the actor holding a node or path to give it up: direct mail of
+    /// kind `question` to the holder, copied to whoever you report to.
+    ///
+    /// The holder answers with a normal reply, and releasing stays its own
+    /// act: nothing is released for it. The mail's context is
+    /// `lease:<lease id>:<you>`, one conversation per lease and asker (asking
+    /// again adds to it), and a data part names the path, you and the
+    /// reason.
+    #[command(after_help = examples!(
+        "lease request src/parser.rs --reason \"a security fix needs one commit here\""
+    ))]
+    Request {
+        /// The node id or path you need, as you'd claim it.
+        target: String,
+        /// Why you need it, for the holder.
+        #[arg(long)]
+        reason: String,
+        /// Print JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+impl LeaseCommand {
+    pub fn name(&self) -> &'static str {
+        match self {
+            LeaseCommand::Request { .. } => "lease.request",
+        }
+    }
+
+    pub fn json(&self) -> bool {
+        match self {
+            LeaseCommand::Request { json, .. } => *json,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct LeaseRequestData {
+    /// What was asked for, as a claim would lease it.
+    pub scope: String,
+    /// One request per lease in the way, each mailed to its holder.
+    pub requests: Vec<LeaseRequestRecord>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct LeaseRequestRecord {
+    /// The lease in the way.
+    pub lease: LeaseRecord,
+    /// The `question` sent to its holder (and the requester's
+    /// `reports_to`), in the context `lease:<lease id>:<requester>`.
+    pub sent: crate::msg::SendData,
+}
+
+/// Who `actor` reports to, as the committed agent definitions say: `None`
+/// for an actor that isn't an agent.
+fn reports_to(root: &Path, actor: &str) -> Result<Option<String>, String> {
+    use mdkg_run::orchestration::{agent, authority};
+    let config = authority(root)
+        .and_then(|a| agent::authority_config(&a))
+        .map_err(|e| e.to_string())?;
+    Ok(config
+        .get("agents")
+        .and_then(|agents| agents.get(actor))
+        .and_then(|a| a.get("reports_to"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string))
+}
+
+fn lease_request_report(
+    root: &Path,
+    actor: Option<String>,
+    target: &str,
+    reason: &str,
+) -> Result<Report<LeaseRequestData>, GraphError> {
+    if reason.trim().is_empty() {
+        return Err(GraphError::usage(
+            Code::UsageInvalidArguments,
+            "a lease request needs a --reason",
+        )
+        .with_hint("say what you need it for, so its holder can decide"));
+    }
+    let plan = plan_claim(root, actor.clone(), target, &ClaimOptions::default())?;
+    if is_named_scope(&plan.scope) {
+        return Err(GraphError::usage(
+            Code::UsageInvalidArguments,
+            "a lease request takes a node or a path, not a role or a turn",
+        )
+        .with_hint("turns belong to the launcher; ask about a role by mail"));
+    }
+    let requester = plan.actor.clone();
+    let mut store = plan.repo.store()?;
+    let now = now_ms();
+    plan.repo.observe(&mut store, now)?;
+    let state = store.coordinator().map_err(store_error)?;
+    // The leases a claim would be refused for: the node held under another
+    // path, and every lease overlapping the scope that can't be held beside
+    // one in the claim's mode.
+    let mut blocking: Vec<&Lease> = Vec::new();
+    let node_holder = plan.node_key.as_deref().and_then(|k| state.node_holder(k));
+    for l in node_holder
+        .into_iter()
+        .chain(state.blockers(&plan.scope, plan.mode))
+    {
+        if l.owner != requester && !blocking.iter().any(|b| b.id == l.id) {
+            blocking.push(l);
+        }
+    }
+    if blocking.is_empty() {
+        return Err(GraphError::not_found(
+            Code::CoordNoLease,
+            format!("no one else's lease is in the way of {}", plan.label),
+        )
+        .with_hint(format!("claim it: `{BIN} claim {}`", plan.target)));
+    }
+    let mut diagnostics = Vec::new();
+    let copy = match reports_to(root, &requester) {
+        Ok(to) => to,
+        Err(_) => {
+            diagnostics.push(
+                Diagnostic::warning(
+                    Code::ConfigUnreadable,
+                    "your agent definition couldn't be read, so nobody you report to was copied",
+                )
+                .with_hint(format!("`{BIN} doctor` checks the setup")),
+            );
+            None
+        }
+    };
+    let mut requests = Vec::new();
+    let mut failed: Option<GraphError> = None;
+    for l in blocking {
+        let record = lease_record_in(&state, l);
+        let mut to = vec![l.owner.clone()];
+        if let Some(c) = copy.as_ref().filter(|c| **c != l.owner && **c != requester) {
+            to.push(c.clone());
+        }
+        // Names and the reason are data: the text names neither.
+        let parts = serde_json::json!([
+            {
+                "kind": "text",
+                "text": format!(
+                    "Lease request: another actor needs {}, which your lease {} holds until {}. \
+                     The data part says who and why. If you can, finish or commit what you're \
+                     doing there and release it (`{BIN} release <path>`); reply either way. \
+                     Releasing is yours to decide: nothing releases it for you.",
+                    output::shown(l.scope.as_str()),
+                    l.id,
+                    record.until
+                ),
+            },
+            {
+                "kind": "data",
+                "mediaType": "application/json",
+                "data": {
+                    "kind": "lease_request",
+                    "lease": l.id.to_string(),
+                    "path": l.scope.to_string(),
+                    "requested": plan.scope.to_string(),
+                    "requester": requester,
+                    "reason": reason,
+                },
+            },
+        ]);
+        // One conversation per lease and asker: a mail context admits only
+        // its members, so a second asker can't post into the first's.
+        let sent = match crate::msg::send_direct(
+            root,
+            Some(requester.clone()),
+            to,
+            "question",
+            &lease_request_context(&l.id, &requester),
+            parts,
+        ) {
+            Ok(sent) => sent,
+            // Mail already sent to other holders stands: say which lease
+            // wasn't asked about, and go on.
+            Err(e) => {
+                let mut d = (*e.diagnostic).clone();
+                d.severity = Severity::Warning;
+                d.message = format!("{} wasn't asked about: {}", l.id, d.message);
+                diagnostics.push(d);
+                failed.get_or_insert(e);
+                continue;
+            }
+        };
+        diagnostics.extend(sent.diagnostics);
+        let Some(sent) = sent.data else {
+            continue;
+        };
+        requests.push(LeaseRequestRecord {
+            lease: record,
+            sent,
+        });
+    }
+    if requests.is_empty()
+        && let Some(e) = failed
+    {
+        return Err(e);
+    }
+    Ok(Report::ok(LeaseRequestData {
+        scope: plan.scope.to_string(),
+        requests,
+    })
+    .with(diagnostics))
+}
+
+/// `lease:<lease id>:<requester>`, kept to what a message id allows: any
+/// other character (an `@` a mailbox may hold) becomes `_`, and it's cut at
+/// 128 characters.
+fn lease_request_context(lease: &LeaseId, requester: &str) -> String {
+    format!("lease:{lease}:{requester}")
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(128)
+        .collect()
+}
+
+/// `mdkg lease request`: mails each holder in the way; never releases.
+pub fn lease_request(
+    root: &Path,
+    actor: Option<String>,
+    target: &str,
+    reason: &str,
+    json: bool,
+) -> u8 {
+    let report = lease_request_report(root, actor, target, reason)
+        .unwrap_or_else(Report::failed)
+        .with(authority_notice(root));
+    output::emit("lease.request", json, report, |d| {
+        for r in &d.requests {
+            println!(
+                "{}",
+                output::shown(&format!(
+                    "asked {} for {} ({}): sent {} #{} to {}",
+                    r.lease.owner,
+                    r.lease.scope,
+                    r.lease.id,
+                    r.sent.message.message_id,
+                    r.sent.message.seq,
+                    r.sent.message.to.join(", ")
+                ))
+            );
+        }
+    })
+}
+
+/// Runs `mdkg lease`.
+pub fn lease(root: &Path, actor: Option<String>, cmd: &LeaseCommand) -> u8 {
+    match cmd {
+        LeaseCommand::Request {
+            target,
+            reason,
+            json,
+        } => lease_request(root, actor, target, reason, *json),
+    }
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct StatusData {
     /// Who this worktree acts as.
     pub actor: String,
-    /// The branch work settles on.
+    /// The branch work settles on: in ref mode, the graph ref (as
+    /// `graph.ref`). Always present, as the published schema requires.
     pub main: String,
+    /// Ref mode: the graph ref work settles on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph: Option<GraphStatus>,
+    /// Ref mode: the read-only code base (`mdkg.mainRef`), when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_base: Option<String>,
     /// Active leases, everyone's; `mine` marks the actor's own.
     pub leases: Vec<LeaseRecord>,
     /// The actor's leases (everyone's with `--all`) that expired in the
@@ -3670,6 +4235,61 @@ pub struct StatusData {
     /// holds), for the mailboxes that have any.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub mail: Vec<MailCount>,
+}
+
+/// The graph ref, as `status` reports it in ref mode (edd-01a18867).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct GraphStatus {
+    /// The graph ref's full name.
+    #[serde(rename = "ref")]
+    pub name: String,
+    /// The commit read.
+    pub tip: String,
+    /// `mdkg.graph.remote`, when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<String>,
+    /// Graph edits found outside the graph ref, reported and never read.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hand_edits: Vec<HandEditRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct HandEditRecord {
+    /// `checkout`, `branch` or `rescued`.
+    pub source: String,
+    /// A repository-relative path, a commit, or a rescued folder.
+    pub at: String,
+}
+
+/// Ref mode's graph block for `status`, and the `graph.hand_edits`
+/// notice when anything was edited outside the graph ref.
+pub(crate) fn graph_status(repo: &Repo) -> Option<GraphStatus> {
+    let mode = repo.mode.as_ref()?;
+    let hand_edits: Vec<HandEditRecord> = graph_git::hand_edits(mode)
+        .into_iter()
+        .map(|h| HandEditRecord {
+            source: h.source.into(),
+            at: h.at,
+        })
+        .collect();
+    if !hand_edits.is_empty() {
+        output::notice(
+            graph_git::graph_warning(
+                "graph.hand_edits",
+                format!(
+                    "{} graph edit(s) outside the graph ref are reported and never read",
+                    hand_edits.len()
+                ),
+            )
+            .with_hint(graph_git::hand_edit_hint(None)),
+        );
+    }
+    Some(GraphStatus {
+        name: mode.graph.name.clone(),
+        tip: mode.commit(),
+        remote: mode.graph.remote.as_ref().map(|r| r.name.clone()),
+        hand_edits,
+    })
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -3689,6 +4309,204 @@ pub struct WorkRecord {
 pub struct MailCount {
     pub mailbox: String,
     pub unacked: u64,
+}
+
+/// What a `done` left behind: `actor`'s active path leases (never a role,
+/// a turn or a node) after its latest `done` at or after `since_ms`, with
+/// that done's time. `None` when there was no such done, or when the actor
+/// holds a node: it has taken new work. The hooks' `lease.done` reads it.
+pub(crate) fn held_after_done<'a>(
+    state: &'a Coordinator,
+    actor: &str,
+    since_ms: u64,
+    now: u64,
+) -> Option<(u64, Vec<&'a Lease>)> {
+    let mine: Vec<&Lease> = state.leases().filter(|l| l.owner == actor).collect();
+    let done = mine
+        .iter()
+        .filter(|l| l.node.is_some() && l.status == Status::Committed)
+        .filter_map(|l| l.committed_at)
+        .filter(|at| *at >= since_ms)
+        .max()?;
+    let active = |l: &Lease| l.status == Status::Active && l.deadline > now;
+    if mine.iter().any(|l| active(l) && l.node.is_some()) {
+        return None;
+    }
+    let held = mine
+        .into_iter()
+        .filter(|l| active(l))
+        .filter(|l| !is_role_or_turn(&l.scope))
+        .collect();
+    Some((done, held))
+}
+
+/// Whether anyone holds `owner`'s turn (`run:<owner>`) now.
+fn in_a_turn(state: &Coordinator, owner: &str, now: u64) -> bool {
+    state.leases().any(|l| {
+        l.confirmed
+            && l.status == Status::Active
+            && l.deadline > now
+            && l.scope
+                .as_str()
+                .strip_prefix("run:")
+                .is_some_and(|name| name.eq_ignore_ascii_case(owner))
+    })
+}
+
+/// A lease on a path: not a node's, a role's or a turn's. `renew` extends
+/// one only while its path has changes in the holder's worktree.
+fn is_path_lease(l: &Lease) -> bool {
+    l.node.is_none() && !is_role_or_turn(&l.scope)
+}
+
+/// Whether `l` was claimed, claimed again or renewed in the first quarter
+/// of its term (30 minutes of the default 2 hours, #11931): a clean one
+/// isn't reported as lapsing then, nor marked idle. The store records no
+/// grant time, so it's read from the deadline; renew never extends a
+/// clean lease, so renewing can't keep one "just claimed". That reading
+/// assumes every lease got the store's default term: a lease granted with
+/// another term would have its first quarter misplaced.
+fn just_claimed(state: &Coordinator, l: &Lease, now: u64) -> bool {
+    let ttl = state.ttl();
+    l.deadline.saturating_sub(ttl).saturating_add(ttl / 4) > now
+}
+
+/// The paths with changes git can see in the worktree at `top`, relative
+/// to the top: staged, unstaged or untracked (an untracked folder as
+/// itself). `None` when git can't say.
+fn changed_paths(top: &Path) -> Option<Vec<Scope>> {
+    let out = git::command(top)
+        .args([
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=normal",
+            "--no-renames",
+            "--ignore-submodules=all",
+        ])
+        .run(None)
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(
+        out.stdout
+            .split(|b| *b == 0)
+            .filter(|e| e.len() > 3)
+            .map(|e| Scope::new(String::from_utf8_lossy(&e[3..]).into_owned()))
+            .collect(),
+    )
+}
+
+/// Whether `l`'s path, anything in it, or an untracked folder around it
+/// has changes.
+fn has_changes(l: &Lease, changed: &[Scope]) -> bool {
+    changed.iter().any(|p| l.scope.overlaps(p))
+}
+
+/// Each worktree's changed paths, read once a command. A file lease
+/// protects uncommitted edits only (decided 2026-10-30, #11980).
+#[derive(Default)]
+struct Changes {
+    read: std::collections::HashMap<PathBuf, Option<Vec<Scope>>>,
+    worktrees: Option<Vec<PathBuf>>,
+}
+
+impl Changes {
+    fn in_worktree(&mut self, top: &Path) -> Option<&[Scope]> {
+        self.read
+            .entry(top.to_path_buf())
+            .or_insert_with(|| changed_paths(top))
+            .as_deref()
+    }
+
+    /// Every worktree of the repository `top` belongs to.
+    fn worktrees(&mut self, top: &Path) -> &[PathBuf] {
+        self.worktrees
+            .get_or_insert_with(|| git::worktrees(top).unwrap_or_default())
+    }
+
+    /// Whether `l`'s path has uncommitted changes, judged in the worktree
+    /// at `top`. A path `top` doesn't have is judged in the worktree that
+    /// has it, as a claim finds it there (#11980); a path no worktree has
+    /// (a `--new` file not written yet) has none. `None` when git can't
+    /// say.
+    fn of(&mut self, top: &Path, l: &Lease) -> Option<bool> {
+        if has_changes(l, self.in_worktree(top)?) {
+            return Some(true);
+        }
+        let rel = l.scope.as_str();
+        if top.join(rel).symlink_metadata().is_ok() {
+            return Some(false);
+        }
+        let elsewhere = self
+            .worktrees(top)
+            .iter()
+            .find(|wt| wt.as_path() != top && wt.join(rel).symlink_metadata().is_ok())
+            .cloned();
+        match elsewhere {
+            Some(wt) => self.in_worktree(&wt).map(|c| has_changes(l, c)),
+            None => Some(false),
+        }
+    }
+}
+
+/// Path leases whose path has no changes in their owner's worktree, that
+/// weren't just claimed, while no turn of the owner's runs: nothing is
+/// working in them, renew won't keep them, and they block others until
+/// they're released or lapse. `actor`'s worktree is this one; another
+/// owner's is the worktree named after it (an actor's default name), and
+/// an owner with no such worktree, or one git can't read, has none idle.
+fn idle_leases(
+    repo: &Repo,
+    actor: &str,
+    state: &Coordinator,
+    now: u64,
+) -> std::collections::HashSet<LeaseId> {
+    let mut by_owner: std::collections::BTreeMap<&str, Vec<&Lease>> =
+        std::collections::BTreeMap::new();
+    for l in state.leases() {
+        if l.confirmed
+            && l.status == Status::Active
+            && l.deadline > now
+            && is_path_lease(l)
+            && !just_claimed(state, l, now)
+        {
+            by_owner.entry(l.owner.as_str()).or_default().push(l);
+        }
+    }
+    let mut changes = Changes::default();
+    let mut idle = std::collections::HashSet::new();
+    for (owner, leases) in by_owner {
+        if in_a_turn(state, owner, now) {
+            continue;
+        }
+        let top = if owner == actor {
+            Some(repo.top.clone())
+        } else {
+            let named: Vec<&PathBuf> = changes
+                .worktrees(&repo.top)
+                .iter()
+                .filter(|wt| {
+                    wt.file_name()
+                        .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(owner))
+                })
+                .collect();
+            match named.as_slice() {
+                [one] => Some((*one).clone()),
+                _ => None,
+            }
+        };
+        let Some(top) = top else {
+            continue;
+        };
+        for l in leases {
+            if changes.of(&top, l) == Some(false) {
+                idle.insert(l.id.clone());
+            }
+        }
+    }
+    idle
 }
 
 /// Whether an active lease is in the last eighth of its time.
@@ -3777,17 +4595,125 @@ pub(crate) fn authority_notice(root: &Path) -> Option<Diagnostic> {
     }
 }
 
-pub fn status(root: &Path, actor: Option<String>, all: bool, json: bool) -> u8 {
-    let own_only = named_actor(actor.as_ref()) && !all;
+/// Missing source objects are unmerged; a failed history check must never
+/// become persisted false settlement evidence.
+fn status_merged(
+    repo: &Repo,
+    state: &Coordinator,
+    main: &str,
+) -> std::io::Result<std::collections::BTreeSet<String>> {
+    // A refresh may release the graph lock before this store snapshot was
+    // read. Never project an older bound tip onto a newer coordinator.
+    if let Some(mode) = &repo.mode {
+        let current = git::commit_of(&repo.top, &mode.graph.name)?;
+        if current != main {
+            return Err(std::io::Error::other(
+                "the bound graph tip changed before the coordinator snapshot was validated",
+            ));
+        }
+    }
+    let commits: std::collections::BTreeSet<String> = state
+        .settlement_queue()
+        .into_iter()
+        .filter_map(|c| c.source.as_ref())
+        .map(|s| s.commit.clone())
+        .collect();
+    let mut merged = std::collections::BTreeSet::new();
+    for commit in commits {
+        match git::is_ancestor_of(&repo.top, &commit, main) {
+            Ok(true) => {
+                merged.insert(commit);
+            }
+            Ok(false) => {}
+            Err(error) => {
+                // Batch-check reports an absent object with success and an
+                // explicit "missing" line. Command/IO failures stay errors.
+                let input = format!("{commit}\n");
+                let probe = git::command(&repo.top)
+                    .args(["cat-file", "--batch-check"])
+                    .run(Some(input.as_bytes()))?;
+                if !probe.status.success()
+                    || !probe.stderr.is_empty()
+                    || String::from_utf8_lossy(&probe.stdout).trim() != format!("{commit} missing")
+                {
+                    return Err(error);
+                }
+            }
+        }
+    }
+    Ok(merged)
+}
+
+/// `status`: every active lease, the actor's first in text (only the
+/// actor's with `mine`; JSON lists everyone's either way), the actor's
+/// expired leases (everyone's with `all`), the settlement queue, temporary
+/// statuses and unacked mail.
+pub fn status(root: &Path, actor: Option<String>, all: bool, mine: bool, json: bool) -> u8 {
     let now = now_ms();
     let report = (|| -> Result<Report<StatusData>, GraphError> {
         let repo = Repo::open(root)?;
         let actor = repo.actor(actor);
-        let mut store = repo.store()?;
-        repo.observe(&mut store, now)?;
-        let state = store.coordinator().map_err(store_error)?;
+        let path = git::store_path(&repo.top).map_err(git_error)?;
+        unreachable_store(&path)?;
+        let store = Store::open_read_only(&path).map_err(store_error)?;
+        let had_store = store.is_some();
+        let mut state = match &store {
+            Some(store) => store.coordinator().map_err(store_error)?,
+            None => Coordinator::new(ttl_ms()),
+        };
+        let mail = match &store {
+            Some(store) => crate::msg::unacked(store, &actor, now)?,
+            None => Vec::new(),
+        }
+        .into_iter()
+        .map(|(mailbox, unacked)| MailCount { mailbox, unacked })
+        .collect();
+        // No SQLite handle or transaction survives into Git, index reads or
+        // output. Expiry is projected only; observation recording uses a
+        // separate zero-wait connection after Git has finished.
+        drop(store);
+        let projection = match &repo.mode {
+            Some(mode) => Some(mode.commit()),
+            None => repo.observation_ref()?,
+        };
+        let mut observation_warning = None;
+        let observation = if let Some(main) = projection {
+            match status_merged(&repo, &state, &main) {
+                Ok(merged) => {
+                    let observation = mdkg_coord::Observation {
+                        read_generation: state.generation(),
+                        leaves: repo.graph_git().leaves_read_only_cached(
+                            &main,
+                            &repo.graph_scope().to_string(),
+                            git::digest_cache_path(&path).as_deref(),
+                        ).map_err(git_error)?,
+                        merged,
+                        prefix: Some(repo.graph_scope()),
+                    };
+                    state.apply(&Command::ObserveMain {
+                        observation: observation.clone(),
+                    });
+                    Some(observation)
+                }
+                Err(error) => {
+                    observation_warning = Some(Diagnostic::warning(
+                        Code::CoordStoreFailed,
+                        format!("observation deferred: history validation failed: {error}"),
+                    ));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        state.expire_due(now);
         // Open changesets whose commit still carries abandoned work.
-        let only = carried_by_open(&repo, &state)?;
+        // A failed history check leaves status usable from its stored snapshot.
+        let only = if observation_warning.is_none() {
+            carried_by_open(&repo, &state)?
+        } else {
+            std::collections::BTreeMap::new()
+        };
         let abandoned: Vec<&mdkg_coord::Changeset> = state
             .changesets()
             .filter(|c| c.state == Settlement::Abandoned && c.source.is_some())
@@ -3804,7 +4730,7 @@ pub fn status(root: &Path, actor: Option<String>, all: bool, json: bool) -> u8 {
                 }
             }
         }
-        let warnings: Vec<Diagnostic> = carried
+        let mut warnings: Vec<Diagnostic> = carried
             .into_iter()
             .filter_map(|(q, abandoned)| {
                 let q = state.changeset(q)?;
@@ -3823,12 +4749,27 @@ pub fn status(root: &Path, actor: Option<String>, all: bool, json: bool) -> u8 {
                 )
             })
             .collect();
+        warnings.extend(observation_warning);
+        if had_store && let Some(observation) = &observation {
+            let deferred = match Store::try_record_observation(&path, observation) {
+                Ok(reason) => reason.map(str::to_owned),
+                Err(error) => Some(error.to_string()),
+            };
+            if let Some(reason) = deferred {
+                warnings.push(Diagnostic::warning(
+                    Code::CoordStoreFailed,
+                    format!("observation deferred: {reason}"),
+                ));
+            }
+        }
+        let idle = idle_leases(&repo, &actor, &state, now);
         let leases = state
             .leases()
             .filter(|l| l.confirmed && l.status == Status::Active)
             .map(|l| LeaseRecord {
                 mine: Some(l.owner == actor),
                 expiring: Some(expiring(&state, l, now)),
+                idle: Some(idle.contains(&l.id)),
                 ..lease_record_in(&state, l)
             })
             .collect();
@@ -3838,10 +4779,6 @@ pub fn status(root: &Path, actor: Option<String>, all: bool, json: bool) -> u8 {
                 mine: Some(l.owner == actor),
                 ..lease_record(l)
             })
-            .collect();
-        let mail = crate::msg::unacked(&store, &actor, now)
-            .into_iter()
-            .map(|(mailbox, unacked)| MailCount { mailbox, unacked })
             .collect();
         let mut leases: Vec<LeaseRecord> = leases;
         let mut expired: Vec<LeaseRecord> = expired;
@@ -3864,9 +4801,18 @@ pub fn status(root: &Path, actor: Option<String>, all: bool, json: bool) -> u8 {
                 .map(|l| (l.scope.as_str(), &mut l.node))
                 .chain(work.iter_mut().map(|w| (w.scope.as_str(), &mut w.node))),
         );
+        let graph = graph_status(&repo);
         Ok(Report::ok(StatusData {
             actor,
-            main: main_ref(&repo.top),
+            main: match &repo.mode {
+                Some(mode) => mode.graph.name.clone(),
+                None => main_ref(&repo.top),
+            },
+            code_base: repo
+                .mode
+                .as_ref()
+                .and_then(|m| m.graph.main_ref_base.clone()),
+            graph,
             leases,
             expired,
             queue: state
@@ -3886,16 +4832,23 @@ pub fn status(root: &Path, actor: Option<String>, all: bool, json: bool) -> u8 {
         // Scopes, owners, files and states come from other actors, and
         // older stores held them unchecked: every line is escaped.
         let say = |line: String| println!("{}", output::shown(&line));
-        say(format!("acting as {}; settling on {}", d.actor, d.main));
-        let shown: Vec<&LeaseRecord> = d
-            .leases
-            .iter()
-            .filter(|l| !own_only || l.mine == Some(true))
-            .collect();
+        let settling = d
+            .graph
+            .as_ref()
+            .map_or(d.main.as_str(), |g| g.name.as_str());
+        say(format!("acting as {}; settling on {}", d.actor, settling));
+        // Yours first, then everyone else's, each in the store's order.
+        let (yours, theirs): (Vec<&LeaseRecord>, Vec<&LeaseRecord>) =
+            d.leases.iter().partition(|l| l.mine == Some(true));
+        let shown: Vec<&LeaseRecord> = if mine {
+            yours
+        } else {
+            yours.into_iter().chain(theirs).collect()
+        };
         if shown.is_empty() {
             say(format!(
                 "no active leases{}",
-                if own_only { " of yours" } else { "" }
+                if mine { " of yours" } else { "" }
             ));
         }
         for l in &shown {
@@ -3904,8 +4857,13 @@ pub fn status(root: &Path, actor: Option<String>, all: bool, json: bool) -> u8 {
             } else {
                 format!(" shared with {}", l.shared_with.join(", "))
             };
+            let idle = if l.idle == Some(true) {
+                " (idle: no changes in its owner's worktree, no turn running)"
+            } else {
+                ""
+            };
             say(format!(
-                "lease {} {}{} by {}{shared} until {}",
+                "lease {} {}{} by {}{shared} until {}{idle}",
                 l.id,
                 l.scope,
                 NodeName::suffix(l.node.as_ref()),
@@ -3913,10 +4871,17 @@ pub fn status(root: &Path, actor: Option<String>, all: bool, json: bool) -> u8 {
                 until_text(l, now)
             ));
         }
+        let idle = shown.iter().filter(|l| l.idle == Some(true)).count();
+        if idle > 0 {
+            say(format!(
+                "{idle} idle lease(s) block others for nothing: renew won't keep them, and their \
+                 owners can give them up now with `{BIN} release <path>`"
+            ));
+        }
         let others = d.leases.len() - shown.len();
         if others > 0 {
             say(format!(
-                "{others} more held by others (`{BIN} status --all` lists them)"
+                "{others} more held by others (`{BIN} status` lists them)"
             ));
         }
         for l in &d.expired {
@@ -3983,6 +4948,20 @@ pub fn sync(root: &Path, _actor: Option<String>, target: Option<&str>, json: boo
         };
         let mut store = repo.store()?;
         repo.observe(&mut store, now_ms())?;
+        // Ref mode: every reader reads the graph ref, which holds every
+        // published version, so there's nothing to bring into a checkout
+        // (and a code branch never takes graph commits).
+        if repo.mode.is_some() {
+            return Ok(Report::ok(SyncData {
+                stacked: Vec::new(),
+                files: Vec::new(),
+                up_to_date: true,
+            })
+            .with([graph_git::graph_info(
+                "graph.nothing_to_sync",
+                "the graph ref holds every published version: nothing to bring in",
+            )]));
+        }
         let state = store.coordinator().map_err(store_error)?;
         let missing = missing_versions(&repo, &state, &scope)?;
         let needed: Vec<(String, String)> = state
@@ -4110,7 +5089,11 @@ fn carried_by_open(
     repo: &Repo,
     state: &Coordinator,
 ) -> Result<std::collections::BTreeMap<String, std::collections::BTreeSet<String>>, GraphError> {
-    let main = main_ref(&repo.top);
+    // Ref mode: commits the graph ref lacks.
+    let main = repo
+        .mode
+        .as_ref()
+        .map_or_else(|| main_ref(&repo.top), |m| m.graph.name.clone());
     let open: std::collections::BTreeSet<String> = state
         .settlement_queue()
         .into_iter()
@@ -4126,6 +5109,32 @@ fn carried_by_open(
         out.insert(c, only);
     }
     Ok(out)
+}
+
+/// Whether the graph ref holds a changeset: its commit is in the ref's
+/// history, or every leaf it changes has its content there.
+pub(crate) fn published(
+    repo: &Repo,
+    mode: &RefMode,
+    c: &mdkg_coord::Changeset,
+) -> Result<bool, GraphError> {
+    if let Some(s) = &c.source
+        && git::has_ref(&repo.top, &s.commit)
+        && git::is_ancestor_of(&repo.top, &s.commit, &mode.graph.name).map_err(git_error)?
+    {
+        return Ok(true);
+    }
+    let seam = repo.graph_git();
+    for (leaf, content) in &c.changes {
+        let have = seam
+            .leaves(&mode.graph.name, leaf.as_str())
+            .map_err(git_error)?
+            .remove(leaf);
+        if have != *content {
+            return Ok(false);
+        }
+    }
+    Ok(!c.changes.is_empty())
 }
 
 fn parse_changeset(raw: &str) -> Result<ChangesetId, GraphError> {
@@ -4170,6 +5179,27 @@ pub fn abandon(root: &Path, changeset: Option<&str>, branch: Option<&str>, json:
                 "no open changesets from that branch",
             )
             .with_hint(format!("see open changesets with `{} status`", crate::BIN)));
+        }
+        // Ref mode: a recorded changeset is published, and the graph ref
+        // holding its commit or its content can't be taken back by
+        // abandoning it (edd-01a18867, Settlement).
+        if let Some(mode) = &repo.mode {
+            for id in &ids {
+                if let Some(c) = state.changeset(*id)
+                    && published(&repo, mode, c)?
+                {
+                    return Err(graph_git::graph_error(
+                        "coord.abandon_published",
+                        format!(
+                            "{id} is published on {}, so it can't be abandoned",
+                            mode.graph.name
+                        ),
+                    )
+                    .with_hint(
+                        "change the node again (a later write), or revert it with a new write",
+                    ));
+                }
+            }
         }
         // Every git read the cascade needs happens before the first write, so
         // a git failure can't leave the cascade half done.
@@ -4247,6 +5277,9 @@ pub struct View {
     repo: Repo,
     state: Coordinator,
     now: u64,
+    /// The ledger's presence and settle records, for settled reads (A29);
+    /// none when they can't be read.
+    ledger: Option<mdkg_coord_sqlite::entries::LedgerReads>,
 }
 
 impl View {
@@ -4304,11 +5337,51 @@ impl View {
         let store = Store::open(&path, ttl_ms()).map_err(store_error)?;
         upgraded(&store);
         let state = store.coordinator().map_err(store_error)?;
+        let ledger = store.ledger_reads().ok();
         Ok(Some(Self {
             repo,
             state,
             now: now_ms(),
+            ledger,
         }))
+    }
+
+    /// Settled reads (A29, "A done file that didn't settle reads as
+    /// unsettled"): a node whose effective status is `done` and that has a
+    /// ledger reads `done (unsettled)` unless it settled, so everything
+    /// derived from done (dependency readiness, `next`, goal progress)
+    /// counts it as not done; `done (unknown)` when that can't be told.
+    pub(crate) fn mark_unsettled(&self, nodes: &mut [IndexNode]) {
+        let done: Vec<usize> = (0..nodes.len())
+            .filter(|i| nodes[*i].status.as_deref() == Some("done"))
+            .collect();
+        if done.is_empty() {
+            return;
+        }
+        let Some(reads) = &self.ledger else {
+            for i in done {
+                if crate::entry::unknown_without_store(&nodes[i]) {
+                    nodes[i].status = Some(crate::entry::UNKNOWN.into());
+                }
+            }
+            return;
+        };
+        let marks = {
+            let refs: Vec<(&IndexNode, Option<String>)> = done
+                .iter()
+                .map(|i| {
+                    let leaf = self.repo.scope_for(&nodes[*i].path);
+                    let mark = self.state.done_mark(&leaf).map(|c| c.to_string());
+                    (&nodes[*i], mark)
+                })
+                .collect();
+            crate::entry::unsettled(&self.repo, reads, &refs)
+        };
+        for (i, mark) in done.into_iter().zip(marks) {
+            if let Some(mark) = mark {
+                nodes[i].status = Some(mark.into());
+            }
+        }
     }
 
     /// The active, unexpired lease covering a node, if any. A role or a
@@ -4385,6 +5458,35 @@ impl View {
         let record = CoordinationRecord { lease, pending };
         (!record.is_empty()).then_some(record)
     }
+}
+
+/// A workspace's node folder relative to its graph's root: its `path`
+/// then its `mdkg_dir`, without `.` or empty segments (the root
+/// workspace's is `.mdkg`). Enabled or not, as lease keys have always
+/// counted it.
+pub(crate) fn workspace_folder(w: &config::Workspace) -> String {
+    let dir: Vec<&str> = w
+        .path
+        .split('/')
+        .chain(w.mdkg_dir.split('/'))
+        .filter(|p| !p.is_empty() && *p != ".")
+        .collect();
+    dir.join("/")
+}
+
+/// The lease-key rule for the folder of the node file at `file`: of
+/// `folders` (a graph's node folders, [`workspace_folder`]'s), the
+/// innermost that holds it, so a file under a workspace nested in
+/// another's folder keys in the nested one. Lease creation
+/// ([`Repo::node_key`]) and the ledger's graph-ref lookup
+/// (`entry::graph_ref_folder`) both call it, so a node's lease and the
+/// gate's view of who holds it never disagree (Terra's code review
+/// #10220, blocker 1, with the orchestrator's call).
+pub(crate) fn innermost_node_folder<'a>(folders: &'a [Scope], file: &Scope) -> Option<&'a Scope> {
+    folders
+        .iter()
+        .filter(|f| f.contains(file) && *f != file)
+        .max_by_key(|f| f.as_str().len())
 }
 
 #[cfg(test)]
@@ -4587,6 +5689,83 @@ mod tests {
         std::fs::remove_dir_all(&base).ok();
     }
 
+    /// Review of d4444ef5, minor 3: every store a command opens keeps an
+    /// acked body for the committed `coordination.messages.ack_grace_days`,
+    /// not only the mail commands'; an invalid value falls back to the
+    /// default here (the mail commands that ack or send refuse it).
+    #[test]
+    fn every_store_keeps_acked_bodies_for_the_configured_grace() {
+        use mdkg_coord_sqlite::mail::{InboxQuery, Outgoing, Retention, Shown, To};
+        let day: u64 = 24 * 60 * 60 * 1000;
+        for (setting, days) in [("2", 2), ("\"2\"", 7)] {
+            let root = git_repo("grace");
+            std::fs::create_dir_all(root.join(".mdkg")).expect("dir");
+            std::fs::write(
+                root.join(config::CONFIG_PATH),
+                format!(r#"{{"coordination": {{"messages": {{"ack_grace_days": {setting}}}}}}}"#),
+            )
+            .expect("config");
+            // The grace is committed authority (e2e 0.7.1 B3).
+            for args in [
+                &["add", "."][..],
+                &[
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "commit",
+                    "-qm",
+                    "grace",
+                ],
+            ] {
+                let ok = std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&root)
+                    .args(args)
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .status()
+                    .expect("git")
+                    .success();
+                assert!(ok, "git {args:?}");
+            }
+            let mut store = Repo::open(&root).expect("repo").store().expect("store");
+            store
+                .send(&Outgoing {
+                    message_id: "p".into(),
+                    context_id: None,
+                    kind: "note".into(),
+                    sender: "a".into(),
+                    via: None,
+                    sender_mailboxes: vec!["a".into()],
+                    to: To::Mailboxes(vec!["b".into()]),
+                    reference_ids: Vec::new(),
+                    parts: serde_json::json!([{"kind": "text", "text": "x"}]),
+                    retention: Retention::PurgeOnAck,
+                    human_hold_days: 7,
+                    now_ms: 0,
+                })
+                .expect("send");
+            let inbox = store
+                .inbox(&InboxQuery {
+                    mailboxes: vec!["b".into()],
+                    ..InboxQuery::default()
+                })
+                .expect("inbox");
+            let shown: Vec<Shown> = inbox.messages.iter().map(Shown::of).collect();
+            store.mark_shown(&shown, &["b".into()], 0).expect("shown");
+            let acked = store
+                .ack(&["p".into()], &["b".into()], "b", None, None, 0)
+                .expect("ack");
+            assert!(acked.purged.is_empty(), "{setting}");
+            let body = |store: &mut Store, at: u64| store.message("p", at).expect("p").parts;
+            assert!(body(&mut store, days * day - 1).is_some(), "{setting}");
+            assert!(body(&mut store, days * day).is_none(), "{setting}");
+            drop(store);
+            std::fs::remove_dir_all(&root).ok();
+        }
+    }
+
     /// #53: a root is checked once per process, and only its own canonical
     /// path is served what was found; another root, a subfolder or a path
     /// that can't be canonicalized is checked afresh.
@@ -4663,7 +5842,9 @@ mod tests {
             prefix: prefix.to_string(),
             folders: std::cell::OnceCell::new(),
             store_work: std::cell::OnceCell::new(),
+            committed: std::cell::OnceCell::new(),
             store_ids: Default::default(),
+            mode: None,
         };
         let cases = [
             ("", "a/b", "./a/b"),

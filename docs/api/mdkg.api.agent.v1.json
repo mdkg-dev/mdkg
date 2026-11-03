@@ -1,0 +1,210 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "mdkg.api.agent.v1",
+  "description": "Draft (mdkg API v1; see docs/api.md). May change until the release that first emits it. An agent: definition, local state and live state (A7).",
+  "x-mdkg-status": "draft",
+  "type": "object",
+  "properties": {
+    "schema": {
+      "const": "mdkg.api.agent.v1"
+    },
+    "ok": {
+      "type": "boolean",
+      "description": "False exactly when there is an error diagnostic."
+    },
+    "data": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Agent"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "diagnostics": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/DiagnosticOut"
+      }
+    }
+  },
+  "required": [
+    "schema",
+    "ok",
+    "diagnostics"
+  ],
+  "$defs": {
+    "Agent": {
+      "type": "object",
+      "properties": {
+        "uri": {
+          "type": "string",
+          "description": "The resource's path at its coordinator, beginning `/v1/`."
+        },
+        "name": {
+          "type": "string"
+        },
+        "graph": {
+          "type": "string",
+          "description": "The resource's path at its coordinator, beginning `/v1/`."
+        },
+        "harness": {
+          "type": "string",
+          "description": "A harness id. An open set: accept values not listed.",
+          "x-mdkg-open": true,
+          "examples": [
+            "claude",
+            "codex",
+            "opencode"
+          ]
+        },
+        "role": {
+          "type": "string",
+          "description": "How its turns launch; not a permission. An open set: accept values not listed.",
+          "x-mdkg-open": true,
+          "examples": [
+            "worker",
+            "reviewer"
+          ]
+        },
+        "definition": {
+          "type": "object",
+          "description": "The effective `mdkg.agent.v1` definition, with origins, as `agents status` shows it."
+        },
+        "supervisor": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "A resource path, or null."
+        },
+        "state": {
+          "type": "string",
+          "description": "The agent's state. An open set: accept values not listed.",
+          "x-mdkg-open": true,
+          "examples": [
+            "stopped",
+            "idle",
+            "running",
+            "draining",
+            "paused"
+          ]
+        },
+        "current_turn": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "A resource path, or null."
+        },
+        "last_turn": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "A resource path, or null."
+        },
+        "turns": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "paused": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Threads the loop guard paused."
+        },
+        "placement": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "A resource path, or null."
+        },
+        "problem": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "uri",
+        "name",
+        "harness",
+        "role",
+        "state",
+        "supervisor",
+        "current_turn",
+        "last_turn",
+        "turns"
+      ]
+    },
+    "DiagnosticOut": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string",
+          "description": "A stable diagnostic code."
+        },
+        "severity": {
+          "type": "string",
+          "description": "Severity.",
+          "enum": [
+            "error",
+            "warning",
+            "info"
+          ]
+        },
+        "path": {
+          "type": "string"
+        },
+        "line": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "node": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "hint": {
+          "type": "string"
+        },
+        "holders": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "related": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string"
+              },
+              "line": {
+                "type": "integer",
+                "minimum": 0
+              }
+            },
+            "required": [
+              "path"
+            ]
+          }
+        }
+      },
+      "required": [
+        "code",
+        "severity",
+        "message"
+      ],
+      "description": "A diagnostic, as every command's envelope writes it."
+    }
+  }
+}

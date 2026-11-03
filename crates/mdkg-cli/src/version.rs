@@ -37,6 +37,9 @@ pub const LINE: &str = if HERE {
 
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct VersionData {
+    /// Implemented API seams; clients check these rather than the build version.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<Vec<String>>,
     /// The crate version.
     pub version: String,
     /// The full SHA of the commit this binary was built from, or `unknown`
@@ -57,6 +60,15 @@ pub struct VersionData {
 
 pub fn data() -> VersionData {
     VersionData {
+        // A17: each is added when its feature ships. `events` and `msg.watch`
+        // ship with the stream's signal ending (A18); `serve.local` with
+        // `mdkg serve`'s socket (its start envelope names the same).
+        capabilities: Some(vec![
+            "channels".into(),
+            "events".into(),
+            "msg.watch".into(),
+            "serve.local".into(),
+        ]),
         version: env!("CARGO_PKG_VERSION").into(),
         commit: if HERE {
             env!("MDKG_BUILD_COMMIT")

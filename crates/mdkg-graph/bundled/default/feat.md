@@ -28,6 +28,14 @@ updated: {{updated}}
 
 What is this feature?
 
+# Requirements
+
+Replace this example with the behavior to deliver.
+
+```text
+- R1: The component shall perform the specified behavior. (verify: name the check)
+```
+
 # Acceptance Criteria
 
 - criterion 1

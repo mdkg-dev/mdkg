@@ -118,6 +118,7 @@ fn codes(envelope: &Value) -> Vec<String> {
         .as_array()
         .into_iter()
         .flatten()
+        .filter(|d| d["code"] != "usage.deprecated")
         .filter_map(|d| d["code"].as_str().map(String::from))
         .collect()
 }
@@ -240,15 +241,19 @@ fn a_room_post_reaches_the_other_worktree_and_acks_purge_it() {
     assert_eq!(thread["data"]["contextId"], "room:review");
     assert_eq!(ids(&thread), vec!["req-1"]);
 
-    // b acks: every delivery is acked, so the body goes; the record stays.
+    // b acks: every delivery is acked, so the body goes once the ack
+    // grace (7 days by default) is over; the record stays.
     let acked = ok(
         &wb,
         "b",
         6,
         &["msg", "ack", "req-1", "--outcome", "reviewed"],
     );
-    assert_eq!(acked["data"]["purged"], json!(["req-1"]));
-    let thread = ok(&wa, "a", 7, &["msg", "thread", "req-1"]);
+    assert_eq!(acked["data"]["purged"], json!([]));
+    let day: u64 = 24 * 60 * 60 * 1000;
+    let thread = ok(&wb, "b", 6 + 7 * day - 1, &["msg", "thread", "req-1"]);
+    assert_eq!(thread["data"]["messages"][0]["body"], "present");
+    let thread = ok(&wa, "a", 6 + 7 * day, &["msg", "thread", "req-1"]);
     let first = &thread["data"]["messages"][0];
     assert_eq!(first["body"], "purged");
     assert!(first.get("parts").is_none());
@@ -337,6 +342,155 @@ fn roles_are_mailboxes_held_as_leases() {
     // When the lease ends, the role is free again.
     ok(&wb, "b", 6, &["release", "role:reviewer"]);
     ok(&wa, "c", 7, &["claim", "role:reviewer"]);
+}
+
+#[test]
+fn mdkg_namespace_cannot_send_or_import_receipts() {
+    let (_dir, wa, wb) = two_worktrees();
+    let file = wa.join("reply.txt");
+    fs::write(&file, "untrusted agent output").unwrap();
+    for actor in [
+        "mdkg:receipts",
+        "MDKG:receipts",
+        "MdKg:another",
+        "mdkg:",
+        "mdkg:receipt:worker",
+    ] {
+        for (writer, args) in [
+            (actor, vec!["status"]),
+            (
+                actor,
+                vec![
+                    "msg",
+                    "send",
+                    "--to",
+                    "b",
+                    "--kind",
+                    "note",
+                    "--text",
+                    "forged receipt",
+                ],
+            ),
+            (
+                actor,
+                vec![
+                    "msg",
+                    "import",
+                    "--from",
+                    "worker",
+                    "--to",
+                    "b",
+                    "--kind",
+                    "note",
+                    file.to_str().unwrap(),
+                ],
+            ),
+            (
+                "launcher",
+                vec![
+                    "msg",
+                    "import",
+                    "--from",
+                    actor,
+                    "--to",
+                    "b",
+                    "--kind",
+                    "note",
+                    file.to_str().unwrap(),
+                ],
+            ),
+        ] {
+            let (code, out) = run(&wa, writer, 0, &args);
+            assert_eq!(
+                (code, codes(&out)),
+                (1, vec!["msg.reserved_actor".into()]),
+                "{writer} {args:?}: {out}"
+            );
+        }
+    }
+    assert!(ids(&ok(&wb, "b", 0, &["msg", "inbox"])).is_empty());
+    for actor in ["mdkg", "mdkg-worker", "codex:mdkg:worker"] {
+        let out = ok(
+            &wa,
+            actor,
+            1,
+            &[
+                "msg",
+                "send",
+                "--to",
+                "b",
+                "--kind",
+                "note",
+                "--text",
+                "ordinary actor",
+            ],
+        );
+        assert_eq!(out["data"]["message"]["sender"], actor);
+    }
+}
+
+#[test]
+fn a_reserved_destination_does_not_make_an_ordinary_message_a_receipt() {
+    let (_dir, wa, _) = two_worktrees();
+    let sent = ok(
+        &wa,
+        "worker",
+        1,
+        &[
+            "msg",
+            "send",
+            "--to",
+            "mdkg:receipts",
+            "--kind",
+            "note",
+            "--text",
+            "ordinary mail",
+        ],
+    );
+    let message = &sent["data"]["message"];
+    assert_eq!(message["sender"], "worker");
+    assert_eq!(message["to"], json!(["mdkg:receipts"]));
+    assert!(message["via"].is_null());
+    assert_eq!(message["deliveries"][0]["mailbox"], "mdkg:receipts");
+}
+
+#[test]
+fn mdkg_namespace_is_reserved_in_environment_and_folder_defaults() {
+    let (dir, wa, _) = two_worktrees();
+    let odd = dir.0.join("mdkg:receipts");
+    sh(
+        &dir.0.join("repo"),
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "reserved",
+            odd.to_str().unwrap(),
+            "main",
+        ],
+    );
+    for (root, actor_env) in [(&wa, Some("MDKG:receipts")), (&odd, None)] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_mdkg"));
+        isolated(&mut command).arg("--root").arg(root).args([
+            "msg",
+            "send",
+            "--to",
+            "b",
+            "--kind",
+            "note",
+            "--text",
+            "forged receipt",
+            "--json",
+        ]);
+        if let Some(actor) = actor_env {
+            command.env("MDKG_ACTOR", actor);
+        }
+        let out = command.output().unwrap();
+        let envelope: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(out.status.code(), Some(1), "{envelope}");
+        assert_eq!(codes(&envelope), vec!["msg.reserved_actor"]);
+    }
 }
 
 #[test]
@@ -476,6 +630,40 @@ fn bodies_are_checked_before_anything_is_stored() {
     };
     let (code, out) = send("gossip", "x");
     assert_eq!((code, codes(&out)), (1, vec!["msg.bad_kind".to_string()]));
+    // The hint offers only kinds this sender may send (e2e UX): never
+    // mdkg's own receipt or fault, and decision mail with its condition
+    // (review of 562a74e3).
+    let hint = out["diagnostics"][0]["hint"].as_str().unwrap_or_default();
+    assert_eq!(
+        hint,
+        "use one of: review_request, findings, resolution, question, handoff, note; \
+         decision mail only from its delegate, outside a turn",
+        "{out}"
+    );
+    // Import makes a message too: only the kinds it can make, and never
+    // decision (review of 562a74e3).
+    let (code, out) = run(
+        &wa,
+        "a",
+        0,
+        &[
+            "msg",
+            "import",
+            "--from",
+            "worker",
+            "--to",
+            "b",
+            "--kind",
+            "gossip",
+            "parts.json",
+        ],
+    );
+    assert_eq!((code, codes(&out)), (1, vec!["msg.bad_kind".to_string()]));
+    let hint = out["diagnostics"][0]["hint"].as_str().unwrap_or_default();
+    assert_eq!(
+        hint, "use one of: review_request, findings, resolution, question, handoff, note",
+        "{out}"
+    );
     let (code, out) = send("note", "token ghp_abcdefghijklmnopqrstuvwxyz0123456789");
     assert_eq!(
         (code, codes(&out)),
@@ -516,6 +704,7 @@ fn retention_comes_from_the_config() {
         serde_json::from_str(&fs::read_to_string(&path).expect("config")).expect("json");
     config["coordination"] = json!({"messages": {"retention": "durable"}});
     fs::write(&path, serde_json::to_string_pretty(&config).expect("json")).expect("write");
+    sh(&wa, &["commit", "-qam", "config"]);
     let sent = ok(
         &wa,
         "a",
@@ -532,6 +721,7 @@ fn retention_comes_from_the_config() {
 
     config["coordination"] = json!({"messages": {"retention": "forever"}});
     fs::write(&path, serde_json::to_string_pretty(&config).expect("json")).expect("write");
+    sh(&wa, &["commit", "-qam", "config"]);
     let (code, out) = run(
         &wa,
         "a",
@@ -1087,7 +1277,7 @@ fn leaving_twice_warns_and_a_typo_is_refused() {
     );
     let hint = out["diagnostics"][0]["hint"].as_str().unwrap_or_default();
     assert!(
-        hint.contains("room list") && !hint.contains("join"),
+        hint.contains("channel list") && !hint.contains("join"),
         "{out}"
     );
 }
@@ -1166,6 +1356,7 @@ fn roles_and_turns_stay_exclusive_under_a_shared_default() {
             serde_json::from_str(&fs::read_to_string(&path).expect("config")).expect("json");
         config["coordination"] = json!({"leases": {"default": "shared"}});
         fs::write(&path, serde_json::to_string_pretty(&config).expect("json")).expect("write");
+        sh(wt, &["commit", "-qam", "lease policy"]);
     }
     let shared = ok(&wa, "a", 0, &["claim", "--new", "gen/"]);
     assert_eq!(
@@ -1182,6 +1373,464 @@ fn roles_and_turns_stay_exclusive_under_a_shared_default() {
             "{scope}"
         );
     }
+}
+
+/// `coordination.messages.ack_grace_days` (friction item 72): 0 purges
+/// a body at the ack that ends it, as before 0.7.1; a value that isn't a
+/// whole number of days up to 3650 is refused before anything is acked
+/// or sent, and reading mail never checks it. Each value is committed:
+/// the grace is committed authority.
+#[test]
+fn the_ack_grace_is_configured_and_checked() {
+    let (_dir, wa, wb) = two_worktrees();
+    let path = wa.join(".mdkg/config.json");
+    let mut config: Value =
+        serde_json::from_str(&fs::read_to_string(&path).expect("config")).expect("json");
+    for (id, now) in [("g1", 1), ("g2", 2)] {
+        ok(
+            &wa,
+            "a",
+            now,
+            &[
+                "msg", "send", "--to", "b", "--kind", "note", "--id", id, "--text", "x",
+            ],
+        );
+    }
+    ok(&wb, "b", 3, &["msg", "inbox"]);
+    for bad in [json!(3651), json!(-1), json!("7"), json!(1.5)] {
+        config["coordination"] = json!({"messages": {"ack_grace_days": bad}});
+        fs::write(&path, config.to_string()).expect("write");
+        sh(&wa, &["commit", "-qam", "grace"]);
+        let (code, out) = run(&wa, "b", 4, &["msg", "ack", "g1"]);
+        assert_eq!(
+            (code, codes(&out)),
+            (4, vec!["config.invalid".to_string()]),
+            "{bad}"
+        );
+        let (code, out) = run(
+            &wa,
+            "a",
+            4,
+            &["msg", "send", "--to", "b", "--kind", "note", "--text", "y"],
+        );
+        assert_eq!(
+            (code, codes(&out)),
+            (4, vec!["config.invalid".to_string()]),
+            "{bad}"
+        );
+        // Reads don't use the grace: a bad one keeps nobody from mail.
+        let inbox = ok(&wa, "b", 4, &["msg", "inbox"]);
+        assert_eq!(ids(&inbox), vec!["g1", "g2"], "{bad}");
+        ok(&wa, "b", 4, &["msg", "thread", "g1"]);
+    }
+    config["coordination"] = json!({"messages": {"ack_grace_days": 0}});
+    fs::write(&path, config.to_string()).expect("write");
+    sh(&wa, &["commit", "-qam", "grace"]);
+    let acked = ok(&wa, "b", 5, &["msg", "ack", "g1"]);
+    assert_eq!(acked["data"]["purged"], json!(["g1"]));
+    config["coordination"] = json!({"messages": {"ack_grace_days": 1}});
+    fs::write(&path, config.to_string()).expect("write");
+    sh(&wa, &["commit", "-qam", "grace"]);
+    let acked = ok(&wa, "b", 6, &["msg", "ack", "g2"]);
+    assert_eq!(acked["data"]["purged"], json!([]));
+    let day: u64 = 24 * 60 * 60 * 1000;
+    let thread = ok(&wa, "b", 6 + day - 1, &["msg", "thread", "g2"]);
+    assert_eq!(thread["data"]["messages"][0]["body"], "present");
+    let thread = ok(&wa, "b", 6 + day, &["msg", "thread", "g2"]);
+    assert_eq!(thread["data"]["messages"][0]["body"], "purged");
+}
+
+/// Sets `coordination.messages.ack_grace_days` in `dir`'s working-tree
+/// config, without committing it.
+fn set_grace(dir: &Path, grace: Value) {
+    let path = dir.join(".mdkg/config.json");
+    let mut config: Value =
+        serde_json::from_str(&fs::read_to_string(&path).expect("config")).expect("json");
+    config["coordination"] = json!({"messages": {"ack_grace_days": grace}});
+    fs::write(&path, config.to_string()).expect("write");
+}
+
+fn shown_grace(dir: &Path) -> Value {
+    let shown = ok(dir, "b", 1, &["config", "show"]);
+    shown["data"]["values"]["coordination"]["messages"]["ack_grace_days"].clone()
+}
+
+/// e2e 0.7.1 B3: the grace is the committed authority `config show`
+/// reports, never a working-tree file. With no graph checkout registered,
+/// that's the invoking checkout's `HEAD`, a linked worktree's included.
+/// An uncommitted value, valid or not, changes nothing.
+#[test]
+fn ack_grace_reads_committed_authority() {
+    let (_dir, wa, wb) = two_worktrees();
+    for (id, now) in [("g1", 1), ("g2", 2), ("g3", 3)] {
+        ok(
+            &wa,
+            "a",
+            now,
+            &[
+                "msg", "send", "--to", "b", "--kind", "note", "--id", id, "--text", "x",
+            ],
+        );
+    }
+    ok(&wb, "b", 5, &["msg", "inbox"]);
+    // Uncommitted: 0 purges nothing, and 3651 refuses nothing.
+    set_grace(&wa, json!(0));
+    let acked = ok(&wa, "b", 6, &["msg", "ack", "g1"]);
+    assert_eq!(acked["data"]["purged"], json!([]), "{acked}");
+    set_grace(&wa, json!(3651));
+    ok(
+        &wa,
+        "a",
+        6,
+        &["msg", "send", "--to", "c", "--kind", "note", "--text", "y"],
+    );
+    assert_eq!(shown_grace(&wa), Value::Null, "nothing committed sets it");
+    // Committed on branch a: what `config show` reports is what runs there,
+    // and branch b, which doesn't commit it, keeps the default.
+    set_grace(&wa, json!(0));
+    sh(&wa, &["commit", "-qam", "grace 0"]);
+    assert_eq!(shown_grace(&wa), json!(0));
+    let acked = ok(&wa, "b", 7, &["msg", "ack", "g2"]);
+    assert_eq!(acked["data"]["purged"], json!(["g2"]), "{acked}");
+    let acked = ok(&wb, "b", 7, &["msg", "ack", "g3"]);
+    assert_eq!(acked["data"]["purged"], json!([]), "{acked}");
+}
+
+/// A repository whose graph `mdkg init` made (on the graph ref with
+/// `ref_mode`, else committed on main), with a linked worktree `wt`.
+fn initialized(ref_mode: bool) -> (Scratch, PathBuf, PathBuf) {
+    let dir = scratch();
+    let repo = dir.0.join("repo");
+    fs::create_dir_all(&repo).expect("repo");
+    fs::write(repo.join("code.rs"), "fn main() {}\n").expect("code");
+    sh(&repo, &["init", "-q", "-b", "main"]);
+    sh(&repo, &["add", "."]);
+    sh(&repo, &["commit", "-q", "-m", "code"]);
+    if ref_mode {
+        sh(
+            &repo,
+            &["config", "mdkg.graph.ref", "refs/heads/mdkg-graph"],
+        );
+    }
+    ok(&repo, "launcher", 1, &["init"]);
+    if !ref_mode {
+        sh(&repo, &["add", "."]);
+        sh(&repo, &["commit", "-q", "-m", "graph"]);
+    }
+    let wt = dir.0.join("wt");
+    sh(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "wt",
+            wt.to_str().expect("utf-8"),
+            "main",
+        ],
+    );
+    (dir, repo, wt)
+}
+
+/// e2e 0.7.1 B3: once a graph checkout is registered, its `HEAD` is the
+/// authority for every worktree, whatever the invoking branch commits.
+#[test]
+fn ack_grace_reads_the_registered_graph_checkout() {
+    let (_dir, repo, wt) = initialized(false);
+    ok(&repo, "launcher", 2, &["install"]);
+    for (id, now) in [("c1", 3), ("c2", 4)] {
+        ok(
+            &wt,
+            "a",
+            now,
+            &[
+                "msg", "send", "--to", "b", "--kind", "note", "--id", id, "--text", "x",
+            ],
+        );
+    }
+    ok(&wt, "b", 5, &["msg", "inbox"]);
+    set_grace(&wt, json!("7"));
+    sh(&wt, &["commit", "-qam", "bad grace"]);
+    let acked = ok(&wt, "b", 6, &["msg", "ack", "c1"]);
+    assert_eq!(acked["data"]["purged"], json!([]), "{acked}");
+    let graph = repo.join(".worktrees/graph");
+    set_grace(&graph, json!(0));
+    sh(&graph, &["commit", "-qam", "grace 0"]);
+    assert_eq!(shown_grace(&wt), json!(0));
+    let acked = ok(&wt, "b", 7, &["msg", "ack", "c2"]);
+    assert_eq!(acked["data"]["purged"], json!(["c2"]), "{acked}");
+}
+
+/// e2e 0.7.1 B3 in ref mode: the grace is the graph ref's, read from a
+/// linked worktree, and a stray checkout config is never consulted. The
+/// ref's config changes through git, as docs/git-graph.md shows.
+#[test]
+fn ack_grace_reads_the_graph_ref_in_ref_mode() {
+    let (dir, repo, wt) = initialized(true);
+    for (id, now) in [("r1", 2), ("r2", 3)] {
+        ok(
+            &wt,
+            "a",
+            now,
+            &[
+                "msg", "send", "--to", "b", "--kind", "note", "--id", id, "--text", "x",
+            ],
+        );
+    }
+    ok(&wt, "b", 4, &["msg", "inbox"]);
+    // A stray, uncommitted checkout config isn't the graph.
+    fs::create_dir_all(wt.join(".mdkg")).expect("mkdir");
+    fs::write(
+        wt.join(".mdkg/config.json"),
+        r#"{"coordination": {"messages": {"ack_grace_days": 0}}}"#,
+    )
+    .expect("write");
+    let acked = ok(&wt, "b", 5, &["msg", "ack", "r1"]);
+    assert_eq!(acked["data"]["purged"], json!([]), "{acked}");
+    fs::remove_dir_all(wt.join(".mdkg")).expect("rm");
+    on_graph_ref(&dir.0, &repo, |edit| set_grace(edit, json!(0)));
+    assert_eq!(shown_grace(&wt), json!(0));
+    let acked = ok(&wt, "b", 6, &["msg", "ack", "r2"]);
+    assert_eq!(acked["data"]["purged"], json!(["r2"]), "{acked}");
+}
+
+/// Changes the graph ref's config by the git route docs/git-graph.md
+/// shows: a detached worktree of the ref, a commit, a compare-and-swap of
+/// the ref, and the worktree removed.
+fn on_graph_ref(scratch: &Path, repo: &Path, edit: impl FnOnce(&Path)) {
+    let dir = scratch.join("cfg-edit");
+    let path = dir.to_str().expect("utf-8");
+    sh(
+        repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            path,
+            "refs/heads/mdkg-graph",
+        ],
+    );
+    edit(&dir);
+    sh(&dir, &["commit", "-qam", "config"]);
+    let rev = |dir: &Path, name: &str| {
+        let out = isolated(
+            Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["rev-parse", name]),
+        )
+        .output()
+        .expect("git");
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    };
+    let (old, new) = (rev(repo, "refs/heads/mdkg-graph"), rev(&dir, "HEAD"));
+    sh(repo, &["update-ref", "refs/heads/mdkg-graph", &new, &old]);
+    sh(repo, &["worktree", "remove", path]);
+}
+
+/// doctor's config check and validate's exit, from `dir`.
+fn judged(dir: &Path) -> (Value, i32) {
+    let (_, doctor) = run(dir, "b", 1, &["doctor"]);
+    let check = doctor["data"]["checks"]
+        .as_array()
+        .expect("checks")
+        .iter()
+        .find(|c| c["name"] == "config")
+        .cloned()
+        .unwrap_or_else(|| panic!("{doctor}"));
+    let (code, _) = run(dir, "b", 1, &["validate"]);
+    (check["status"].clone(), code)
+}
+
+/// Review of 33ffbdae: doctor and validate judge the mail settings of the
+/// authority mail runs with: the registered graph checkout's HEAD over the
+/// invoking branch's, and the graph ref in ref mode.
+#[test]
+fn doctor_and_validate_judge_the_authority_mail_reads() {
+    let (_dir, repo, wt) = initialized(false);
+    ok(&repo, "launcher", 2, &["install"]);
+    let graph = repo.join(".worktrees/graph");
+    set_grace(&graph, json!(3651));
+    sh(&graph, &["commit", "-qam", "bad grace"]);
+    let (status, code) = judged(&wt);
+    assert_eq!(status, "error");
+    assert_ne!(code, 0);
+    // The reverse: the authority's is fine, the invoking branch's isn't.
+    set_grace(&graph, json!(7));
+    sh(&graph, &["commit", "-qam", "grace"]);
+    set_grace(&wt, json!(3651));
+    sh(&wt, &["commit", "-qam", "bad grace here"]);
+    let (status, code) = judged(&wt);
+    assert_ne!(status, "error");
+    assert_eq!(code, 0);
+
+    let (dir, repo, wt) = initialized(true);
+    assert_eq!(judged(&wt).1, 0);
+    on_graph_ref(&dir.0, &repo, |edit| set_grace(edit, json!("7")));
+    let (status, code) = judged(&wt);
+    assert_eq!(status, "error");
+    assert_ne!(code, 0);
+}
+
+/// Terra #15643/#15701 (orchestrator #15706): in ref mode a malformed or
+/// oversized committed agent definition blocks no claim, release or send,
+/// while a command that reads the whole authority still refuses it.
+#[test]
+fn ref_mode_coordination_ignores_broken_agent_definitions() {
+    for (what, body) in [
+        ("malformed", "{ not json".to_owned()),
+        (
+            "oversized",
+            format!("{{\"x\":\"{}\"}}", "a".repeat(1024 * 1024)),
+        ),
+    ] {
+        let (dir, repo, wt) = initialized(true);
+        on_graph_ref(&dir.0, &repo, |edit| {
+            fs::create_dir_all(edit.join(".mdkg/agents")).expect("agents");
+            fs::write(edit.join(".mdkg/agents/broken.json"), &body).expect("definition");
+            sh(edit, &["add", ".mdkg/agents/broken.json"]);
+        });
+        let claimed = ok(&wt, "a", 2, &["claim", "--new", "gen/"]);
+        assert_eq!(
+            claimed["data"]["lease"]["scope"], "gen",
+            "{what}: {claimed}"
+        );
+        ok(&wt, "a", 3, &["release", "gen/"]);
+        ok(
+            &wt,
+            "a",
+            4,
+            &["msg", "send", "--to", "b", "--kind", "note", "--text", "x"],
+        );
+        ok(&wt, "b", 5, &["msg", "inbox"]);
+        let (code, out) = run(&wt, "a", 6, &["list"]);
+        assert_ne!(code, 0, "{what}: a full read refuses it: {out}");
+    }
+}
+
+/// Review of 7a523b05: the lease policy is the authority's, the
+/// registered graph checkout's HEAD over the invoking branch's, and a
+/// malformed committed policy is refused even with a valid working copy.
+#[test]
+fn claims_read_the_authoritys_lease_policy() {
+    let (_dir, repo, wt) = initialized(false);
+    ok(&repo, "launcher", 2, &["install"]);
+    let graph = repo.join(".worktrees/graph");
+    let policy = |dir: &Path, leases: Value| {
+        let path = dir.join(".mdkg/config.json");
+        let mut config: Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("config")).expect("json");
+        config["coordination"] = json!({ "leases": leases });
+        fs::write(&path, config.to_string()).expect("write");
+        sh(dir, &["commit", "-qam", "lease policy"]);
+    };
+    // Shared on the invoking branch only: not the authority's.
+    policy(
+        &wt,
+        json!({"paths": [{"glob": "gen/**", "mode": "shared"}]}),
+    );
+    let claimed = ok(&wt, "a", 3, &["claim", "--new", "gen/"]);
+    assert_eq!(claimed["data"]["lease"]["mode"], "exclusive", "{claimed}");
+    ok(&wt, "a", 4, &["release", "gen/"]);
+    // Shared on the graph checkout: it applies, though the invoking
+    // branch now says exclusive (Terra #15633).
+    policy(
+        &wt,
+        json!({"paths": [{"glob": "gen/**", "mode": "exclusive"}]}),
+    );
+    policy(
+        &graph,
+        json!({"paths": [{"glob": "gen/**", "mode": "shared"}]}),
+    );
+    let claimed = ok(&wt, "a", 5, &["claim", "--new", "gen/"]);
+    assert_eq!(claimed["data"]["lease"]["mode"], "shared", "{claimed}");
+    ok(&wt, "a", 6, &["release", "gen/"]);
+    // Malformed there, while the invoking copy is valid.
+    policy(&graph, json!({"default": "advisory"}));
+    let (code, out) = run(&wt, "a", 7, &["claim", "--new", "gen/"]);
+    assert_ne!(code, 0, "{out}");
+    assert!(out.to_string().contains("coordination.leases"), "{out}");
+}
+
+/// A24's flags (friction items 56 and 54): `--supersedes` and `--slot`
+/// replace the sender's own unacked mail at the new message's recipients,
+/// so it leaves their inboxes; anyone else's message, an unknown id, a bad
+/// or reserved slot are refused with nothing sent.
+#[test]
+fn supersedes_and_slots_replace_the_senders_own_mail() {
+    let (_dir, wa, wb) = two_worktrees();
+    let send = |now: u64, extra: &[&str]| {
+        let mut args = vec!["msg", "send", "--kind", "findings", "--text", "x"];
+        args.extend_from_slice(extra);
+        ok(&wa, "a", now, &args)
+    };
+    send(1, &["--to", "b,c", "--id", "f1"]);
+    ok(&wb, "b", 2, &["msg", "inbox"]);
+    // The replacement reaches b only: c keeps f1.
+    let sent = send(3, &["--to", "b", "--id", "f2", "--supersedes", "f1"]);
+    assert_eq!(sent["data"]["superseded"], json!(["f1"]));
+    assert_eq!(ids(&ok(&wb, "b", 4, &["msg", "inbox"])), vec!["f2"]);
+    assert_eq!(ids(&ok(&wb, "c", 4, &["msg", "inbox"])), vec!["f1"]);
+    let f1 = ok(&wa, "a", 4, &["msg", "thread", "f1"]);
+    let delivery = f1["data"]["messages"][0]["deliveries"]
+        .as_array()
+        .expect("deliveries")
+        .iter()
+        .find(|d| d["mailbox"] == "b")
+        .cloned()
+        .expect("b's delivery");
+    assert_eq!(delivery["ackedBy"], "mdkg");
+    assert_eq!(delivery["ackedVia"], "supersede");
+
+    // A slot replaces the sender's earlier unacked mail in that slot.
+    let first = send(5, &["--to", "b", "--id", "s1", "--slot", "brief.b"]);
+    assert!(first["data"].get("superseded").is_none());
+    let second = send(6, &["--to", "b", "--id", "s2", "--slot", "brief.b"]);
+    assert_eq!(second["data"]["superseded"], json!(["s1"]));
+    assert_eq!(ids(&ok(&wb, "b", 7, &["msg", "inbox"])), vec!["f2", "s2"]);
+
+    // Refused, with nothing sent.
+    for (extra, code) in [
+        (vec!["--supersedes", "nope"], "msg.unknown_message"),
+        (vec!["--slot", "Not A Slot"], "usage.invalid_arguments"),
+        (vec!["--slot", "fault:a:x"], "usage.invalid_arguments"),
+    ] {
+        let mut args = vec![
+            "msg", "send", "--to", "b", "--kind", "note", "--id", "r1", "--text", "x",
+        ];
+        args.extend_from_slice(&extra);
+        let (_, out) = run(&wa, "a", 8, &args);
+        assert_eq!(codes(&out), vec![code.to_string()], "{extra:?}");
+        if code == "msg.unknown_message" {
+            // The sender's own mail isn't in its inbox: the hint says where.
+            let hint = out["diagnostics"][0]["hint"].as_str().unwrap_or("");
+            assert!(hint.contains("msg thread"), "{out}");
+        }
+    }
+    let (code, out) = run(
+        &wb,
+        "b",
+        8,
+        &[
+            "msg",
+            "send",
+            "--to",
+            "a",
+            "--kind",
+            "note",
+            "--id",
+            "r1",
+            "--text",
+            "x",
+            "--supersedes",
+            "f2",
+        ],
+    );
+    assert_eq!((code, codes(&out)), (5, vec!["msg.not_sender".to_string()]));
+    let (_, out) = run(&wa, "a", 9, &["msg", "thread", "r1"]);
+    assert_eq!(codes(&out), vec!["msg.unknown_context".to_string()]);
 }
 
 /// D2 and D5 (orchestrator, 2026-10-21): a human acks their own mail and
@@ -1220,7 +1869,7 @@ fn humans_ack_their_own_mail_and_rooms_guard_their_members() {
     assert_eq!((code, codes(&out)), (5, vec!["msg.not_holder".to_string()]));
     ok(&wa, "human:nick", 3, &["msg", "inbox"]);
     let acked = ok(&wa, "human:nick", 3, &["msg", "ack", "q1"]);
-    assert_eq!(acked["data"]["purged"], json!(["q1"]));
+    assert_eq!(acked["data"]["purged"], json!([]), "kept for the ack grace");
     // A human still isn't an actor anywhere else.
     let (code, out) = run(&wa, "human:nick", 4, &["claim", "task-1"]);
     assert_eq!(
@@ -1233,6 +1882,7 @@ fn humans_ack_their_own_mail_and_rooms_guard_their_members() {
         serde_json::from_str(&fs::read_to_string(&path).expect("config")).expect("json");
     config["coordination"] = json!({"messages": {"human_hold_days": 0}});
     fs::write(&path, serde_json::to_string_pretty(&config).expect("json")).expect("write");
+    sh(&wa, &["commit", "-qam", "config"]);
     let (code, out) = run(
         &wa,
         "a",
@@ -1242,6 +1892,7 @@ fn humans_ack_their_own_mail_and_rooms_guard_their_members() {
     assert_eq!((code, codes(&out)), (4, vec!["config.invalid".to_string()]));
     config["coordination"] = json!({"messages": {"human_hold_days": 2}});
     fs::write(&path, serde_json::to_string_pretty(&config).expect("json")).expect("write");
+    sh(&wa, &["commit", "-qam", "config"]);
     ok(
         &wa,
         "a",
@@ -1342,7 +1993,7 @@ fn a_direct_reply_to_a_room_post_starts_its_own_thread() {
     assert!(
         out["diagnostics"][0]["hint"]
             .as_str()
-            .is_some_and(|h| h.contains("--room <room>"))
+            .is_some_and(|h| h.contains("--channel <channel>"))
     );
     assert!(!out.to_string().contains("ops"), "never echoed: {out}");
 }
@@ -1604,10 +2255,12 @@ fn role_members_humans_and_holds_end_to_end() {
     ok(&wb, "b", 9, &["msg", "inbox"]);
     let acked = ok(&wb, "b", 9, &["msg", "ack", "p"]);
     assert_eq!(acked["data"]["purged"], json!([]), "the human hasn't acked");
+    // The hold (7 days from the send, at 8) and b's ack grace (7 days
+    // from its ack, at 9): the body goes at the later of the two.
     let day: u64 = 24 * 60 * 60 * 1000;
-    let thread = ok(&wa, "a", 8 + 7 * day - 1, &["msg", "thread", "p"]);
-    assert_eq!(thread["data"]["messages"][0]["body"], "present");
     let thread = ok(&wa, "a", 8 + 7 * day, &["msg", "thread", "p"]);
+    assert_eq!(thread["data"]["messages"][0]["body"], "present");
+    let thread = ok(&wa, "a", 9 + 7 * day, &["msg", "thread", "p"]);
     assert_eq!(thread["data"]["messages"][0]["body"], "purged");
 }
 
@@ -2315,7 +2968,7 @@ fn human_wording() {
     let again = ok(&wa, "human:nick", 2, &["room", "leave", "hr"]);
     assert_eq!(
         again["diagnostics"][0]["hint"],
-        "nothing to do: you aren't in this room"
+        "nothing to do: you aren't in this channel"
     );
 
     let file = dir.0.join("out.txt");
@@ -2356,7 +3009,7 @@ fn human_wording() {
     let envelope: Value = serde_json::from_slice(&out.stdout).expect("json");
     assert_eq!(codes(&envelope), vec!["msg.human_actor".to_string()]);
     let base = "an agent acts as itself, and a human's answer goes in a `decision` it sends; \
-                a human may only ack, read (`msg inbox|wait|thread`) and leave a room";
+                a human may only ack, read (`msg inbox|wait|thread`) and leave a channel";
     assert_eq!(
         envelope["diagnostics"][0]["hint"],
         format!("{base}; for other commands, unset $MDKG_ACTOR (or pass --as '')")
@@ -2966,6 +3619,318 @@ fn inbox_and_wait_take_several_kinds() {
     assert_ne!(code, 0, "{out}");
 }
 
+/// `--from` keeps only mail from the senders named, with `--kind` too
+/// (0.7.0 friction log item 12).
+#[test]
+fn from_filters_inbox_and_wait_by_sender() {
+    let (_dir, wa, wb) = two_worktrees();
+    for (n, (sender, id, kind)) in [
+        ("a", "a-q", "question"),
+        ("c", "c-q", "question"),
+        ("a", "a-n", "note"),
+        ("d", "d-n", "note"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        ok(
+            &wa,
+            sender,
+            n as u64,
+            &[
+                "msg", "send", "--to", "b", "--kind", kind, "--id", id, "--text", id,
+            ],
+        );
+    }
+    let from_a = ok(&wb, "b", 5, &["msg", "inbox", "--from", "a"]);
+    assert_eq!(ids(&from_a), vec!["a-q", "a-n"], "{from_a}");
+    let listed = ok(&wb, "b", 5, &["msg", "inbox", "--from", "c,d"]);
+    assert_eq!(ids(&listed), vec!["c-q", "d-n"], "{listed}");
+    let both = ok(
+        &wb,
+        "b",
+        5,
+        &["msg", "inbox", "--from", "a", "--kind", "question"],
+    );
+    assert_eq!(ids(&both), vec!["a-q"], "{both}");
+    // The limit counts only matching mail.
+    let one = ok(
+        &wb,
+        "b",
+        5,
+        &["msg", "inbox", "--from", "d", "--limit", "1"],
+    );
+    assert_eq!(ids(&one), vec!["d-n"], "{one}");
+    assert_eq!(one["data"]["more"], false, "{one}");
+    let waited = ok(
+        &wb,
+        "b",
+        6,
+        &["msg", "wait", "--timeout", "0", "--from", "c"],
+    );
+    assert_eq!(ids(&waited), vec!["c-q"], "{waited}");
+    let none = ok(&wb, "b", 6, &["msg", "inbox", "--from", "nobody"]);
+    assert!(ids(&none).is_empty(), "{none}");
+    // A name no sender could have is refused, and not echoed.
+    let (code, out) = run(&wb, "b", 7, &["msg", "inbox", "--from", "a b\u{202e}"]);
+    assert_ne!(code, 0, "{out}");
+    assert_eq!(out["diagnostics"][0]["code"], "msg.bad_id", "{out}");
+    assert!(!out.to_string().contains("a b"), "{out}");
+}
+
+/// `ack --through` acks shown mail up to a number, skips findings unless
+/// `--kind` names them, and never acks mail its reader wasn't shown
+/// (0.7.0 friction log items 12 and 24).
+#[test]
+fn ack_through_acks_shown_mail_and_skips_findings_and_unseen_mail() {
+    let (_dir, wa, wb) = two_worktrees();
+    for (n, (id, kind)) in [
+        ("n1", "note"),
+        ("f1", "findings"),
+        ("h1", "handoff"),
+        ("q1", "question"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        ok(
+            &wa,
+            "a",
+            n as u64,
+            &[
+                "msg", "send", "--to", "b", "--kind", kind, "--id", id, "--text", id,
+            ],
+        );
+    }
+    // b reads all four; then one more arrives, unseen.
+    let listed = ok(&wb, "b", 5, &["msg", "inbox"]);
+    let cursor = listed["data"]["cursor"].as_u64().expect("cursor");
+    ok(
+        &wa,
+        "a",
+        6,
+        &[
+            "msg", "send", "--to", "b", "--kind", "note", "--id", "n2", "--text", "n2",
+        ],
+    );
+    // Through the newest number, so the unseen one is in range too.
+    let last = cursor + 1;
+    let through = format!("#{last}");
+    let only_notes = ok(
+        &wb,
+        "b",
+        7,
+        &["msg", "ack", "--through", &through, "--kind", "note"],
+    );
+    let acked = |e: &Value| -> Vec<String> {
+        e["data"]["acked"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|a| a["messageId"].as_str().map(String::from))
+            .collect()
+    };
+    let skipped = |e: &Value| -> Vec<(String, String)> {
+        e["data"]["skipped"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|a| {
+                (
+                    a["messageId"].as_str().unwrap_or_default().to_string(),
+                    a["reason"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect()
+    };
+    assert_eq!(acked(&only_notes), ["n1"], "{only_notes}");
+    assert_eq!(
+        skipped(&only_notes),
+        [("n2".to_string(), "not_shown".to_string())],
+        "{only_notes}"
+    );
+    // Without --kind: everything shown but the findings.
+    let rest = ok(
+        &wb,
+        "b",
+        8,
+        &["msg", "ack", "--through", &cursor.to_string()],
+    );
+    assert_eq!(acked(&rest), ["h1", "q1"], "{rest}");
+    assert_eq!(
+        skipped(&rest),
+        [("f1".to_string(), "findings".to_string())],
+        "{rest}"
+    );
+    let left = ok(&wb, "b", 9, &["msg", "inbox", "--no-mark"]);
+    assert_eq!(ids(&left), ["f1", "n2"], "{left}");
+    // Findings by kind, or by an explicit number.
+    let findings = ok(
+        &wb,
+        "b",
+        10,
+        &[
+            "msg",
+            "ack",
+            "--through",
+            &cursor.to_string(),
+            "--kind",
+            "findings",
+            "--outcome",
+            "forwarded",
+        ],
+    );
+    assert_eq!(acked(&findings), ["f1"], "{findings}");
+    assert!(skipped(&findings).is_empty(), "{findings}");
+    // A bad number, ids beside --through, and --kind without it are refused.
+    for args in [
+        &["msg", "ack", "--through", "x1"][..],
+        &["msg", "ack", "n2", "--through", "9"],
+        &["msg", "ack", "n2", "--kind", "note"],
+        &["msg", "ack"],
+    ] {
+        let (code, out) = run(&wb, "b", 11, args);
+        assert_ne!(code, 0, "{args:?}: {out}");
+    }
+    let (code, out) = run(
+        &wb,
+        "b",
+        11,
+        &["msg", "ack", "--through", "9", "--kind", "nonsense"],
+    );
+    assert_ne!(code, 0, "{out}");
+}
+
+/// `msg forward` re-sends bodies verbatim with their senders, then acks
+/// them in the same step; nothing is acked when it can't send (0.7.0
+/// friction log item 3).
+#[test]
+fn forward_resends_bodies_with_their_senders_and_then_acks_them() {
+    let (_dir, wa, wb) = two_worktrees();
+    ok(
+        &wa,
+        "rev-1",
+        0,
+        &[
+            "msg",
+            "send",
+            "--to",
+            "b",
+            "--kind",
+            "findings",
+            "--id",
+            "f1",
+            "--text",
+            "major: x is wrong",
+        ],
+    );
+    let data = wa.join("finding.json");
+    fs::write(&data, r#"{"severity": "minor", "file": "src/a.rs"}"#).expect("data");
+    ok(
+        &wa,
+        "rev-2",
+        1,
+        &[
+            "msg",
+            "send",
+            "--to",
+            "b",
+            "--kind",
+            "findings",
+            "--id",
+            "f2",
+            "--data-file",
+            data.to_str().expect("utf-8"),
+        ],
+    );
+    ok(
+        &wa,
+        "a",
+        2,
+        &[
+            "msg", "send", "--to", "b", "--kind", "note", "--id", "n1", "--text", "hi",
+        ],
+    );
+    // Unseen mail can't be forwarded: nothing is sent or acked.
+    let (code, out) = run(&wb, "b", 3, &["msg", "forward", "f1", "--to", "lane"]);
+    assert_ne!(code, 0, "{out}");
+    assert_eq!(codes(&out), ["msg.not_shown"], "{out}");
+    let listed = ok(&wb, "b", 4, &["msg", "inbox"]);
+    let f1 = listed["data"]["messages"][0]["seq"].as_u64().expect("seq");
+    // Mixed kinds need --kind.
+    let (code, out) = run(&wb, "b", 5, &["msg", "forward", "f1", "n1", "--to", "lane"]);
+    assert_ne!(code, 0, "{out}");
+    let fwd = ok(
+        &wb,
+        "b",
+        6,
+        &[
+            "msg",
+            "forward",
+            &format!("#{f1}"),
+            "f2",
+            "--to",
+            "lane",
+            "--text",
+            "Reviews of abc123",
+        ],
+    );
+    let message = &fwd["data"]["message"];
+    assert_eq!(message["kind"], "findings", "{fwd}");
+    assert_eq!(message["sender"], "b", "{fwd}");
+    let parts = message["parts"].as_array().expect("parts");
+    assert_eq!(parts.len(), 5, "{fwd}");
+    assert_eq!(parts[0]["text"], "Reviews of abc123");
+    let head = parts[1]["text"].as_str().expect("header");
+    assert!(
+        head.contains(&format!("#{f1} findings from rev-1")) && head.contains("(message f1)"),
+        "{head}"
+    );
+    assert_eq!(parts[2]["text"], "major: x is wrong");
+    assert!(
+        parts[3]["text"]
+            .as_str()
+            .expect("header")
+            .contains("from rev-2")
+    );
+    assert_eq!(parts[4]["kind"], "data");
+    assert_eq!(parts[4]["data"]["file"], "src/a.rs");
+    let acked: Vec<&str> = fwd["data"]["acked"]
+        .as_array()
+        .expect("acked")
+        .iter()
+        .filter_map(|a| a["messageId"].as_str())
+        .collect();
+    assert_eq!(acked, ["f1", "f2"], "{fwd}");
+    let new_id = message["messageId"].as_str().expect("id");
+    // The acks record where they went; the lane has the forward.
+    let thread = ok(&wa, "a", 7, &["msg", "thread", "f1", "--no-mark"]);
+    let outcome = thread["data"]["messages"][0]["deliveries"][0]["outcome"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert_eq!(outcome, format!("forwarded as {new_id}"), "{thread}");
+    let lane = ok(&wa, "lane", 8, &["msg", "inbox", "--no-mark"]);
+    assert_eq!(ids(&lane), [new_id], "{lane}");
+    // Acked now, so it can't be forwarded again.
+    let (code, out) = run(&wb, "b", 9, &["msg", "forward", "f1", "--to", "lane"]);
+    assert_ne!(code, 0, "{out}");
+    assert_eq!(codes(&out), ["msg.not_holder"], "{out}");
+    // Never as a decision, and never someone else's mail.
+    let (code, out) = run(
+        &wb,
+        "b",
+        10,
+        &["msg", "forward", "n1", "--to", "lane", "--kind", "decision"],
+    );
+    assert_ne!(code, 0, "{out}");
+    let (code, out) = run(&wa, "c", 11, &["msg", "forward", "n1", "--to", "lane"]);
+    assert_ne!(code, 0, "{out}");
+    assert_eq!(codes(&out), ["msg.not_holder"], "{out}");
+    let still = ok(&wb, "b", 12, &["msg", "inbox", "--no-mark"]);
+    assert_eq!(ids(&still), ["n1"], "{still}");
+}
+
 /// The wake hooks' filter (orchestrator #228): direct mail of any kind, and
 /// in a room only the kinds that ask something; room notes don't wake.
 #[test]
@@ -3002,4 +3967,510 @@ fn room_kind_filters_room_mail_and_leaves_direct_mail() {
     assert_eq!(ids(&both), vec!["d-note"], "{both}");
     let (code, out) = run(&wb, "b", 11, &["msg", "wait", "--room-kind", "nonsense"]);
     assert_ne!(code, 0, "{out}");
+}
+
+#[test]
+fn channel_commands_and_hidden_aliases_preserve_the_same_data() {
+    // Snapshot heads belong to one store. Compare all resource data while
+    // checking each independent fixture's opaque cursor separately.
+    fn without_event_cursor(envelope: &Value) -> Value {
+        let mut data = envelope["data"].clone();
+        let cursor = data
+            .as_object_mut()
+            .unwrap()
+            .remove("event_cursor")
+            .unwrap();
+        assert!(cursor.is_string());
+        assert!(!cursor.as_str().unwrap().is_empty());
+        data
+    }
+    let (_d1, canonical, _) = two_worktrees();
+    let (_d2, legacy, _) = two_worktrees();
+    for (now, operation, extra) in [
+        (0, "create", vec!["--member", "b"]),
+        (1, "join", vec!["--member", "c"]),
+        (2, "leave", vec!["--member", "c"]),
+        (3, "list", vec![]),
+    ] {
+        let mut args = vec!["channel", operation];
+        if operation != "list" {
+            args.push("dev");
+        }
+        args.extend(extra);
+        let current = ok(&canonical, "a", now, &args);
+        args[0] = "room";
+        let old = ok(&legacy, "a", now, &args);
+        let (new_key, old_key) = if operation == "list" {
+            ("channels", "rooms")
+        } else {
+            ("channel", "room")
+        };
+        assert_eq!(current["data"][new_key], old["data"][old_key]);
+        assert_eq!(current["schema"], format!("mdkg.channel.{operation}.v1"));
+        assert_eq!(old["schema"], format!("mdkg.room.{operation}.v1"));
+        assert!(
+            old["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|d| d["code"] == "usage.deprecated")
+        );
+        assert!(current["diagnostics"].as_array().unwrap().is_empty());
+    }
+    let args = [
+        "msg",
+        "send",
+        "--channel",
+        "dev",
+        "--kind",
+        "note",
+        "--id",
+        "channel-post",
+        "--text",
+        "hello",
+    ];
+    let current = ok(&canonical, "a", 4, &args);
+    let mut old_args = args;
+    old_args[2] = "--room";
+    let old = ok(&legacy, "a", 4, &old_args);
+    assert_eq!(current["data"], old["data"]);
+    assert_eq!(current["data"]["message"]["channel"], "dev");
+    assert_eq!(current["data"]["message"]["room"], "dev");
+    // A21 preserves the shipped context spelling as opaque stored data.
+    assert_eq!(current["data"]["message"]["contextId"], "room:dev");
+    for operation in ["inbox", "wait", "thread"] {
+        let current = ok(&canonical, "b", 5, &["msg", operation, "--channel", "dev"]);
+        let old = ok(&legacy, "b", 5, &["msg", operation, "--room", "dev"]);
+        assert_eq!(without_event_cursor(&current), without_event_cursor(&old));
+        if operation == "thread" {
+            assert_eq!(current["data"]["contextId"], "room:dev");
+        }
+        assert!(
+            old["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|d| d["code"] == "usage.deprecated")
+        );
+    }
+    let current = ok(
+        &canonical,
+        "b",
+        6,
+        &["msg", "inbox", "--channel-kind", "note"],
+    );
+    let old = ok(&legacy, "b", 6, &["msg", "inbox", "--room-kind", "note"]);
+    assert_eq!(without_event_cursor(&current), without_event_cursor(&old));
+    assert!(
+        old["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["code"] == "usage.deprecated")
+    );
+}
+
+#[test]
+fn channel_alias_errors_keep_their_shipped_codes() {
+    let (_dir, wa, _) = two_worktrees();
+    for (command, flag, expected) in [
+        ("channel", "--channel", "channel.unknown"),
+        ("room", "--room", "room.unknown"),
+    ] {
+        let (exit, out) = run(&wa, "a", 0, &[command, "join", "missing"]);
+        assert_eq!(exit, 3);
+        assert!(codes(&out).contains(&expected.to_string()));
+        let (exit, out) = run(
+            &wa,
+            "a",
+            0,
+            &[
+                "msg", "send", flag, "missing", "--kind", "note", "--text", "hello",
+            ],
+        );
+        assert_eq!(exit, 3);
+        assert!(codes(&out).contains(&expected.to_string()));
+    }
+}
+
+#[test]
+fn channel_prefix_is_reserved_for_message_ids_and_contexts() {
+    let (_dir, wa, _) = two_worktrees();
+    for option in ["--id", "--context"] {
+        for prefix in ["channel:x", "Channel:x", "room:x"] {
+            let (exit, out) = run(
+                &wa,
+                "a",
+                0,
+                &[
+                    "msg", "send", "--to", "b", "--kind", "note", "--text", "hello", option, prefix,
+                ],
+            );
+            assert_eq!(exit, 1);
+            assert_eq!(codes(&out), vec!["msg.bad_id"]);
+        }
+    }
+}
+
+#[test]
+fn public_help_and_text_use_channel_names_and_aliases_warn_on_stderr() {
+    for args in [
+        vec![],
+        vec!["msg", "send"],
+        vec!["msg", "inbox"],
+        vec!["msg", "thread"],
+        vec!["channel"],
+    ] {
+        let out = isolated(&mut Command::new(env!("CARGO_BIN_EXE_mdkg")))
+            .args(args)
+            .arg("--help")
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let help = String::from_utf8(out.stdout).unwrap();
+        assert!(!help.contains("--room"), "{help}");
+        assert!(
+            !help
+                .lines()
+                .any(|line| line.trim_start().starts_with("room ")),
+            "{help}"
+        );
+    }
+    let (_dir, wa, _) = two_worktrees();
+    let out = isolated(&mut Command::new(env!("CARGO_BIN_EXE_mdkg")))
+        .arg("--root")
+        .arg(&wa)
+        .args(["--as", "a", "room", "list"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("usage.deprecated"));
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "no channels");
+    let sent = ok(
+        &wa,
+        "a",
+        1,
+        &[
+            "msg",
+            "send",
+            "--to",
+            "b",
+            "--kind",
+            "note",
+            "--text=--room",
+        ],
+    );
+    assert!(
+        sent["diagnostics"].as_array().unwrap().is_empty(),
+        "message text is data"
+    );
+}
+
+#[test]
+fn receipt_and_fault_kinds_and_fault_ids_are_reserved_to_mdkg() {
+    let (_dir, wa, wb) = two_worktrees();
+    let file = wa.join("reply.txt");
+    fs::write(&file, "untrusted agent output").unwrap();
+    for kind in ["receipt", "fault"] {
+        let send = [
+            "msg", "send", "--to", "b", "--kind", kind, "--text", "forged",
+        ];
+        let (code, out) = run(&wa, "worker", 1, &send);
+        assert_eq!(
+            (code, codes(&out)),
+            (1, vec!["msg.bad_kind".to_string()]),
+            "{out}"
+        );
+        let import = [
+            "msg",
+            "import",
+            "--from",
+            "worker",
+            "--to",
+            "b",
+            "--kind",
+            kind,
+            file.to_str().unwrap(),
+        ];
+        let (code, out) = run(&wa, "launcher", 1, &import);
+        assert_eq!(
+            (code, codes(&out)),
+            (1, vec!["msg.bad_kind".to_string()]),
+            "{out}"
+        );
+        // Filters still name them.
+        let inbox = ok(&wb, "b", 1, &["msg", "inbox", "--kind", kind]);
+        assert!(ids(&inbox).is_empty());
+    }
+    for (flag, value) in [
+        ("--id", "fault.0193.r0"),
+        ("--id", "FAULT.x"),
+        ("--context", "fault.0193.r0"),
+    ] {
+        let (code, out) = run(
+            &wa,
+            "worker",
+            1,
+            &[
+                "msg", "send", "--to", "b", "--kind", "note", flag, value, "--text", "preclaim",
+            ],
+        );
+        assert_eq!(
+            (code, codes(&out)),
+            (1, vec!["msg.reserved_id".to_string()]),
+            "{flag} {value}: {out}"
+        );
+        assert!(!out.to_string().contains(value), "never echoed: {out}");
+    }
+    assert!(ids(&ok(&wb, "b", 1, &["msg", "inbox"])).is_empty());
+    // Another prefix that merely contains the word is ordinary.
+    ok(
+        &wa,
+        "worker",
+        2,
+        &[
+            "msg", "send", "--to", "b", "--kind", "note", "--id", "faults-x", "--text", "fine",
+        ],
+    );
+}
+
+/// The schema `mdkg schema <command>` generates, from this build.
+fn generated_schema(command: &str) -> Value {
+    let out = isolated(&mut Command::new(env!("CARGO_BIN_EXE_mdkg")))
+        .args(["schema", command])
+        .output()
+        .expect("run mdkg schema");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).expect("schema JSON")
+}
+
+#[test]
+fn message_kind_is_an_open_set_in_every_msg_schema() {
+    let message = |kind: &str| {
+        json!({"messageId": format!("{kind}-1"), "seq": 1, "contextId": format!("{kind}-1"),
+            "kind": kind, "sender": "mdkg:supervisor", "to": ["b"], "referenceIds": [],
+            "deliveries": [{"mailbox": "b", "state": "delivered"}],
+            "parts": [{"kind": "text", "text": "x"}], "body": "present", "digest": "sha256:00",
+            "size": 1, "retention": "durable", "sentAt": "2026-10-30T00:00:00Z", "sentAtMs": 0})
+    };
+    for command in [
+        "msg.send",
+        "msg.inbox",
+        "msg.wait",
+        "msg.forward",
+        "msg.thread",
+        "msg.import",
+    ] {
+        let schema = generated_schema(command);
+        let kind = &schema["$defs"]["KindName"];
+        assert_eq!(kind["type"], "string", "{command}");
+        assert_eq!(kind["x-mdkg-open"], true, "{command}");
+        assert!(kind.get("enum").is_none(), "{command}: {kind}");
+        let examples = kind["examples"].as_array().expect("examples");
+        for known in ["note", "question", "receipt", "fault"] {
+            assert!(examples.contains(&json!(known)), "{command}: {known}");
+        }
+        let mut errors = Vec::new();
+        common::check(&schema, kind, &json!("receipt"), "$", &mut errors);
+        common::check(&schema, kind, &json!("fault"), "$", &mut errors);
+        common::check(&schema, kind, &json!("a_later_kind"), "$", &mut errors);
+        assert!(errors.is_empty(), "{command}: {errors:?}");
+    }
+    // A whole inbox envelope holding a receipt and a fault validates.
+    let schema = generated_schema("msg.inbox");
+    let envelope = json!({"schema": "mdkg.msg.inbox.v1", "ok": true, "diagnostics": [],
+        "data": {"mailboxes": ["b"], "messages": [message("receipt"), message("fault")],
+            "cursor": 1, "more": false}});
+    let mut errors = Vec::new();
+    common::check(&schema, &schema, &envelope, "$", &mut errors);
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[test]
+fn a_forwarded_fault_or_receipt_is_refused_as_its_own_kind() {
+    let (dir, wa, wb) = two_worktrees();
+    // Make sure the store exists, then put mdkg's own mail in b's mailbox,
+    // as the launcher does.
+    ok(&wa, "a", 1, &["msg", "inbox"]);
+    {
+        use mdkg_coord_sqlite::mail::{Outgoing, Retention, To};
+        let mut store = mdkg_coord_sqlite::Store::open_with(
+            &dir.0.join("repo/.git/mdkg/coord.sqlite"),
+            TTL,
+            mdkg_coord_sqlite::Upgrade::Allow,
+        )
+        .expect("store");
+        for (id, kind, sender) in [
+            ("fault.0193.r0", "fault", "mdkg:supervisor"),
+            ("receipt-1", "receipt", "mdkg:receipts"),
+        ] {
+            store
+                .send(&Outgoing {
+                    message_id: id.into(),
+                    context_id: None,
+                    kind: kind.into(),
+                    sender: sender.into(),
+                    via: None,
+                    sender_mailboxes: vec![],
+                    to: To::Mailboxes(vec!["b".into()]),
+                    reference_ids: vec![],
+                    parts: json!([{"kind": "text", "text": "mdkg's own"}]),
+                    retention: Retention::Durable,
+                    human_hold_days: 7,
+                    now_ms: 2,
+                })
+                .expect("mdkg sends");
+        }
+    }
+    ok(&wb, "b", 3, &["msg", "inbox", "--kind", "fault,receipt"]);
+    for id in ["fault.0193.r0", "receipt-1"] {
+        let (code, out) = run(&wb, "b", 4, &["msg", "forward", id, "--to", "c"]);
+        assert_eq!(
+            (code, codes(&out)),
+            (1, vec!["msg.bad_kind".to_string()]),
+            "{id}: {out}"
+        );
+    }
+    // Nothing was sent or acked: both are still b's.
+    assert_eq!(
+        ids(&ok(
+            &wb,
+            "b",
+            5,
+            &["msg", "inbox", "--kind", "fault,receipt"]
+        ))
+        .len(),
+        2
+    );
+    // Forwarded under another kind, it's ordinary mail from b.
+    let out = ok(
+        &wb,
+        "b",
+        6,
+        &[
+            "msg",
+            "forward",
+            "fault.0193.r0",
+            "--to",
+            "c",
+            "--kind",
+            "note",
+        ],
+    );
+    assert_eq!(out["data"]["message"]["kind"], "note");
+}
+
+#[test]
+fn a_plain_read_hides_receipts_but_keeps_a_kind_this_build_doesnt_know() {
+    let (dir, wa, wb) = two_worktrees();
+    ok(&wa, "a", 1, &["msg", "inbox"]);
+    {
+        use mdkg_coord_sqlite::mail::{Outgoing, Retention, To};
+        let mut store = mdkg_coord_sqlite::Store::open_with(
+            &dir.0.join("repo/.git/mdkg/coord.sqlite"),
+            TTL,
+            mdkg_coord_sqlite::Upgrade::Allow,
+        )
+        .expect("store");
+        // What a newer build sends: a kind this one doesn't list.
+        for (id, kind, sender) in [
+            ("receipt-1", "receipt", "mdkg:receipts"),
+            ("newer-1", "x_new", "a"),
+        ] {
+            store
+                .send(&Outgoing {
+                    message_id: id.into(),
+                    context_id: None,
+                    kind: kind.into(),
+                    sender: sender.into(),
+                    via: None,
+                    sender_mailboxes: vec![],
+                    to: To::Mailboxes(vec!["b".into()]),
+                    reference_ids: vec![],
+                    parts: json!([{"kind": "text", "text": "hello"}]),
+                    retention: Retention::Durable,
+                    human_hold_days: 7,
+                    now_ms: 2,
+                })
+                .expect("sent");
+        }
+    }
+    assert_eq!(ids(&ok(&wb, "b", 3, &["msg", "inbox"])), vec!["newer-1"]);
+    let (code, out) = run(&wb, "b", 4, &["msg", "wait", "--timeout", "0"]);
+    assert_eq!((code, ids(&out)), (0, vec!["newer-1".to_string()]), "{out}");
+    assert_eq!(
+        ids(&ok(&wb, "b", 5, &["msg", "inbox", "--kind", "receipt"])),
+        vec!["receipt-1"]
+    );
+}
+
+#[test]
+fn ack_through_skips_and_names_a_fault_unless_the_kind_names_it() {
+    let (dir, wa, wb) = two_worktrees();
+    ok(&wa, "a", 1, &["msg", "inbox"]);
+    {
+        use mdkg_coord_sqlite::mail::{FaultOut, Outgoing, Retention, To};
+        let mut store = mdkg_coord_sqlite::Store::open_with(
+            &dir.0.join("repo/.git/mdkg/coord.sqlite"),
+            TTL,
+            mdkg_coord_sqlite::Upgrade::Allow,
+        )
+        .expect("store");
+        let to = vec!["b".to_string()];
+        store
+            .send_fault(
+                &FaultOut {
+                    fault_id: "0193",
+                    agent: "lane",
+                    code: "run.agent_failed",
+                    to: &to,
+                    human_hold_days: 7,
+                    now_ms: 2,
+                },
+                |t| {
+                    json!([{"kind": "text", "text": "fault"}, {"kind": "data", "data": {
+                        "schema": "mdkg.run.fault.v1", "fault_id": "0193", "agent": "lane",
+                        "code": "run.agent_failed", "count": t.count, "first_at": t.first_at}}])
+                },
+            )
+            .expect("fault");
+        store
+            .send(&Outgoing {
+                message_id: "n1".into(),
+                context_id: None,
+                kind: "note".into(),
+                sender: "a".into(),
+                via: None,
+                sender_mailboxes: vec!["a".into()],
+                to: To::Mailboxes(to.clone()),
+                reference_ids: vec![],
+                parts: json!([{"kind": "text", "text": "hi"}]),
+                retention: Retention::PurgeOnAck,
+                human_hold_days: 7,
+                now_ms: 3,
+            })
+            .expect("note");
+    }
+    let inbox = ok(&wb, "b", 4, &["msg", "inbox"]);
+    assert_eq!(ids(&inbox), ["fault.0193.r0", "n1"]);
+    let cursor = inbox["data"]["cursor"].to_string();
+    let out = ok(&wb, "b", 5, &["msg", "ack", "--through", &cursor]);
+    assert_eq!(out["data"]["acked"][0]["messageId"], "n1", "{out}");
+    let skipped = out["data"]["skipped"].as_array().expect("skipped");
+    assert_eq!(skipped.len(), 1, "{out}");
+    assert_eq!(skipped[0]["messageId"], "fault.0193.r0");
+    assert_eq!(skipped[0]["reason"], "fault", "R6: skipped and named");
+    assert_eq!(ids(&ok(&wb, "b", 6, &["msg", "inbox"])), ["fault.0193.r0"]);
+    let out = ok(
+        &wb,
+        "b",
+        7,
+        &["msg", "ack", "--through", &cursor, "--kind", "fault"],
+    );
+    assert_eq!(out["data"]["acked"][0]["messageId"], "fault.0193.r0");
+    assert!(ids(&ok(&wb, "b", 8, &["msg", "inbox"])).is_empty());
 }

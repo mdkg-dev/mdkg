@@ -9,7 +9,40 @@ use mdkg_format::Code;
 use crate::error::GraphError;
 use crate::fs_walk;
 
-const DOC_FOLDERS: &[&str] = &["core", "design", "work"];
+/// The folders under a workspace's mdkg dir whose markdown files are
+/// documents.
+pub const DOC_FOLDERS: &[&str] = &["core", "design", "work"];
+
+/// A core folder's `core.md`, the graph's core page, which the indexer
+/// never reads as a node.
+pub fn is_core_page(file: &Path) -> bool {
+    file.file_name().is_some_and(|n| n == "core.md")
+        && file
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|n| n == "core")
+}
+
+/// Whether `rel`, a `/`-separated path under a workspace's mdkg dir (as a
+/// git tree spells it), is a file [`discover`] lists and the indexer then
+/// reads as a node: a markdown file ([`fs_walk::is_markdown`]) in `core`,
+/// `design` or `work`, at most `max_depth` folders below it, and not the
+/// core page ([`is_core_page`]). The one rule for the walk on disk and a
+/// lookup in git objects (Terra's code review #9504, blocker 2).
+pub fn is_node_document(rel: &str, max_depth: u64) -> bool {
+    let parts: Vec<&str> = rel.split('/').collect();
+    let [folder, dirs @ .., _] = parts.as_slice() else {
+        return false;
+    };
+    let path = Path::new(rel);
+    DOC_FOLDERS.contains(folder)
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && *p != "." && *p != "..")
+        && u64::try_from(dirs.len()).is_ok_and(|d| d <= max_depth)
+        && fs_walk::is_markdown(path)
+        && !is_core_page(path)
+}
 
 /// Documents grouped by workspace, in workspace and file order.
 #[derive(Debug, Clone)]

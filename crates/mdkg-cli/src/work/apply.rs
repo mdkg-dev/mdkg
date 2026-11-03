@@ -530,6 +530,7 @@ fn record_existing(
 }
 
 pub fn apply(repo: &Repo, actor: Option<String>, hash: &str) -> Result<LocalizeData, GraphError> {
+    plan::refuse_ref_mode(repo)?;
     apply_after_commit(repo, actor, hash, &mut || Ok(()))
 }
 

@@ -9,7 +9,10 @@ use serde_json::{Value, json};
 
 use super::{Event, HarnessEvent, Input, Outcome, Rendered};
 
-use mdkg_run::hooks::{OPENCODE_FILE_TOOLS as FILE_TOOLS, OPENCODE_PATCH_TOOLS as PATCH_TOOLS};
+use crate::hooks::{
+    OPENCODE_FILE_TOOLS as FILE_TOOLS, OPENCODE_PATCH_TOOLS as PATCH_TOOLS,
+    OPENCODE_SHELL_TOOLS as SHELL_TOOLS,
+};
 
 /// The lines of a patch that name a file it writes.
 const PATCH_FILE_LINES: &[&str] = &[
@@ -19,7 +22,7 @@ const PATCH_FILE_LINES: &[&str] = &[
     "*** Move to: ",
 ];
 
-pub(super) fn parse(event: Event, v: &Value) -> Result<Input, String> {
+pub(crate) fn parse(event: Event, v: &Value) -> Result<Input, String> {
     let text = |k: &str| v.get(k).and_then(Value::as_str).map(String::from);
     let tool = text("tool");
     let args = v.get("args");
@@ -60,6 +63,12 @@ pub(super) fn parse(event: Event, v: &Value) -> Result<Input, String> {
         }),
         start_provenance: None,
         stop_active: false,
+        command: tool
+            .as_deref()
+            .is_some_and(|t| SHELL_TOOLS.contains(&t))
+            .then(|| arg("command"))
+            .flatten()
+            .map(String::from),
         tool,
         paths,
     })
@@ -82,7 +91,7 @@ fn patch_paths(patch: &str) -> Vec<String> {
     out
 }
 
-pub(super) fn render(_event: Event, o: &Outcome) -> Rendered {
+pub(crate) fn render(_event: Event, o: &Outcome) -> Rendered {
     let v = match o {
         Outcome::Silent => json!({}),
         Outcome::Context(s) => json!({"context": s}),
@@ -159,6 +168,32 @@ mod tests {
         )
         .expect("parse");
         assert!(read.paths.is_empty());
+    }
+
+    #[test]
+    fn both_shell_tool_names_carry_their_command() {
+        // 2.1 calls it `bash`, 2.2 `shell`; other tools carry none.
+        for tool in ["bash", "shell"] {
+            let input = parse(
+                Event::Edit,
+                &json!({"tool": tool, "args": {"command": "git push origin main"}}),
+            )
+            .expect("parse");
+            assert_eq!(
+                input.command.as_deref(),
+                Some("git push origin main"),
+                "{tool}"
+            );
+            assert!(input.paths.is_empty(), "{tool}");
+        }
+        for tool in ["read", "execute", "Shell"] {
+            let input = parse(
+                Event::Edit,
+                &json!({"tool": tool, "args": {"command": "git push origin main"}}),
+            )
+            .expect("parse");
+            assert_eq!(input.command, None, "{tool}");
+        }
     }
 
     #[test]

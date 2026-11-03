@@ -1,0 +1,46 @@
+{
+  "name": "18-canonical-paths",
+  "scenario": "canonical_paths",
+  "fixture": {
+    "format_version": "0.7",
+    "graph_id": "01a185ac-560e-76e0-91af-2c49dfc29b81",
+    "files": {
+      "work.txt": "initial content\n"
+    }
+  },
+  "operations": [
+    {
+      "op": "message.send",
+      "actor": "a",
+      "args": {
+        "mailbox": "human:nick",
+        "kind": "note",
+        "id": "human:message",
+        "context": "human:context",
+        "text": "opaque identifiers"
+      },
+      "expect": {
+        "ok": true,
+        "data": {
+          "message": {
+            "messageId": "human:message",
+            "uri": "/v1/messages/human%3Amessage"
+          }
+        }
+      },
+      "cli": {
+        "exit": 0,
+        "envelope": {
+          "schema": "mdkg.msg.send.v1"
+        }
+      }
+    }
+  ],
+  "expect": {
+    "uri": "/v1/messages/human%3Amessage",
+    "subjects": [
+      "/v1/mailboxes/human%3Anick",
+      "/v1/contexts/human%3Acontext"
+    ]
+  }
+}

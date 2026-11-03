@@ -223,23 +223,6 @@ pub fn paths(entries: &[TreeEntry]) -> Vec<String> {
         .collect()
 }
 
-/// The contents of `path` at the head, if the tree has it as a file.
-pub fn read(repo: &Repo, entries: &[TreeEntry], path: &str) -> Result<Option<Vec<u8>>, String> {
-    let Some(entry) = entries
-        .iter()
-        .find(|e| e.path == path.as_bytes() && matches!(e.mode.as_str(), "100644" | "100755"))
-    else {
-        return Ok(None);
-    };
-    let mut out = None;
-    repo.each_blob(std::slice::from_ref(&entry.oid), |_, blob| {
-        out = Some(blob.to_vec());
-        Ok(())
-    })
-    .map_err(|e| format!("can't read {path} at the head: {e}"))?;
-    Ok(out)
-}
-
 fn write_entry(dest: &Path, blob: &[u8]) -> std::io::Result<()> {
     // `create_new`: a path written twice fails instead of overwriting.
     let mut f = std::fs::OpenOptions::new()

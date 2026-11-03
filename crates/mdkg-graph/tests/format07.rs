@@ -72,6 +72,53 @@ fn codes(root: &Path) -> (Vec<Code>, Vec<Code>) {
 }
 
 #[test]
+fn requirement_examples_exist_in_local_and_bundled_templates() {
+    let local_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.mdkg/templates/default");
+    // This repository's own templates; the public export's graph is a
+    // fresh `mdkg init` without them, so there only the bundled ones count.
+    let has_local = local_dir.is_dir();
+    if !has_local {
+        eprintln!("skipped the local templates: this repository has no .mdkg/templates/default");
+    }
+    for kind in ["task", "bug", "feat", "spike", "edd", "prd"] {
+        let local = has_local.then(|| {
+            std::fs::read_to_string(local_dir.join(format!("{kind}.md")))
+                .expect("repository template")
+        });
+        let bundled = mdkg_graph::bundled::BUNDLED_DEFAULT
+            .iter()
+            .find(|(name, _)| *name == kind)
+            .map(|(_, text)| *text)
+            .expect("bundled template");
+        for template in local.as_deref().into_iter().chain([bundled]) {
+            let parsed = mdkg_graph::requirements::parse(template);
+            assert!(parsed.section_found, "{kind}");
+            assert_eq!(parsed.items, 0, "{kind}");
+            assert!(parsed.requirements.is_empty(), "{kind}");
+            let section = template
+                .split_once("# Requirements\n")
+                .expect("requirements heading")
+                .1
+                .split("\n# ")
+                .next()
+                .expect("requirements section");
+            let items: Vec<_> = section
+                .lines()
+                .filter(|line| line.starts_with("- "))
+                .collect();
+            assert_eq!(items.len(), 1, "{kind}: {items:?}");
+            let example = items[0].strip_prefix("- R1: ").expect("requirement id");
+            if kind == "spike" {
+                assert!(example.ends_with('?'), "{kind}: {example}");
+            } else {
+                assert!(example.contains(" shall "), "{kind}: {example}");
+                assert!(example.contains("(verify: "), "{kind}: {example}");
+            }
+        }
+    }
+}
+
+#[test]
 fn a_v07_graph_links_by_uuid_and_resolves_legacy_ids() {
     let g = graph(
         "links",
@@ -823,4 +870,132 @@ fn a_legacy_goals_required_skills_arent_checked() {
     );
     let (errors, _) = codes(&g.0);
     assert!(errors.is_empty(), "{errors:?}");
+}
+
+/// Each requirement warning's code and its file line, sorted.
+fn requirement_warnings(root: &Path) -> Vec<(Code, String, Option<usize>)> {
+    let config = config::load(root).expect("test setup");
+    let receipt = validate::validate(root, &config).expect("test setup");
+    assert!(receipt.errors.is_empty(), "{:?}", receipt.errors);
+    let mut out: Vec<_> = receipt
+        .warnings
+        .iter()
+        .filter(|d| d.code.as_str().starts_with("req."))
+        .map(|d| (d.code, d.path.clone().unwrap_or_default(), d.line))
+        .collect();
+    out.sort_by(|a, b| (a.1.as_str(), a.2, a.0.as_str()).cmp(&(b.1.as_str(), b.2, b.0.as_str())));
+    out
+}
+
+#[test]
+fn requirement_lint_warns_with_each_code_and_never_errors() {
+    const EDD: &str = "edd-0192f3a4-0000-7000-8000-000000000010";
+    const PRD: &str = "prd-0192f3a4-0000-7000-8000-000000000011";
+    const SPIKE: &str = "spike-0192f3a4-0000-7000-8000-000000000012";
+    const BARE: &str = "bug-0192f3a4-0000-7000-8000-000000000013";
+    const DONE: &str = "task-0192f3a4-0000-7000-8000-000000000014";
+    const RULE: &str = "rule-0192f3a4-0000-7000-8000-000000000015";
+    const MISSING: &str = "edd-0192f3a4-0000-7000-8000-0000000000ff";
+    // `node` writes eight frontmatter lines, so body line n is file line
+    // n + 8; a design node has no status, so n + 7.
+    let design_node = |id: &str, node_type: &str, body: &str| {
+        node(id, node_type, "", body).replacen("status: todo\n", "", 1)
+    };
+    let edd = design_node(
+        EDD,
+        "edd",
+        &format!(
+            "# Requirements\n\
+             - R1: The store shall keep every entry.\n\
+             - R2 (changes {PRD}#R1): The store shall copy itself.\n\
+             - R3 (retired): The store shall be fast.\n"
+        ),
+    );
+    let prd = design_node(
+        PRD,
+        "prd",
+        "# Requirements\n- R1: When asked, the product shall answer within 2 seconds.\n",
+    );
+    let task = node(
+        TASK,
+        "task",
+        "",
+        &format!(
+            "# Overview\n\nWork.\n\n# Requirements\n\
+             - R1 (changes {EDD}#R1): When a write lands, the store shall record it.\n\
+             - R1: The store shall keep a copy.\n\
+             - R2: The store should be fast.\n\
+             - R3 (changes {EDD}#R9): If the copy fails, then the store shall stop.\n\
+             - R4 (adds {SPIKE}): The store shall log each write.\n\
+             - R5 (adds {MISSING}): The store shall log each read.\n\
+             - R6 (removes {EDD}#R9): The store shall drop the cache.\n\
+             - Something without an id.\n\
+             - R7: The store shall be robust.\n\
+             - R8: The store shall answer within 2 robust seconds.\n\
+             - R9: The store shall fast-forward its ref.\n"
+        ),
+    );
+    let spike = node(
+        SPIKE,
+        "spike",
+        "",
+        "# Requirements\n- R1: Which store is faster?\n- R2: Find the faster store.\n",
+    );
+    let bare = node(BARE, "bug", "", "# Overview\n\nNo requirements.\n");
+    // A rule's own prose under `# Requirements` isn't a requirement list.
+    let rule = design_node(
+        RULE,
+        "rule",
+        "# Requirements\n\n- Keep edges in frontmatter.\n- R1: Things should be fast.\n",
+    );
+    let done = node(DONE, "task", "", "# Overview\n\nClosed.\n").replacen(
+        "status: todo",
+        "status: done",
+        1,
+    );
+    let g = graph(
+        "requirements",
+        &[
+            (".mdkg/design/edd.md", edd),
+            (".mdkg/design/prd.md", prd),
+            (".mdkg/work/task.md", task),
+            (".mdkg/work/spike.md", spike),
+            (".mdkg/work/bare.md", bare),
+            (".mdkg/work/done.md", done),
+            (".mdkg/core/rule.md", rule),
+        ],
+    );
+    let design = |rel: &str| format!(".mdkg/design/{rel}");
+    let work = |rel: &str| format!(".mdkg/work/{rel}");
+    let expected = vec![
+        (Code::ReqMissing, work("bare.md"), None),
+        (Code::ReqRelationOnDesign, design("edd.md"), Some(10)),
+        (Code::ReqNotQuestion, work("spike.md"), Some(11)),
+        // Body lines 7 to 14 of the task.
+        (Code::ReqDuplicateId, work("task.md"), Some(15)),
+        (Code::ReqNotEars, work("task.md"), Some(16)),
+        (Code::ReqVague, work("task.md"), Some(16)),
+        (Code::ReqBadRelation, work("task.md"), Some(17)),
+        (Code::ReqBadRelation, work("task.md"), Some(18)),
+        (Code::ReqBadRelation, work("task.md"), Some(19)),
+        (Code::ReqBadLine, work("task.md"), Some(21)),
+        (Code::ReqVague, work("task.md"), Some(22)),
+    ];
+    let mut expected = expected;
+    expected
+        .sort_by(|a, b| (a.1.as_str(), a.2, a.0.as_str()).cmp(&(b.1.as_str(), b.2, b.0.as_str())));
+    assert_eq!(requirement_warnings(&g.0), expected);
+    // The rule is in the graph; its prose only goes unwarned.
+    let index = load(&g.0).expect("index");
+    assert!(index.get(&format!("root:{RULE}")).is_some());
+
+    // "EARS uses shall" for should, must and will.
+    let config = config::load(&g.0).expect("test setup");
+    let receipt = validate::validate(&g.0, &config).expect("test setup");
+    let not_ears = receipt
+        .warnings
+        .iter()
+        .find(|d| d.code == Code::ReqNotEars)
+        .expect("not_ears");
+    assert_eq!(not_ears.hint.as_deref(), Some("EARS uses shall"));
 }

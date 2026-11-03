@@ -224,3 +224,115 @@ fn a_goal_done_anchors_the_chain() {
     let (code, out) = run_in(&repo, &["verify"]);
     assert_eq!((code, codes(&out)), (0, vec![]), "anchored: {out}");
 }
+
+#[test]
+fn anchor_text_counts_actors_and_json_keeps_the_complete_list() {
+    let dir = scratch();
+    let repo = repo(&dir);
+    // Seed a genuine journal without hundreds of CLI subprocesses.
+    let mut actors: Vec<String> = (0..160)
+        .map(|i| {
+            mdkg_run::mail::CliMail::new(
+                env!("CARGO_BIN_EXE_mdkg").into(),
+                repo.clone(),
+                if i % 2 == 0 {
+                    "launcher"
+                } else {
+                    "orchestrator"
+                }
+                .into(),
+            )
+            .holder
+        })
+        .collect();
+    actors.extend(
+        [
+            "claude-worker",
+            "codex-worker",
+            "opencode-worker",
+            "launcher@other",
+            "orchestrator@run-not-a-uuid",
+            "mdkg",
+        ]
+        .map(String::from),
+    );
+    actors.sort();
+    let seed = || {
+        let mut store =
+            mdkg_coord_sqlite::Store::open(&repo.join(".git/mdkg/coord.sqlite"), 7_200_000)
+                .expect("fixture store");
+        for (i, actor) in actors.iter().enumerate() {
+            let outcome = store
+                .execute(&mdkg_coord::Command::Claim {
+                    owner: actor.clone(),
+                    scope: mdkg_coord::Scope::new(format!("fixture/actor-{i}")),
+                    mode: mdkg_coord::lease::Mode::Exclusive,
+                    now: 1,
+                    request: None,
+                    node: None,
+                })
+                .unwrap();
+            let mdkg_coord::Outcome::Lease { lease } = outcome else {
+                panic!("{outcome:?}")
+            };
+            assert_eq!(
+                store
+                    .execute(&mdkg_coord::Command::Release {
+                        owner: actor.clone(),
+                        lease,
+                        now: 1,
+                    })
+                    .unwrap(),
+                mdkg_coord::Outcome::Done
+            );
+        }
+    };
+    seed();
+    let out = isolated(&mut Command::new(env!("CARGO_BIN_EXE_mdkg")))
+        .current_dir(&repo)
+        .args(["--as", "named-worker", "anchor"])
+        .output()
+        .expect("anchor text");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let text = String::from_utf8(out.stdout).expect("text");
+    assert!(
+        text.lines().next().unwrap().starts_with("anchored store "),
+        "{text}"
+    );
+    assert!(
+        text.lines().next().unwrap().ends_with("; commit it"),
+        "{text}"
+    );
+    let store = mdkg_coord_sqlite::Store::open(&repo.join(".git/mdkg/coord.sqlite"), 7_200_000)
+        .expect("fixture store");
+    let (checkpoint, _) = store.log_head().expect("checkpoint head");
+    assert_eq!(
+        text.lines().nth(1).expect("checkpoint line"),
+        format!(
+            "checkpoint {checkpoint}: records 1 to {}; actors: launcher 160, named 5, system 1 (full list: --json)",
+            checkpoint - 1
+        )
+    );
+    drop(store);
+    assert!(!text.contains("launcher@run-"), "{text}");
+    assert!(text.len() < 700, "{text}");
+
+    // A new range with more actors than fit in the stored prose summary.
+    seed();
+    let (code, out) = run_in(&repo, &["anchor"]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(
+        out["data"]["checkpoint"]["actors"],
+        serde_json::json!(actors)
+    );
+    let (code, out) = run_in(&repo, &["anchor"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(
+        out["data"].get("checkpoint").is_none(),
+        "no fresh records: {out}"
+    );
+}

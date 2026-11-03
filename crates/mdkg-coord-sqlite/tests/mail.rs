@@ -211,6 +211,85 @@ fn ttl_bodies_go_on_time_and_durable_ones_stay() {
     assert!(s.message("d", 10 * day).unwrap().parts.is_some(), "durable");
 }
 
+/// The ack grace (friction item 72) keeps an acked `purge_on_ack` body
+/// for its days after the ack that would end it, and changes nothing
+/// else: a TTL body still goes on time, a human's body is kept to the
+/// later of the hold and the grace, and an unacked body is never purged.
+#[test]
+fn an_acked_body_is_kept_for_the_grace_and_ttls_and_holds_keep_their_times() {
+    let dir = Scratch::new("grace");
+    let mut s = dir.store();
+    s.set_ack_grace_days(3);
+    let day = 24 * 60 * 60 * 1000;
+    let to_b = || To::Mailboxes(vec!["b".into()]);
+    s.send(&post("p", "a", to_b(), "x", 0)).unwrap();
+    let mut ttl = post("t", "a", to_b(), "y", 0);
+    ttl.retention = Retention::Ttl(1);
+    s.send(&ttl).unwrap();
+    // To a human with a 7-day hold, and to b, who acks at once.
+    s.send(&post(
+        "h",
+        "a",
+        To::Mailboxes(vec!["b".into(), "human:nick".into()]),
+        "z",
+        0,
+    ))
+    .unwrap();
+    s.send(&post("u", "a", to_b(), "w", 0)).unwrap();
+    show(&mut s, "b", 1);
+    let acked = s
+        .ack(
+            &["p".into(), "t".into(), "h".into()],
+            &["b".into()],
+            "b",
+            None,
+            None,
+            day,
+        )
+        .unwrap();
+    assert!(acked.purged.is_empty(), "nothing goes at the ack");
+    assert!(s.message("p", 4 * day - 1).unwrap().parts.is_some());
+    assert!(
+        s.message("t", 4 * day - 1).unwrap().parts.is_none(),
+        "its TTL"
+    );
+    assert!(
+        s.message("p", 4 * day).unwrap().parts.is_none(),
+        "the grace is over"
+    );
+    assert!(
+        s.message("h", 7 * day - 1).unwrap().parts.is_some(),
+        "the hold"
+    );
+    assert!(s.message("h", 7 * day).unwrap().parts.is_none());
+    assert!(s.message("u", 30 * day).unwrap().parts.is_some(), "unacked");
+}
+
+/// Only the ack that ends a body's last delivery starts its grace: acking
+/// it again, as a turn-end ack or a forward does, doesn't push the purge
+/// back (review of d4444ef5, minor 1).
+#[test]
+fn a_repeat_ack_does_not_move_the_purge_time() {
+    let dir = Scratch::new("reack");
+    let mut s = dir.store();
+    s.set_ack_grace_days(3);
+    let day = 24 * 60 * 60 * 1000;
+    s.send(&post("p", "a", To::Mailboxes(vec!["b".into()]), "x", 0))
+        .unwrap();
+    show(&mut s, "b", 1);
+    s.ack(&["p".into()], &["b".into()], "b", None, None, day)
+        .unwrap();
+    let again = s
+        .ack(&["p".into()], &["b".into()], "b", None, None, 3 * day)
+        .unwrap();
+    assert!(again.purged.is_empty());
+    assert!(s.message("p", 4 * day - 1).unwrap().parts.is_some());
+    assert!(
+        s.message("p", 4 * day).unwrap().parts.is_none(),
+        "the grace runs from the first ack"
+    );
+}
+
 #[test]
 fn replies_share_the_context_and_threads_list_it_in_order() {
     let dir = Scratch::new("thread");
@@ -1028,4 +1107,603 @@ fn a_mark_after_a_restore_leaves_a_different_message_unshown() {
     s.mark_shown(&[Shown::of(&m)], &["b".into()], 6).unwrap();
     s.ack(&["m".into()], &["b".into()], "b", None, None, 7)
         .unwrap();
+}
+
+#[test]
+fn inbox_from_counts_only_the_senders_named() {
+    let dir = Scratch::new("inbox-from");
+    let mut s = dir.store();
+    for (n, (id, sender)) in [("a1", "a"), ("c1", "c"), ("a2", "a")]
+        .into_iter()
+        .enumerate()
+    {
+        s.send(&post(
+            id,
+            sender,
+            To::Mailboxes(vec!["b".into()]),
+            id,
+            n as u64,
+        ))
+        .expect("send");
+    }
+    let q = InboxQuery {
+        mailboxes: vec!["b".into()],
+        limit: Some(1),
+        ..InboxQuery::default()
+    };
+    let from_a = s.inbox_from(&q, &["a".into()]).expect("inbox");
+    let got: Vec<&str> = from_a
+        .messages
+        .iter()
+        .map(|m| m.message_id.as_str())
+        .collect();
+    assert_eq!(got, ["a1"]);
+    assert!(from_a.more, "a2 matches too");
+    let from_c = s.inbox_from(&q, &["c".into()]).expect("inbox");
+    assert!(!from_c.more);
+    assert_eq!(from_c.messages[0].message_id, "c1");
+}
+
+#[test]
+fn ack_through_acks_each_mailboxs_shown_deliveries_in_range() {
+    let dir = Scratch::new("ack-through");
+    let mut s = dir.store();
+    let both = || To::Mailboxes(vec!["b".into(), "role:r".into()]);
+    let (m1, _) = s.send(&post("m1", "a", both(), "m1", 1)).expect("send");
+    let mut f = post("f1", "a", both(), "f1", 2);
+    f.kind = "findings".into();
+    s.send(&f).expect("send");
+    let (m3, _) = s.send(&post("m3", "a", both(), "m3", 3)).expect("send");
+    // Only b has seen them; role:r hasn't.
+    show(&mut s, "b", 4);
+    let mailboxes = vec!["b".to_string(), "role:r".to_string()];
+    let (acked, skipped) = s
+        .ack_through(m3.seq - 1, &[], &mailboxes, "b", None, Some("bulk"), 5)
+        .expect("ack");
+    assert_eq!(acked.acked, [("m1".to_string(), "b".to_string())]);
+    assert!(acked.purged.is_empty(), "role:r hasn't acked m1");
+    let why: Vec<(&str, &str, &str)> = skipped
+        .iter()
+        .map(|k| (k.message_id.as_str(), k.mailbox.as_str(), k.reason))
+        .collect();
+    assert_eq!(
+        why,
+        [
+            ("f1", "b", "findings"),
+            ("m1", "role:r", "not_shown"),
+            ("f1", "role:r", "findings"),
+        ]
+    );
+    // Out of range: m3 stays for both.
+    assert_eq!(inbox(&mut s, "b", None), ["f1", "m3"]);
+    show(&mut s, "role:r", 6);
+    let (acked, skipped) = s
+        .ack_through(m3.seq, &["note".into()], &mailboxes, "b", None, None, 7)
+        .expect("ack");
+    assert!(skipped.is_empty(), "{skipped:?}");
+    assert_eq!(acked.acked.len(), 3, "{acked:?}");
+    assert_eq!(acked.purged, ["m1", "m3"]);
+    let body = s.message("m1", 8).expect("message").parts;
+    assert!(body.is_none(), "purged once every delivery is acked");
+    assert!(m1.seq < m3.seq);
+}
+
+/// A forward that fails at any step sends and acks nothing, and one that
+/// succeeds can't be repeated (review of 7aaedb9).
+#[test]
+fn a_forward_is_all_or_nothing_and_happens_once() {
+    let dir = Scratch::new("forward");
+    let mut s = dir.store();
+    let to_b = || To::Mailboxes(vec!["b".into()]);
+    let (m1, _) = s.send(&post("m1", "a", to_b(), "one", 1)).expect("send");
+    let (m2, _) = s.send(&post("m2", "a", to_b(), "two", 2)).expect("send");
+    let (other, _) = s
+        .send(&post("o1", "a", To::Mailboxes(vec!["c".into()]), "c's", 3))
+        .expect("send");
+    show(&mut s, "b", 4);
+    let b = vec!["b".to_string()];
+    let fwd = |id: &str, to: To| {
+        let mut out = post(id, "b", to, "forwarded", 5);
+        out.sender_mailboxes = vec!["b".into()];
+        out
+    };
+    let src = |m: &mdkg_coord_sqlite::mail::Message| (m.message_id.clone(), m.digest.clone());
+    let unchanged = |s: &mut Store| {
+        assert_eq!(inbox(s, "b", None), ["m1", "m2"], "nothing acked");
+        assert!(inbox(s, "lane", None).is_empty(), "nothing sent");
+    };
+    // Another reader's mail, given by id.
+    let e = s
+        .forward(
+            &fwd("f-a", to_b()),
+            &[src(&m1), src(&other)],
+            &b,
+            "b",
+            None,
+            6,
+        )
+        .expect_err("not b's");
+    assert!(matches!(e, MailError::NotHolder(_)), "{e:?}");
+    unchanged(&mut s);
+    // A body changed since it was read (a restore in between).
+    let stale = (m2.message_id.clone(), "sha256:stale".to_string());
+    let e = s
+        .forward(
+            &fwd("f-b", To::Mailboxes(vec!["lane".into()])),
+            &[src(&m1), stale],
+            &b,
+            "b",
+            None,
+            6,
+        )
+        .expect_err("stale");
+    assert!(matches!(e, MailError::NotHolder(_)), "{e:?}");
+    unchanged(&mut s);
+    // The send fails after the sources check out: an unknown room, and no
+    // recipient but the forwarder.
+    let e = s
+        .forward(
+            &fwd("f-c", To::Room("nowhere".into())),
+            &[src(&m1)],
+            &b,
+            "b",
+            None,
+            6,
+        )
+        .expect_err("no room");
+    assert!(matches!(e, MailError::UnknownRoom(_)), "{e:?}");
+    let e = s
+        .forward(&fwd("f-d", to_b()), &[src(&m1)], &b, "b", None, 6)
+        .expect_err("only b");
+    assert!(matches!(e, MailError::NoRecipients), "{e:?}");
+    unchanged(&mut s);
+    // One forward succeeds, acks both and purges their bodies.
+    let lane = || To::Mailboxes(vec!["lane".into()]);
+    let (sent, acked) = s
+        .forward(
+            &fwd("f-e", lane()),
+            &[src(&m1), src(&m2)],
+            &b,
+            "b",
+            Some("fwd"),
+            7,
+        )
+        .expect("forward");
+    assert_eq!(acked.purged, ["m1", "m2"]);
+    assert_eq!(
+        inbox(&mut s, "lane", None),
+        std::slice::from_ref(&sent.message_id)
+    );
+    assert!(inbox(&mut s, "b", None).is_empty());
+    // A retry, or a second forward racing the first, finds them acked and
+    // their bodies gone: refused, with nothing more sent.
+    let e = s
+        .forward(&fwd("f-f", lane()), &[src(&m1), src(&m2)], &b, "b", None, 8)
+        .expect_err("already forwarded");
+    assert!(matches!(e, MailError::NotHolder(_)), "{e:?}");
+    assert_eq!(inbox(&mut s, "lane", None), [sent.message_id]);
+}
+
+/// Two forwards of the same mail at once, on two connections: exactly one
+/// is stored, and the other sends nothing (review of 7aaedb9).
+#[test]
+fn racing_forwards_store_exactly_one() {
+    let dir = Scratch::new("forward-race");
+    let mut s = dir.store();
+    let (m1, _) = s
+        .send(&post("m1", "a", To::Mailboxes(vec!["b".into()]), "one", 1))
+        .expect("send");
+    show(&mut s, "b", 2);
+    drop(s);
+    let source = (m1.message_id.clone(), m1.digest.clone());
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let results: Vec<bool> = ["f-1", "f-2"]
+        .into_iter()
+        .map(|id| {
+            let mut store = dir.store();
+            let barrier = barrier.clone();
+            let source = source.clone();
+            std::thread::spawn(move || {
+                let mut out = post(id, "b", To::Mailboxes(vec!["lane".into()]), id, 3);
+                out.sender_mailboxes = vec!["b".into()];
+                barrier.wait();
+                store
+                    .forward(&out, &[source], &["b".to_string()], "b", None, 3)
+                    .is_ok()
+            })
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|t| t.join().expect("thread"))
+        .collect();
+    assert_eq!(results.iter().filter(|ok| **ok).count(), 1, "{results:?}");
+    let mut s = dir.store();
+    assert_eq!(inbox(&mut s, "lane", None).len(), 1);
+}
+
+/// The send is rolled back when an ack after it fails: the first source's
+/// ack and purge go too (review of 278826c).
+#[test]
+fn a_forward_whose_later_ack_fails_rolls_back_its_send() {
+    let dir = Scratch::new("forward-rollback");
+    let mut s = dir.store();
+    let to_b = || To::Mailboxes(vec!["b".into()]);
+    let (m1, _) = s.send(&post("m1", "a", to_b(), "one", 1)).expect("send");
+    show(&mut s, "b", 2);
+    // Delivered to b after the listing, so never shown to it.
+    let (m3, _) = s.send(&post("m3", "a", to_b(), "three", 3)).expect("send");
+    let mut out = post("f-1", "b", To::Mailboxes(vec!["lane".into()]), "fwd", 4);
+    out.sender_mailboxes = vec!["b".into()];
+    let sources = [
+        (m1.message_id.clone(), m1.digest.clone()),
+        (m3.message_id.clone(), m3.digest.clone()),
+    ];
+    let e = s
+        .forward(&out, &sources, &["b".to_string()], "b", None, 4)
+        .expect_err("m3 wasn't shown");
+    assert!(matches!(e, MailError::NotShown(_)), "{e:?}");
+    assert!(
+        inbox(&mut s, "lane", None).is_empty(),
+        "the send rolled back"
+    );
+    assert_eq!(
+        inbox(&mut s, "b", None),
+        ["m1", "m3"],
+        "m1's ack rolled back"
+    );
+    let m1 = s.message("m1", 5).expect("message");
+    assert!(m1.parts.is_some(), "m1's purge rolled back");
+    assert!(m1.deliveries.iter().all(|d| d.state == "delivered"));
+}
+
+/// Two of the three source guards, each alone (the digest guard is
+/// isolated in `a_forward_is_all_or_nothing_and_happens_once`): a source the forwarder acked whose
+/// body another recipient keeps, and an unacked source whose body a TTL
+/// purged after it was read (review of 278826c).
+#[test]
+fn a_forward_refuses_an_acked_source_and_a_purged_one_separately() {
+    let dir = Scratch::new("forward-guards");
+    let mut s = dir.store();
+    let b = vec!["b".to_string()];
+    let fwd = |id: &str, now: u64| {
+        let mut out = post(id, "b", To::Mailboxes(vec!["lane".into()]), id, now);
+        out.sender_mailboxes = vec!["b".into()];
+        out
+    };
+    // Acked by b, body kept for d.
+    let (shared, _) = s
+        .send(&post(
+            "s1",
+            "a",
+            To::Mailboxes(vec!["b".into(), "d".into()]),
+            "s",
+            1,
+        ))
+        .expect("send");
+    show(&mut s, "b", 2);
+    s.ack(&["s1".into()], &b, "b", None, None, 2).expect("ack");
+    assert!(
+        s.message("s1", 2).expect("message").parts.is_some(),
+        "d keeps it"
+    );
+    let e = s
+        .forward(
+            &fwd("f-1", 3),
+            &[(shared.message_id.clone(), shared.digest.clone())],
+            &b,
+            "b",
+            None,
+            3,
+        )
+        .expect_err("already acked");
+    assert!(matches!(e, MailError::NotHolder(_)), "{e:?}");
+    // Unacked, read, then purged by its TTL before the forward.
+    let mut ttl = post("t1", "a", To::Mailboxes(vec!["b".into()]), "t", 4);
+    ttl.retention = Retention::Ttl(1);
+    let (t1, _) = s.send(&ttl).expect("send");
+    show(&mut s, "b", 5);
+    let later = 4 + 2 * 24 * 3_600_000;
+    let e = s
+        .forward(
+            &fwd("f-2", later),
+            &[(t1.message_id.clone(), t1.digest.clone())],
+            &b,
+            "b",
+            None,
+            later,
+        )
+        .expect_err("purged");
+    assert!(matches!(e, MailError::NotHolder(_)), "{e:?}");
+    assert!(inbox(&mut s, "lane", None).is_empty(), "nothing sent");
+    assert_eq!(inbox(&mut s, "b", None), ["t1"], "t1 stays unacked");
+}
+
+#[test]
+fn both_channel_context_prefixes_are_excluded_from_direct_conversations() {
+    for prefix in ["room:r", "channel:r"] {
+        let dir = Scratch::new("reserved-context");
+        let mut store = dir.store();
+        let mut direct = post("direct", "a", To::Mailboxes(vec!["b".into()]), "private", 0);
+        direct.context_id = Some(prefix.into());
+        assert!(matches!(
+            store.send(&direct),
+            Err(MailError::NotInConversation)
+        ));
+        direct.context_id = None;
+        store.send(&direct).unwrap();
+        older_context(&dir, "direct", prefix);
+        let mut reply = post("reply", "b", To::Mailboxes(vec!["a".into()]), "answer", 1);
+        reply.reference_ids.push("direct".into());
+        assert_eq!(store.send(&reply).unwrap().0.context_id, "reply");
+        // Even a direct participant cannot explicitly join the reserved context.
+        reply.message_id = "explicit".into();
+        reply.context_id = Some(prefix.into());
+        assert!(matches!(
+            store.send(&reply),
+            Err(MailError::NotInConversation)
+        ));
+    }
+}
+
+#[test]
+fn actor_mail_snapshots_match_role_history_at_their_opaque_cursor() {
+    use mdkg_coord::{Command, Mode, Outcome, Scope};
+    use mdkg_coord_sqlite::events::Reader;
+    use std::collections::BTreeMap;
+    let dir = Scratch::new("actor-snapshots");
+    let mut store = dir.store();
+    store
+        .room_create("review", "sender", &["role:reviewer".into()], 0)
+        .unwrap();
+    store
+        .send(&post(
+            "role-message",
+            "sender",
+            To::Room("review".into()),
+            "role mail",
+            1,
+        ))
+        .unwrap();
+    let path = dir.0.join("mdkg/coord.sqlite");
+    let writer_path = path.clone();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let writer_barrier = barrier.clone();
+    let writer = std::thread::spawn(move || {
+        let mut writer = Store::open_with(&writer_path, 1000, Upgrade::Refuse).unwrap();
+        writer_barrier.wait();
+        for _ in 0..64 {
+            let lease = match writer
+                .execute(&Command::Claim {
+                    owner: "a".into(),
+                    scope: Scope::new("role:reviewer"),
+                    mode: Mode::Exclusive,
+                    now: 10,
+                    request: None,
+                    node: None,
+                })
+                .unwrap()
+            {
+                Outcome::Lease { lease } => lease,
+                other => panic!("expected role: {other:?}"),
+            };
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            writer
+                .execute(&Command::Release {
+                    owner: "a".into(),
+                    lease,
+                    now: 10,
+                })
+                .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    });
+    barrier.wait();
+    let mut snapshots = Vec::new();
+    for _ in 0..64 {
+        let (inbox, mailboxes) = store
+            .inbox_from_for_actor(
+                &InboxQuery {
+                    now_ms: 10,
+                    ..InboxQuery::default()
+                },
+                &[],
+                "a",
+                None,
+                || 10,
+            )
+            .unwrap();
+        let owns = mailboxes.iter().any(|m| m == "role:reviewer");
+        assert_eq!(inbox.messages.len(), usize::from(owns));
+        snapshots.push((inbox.event_cursor, owns));
+        let (channels, cursor) = store
+            .channels_for_actor_with_cursor("a", true, || 10)
+            .unwrap();
+        assert!(channels.is_empty() || (channels.len() == 1 && channels[0].1 == 1));
+        snapshots.push((cursor, !channels.is_empty()));
+        match store.member_room_messages_for_actor_with_cursor(
+            "review",
+            "a",
+            Page::default(),
+            || 10,
+        ) {
+            Ok((messages, cursor)) => {
+                assert_eq!(messages.len(), 1);
+                snapshots.push((cursor, true));
+            }
+            Err(MailError::NotMember { .. }) => {}
+            other => panic!("unexpected member snapshot: {other:?}"),
+        }
+    }
+    writer.join().unwrap();
+    let mut history = BTreeMap::new();
+    let mut held = false;
+    let mut reader =
+        Reader::open(&path, "01a185ac-560e-76e0-91af-2c49dfc29b81", Some("start")).unwrap();
+    loop {
+        let page = reader.poll(256).unwrap();
+        for event in page.events {
+            if event.data["lease"]["scope"] == "role:reviewer" {
+                held = event.data["lease"]["status"] == "active";
+            }
+            history.insert(event.cursor, held);
+        }
+        if !page.more {
+            break;
+        }
+    }
+    for (cursor, held) in snapshots {
+        assert_eq!(
+            history.get(&cursor),
+            Some(&held),
+            "snapshot role selection must match its cursor's history"
+        );
+    }
+    assert!(matches!(
+        store.inbox_from_for_actor(
+            &InboxQuery::default(),
+            &[],
+            "a",
+            Some("role:reviewer"),
+            || 10
+        ),
+        Err(MailError::MailboxNotHeld { role: true })
+    ));
+}
+
+#[test]
+fn numeric_thread_interpretation_matches_its_snapshot_cursor() {
+    use mdkg_coord_sqlite::events::Reader;
+    use std::collections::BTreeMap;
+    let dir = Scratch::new("numeric-snapshot");
+    let mut store = dir.store();
+    store
+        .send(&post(
+            "old",
+            "sender",
+            To::Mailboxes(vec!["b".into()]),
+            "old thread",
+            1,
+        ))
+        .unwrap();
+    let path = dir.0.join("mdkg/coord.sqlite");
+    let writer_path = path.clone();
+    let writer = std::thread::spawn(move || {
+        let mut writer = Store::open_with(&writer_path, 1000, Upgrade::Refuse).unwrap();
+        let mut message = post(
+            "1",
+            "sender",
+            To::Mailboxes(vec!["b".into()]),
+            "numeric id",
+            2,
+        );
+        message.context_id = Some("new-context".into());
+        writer.send(&message).unwrap();
+    });
+    let mut snapshots = Vec::new();
+    for _ in 0..32 {
+        let (context, messages, cursor) = store
+            .thread_handle_with_cursor("1", Some((1, false)), Page::default(), || 3)
+            .unwrap();
+        assert_eq!(messages.len(), 1);
+        snapshots.push((cursor, context));
+    }
+    writer.join().unwrap();
+    let (context, _, _) = store
+        .thread_handle_with_cursor("#1", Some((1, true)), Page::default(), || 3)
+        .unwrap();
+    assert_eq!(
+        context, "old",
+        "forced number keeps the sequence interpretation"
+    );
+    let (context, _, _) = store
+        .thread_handle_with_cursor("1", Some((1, false)), Page::default(), || 3)
+        .unwrap();
+    assert_eq!(context, "new-context", "literal ids keep precedence");
+    let mut reader =
+        Reader::open(&path, "01a185ac-560e-76e0-91af-2c49dfc29b81", Some("start")).unwrap();
+    let mut numeric_exists = false;
+    let mut history = BTreeMap::new();
+    loop {
+        let page = reader.poll(256).unwrap();
+        for event in page.events {
+            if event.data["message"]["messageId"] == "1" {
+                numeric_exists = true;
+            }
+            history.insert(
+                event.cursor,
+                if numeric_exists { "new-context" } else { "old" },
+            );
+        }
+        if !page.more {
+            break;
+        }
+    }
+    for (cursor, context) in snapshots {
+        assert_eq!(
+            history.get(&cursor).copied(),
+            Some(context.as_str()),
+            "handle interpretation must match the cursor's history"
+        );
+    }
+}
+
+#[test]
+fn fault_ids_and_new_fault_conversations_are_reserved_to_mdkg_senders() {
+    let dir = Scratch::new("reserved-fault-id");
+    let mut s = dir.store();
+    let to = || To::Mailboxes(vec!["b".into()]);
+    for id in ["fault.x.r0", "FAULT.x.r0", "Fault.y"] {
+        assert!(
+            matches!(
+                s.send(&post(id, "a", to(), "preclaim", 1)),
+                Err(MailError::ReservedId)
+            ),
+            "{id}"
+        );
+    }
+    let mut named = post("m1", "a", to(), "new conversation", 1);
+    named.context_id = Some("fault.x.r0".into());
+    assert!(matches!(s.send(&named), Err(MailError::ReservedId)));
+    assert!(inbox(&mut s, "b", None).is_empty(), "nothing was stored");
+    // mdkg's own sender takes the id, and a reply may then join its
+    // conversation by naming it.
+    let mut fault = post("fault.x.r0", "mdkg:supervisor", to(), "fault", 2);
+    fault.sender_mailboxes = Vec::new();
+    s.send(&fault).unwrap();
+    let mut reply = post("m2", "b", To::Mailboxes(vec!["c".into()]), "seen", 3);
+    reply.reference_ids = vec!["fault.x.r0".into()];
+    reply.context_id = Some("fault.x.r0".into());
+    s.send(&reply).unwrap();
+}
+
+#[test]
+fn an_empty_kind_list_hides_only_receipts_and_keeps_unknown_kinds() {
+    let dir = Scratch::new("kinds");
+    let mut s = dir.store();
+    for (id, kind, n) in [("n1", "note", 1), ("r1", "receipt", 2), ("x1", "x_new", 3)] {
+        let mut out = post(id, "a", To::Mailboxes(vec!["b".into()]), "hi", n);
+        out.kind = kind.into();
+        s.send(&out).unwrap();
+    }
+    // A kind a later build added still reads; a receipt is left out.
+    assert_eq!(inbox(&mut s, "b", None), vec!["n1", "x1"]);
+    let named = |s: &mut Store, kinds: &[&str]| -> Vec<String> {
+        s.inbox(&InboxQuery {
+            mailboxes: vec!["b".into()],
+            kinds: kinds.iter().map(|k| k.to_string()).collect(),
+            ..InboxQuery::default()
+        })
+        .unwrap()
+        .messages
+        .into_iter()
+        .map(|m| m.message_id)
+        .collect()
+    };
+    assert_eq!(named(&mut s, &["receipt"]), vec!["r1"]);
+    assert_eq!(named(&mut s, &["x_new", "receipt"]), vec!["r1", "x1"]);
+    // `status` counts what a plain read shows: the receipt isn't counted.
+    assert_eq!(
+        s.unacked(&["b".into()]).unwrap(),
+        vec![("b".to_string(), 2)]
+    );
 }

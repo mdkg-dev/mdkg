@@ -1,0 +1,300 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "mdkg.api.event_data.v1",
+  "description": "Draft API v1 A9 payload objects. The event schema selects the matching definition by type. Body parts and raw record bodies are untrusted opaque data.",
+  "x-mdkg-status": "draft",
+  "type": "object",
+  "$defs": {
+    "LeaseData": {
+      "type": "object",
+      "properties": {
+        "lease": {
+          "$ref": "mdkg.api.lease.v1.json#/$defs/Lease"
+        }
+      },
+      "required": [
+        "lease"
+      ]
+    },
+    "LeasesData": {
+      "type": "object",
+      "properties": {
+        "leases": {
+          "type": "array",
+          "items": {
+            "$ref": "mdkg.api.lease.v1.json#/$defs/Lease"
+          }
+        }
+      },
+      "required": [
+        "leases"
+      ]
+    },
+    "ChangesetData": {
+      "type": "object",
+      "properties": {
+        "changeset": {
+          "$ref": "mdkg.api.changeset.v1.json#/$defs/Changeset"
+        },
+        "nodes": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "description": "A canonical resource path (A2)."
+          }
+        }
+      },
+      "required": [
+        "changeset",
+        "nodes"
+      ]
+    },
+    "ChangesetsData": {
+      "type": "object",
+      "properties": {
+        "changesets": {
+          "type": "array",
+          "items": {
+            "$ref": "mdkg.api.changeset.v1.json#/$defs/Changeset"
+          }
+        }
+      },
+      "required": [
+        "changesets"
+      ]
+    },
+    "MessageData": {
+      "type": "object",
+      "properties": {
+        "message": {
+          "$ref": "mdkg.api.message.v1.json#/$defs/Message"
+        }
+      },
+      "required": [
+        "message"
+      ]
+    },
+    "ChannelData": {
+      "type": "object",
+      "properties": {
+        "channel": {
+          "$ref": "mdkg.api.channel.v1.json#/$defs/Channel"
+        }
+      },
+      "required": [
+        "channel"
+      ]
+    },
+    "AckData": {
+      "type": "object",
+      "properties": {
+        "acked": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "message": {
+                "type": "string",
+                "description": "A canonical resource path (A2)."
+              },
+              "mailbox": {
+                "type": "string",
+                "description": "A canonical resource path (A2)."
+              }
+            },
+            "required": [
+              "message",
+              "mailbox"
+            ]
+          }
+        },
+        "by": {
+          "type": "string"
+        },
+        "purged": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "description": "A canonical resource path (A2)."
+          }
+        }
+      },
+      "required": [
+        "acked",
+        "by",
+        "purged"
+      ]
+    },
+    "PurgeData": {
+      "type": "object",
+      "properties": {
+        "messages": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "description": "A canonical resource path (A2)."
+          }
+        },
+        "reason": {
+          "type": "string",
+          "x-mdkg-open": true
+        }
+      },
+      "required": [
+        "messages",
+        "reason"
+      ]
+    },
+    "MainData": {
+      "type": "object",
+      "properties": {
+        "commit": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "settled": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "description": "A canonical resource path (A2)."
+          }
+        }
+      },
+      "required": [
+        "commit",
+        "settled"
+      ]
+    },
+    "StatusData": {
+      "type": "object",
+      "properties": {
+        "node": {
+          "type": "string",
+          "description": "A canonical resource path (A2)."
+        },
+        "status": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-mdkg-open": true
+        }
+      },
+      "required": [
+        "node",
+        "status"
+      ]
+    },
+    "RecordData": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string"
+        },
+        "record": {
+          "type": "object",
+          "properties": {
+            "v": {
+              "const": 1
+            },
+            "seq": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "prev": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "ts": {
+              "type": "string"
+            },
+            "actor": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string"
+            },
+            "subject": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "body": {
+              "type": "object",
+              "additionalProperties": true
+            }
+          },
+          "required": [
+            "v",
+            "seq",
+            "prev",
+            "ts",
+            "actor",
+            "kind",
+            "subject",
+            "body"
+          ]
+        },
+        "refused": {
+          "type": "boolean"
+        },
+        "code": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "imported": {
+          "const": true
+        },
+        "opaque": {
+          "const": true,
+          "description": "The store's lease journal from before its log didn't replay to the outcomes older builds recorded, so this lease or changeset record has no derived state. On the `log.genesis` record, it is where that began."
+        },
+        "diverged_at": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "On the `log.genesis` record of an opaque history: the first journal entry that didn't replay."
+        }
+      },
+      "required": [
+        "kind",
+        "record"
+      ]
+    },
+    "HeartbeatData": {
+      "type": "object",
+      "properties": {
+        "head": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "head"
+      ]
+    },
+    "ErrorData": {
+      "type": "object",
+      "properties": {
+        "diagnostics": {
+          "type": "array",
+          "items": {
+            "$ref": "mdkg.api.channel.v1.json#/$defs/DiagnosticOut"
+          }
+        },
+        "head": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "diagnostics",
+        "head"
+      ]
+    }
+  }
+}

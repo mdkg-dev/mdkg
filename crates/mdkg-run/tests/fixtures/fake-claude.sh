@@ -67,5 +67,6 @@ fi
 case "$(cat fake-mode 2>/dev/null || echo ok)" in
   error) echo "{\"type\":\"result\",\"subtype\":\"error_max_turns\",\"is_error\":true,\"session_id\":\"$session\"}" ;;
   crash) echo "boom" >&2; exit 3 ;;
-  *) echo "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"claude reply\",\"session_id\":\"$session\"}" ;;
+  # A fake-reply file holds the final message (one line), else "claude reply".
+  *) echo "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"$(cat fake-reply 2>/dev/null || echo claude reply)\",\"session_id\":\"$session\"}" ;;
 esac

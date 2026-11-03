@@ -14,10 +14,17 @@ pub fn codex_fragment(bin: &str) -> String {
         "SessionStart": [{"hooks": [command("start")]}],
         "UserPromptSubmit": [{"hooks": [command("start")]}],
         "Stop": [{"hooks": [command("stop")]}],
-        "PreToolUse": [{"matcher": "apply_patch", "hooks": [command("edit")]}]
+        "PreToolUse": [{"matcher": PRE_TOOL_MATCHER, "hooks": [command("edit")]}]
     }});
     format!("{fragment:#}\n")
 }
+
+/// The tools the router checks before they run: `apply_patch`'s edits
+/// (`lease.edit`), and Bash, whose git pushes `git.protect` reads.
+pub const PRE_TOOL_MATCHER: &str = "apply_patch|Bash";
+
+/// 0.7.0's matcher, still recognised as mdkg's own.
+const PRE_TOOL_MATCHER_070: &str = "apply_patch";
 
 fn shell_word(bin: &str) -> String {
     if !bin.is_empty()
@@ -84,13 +91,15 @@ fn only_ours(bytes: &[u8], bin: &str) -> bool {
         (&doc.hooks.session_start, "start", None),
         (&doc.hooks.user_prompt_submit, "start", None),
         (&doc.hooks.stop, "stop", None),
-        (&doc.hooks.pre_tool_use, "edit", Some("apply_patch")),
+        (&doc.hooks.pre_tool_use, "edit", Some(PRE_TOOL_MATCHER)),
     ];
     events.iter().any(|(entries, _, _)| !entries.is_empty())
         && events.iter().all(|(entries, event, matcher)| {
             entries.len() <= 1
                 && entries.iter().all(|entry| {
-                    entry.matcher.as_deref() == *matcher
+                    (entry.matcher.as_deref() == *matcher
+                        || (*matcher == Some(PRE_TOOL_MATCHER)
+                            && entry.matcher.as_deref() == Some(PRE_TOOL_MATCHER_070)))
                         && entry.hooks.len() == 1
                         && entry.hooks[0].kind == "command"
                         && entry.hooks[0].command == hook_command(bin, event)
@@ -206,7 +215,7 @@ mod tests {
                 format!("mdkg-next hook {cmd} --harness codex")
             );
         }
-        assert_eq!(v["hooks"]["PreToolUse"][0]["matcher"], "apply_patch");
+        assert_eq!(v["hooks"]["PreToolUse"][0]["matcher"], "apply_patch|Bash");
         let stop = json!({"hooks":{"Stop":v["hooks"]["Stop"]}});
         assert!(accepts(&stop));
         for empty in [json!({}), json!({"hooks":{}}), json!({"hooks":{"Stop":[]}})] {

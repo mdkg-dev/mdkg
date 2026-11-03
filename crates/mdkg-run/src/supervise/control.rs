@@ -5,6 +5,8 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
+use super::registry::{AgentState, Registered};
+use crate::RunError;
 use serde::{Deserialize, Serialize};
 
 /// Watch progress, independent of the agent's lifetime cursor/session state.
@@ -31,7 +33,11 @@ impl Default for Progress {
 #[derive(Debug, Default)]
 struct Shared {
     stopped: bool,
+    failure: Option<RunError>,
     progress: BTreeMap<String, Progress>,
+    /// The registered supervisor, whose agents `agents stop` drains one
+    /// at a time.
+    supervisor: Option<Arc<Registered>>,
 }
 
 /// Shared by the watcher and each supervisor thread. Stopping never signals
@@ -45,10 +51,31 @@ impl Control {
         Self(Arc::new((
             Mutex::new(Shared {
                 stopped: false,
+                failure: None,
                 progress,
+                supervisor: None,
             }),
             Condvar::new(),
         )))
+    }
+
+    /// Lets each agent's worker drain on its own stop request
+    /// ([`super::stop`]) and record its state in the supervisor's record.
+    pub fn set_supervisor(&self, supervisor: Arc<Registered>) {
+        self.0
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .supervisor = Some(supervisor);
+    }
+
+    pub fn supervisor(&self) -> Option<Arc<Registered>> {
+        self.0
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .supervisor
+            .clone()
     }
 
     pub fn request_stop(&self) {
@@ -61,6 +88,26 @@ impl Control {
         self.0.0.lock().unwrap_or_else(|e| e.into_inner()).stopped
     }
 
+    /// Stop admitting work and retain the first fatal reason. This differs
+    /// from a normal binary-change stop: after draining, the caller must
+    /// return this error and must not exec a replacement process.
+    pub fn fail(&self, error: RunError) {
+        let (shared, wake) = &*self.0;
+        let mut shared = shared.lock().unwrap_or_else(|e| e.into_inner());
+        shared.failure.get_or_insert(error);
+        shared.stopped = true;
+        wake.notify_all();
+    }
+
+    pub fn failure(&self) -> Option<RunError> {
+        self.0
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .failure
+            .clone()
+    }
+
     pub fn progress(&self) -> BTreeMap<String, Progress> {
         self.0
             .0
@@ -70,20 +117,79 @@ impl Control {
             .clone()
     }
 
+    /// Waits up to `duration`, waking on a stop, and on the agent's own
+    /// stop request within [`DRAIN_POLL`].
     fn pause(&self, duration: Duration) {
         let (shared, wake) = &*self.0;
-        let held = shared.lock().unwrap_or_else(|e| e.into_inner());
-        let _held = wake
-            .wait_timeout_while(held, duration, |s| !s.stopped)
-            .unwrap_or_else(|e| e.into_inner());
+        let until = std::time::Instant::now() + duration;
+        loop {
+            let left = until.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() || drain_requested() {
+                return;
+            }
+            let held = shared.lock().unwrap_or_else(|e| e.into_inner());
+            let (held, _) = wake
+                .wait_timeout_while(held, left.min(DRAIN_POLL), |s| !s.stopped)
+                .unwrap_or_else(|e| e.into_inner());
+            if held.stopped {
+                return;
+            }
+        }
     }
 }
 
+/// How often a pause looks for the agent's stop request.
+const DRAIN_POLL: Duration = Duration::from_millis(250);
+
 thread_local! {
     static CURRENT: RefCell<Option<Control>> = const { RefCell::new(None) };
+    /// The agent this worker thread supervises.
+    static AGENT: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
-pub(super) fn with_control<T>(control: Option<&Control>, run: impl FnOnce() -> T) -> T {
+/// Runs `run` as `agent`'s worker: [`stop_requested`] then also answers
+/// for the agent's own stop request.
+pub(crate) fn with_agent<T>(agent: &str, run: impl FnOnce() -> T) -> T {
+    struct Restore(Option<String>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            AGENT.with(|a| *a.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore = Restore(AGENT.with(|a| a.replace(Some(agent.into()))));
+    run()
+}
+
+/// This worker's agent and its supervisor, when both are known.
+fn agent_supervisor() -> Option<(String, Arc<Registered>)> {
+    let agent = AGENT.with(|a| a.borrow().clone())?;
+    let supervisor = CURRENT.with(|c| c.borrow().as_ref().and_then(Control::supervisor))?;
+    Some((agent, supervisor))
+}
+
+/// Whether `agents stop` asked this worker's supervisor to drain its agent.
+pub fn drain_requested() -> bool {
+    agent_supervisor().is_some_and(|(agent, supervisor)| {
+        super::stop::requested(supervisor.run_dir(), &agent, &supervisor.id())
+    })
+}
+
+/// The id of the supervisor this thread works for, if it registered.
+pub fn supervisor_id() -> Option<String> {
+    CURRENT
+        .with(|c| c.borrow().as_ref().and_then(Control::supervisor))
+        .map(|s| s.id())
+}
+
+/// Records this worker's agent's state in its supervisor's record.
+pub(crate) fn set_state(state: AgentState) -> Result<(), RunError> {
+    match agent_supervisor() {
+        Some((agent, supervisor)) => supervisor.set(&agent, state),
+        None => Ok(()),
+    }
+}
+
+pub(crate) fn with_control<T>(control: Option<&Control>, run: impl FnOnce() -> T) -> T {
     struct Restore(Option<Control>);
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -95,13 +201,17 @@ pub(super) fn with_control<T>(control: Option<&Control>, run: impl FnOnce() -> T
 }
 
 /// Called only between turns/queue dispatches. Never use it to abort work
-/// after a reminder reservation has been made.
+/// after a reminder reservation has been made. True on a stop of the whole
+/// supervisor, and once `agents stop` asked it to drain this worker's agent.
 pub fn stop_requested() -> bool {
-    CURRENT.with(|c| c.borrow().as_ref().is_some_and(Control::stopped))
+    CURRENT.with(|c| c.borrow().as_ref().is_some_and(Control::stopped)) || drain_requested()
 }
 
 /// Controlled idle waits poll at least once per second so a stopped process
-/// can join promptly. The mail cursor still decides which messages are new.
+/// can join promptly. This includes the local panic-drain control used by `up`:
+/// a synchronous mail wait cannot otherwise notice a sibling's failure until
+/// its timeout expires. With CLI mail this costs one child per idle second.
+/// The mail cursor still decides which messages are new.
 pub fn wait_secs(requested: u64) -> u64 {
     CURRENT.with(|c| {
         if c.borrow().is_some() {
@@ -130,6 +240,9 @@ pub fn load_progress(agent: &str) -> Progress {
     })
 }
 
+/// Update the in-process snapshot only. Durable callers must first persist
+/// their progress and call `Control::fail` if persistence or its protocol fails;
+/// this snapshot must never turn such an error into a successful drain/exec.
 pub fn save_progress(agent: &str, progress: Progress) {
     CURRENT.with(|c| {
         if let Some(c) = c.borrow().as_ref() {
@@ -167,8 +280,7 @@ pub(super) fn force_readiness_timeout() {
 /// A broken cleanup must fail this regression without hanging its parent suite.
 #[cfg(test)]
 pub(super) fn bounded_timeout_test(name: &str, test: impl FnOnce()) {
-    const CHILD: &str = "MDKG_TEST_CONTROL_TIMEOUT";
-    if std::env::var(CHILD).is_ok_and(|v| v == name) {
+    bounded_test(name, || {
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(test))
             .expect_err("the forced readiness failure must propagate");
         let message = panic
@@ -177,12 +289,20 @@ pub(super) fn bounded_timeout_test(name: &str, test: impl FnOnce()) {
             .or_else(|| panic.downcast_ref::<&str>().copied())
             .unwrap_or_default();
         assert!(message.contains("forced readiness timeout"), "{message}");
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn bounded_test(name: &str, test: impl FnOnce()) {
+    const CHILD: &str = "MDKG_TEST_CONTROL_TIMEOUT";
+    if std::env::var(CHILD).is_ok_and(|v| v == name) {
+        test();
         return;
     }
     let mut child = std::process::Command::new(std::env::current_exe().expect("test executable"))
         .args(["--exact", name, "--test-threads=1"])
         .env(CHILD, name)
-        .stdout(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("timeout regression child");
@@ -193,8 +313,17 @@ pub(super) fn bounded_timeout_test(name: &str, test: impl FnOnce()) {
                 let output = child.wait_with_output().expect("child output");
                 assert!(
                     status.success(),
-                    "timeout regression child failed: {}",
+                    "timeout regression child failed: {}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
                     String::from_utf8_lossy(&output.stderr)
+                );
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let mut summaries = stdout.lines().filter(|l| l.starts_with("test result: "));
+                assert!(
+                    summaries.next().is_some_and(|line| line.starts_with(
+                        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured;"
+                    )) && summaries.next().is_none(),
+                    "timeout regression child did not pass exactly one test: {stdout}"
                 );
                 return;
             }
@@ -216,6 +345,38 @@ pub(super) fn bounded_timeout_test(name: &str, test: impl FnOnce()) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_test_rejects_a_filter_that_runs_no_tests() {
+        let error = std::panic::catch_unwind(|| {
+            bounded_test("supervise::control::tests::missing_watchdog_test", || {
+                panic!("a nonexistent test cannot run this closure");
+            });
+        })
+        .expect_err("a successful child with zero tests must be refused");
+        let message = error
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| error.downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        assert!(
+            message.contains("did not pass exactly one test"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn fatal_error_survives_normal_stop_and_later_failures() {
+        let c = Control::default();
+        c.request_stop();
+        let first = RunError::failure("run.io_failed", "durable completion failed");
+        c.fail(first.clone());
+        c.fail(RunError::failure("run.agent_failed", "later panic"));
+        c.request_stop();
+        assert!(c.stopped());
+        assert_eq!(c.failure(), Some(first.clone()));
+        assert_eq!(c.clone().failure(), Some(first));
+    }
 
     #[test]
     fn control_is_scoped_per_thread_and_restored_after_unwind() {

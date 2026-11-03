@@ -5,6 +5,7 @@
 
 use std::fs;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use mdkg_coord_sqlite::git;
 use serde_json::Value;
@@ -18,7 +19,9 @@ mod evidence;
 #[doc(hidden)]
 pub mod guard;
 pub mod route;
-pub use dispatch::{Report, WakeStatus, supervise};
+pub use dispatch::{
+    Report, WakeStatus, WatchedDispatch, dispatch_watched, supervise, supervise_durable,
+};
 
 /// Proposed mode seam: a saved launcher spec or a named configuration entry
 /// selects headless. With neither, the actor waits for interactive registration.
@@ -67,12 +70,7 @@ pub fn mode(root: &Path, dir: &Path, actor: &str) -> Result<Mode, RunError> {
             true
         }
     };
-    let cfg = read_json(&root.join(".mdkg/config.json"))?;
-    if cfg.as_ref().is_some_and(|c| !c.is_object()) {
-        return Err(invalid("receiver configuration isn't an object"));
-    }
-    let mut cfg = cfg.unwrap_or(Value::Null);
-    crate::orchestration::agent::merge(root, &mut cfg)?;
+    let cfg = crate::orchestration::load_agent_config(root)?;
     let configured = match cfg.get("agents") {
         None | Some(Value::Null) => false,
         Some(Value::Object(agents)) => match agents.get(actor).filter(|_| actor != "defaults") {
@@ -107,8 +105,30 @@ pub fn with_mode<T>(
     cwd: &Path,
     f: impl FnOnce(Mode, &mut dyn Mail) -> Result<T, RunError>,
 ) -> Result<T, RunError> {
-    with_mode_on_renewal_failure(mail, root, dir, actor, cwd, Err, f)
+    with_mode_inner(mail, (root, dir, actor, cwd), Some(START), Err, f)
 }
+
+/// How a start ([`with_mode`]) checks the lease it just claimed, and keeps
+/// trying a check that timed out: each try's lease calls get `budget`
+/// together, with a pause from `first`, doubling up to `most`, between
+/// tries. No try starts after `total` from the first, the tries' own time
+/// included, so the last can run up to its budget past it. Under load, a
+/// supervisor's start failed its few-second check five times in a row and
+/// exited (friction 87).
+#[derive(Debug, Clone, Copy)]
+struct Backoff {
+    budget: Duration,
+    first: Duration,
+    most: Duration,
+    total: Duration,
+}
+
+const START: Backoff = Backoff {
+    budget: crate::mail::RECEIVER_START_BUDGET,
+    first: Duration::from_secs(1),
+    most: Duration::from_secs(15),
+    total: Duration::from_secs(120),
+};
 
 // A dispatcher can report proven non-delivery when initial renewal fails,
 // before its callback is entered. Other admission/cleanup failures keep their
@@ -122,24 +142,61 @@ fn with_mode_on_renewal_failure<T>(
     renewal_failure: impl FnOnce(RunError) -> Result<T, RunError>,
     f: impl FnOnce(Mode, &mut dyn Mail) -> Result<T, RunError>,
 ) -> Result<T, RunError> {
+    with_mode_inner(mail, (root, dir, actor, cwd), None, renewal_failure, f)
+}
+
+/// With `retry`, the first renewal gets its budget, and one that timed out
+/// releases the lease and claims it again after a pause, until
+/// `retry.total` is spent; each try is logged. Only before `f` runs:
+/// renewals while it runs keep their budget.
+fn with_mode_inner<T>(
+    mail: &mut dyn Mail,
+    (root, dir, actor, cwd): (&Path, &Path, &str, &Path),
+    retry: Option<Backoff>,
+    renewal_failure: impl FnOnce(RunError) -> Result<T, RunError>,
+    f: impl FnOnce(Mode, &mut dyn Mail) -> Result<T, RunError>,
+) -> Result<T, RunError> {
     state::check_name(actor)?;
-    turn::claim_turn(mail, dir, actor, cwd)?;
-    let mut held = Held {
-        mail,
-        actor,
-        dir,
-        released: false,
-    };
-    let result = match held.mail.renew_held(&turn::lease_scope(actor)) {
-        Ok(_) => state::not_installing(dir, cwd)
-            .and_then(|()| mode(root, dir, actor))
-            .and_then(|mode| f(mode, held.mail)),
-        Err(e) => renewal_failure(e),
-    };
-    let released = held.release();
-    let value = result?;
-    released?;
-    Ok(value)
+    let begun = Instant::now();
+    let budget = retry.map_or(crate::mail::RECEIVER_RENEWAL_BUDGET, |r| r.budget);
+    let mut pause = retry.map_or(Duration::ZERO, |r| r.first);
+    let mut tries = 1u32;
+    loop {
+        turn::claim_turn(mail, dir, actor, cwd)?;
+        let mut held = Held {
+            mail: &mut *mail,
+            actor,
+            dir,
+            released: false,
+        };
+        let renewed = held
+            .mail
+            .renew_held_checked(&turn::lease_scope(actor), budget);
+        if let (Err(e), Some(r)) = (&renewed, retry)
+            && e.timed_out
+            && begun.elapsed() + pause <= r.total
+        {
+            held.release()?;
+            eprintln!(
+                "warning: {actor}'s turn lease check timed out (try {tries}); trying again in {}s",
+                pause.as_secs_f32()
+            );
+            std::thread::sleep(pause);
+            pause = (pause * 2).min(r.most);
+            tries += 1;
+            continue;
+        }
+        let result = match renewed {
+            Ok(_) => state::not_installing(dir, cwd)
+                .and_then(|()| mode(root, dir, actor))
+                .and_then(|mode| f(mode, held.mail)),
+            Err(e) => renewal_failure(e.error),
+        };
+        let released = held.release();
+        let value = result?;
+        released?;
+        return Ok(value);
+    }
 }
 
 struct Held<'a> {
@@ -219,6 +276,88 @@ fn reminder_id(session: &Uuid, seq: u64) -> String {
     format!("mdkg-{:x}", hash.finalize())
 }
 
+/// A header page as the wake filter reads it: a note replying to `actor`'s
+/// own message is marked, so it never wakes the agent ([`hooks::wakes`]).
+pub fn wake_headers(
+    mail: &mut dyn Mail,
+    actor: &str,
+    page: Vec<crate::mail::Header>,
+) -> Vec<Header> {
+    page.into_iter()
+        .map(|h| Header {
+            own_reply: hooks::own_reply(&h.kind, &h.reference_ids, actor, |id| {
+                sender_of(mail, actor, id)
+            }),
+            seq: h.seq,
+            kind: h.kind,
+            sender: h.sender,
+            room: h.room,
+        })
+        .collect()
+}
+
+/// Senders found, by message id: a message's sender never changes, so a
+/// note that doesn't wake isn't looked up again at every step. Bounded;
+/// a lookup that fails isn't kept.
+static SENDERS: std::sync::Mutex<Option<std::collections::HashMap<String, String>>> =
+    std::sync::Mutex::new(None);
+
+/// The most senders [`SENDERS`] keeps before it starts over.
+const SENDERS_KEPT: usize = 4096;
+
+fn sender_of(mail: &mut dyn Mail, actor: &str, id: &str) -> Option<String> {
+    if let Ok(cache) = SENDERS.lock()
+        && let Some(sender) = cache.as_ref().and_then(|c| c.get(id))
+    {
+        return Some(sender.clone());
+    }
+    let sender = mail.sender_of(actor, id).ok().flatten()?;
+    if let Ok(mut cache) = SENDERS.lock() {
+        let cache = cache.get_or_insert_with(Default::default);
+        if cache.len() >= SENDERS_KEPT {
+            cache.clear();
+        }
+        cache.insert(id.to_string(), sender.clone());
+    }
+    Some(sender)
+}
+
+/// The most header pages a wake reads past mail that doesn't wake.
+const WAKE_PAGES: usize = 40;
+
+/// The unread headers above `floor`, oldest first, as the wake filter reads
+/// them: page after page (each at most `limit`) until one holds mail that
+/// wakes, or none is left. Notes that never wake (replies to the agent's
+/// own messages) stay unread and unreminded, so they'd otherwise fill
+/// every page and hide what comes after them. Past [`WAKE_PAGES`] pages of
+/// them with more left, it fails open: the newest note read wakes the
+/// agent, whose reminder then moves the floor past them all.
+pub fn wake_page(
+    mail: &mut dyn Mail,
+    actor: &str,
+    floor: u64,
+    limit: usize,
+) -> Result<Vec<Header>, RunError> {
+    let mut out: Vec<Header> = Vec::new();
+    let mut after = floor;
+    for _ in 0..WAKE_PAGES {
+        let page = mail.headers(actor, Some(after), limit)?;
+        let more = page.more;
+        let next = page.messages.iter().map(|h| h.seq).max().or(page.cursor);
+        let headers = wake_headers(mail, actor, page.messages);
+        let woke = headers.iter().any(hooks::wakes);
+        out.extend(headers);
+        match next {
+            Some(n) if more && !woke && n > after => after = n,
+            _ => return Ok(out),
+        }
+    }
+    if let Some(last) = out.last_mut() {
+        last.own_reply = false;
+    }
+    Ok(out)
+}
+
 /// After admission and the conversation loop-guard check, reserve the newest
 /// wake-worthy header, then filter against the displaced watermark returned
 /// *under the same lock*. A separate earlier read is not sufficient: a hook
@@ -269,13 +408,68 @@ mod tests {
         fn new() -> Self {
             let path = std::env::temp_dir().join(format!("mdkg-receiver-{}", Uuid::now_v7()));
             fs::create_dir_all(path.join(".mdkg")).unwrap();
-            Self(path)
+            let path = fs::canonicalize(path).unwrap();
+            Self::git(&path, &["init", "-q", "-b", "main"]);
+            let fixture = Self(path);
+            fixture.config("{}");
+            fixture
         }
         fn dir(&self) -> PathBuf {
             self.0.join("run")
         }
         fn config(&self, text: &str) {
-            fs::write(self.0.join(".mdkg/config.json"), text).unwrap();
+            Self::config_at(&self.0, text);
+        }
+        fn config_at(root: &Path, text: &str) {
+            let mut value = serde_json::from_str::<Value>(text).ok();
+            if let Some(Some(object)) = value.as_mut().map(Value::as_object_mut) {
+                object.insert("schema_version".into(), 3.into());
+                object.insert("format_version".into(), "0.7".into());
+                object.insert(
+                    "graph_id".into(),
+                    "0192f3a0-0000-7000-8000-000000000000".into(),
+                );
+            }
+            let bytes = value.map_or_else(|| text.to_owned(), |v| v.to_string());
+            fs::write(root.join(".mdkg/config.json"), bytes).unwrap();
+            Self::git(root, &["add", "--", ".mdkg/config.json"]);
+            let changed = Self::git(root, &["diff", "--cached", "--quiet"]);
+            match changed.status.code() {
+                Some(0) => (),
+                Some(1) => {
+                    Self::git(root, &["commit", "-q", "-m", "graph"]);
+                }
+                _ => panic!("git diff failed"),
+            }
+        }
+        fn git(root: &Path, args: &[&str]) -> std::process::Output {
+            let output = std::process::Command::new("git")
+                .current_dir(root)
+                .env_clear()
+                .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+                .env("HOME", root)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_ATTR_NOSYSTEM", "1")
+                .args([
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-c",
+                    "init.templateDir=",
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success() || args == ["diff", "--cached", "--quiet"],
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output
         }
         fn saved(&self, name: &str) {
             let agent = state::resolve(
@@ -304,6 +498,15 @@ mod tests {
         after_claim: Option<Box<dyn FnOnce()>>,
         release_fails: bool,
         releases: usize,
+        /// The next renewals that time out unanswered (friction 87).
+        timeouts: u32,
+        /// The next renewals that fail with an answer.
+        refusals: u32,
+        claims: usize,
+        /// The budget each renewal was given.
+        budgets: Vec<Duration>,
+        /// How long each renewal takes.
+        slow: Duration,
     }
     impl Mail for LeaseMail {
         fn claim(&mut self, scope: &str) -> Result<(), RunError> {
@@ -311,6 +514,7 @@ mod tests {
             if self.held.replace(true) {
                 return Err(RunError::failure("coord.lease_held", "held"));
             }
+            self.claims += 1;
             if let Some(f) = self.after_claim.take() {
                 f();
             }
@@ -322,6 +526,31 @@ mod tests {
             } else {
                 Err(invalid("lease lost"))
             }
+        }
+        fn renew_held_checked(
+            &mut self,
+            scope: &str,
+            budget: Duration,
+        ) -> Result<u64, crate::mail::Renewal> {
+            self.budgets.push(budget);
+            std::thread::sleep(self.slow);
+            let fail = |timed_out| crate::mail::Renewal {
+                error: RunError::failure("run.mail_failed", "turn lease check timed out"),
+                timed_out,
+            };
+            if self.timeouts > 0 {
+                self.timeouts -= 1;
+                return Err(fail(true));
+            }
+            if self.refusals > 0 {
+                self.refusals -= 1;
+                return Err(fail(false));
+            }
+            self.renew_held(scope)
+                .map_err(|error| crate::mail::Renewal {
+                    error,
+                    timed_out: false,
+                })
         }
         fn release(&mut self, _: &str) -> Result<(), RunError> {
             self.releases += 1;
@@ -357,6 +586,177 @@ mod tests {
         }
     }
 
+    /// Answers `sender_of` from a table, and counts the lookups; serves
+    /// `unread` as header pages.
+    #[derive(Default)]
+    struct Senders {
+        known: Vec<(&'static str, &'static str)>,
+        asked: Vec<String>,
+        unread: Vec<crate::mail::Header>,
+        pages: usize,
+    }
+    impl Mail for Senders {
+        fn headers(
+            &mut self,
+            _: &str,
+            after: Option<u64>,
+            limit: usize,
+        ) -> Result<crate::mail::Headers, RunError> {
+            self.pages += 1;
+            let newer: Vec<_> = self
+                .unread
+                .iter()
+                .filter(|h| h.seq > after.unwrap_or(0))
+                .cloned()
+                .collect();
+            let messages: Vec<_> = newer.iter().take(limit.min(5)).cloned().collect();
+            Ok(crate::mail::Headers {
+                cursor: messages.iter().map(|h| h.seq).max(),
+                more: newer.len() > messages.len(),
+                messages,
+            })
+        }
+        fn sender_of(&mut self, agent: &str, id: &str) -> Result<Option<String>, RunError> {
+            assert_eq!(agent, "alice");
+            self.asked.push(id.into());
+            if id == "broken" {
+                return Err(RunError::failure("run.mail_failed", "unreadable"));
+            }
+            Ok(self
+                .known
+                .iter()
+                .find(|(m, _)| *m == id)
+                .map(|(_, s)| s.to_string()))
+        }
+        fn claim(&mut self, _: &str) -> Result<(), RunError> {
+            panic!("no claims")
+        }
+        fn release(&mut self, _: &str) -> Result<(), RunError> {
+            panic!("no releases")
+        }
+        fn holder(&self) -> String {
+            "test-receiver".into()
+        }
+        fn inbox(&mut self, _: &str, _: usize) -> Result<Inbox, RunError> {
+            panic!("no body reads")
+        }
+        fn wait(&mut self, _: &str, _: Option<u64>, _: u64) -> Result<Option<Inbox>, RunError> {
+            panic!("no waits")
+        }
+        fn import(&mut self, _: &Import<'_>) -> Result<String, RunError> {
+            panic!("no imports")
+        }
+        fn ack(&mut self, _: &str, _: &[String], _: &str) -> Result<(), RunError> {
+            panic!("no ack")
+        }
+        fn release_as(&mut self, _: &str, _: &str) -> Result<(), RunError> {
+            panic!("no releases")
+        }
+        fn holds(&mut self, _: &str, _: &str, _: Option<&str>) -> Result<bool, RunError> {
+            panic!("no file claims")
+        }
+        fn note(&mut self, _: &Note<'_>) -> Result<String, RunError> {
+            panic!("no notes")
+        }
+    }
+
+    #[test]
+    fn a_note_replying_to_the_agents_own_message_never_wakes_the_receiver() {
+        let page = |kind: &str, refs: &[&str]| crate::mail::Header {
+            seq: 7,
+            kind: kind.into(),
+            sender: "orchestrator".into(),
+            room: None,
+            reference_ids: refs.iter().map(|r| r.to_string()).collect(),
+        };
+        let mut mail = Senders {
+            known: vec![("mine", "alice"), ("theirs", "orchestrator")],
+            ..Senders::default()
+        };
+        let got = wake_headers(
+            &mut mail,
+            "alice",
+            vec![
+                page("note", &["mine"]),
+                page("note", &["theirs"]),
+                page("note", &["unknown"]),
+                page("note", &["broken"]),
+                page("note", &[]),
+                page("question", &["mine"]),
+            ],
+        );
+        let woke: Vec<bool> = got.iter().map(hooks::wakes).collect();
+        assert_eq!(woke, [false, true, true, true, true, true]);
+        // Only a note that replies is looked up.
+        assert_eq!(mail.asked, ["mine", "theirs", "unknown", "broken"]);
+        assert!(reserve_payload(Path::new("/unused"), "alice", &Uuid::nil(), &got[..1]).is_none());
+    }
+
+    #[test]
+    fn notes_that_dont_wake_never_hide_a_later_wake_behind_a_page() {
+        let header = |seq: u64, kind: &str, refs: &[&str]| crate::mail::Header {
+            seq,
+            kind: kind.into(),
+            sender: "peer".into(),
+            room: None,
+            reference_ids: refs.iter().map(|r| r.to_string()).collect(),
+        };
+        // Twelve acknowledgements of the agent's own handoff, then a
+        // question: more than two pages of notes that never wake.
+        let mut unread: Vec<_> = (1..=12)
+            .map(|n| header(n, "note", &["paged-mine"]))
+            .collect();
+        unread.push(header(13, "question", &[]));
+        unread.push(header(14, "note", &["paged-mine"]));
+        let mut mail = Senders {
+            known: vec![("paged-mine", "alice")],
+            unread,
+            ..Senders::default()
+        };
+        let got = wake_page(&mut mail, "alice", 0, 200).expect("pages");
+        assert_eq!(mail.pages, 3, "paged until the question");
+        let woke: Vec<u64> = got
+            .iter()
+            .filter(|h| hooks::wakes(h))
+            .map(|h| h.seq)
+            .collect();
+        assert_eq!(woke, [13]);
+        // The sender is looked up once, however many notes name it.
+        assert!(mail.asked.len() <= 1, "{:?}", mail.asked);
+        // From a floor past the question, nothing wakes, and paging stops
+        // at the last page.
+        let mut quiet = Senders {
+            known: vec![("paged-mine", "alice")],
+            unread: (1..=7)
+                .map(|n| header(n, "note", &["paged-mine"]))
+                .collect(),
+            ..Senders::default()
+        };
+        let got = wake_page(&mut quiet, "alice", 0, 200).expect("pages");
+        assert_eq!((got.len(), quiet.pages), (7, 2));
+        assert!(!got.iter().any(hooks::wakes));
+        // More notes than the pages it reads, then a question: it fails
+        // open on the newest note read, so the floor moves past them.
+        let many = WAKE_PAGES as u64 * 5 + 3;
+        let mut unread: Vec<_> = (1..=many)
+            .map(|n| header(n, "note", &["paged-mine"]))
+            .collect();
+        unread.push(header(many + 1, "question", &[]));
+        let mut flooded = Senders {
+            known: vec![("paged-mine", "alice")],
+            unread,
+            ..Senders::default()
+        };
+        let got = wake_page(&mut flooded, "alice", 0, 200).expect("pages");
+        assert_eq!(flooded.pages, WAKE_PAGES);
+        let woke: Vec<u64> = got
+            .iter()
+            .filter(|h| hooks::wakes(h))
+            .map(|h| h.seq)
+            .collect();
+        assert_eq!(woke, [WAKE_PAGES as u64 * 5]);
+    }
+
     #[test]
     fn mode_comes_from_specs_not_registration_or_defaults() {
         let f = Fixture::new();
@@ -370,6 +770,37 @@ mod tests {
         f.saved("codex:alice");
         assert_eq!(mode(&f.0, &f.dir(), "codex:alice").unwrap(), Mode::Headless);
         assert_eq!(mode(&f.0, &f.dir(), "alice").unwrap(), Mode::Interactive);
+    }
+
+    #[test]
+    fn receiver_mode_uses_the_graph_ref_not_checkout_contents_or_head() {
+        let f = Fixture::new();
+        f.config(r#"{"agents":{"alice":{}}}"#);
+        Fixture::git(&f.0, &["update-ref", "refs/heads/mdkg-graph", "HEAD"]);
+        Fixture::git(
+            &f.0,
+            &[
+                "config",
+                "--local",
+                "mdkg.graph.ref",
+                "refs/heads/mdkg-graph",
+            ],
+        );
+        Fixture::git(
+            &f.0,
+            &[
+                "config",
+                "--local",
+                "mdkg.graph.0192f3a0-0000-7000-8000-000000000000.ref",
+                "refs/heads/mdkg-graph",
+            ],
+        );
+        f.config(r#"{"agents":{"bob":{}}}"#);
+        fs::write(f.0.join(".mdkg/config.json"), r#"{"agents":{"carol":{}}}"#).unwrap();
+
+        assert_eq!(mode(&f.0, &f.dir(), "alice").unwrap(), Mode::Headless);
+        assert_eq!(mode(&f.0, &f.dir(), "bob").unwrap(), Mode::Interactive);
+        assert_eq!(mode(&f.0, &f.dir(), "carol").unwrap(), Mode::Interactive);
     }
 
     #[test]
@@ -417,10 +848,10 @@ mod tests {
     fn mode_is_rechecked_after_acquiring_the_run_lease() {
         let f = Fixture::new();
         assert_eq!(mode(&f.0, &f.dir(), "alice").unwrap(), Mode::Interactive);
-        let config = f.0.join(".mdkg/config.json");
+        let root = f.0.clone();
         let mut mail = LeaseMail {
             after_claim: Some(Box::new(move || {
-                fs::write(config, r#"{"agents":{"alice":{}}}"#).unwrap();
+                Fixture::config_at(&root, r#"{"agents":{"alice":{}}}"#);
             })),
             ..Default::default()
         };
@@ -450,6 +881,109 @@ mod tests {
         .unwrap();
         let after: state::LeaseRecord = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
         assert_eq!(after, replacement);
+    }
+
+    /// Room for several quick tries, however slow the machine.
+    const QUICK: Backoff = Backoff {
+        budget: Duration::from_secs(7),
+        first: Duration::from_millis(1),
+        most: Duration::from_millis(4),
+        total: Duration::from_secs(10),
+    };
+
+    /// Room for pauses of 1 + 2 + 4 + 4 + 4 + 4 ms, and no seventh.
+    const SHORT: Backoff = Backoff {
+        total: Duration::from_millis(20),
+        ..QUICK
+    };
+
+    fn start<T>(
+        f: &Fixture,
+        mail: &mut LeaseMail,
+        retry: Option<Backoff>,
+        body: impl FnOnce(Mode, &mut dyn Mail) -> Result<T, RunError>,
+    ) -> Result<T, RunError> {
+        with_mode_inner(mail, (&f.0, &f.dir(), "alice", &f.0), retry, Err, body)
+    }
+
+    /// friction 87: under load a start's lease check timed out and the
+    /// supervisor exited. A start tries again, each time on a lease taken
+    /// anew, until its allowance is spent; the callback runs once.
+    #[test]
+    fn a_start_retries_a_timed_out_lease_check_with_the_lease_released_between() {
+        let f = Fixture::new();
+        let mut mail = LeaseMail {
+            timeouts: 3,
+            ..LeaseMail::default()
+        };
+        let mut ran = 0;
+        start(&f, &mut mail, Some(QUICK), |_, _| {
+            ran += 1;
+            Ok(())
+        })
+        .expect("started");
+        assert_eq!((ran, mail.claims, mail.releases), (1, 4, 4));
+        assert!(!mail.held.get());
+        // Every try gets the start's budget, not a dispatcher's.
+        assert_eq!(mail.budgets, [QUICK.budget; 4]);
+        assert_eq!(START.budget, crate::mail::RECEIVER_START_BUDGET);
+        assert_eq!(START.first, Duration::from_secs(1));
+        assert_eq!(START.most, Duration::from_secs(15));
+        assert_eq!(START.total, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn a_start_gives_up_when_its_allowance_is_spent_and_never_retries_an_answer() {
+        let f = Fixture::new();
+        // Pauses of 1 + 2 + 4 + 4 + 4 + 4 ms fit in 20, a seventh wouldn't,
+        // and the tries' own time counts too: at most seven tries.
+        let mut mail = LeaseMail {
+            timeouts: 100,
+            ..LeaseMail::default()
+        };
+        let e = start(&f, &mut mail, Some(SHORT), |_, _| -> Result<(), _> {
+            panic!("never admitted")
+        })
+        .expect_err("gave up");
+        assert!(e.message.contains("timed out"), "{e:?}");
+        assert!((1..=7).contains(&mail.claims), "{}", mail.claims);
+        assert_eq!(mail.claims, mail.releases);
+        assert!(!mail.held.get());
+        // Tries of 15 ms each: the second ends past 20 ms, so no third,
+        // though the pauses alone would allow seven (review of a0b79a38).
+        let mut mail = LeaseMail {
+            timeouts: 100,
+            slow: Duration::from_millis(15),
+            ..LeaseMail::default()
+        };
+        start(&f, &mut mail, Some(SHORT), |_, _| -> Result<(), _> {
+            panic!("never admitted")
+        })
+        .expect_err("gave up");
+        assert!(mail.claims <= 2, "{}", mail.claims);
+        assert_eq!(mail.claims, mail.releases);
+        // A renewal that was answered (lost, refused) isn't tried again.
+        let mut mail = LeaseMail {
+            refusals: 1,
+            ..LeaseMail::default()
+        };
+        start(&f, &mut mail, Some(QUICK), |_, _| -> Result<(), _> {
+            panic!("never admitted")
+        })
+        .expect_err("refused");
+        assert_eq!(mail.claims, 1);
+        // Nor is any renewal without a retry allowance: a dispatcher's.
+        let mut mail = LeaseMail {
+            timeouts: 1,
+            ..LeaseMail::default()
+        };
+        start(&f, &mut mail, None, |_, _| -> Result<(), _> {
+            panic!("never admitted")
+        })
+        .expect_err("no retry");
+        assert_eq!((mail.claims, mail.releases), (1, 1));
+        // And it keeps a dispatcher's tight budget.
+        assert_eq!(mail.budgets, [crate::mail::RECEIVER_RENEWAL_BUDGET]);
     }
 
     #[test]
@@ -541,6 +1075,7 @@ mod tests {
             kind: "note".into(),
             sender: "alice".into(),
             room: None,
+            own_reply: false,
         }
     }
 
@@ -647,7 +1182,7 @@ mod tests {
         assert!(
             batch
                 .line
-                .contains("#7 review_request from a sender in room release")
+                .contains("#7 review_request from a sender in channel release")
         );
         assert!(!batch.line.contains("INJECT"));
         assert!(!batch.line.contains("#99"));

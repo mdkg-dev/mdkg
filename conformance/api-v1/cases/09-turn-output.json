@@ -1,0 +1,68 @@
+{
+  "name": "09-turn-output",
+  "scenario": "turn_output",
+  "driver": "crates/mdkg-run/src/turn/live.rs: conformance_09_native_output_replays_to_the_normalized_events",
+  "note": "Native output per harness, in the shapes each harness documents (hand-built samples, not recordings), and the normalized events it must replay to. Only type and data are compared; seq, time and the turn path are the journal's.",
+  "harnesses": {
+    "claude": {
+      "capabilities": ["output.text", "output.tools", "output.usage"],
+      "native": [
+        {"stream": "stdout", "line": "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s\"}"},
+        {"stream": "stdout", "line": "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Reading.\"},{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"Read\",\"input\":{\"file_path\":\"/w/src/lib.rs\"}}]}}"},
+        {"stream": "stdout", "line": "{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"t1\",\"content\":\"...\"}]}}"},
+        {"stream": "stdout", "line": "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"id\":\"t2\",\"name\":\"Edit\",\"input\":{\"file_path\":\"/w/src/lib.rs\"}}]}}"},
+        {"stream": "stdout", "line": "{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"t2\",\"is_error\":true}]}}"},
+        {"stream": "stderr", "line": "a harness notice"},
+        {"stream": "stdout", "line": "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\",\"session_id\":\"s\",\"total_cost_usd\":0.25,\"usage\":{\"input_tokens\":3,\"output_tokens\":4,\"cache_read_input_tokens\":5}}"}
+      ],
+      "expect": [
+        {"type": "native"},
+        {"type": "text", "data": {"text": "Reading."}},
+        {"type": "tool.started", "data": {"class": "read", "name": "Read", "summary": "/w/src/lib.rs"}},
+        {"type": "tool.ended", "data": {"class": "read", "name": "Read", "ok": true}},
+        {"type": "tool.started", "data": {"class": "edit", "name": "Edit", "summary": "/w/src/lib.rs"}},
+        {"type": "tool.ended", "data": {"class": "edit", "name": "Edit", "ok": false}},
+        {"type": "status", "data": {"text": "a harness notice"}},
+        {"type": "usage", "data": {"input_tokens": 3, "output_tokens": 4, "cache_read_tokens": 5, "total_tokens": null, "cost_usd": 0.25}}
+      ]
+    },
+    "codex": {
+      "capabilities": ["output.text", "output.usage"],
+      "native": [
+        {"stream": "stderr", "line": "OpenAI Codex v0.163.0"},
+        {"stream": "stderr", "line": "--------"},
+        {"stream": "stderr", "line": "sandbox: read-only"},
+        {"stream": "stderr", "line": "--------"},
+        {"stream": "stderr", "line": "exec bash -lc 'cargo test'"},
+        {"stream": "stderr", "line": "tokens used"},
+        {"stream": "stderr", "line": "1,234"}
+      ],
+      "expect": [
+        {"type": "status", "data": {"text": "OpenAI Codex v0.163.0"}},
+        {"type": "status", "data": {"text": "--------"}},
+        {"type": "status", "data": {"text": "sandbox: read-only"}},
+        {"type": "status", "data": {"text": "--------"}},
+        {"type": "status", "data": {"text": "exec bash -lc 'cargo test'"}},
+        {"type": "usage", "data": {"input_tokens": null, "output_tokens": null, "cache_read_tokens": null, "total_tokens": 1234, "cost_usd": null}}
+      ]
+    },
+    "opencode": {
+      "capabilities": ["output.text", "output.tools", "output.usage"],
+      "native": [
+        {"stream": "stdout", "line": "{\"type\":\"step_start\",\"sessionID\":\"ses\",\"part\":{}}"},
+        {"stream": "stdout", "line": "{\"type\":\"tool_use\",\"sessionID\":\"ses\",\"part\":{\"type\":\"tool\",\"callID\":\"c1\",\"tool\":\"grep\",\"state\":{\"status\":\"completed\",\"input\":{\"pattern\":\"fn main\"}}}}"},
+        {"stream": "stdout", "line": "{\"type\":\"text\",\"sessionID\":\"ses\",\"part\":{\"text\":\"found it\"}}"},
+        {"stream": "stdout", "line": "{\"type\":\"step_finish\",\"part\":{\"tokens\":{\"input\":10,\"output\":20,\"cache\":{\"read\":30}},\"cost\":0.5}}"},
+        {"stream": "stdout", "line": "{\"type\":\"error\",\"error\":{\"name\":\"APIError\",\"data\":{\"message\":\"overloaded\"}}}"}
+      ],
+      "expect": [
+        {"type": "native"},
+        {"type": "tool.started", "data": {"class": "read", "name": "grep", "summary": "fn main"}},
+        {"type": "tool.ended", "data": {"class": "read", "name": "grep", "ok": true}},
+        {"type": "text", "data": {"text": "found it"}},
+        {"type": "usage", "data": {"input_tokens": 10, "output_tokens": 20, "cache_read_tokens": 30, "total_tokens": null, "cost_usd": 0.5}},
+        {"type": "error", "data": {"text": "overloaded"}}
+      ]
+    }
+  }
+}

@@ -1,0 +1,233 @@
+{
+  "name": "07-ordering-and-history",
+  "fixture": {
+    "format_version": "0.7",
+    "graph_id": "01a185ac-560e-76e0-91af-2c49dfc29b81",
+    "files": {
+      "work.txt": "initial content\n"
+    }
+  },
+  "operations": [
+    {
+      "op": "channel.create",
+      "actor": "a",
+      "args": {
+        "name": "dev",
+        "members": [
+          "b"
+        ]
+      },
+      "expect": {
+        "ok": true
+      },
+      "cli": {
+        "exit": 0,
+        "envelope": {
+          "schema": "mdkg.channel.create.v1"
+        }
+      }
+    },
+    {
+      "op": "lease.claim",
+      "actor": "a",
+      "args": {
+        "scope": "work.txt"
+      },
+      "expect": {
+        "ok": true,
+        "data": {
+          "lease": {
+            "id": "$lease",
+            "status": "active"
+          }
+        }
+      },
+      "cli": {
+        "exit": 0,
+        "envelope": {}
+      }
+    },
+    {
+      "op": "lease.release",
+      "actor": "b",
+      "args": {
+        "target": "$lease"
+      },
+      "expect": {
+        "ok": false,
+        "diagnostics": [
+          {
+            "code": "coord.not_owner"
+          }
+        ]
+      },
+      "cli": {
+        "exit": 5,
+        "envelope": {}
+      }
+    },
+    {
+      "op": "lease.renew",
+      "actor": "a",
+      "args": {},
+      "expect": {
+        "ok": true
+      },
+      "cli": {
+        "exit": 0,
+        "envelope": {}
+      }
+    },
+    {
+      "op": "message.send",
+      "actor": "a",
+      "args": {
+        "channel": "dev",
+        "kind": "note",
+        "id": "history-message",
+        "text": "untrusted fixture message"
+      },
+      "expect": {
+        "ok": true,
+        "data": {
+          "message": {
+            "messageId": "history-message",
+            "to": [
+              "b"
+            ]
+          }
+        }
+      },
+      "cli": {
+        "exit": 0,
+        "envelope": {}
+      }
+    },
+    {
+      "op": "channel.join",
+      "actor": "a",
+      "args": {
+        "name": "dev",
+        "members": [
+          "c"
+        ]
+      },
+      "expect": {
+        "ok": true
+      },
+      "cli": {
+        "exit": 0,
+        "envelope": {}
+      }
+    },
+    {
+      "op": "channel.leave",
+      "actor": "a",
+      "args": {
+        "name": "dev",
+        "members": [
+          "b"
+        ]
+      },
+      "expect": {
+        "ok": true
+      },
+      "cli": {
+        "exit": 0,
+        "envelope": {}
+      }
+    },
+    {
+      "op": "lease.release",
+      "actor": "a",
+      "args": {
+        "target": "$lease"
+      },
+      "expect": {
+        "ok": true
+      },
+      "cli": {
+        "exit": 0,
+        "envelope": {}
+      }
+    }
+  ],
+  "expect": {
+    "properties": [
+      "one_event_per_record",
+      "ordered_cursors",
+      "stable_event_ids",
+      "historical_payloads",
+      "refused_raw_fallback"
+    ],
+    "events": [
+      {
+        "type": "mdkg.lease.claimed",
+        "data": {
+          "lease": {
+            "id": "$lease",
+            "status": "active"
+          }
+        }
+      },
+      {
+        "type": "mdkg.record.appended",
+        "data": {
+          "kind": "lease.release",
+          "refused": true,
+          "code": "coord.not_owner"
+        }
+      },
+      {
+        "type": "mdkg.message.sent",
+        "data": {
+          "message": {
+            "messageId": "history-message",
+            "to": [
+              "b"
+            ],
+            "deliveries": [
+              {
+                "mailbox": "b",
+                "state": "delivered"
+              }
+            ]
+          }
+        }
+      },
+      {
+        "type": "mdkg.channel.joined",
+        "data": {
+          "channel": {
+            "members": [
+              "a",
+              "b",
+              "c"
+            ]
+          }
+        }
+      },
+      {
+        "type": "mdkg.channel.left",
+        "data": {
+          "channel": {
+            "members": [
+              "a",
+              "c"
+            ]
+          }
+        }
+      },
+      {
+        "type": "mdkg.lease.released",
+        "data": {
+          "lease": {
+            "id": "$lease",
+            "status": "released"
+          }
+        }
+      }
+    ]
+  },
+  "scenario": "ordering_history"
+}

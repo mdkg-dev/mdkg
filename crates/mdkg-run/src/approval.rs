@@ -232,6 +232,22 @@ pub fn outside_turn(
     roots: &[&Path],
     marked: bool,
 ) -> Result<(), String> {
+    outside_turn_from(common, actor, roots, marked, std::process::id())
+}
+
+/// [`outside_turn`], walking the ancestry from `start_pid` instead of this
+/// process: `mdkg serve` passes its HTTP caller's pid, read from the
+/// socket's peer credentials, so a request from inside an agent turn is
+/// refused as a decision from one is. A `start_pid` of 0 walks nothing:
+/// only the actor and each live launcher's identity are checked (serve's
+/// loopback listener, which has no peer pid).
+pub fn outside_turn_from(
+    common: &Path,
+    actor: &str,
+    roots: &[&Path],
+    marked: bool,
+    start_pid: u32,
+) -> Result<(), String> {
     if marked {
         return Err("decisions are refused inside an agent turn".into());
     }
@@ -245,7 +261,7 @@ pub fn outside_turn(
     }
     let mut processes = None;
     for common in common_dirs {
-        outside_repository_turn(&common, actor, roots, &mut processes)?;
+        outside_repository_turn(&common, actor, roots, start_pid, &mut processes)?;
     }
     Ok(())
 }
@@ -254,6 +270,7 @@ fn outside_repository_turn(
     common: &Path,
     actor: &str,
     roots: &[&Path],
+    start_pid: u32,
     processes: &mut Option<ProcessTable>,
 ) -> Result<(), String> {
     use std::io::Read;
@@ -312,7 +329,11 @@ fn outside_repository_turn(
         if processes.is_none() {
             *processes = Some(sender_processes()?);
         }
-        outside_launcher(&record, processes.as_ref().expect("observed processes"))?;
+        outside_launcher(
+            &record,
+            processes.as_ref().expect("observed processes"),
+            start_pid,
+        )?;
     }
     Ok(())
 }
@@ -353,6 +374,7 @@ fn sender_processes() -> Result<ProcessTable, String> {
 fn outside_launcher(
     record: &crate::hooks::TurnProcess,
     table: &ProcessTable,
+    start_pid: u32,
 ) -> Result<(), String> {
     let started = record
         .started
@@ -369,7 +391,7 @@ fn outside_launcher(
     {
         return Err("cannot verify live launcher process identity".into());
     }
-    let mut pid = std::process::id();
+    let mut pid = start_pid;
     let mut seen = std::collections::BTreeSet::new();
     for _ in 0..128 {
         if pid == record.pid {
@@ -387,7 +409,7 @@ fn outside_launcher(
 }
 
 /// The only grant supported in 0.7. Each actor's entry must be complete in
-/// its source file; a local entry replaces the user's entry for that actor.
+/// the user settings file, the only source of grants.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Delegate {
@@ -412,8 +434,12 @@ fn name(s: &str) -> bool {
 }
 
 impl Delegations {
-    /// Read the D9 sources individually. Merging project leaves with trusted
-    /// leaves would manufacture a grant no operator actually wrote.
+    /// Read the grants from the user settings file alone. Merging project
+    /// leaves with trusted leaves would manufacture a grant no operator
+    /// actually wrote. `<common>/mdkg/config.local.json` is writable by the
+    /// workers the grants constrain, so it may only tighten (dec-01a18ee0
+    /// items 1 and 7): a revocation there applies, a grant is ignored with
+    /// a warning.
     pub fn load(root: &Path, environment: Environment<'_>) -> Result<Self, String> {
         let paths = Paths::discover(root, environment).map_err(|e| e.to_string())?;
         let project = Input::read(Layer::Project, &paths.project).map_err(|e| e.to_string())?;
@@ -432,41 +458,89 @@ impl Delegations {
             .is_some_and(|p| p.value.pointer("/authority/delegates").is_some())
         {
             out.warnings.push(format!(
-                "authority.delegates in {} is refused: delegation is user or machine-local only",
+                "authority.delegates in {} is refused: delegation comes only from the user settings file",
                 paths.project.display()
             ));
         }
-        for (layer, source) in [
-            (Layer::User, paths.user.as_deref()),
-            (Layer::Local, paths.local.as_deref()),
-        ] {
-            let Some(source) = source else {
-                continue;
-            };
-            let input = match trusted_input(&paths, layer, source, || {})? {
-                DelegationSource::Absent => continue,
+        if let Some(source) = paths.user.as_deref() {
+            let input = match trusted_input(&paths, Layer::User, source, || {})? {
                 DelegationSource::Worktree => {
                     out.warnings.push(format!(
                         "delegation source {} is inside a Git worktree and is ignored",
                         source.display()
                     ));
-                    continue;
+                    None
                 }
-                DelegationSource::Trusted(input) => input,
+                DelegationSource::Absent => None,
+                DelegationSource::Trusted(input) => Some(input),
             };
-            let physical = input
-                .origin
-                .path
-                .clone()
-                .ok_or("delegation has no source file")?;
-            out.apply(&input, physical)?;
+            if let Some(input) = input {
+                let physical = input
+                    .origin
+                    .path
+                    .clone()
+                    .ok_or("delegation has no source file")?;
+                out.apply(&input, physical)?;
+            }
+        }
+        // After the user grants, so a local revocation can only remove one.
+        // A local file that's there but can't be read or parsed may hold a
+        // revocation, so it fails closed: no grant applies until it's fixed
+        // (review of 55fd024a), never the user grants it might revoke.
+        if let Some(local) = paths.local.as_deref() {
+            match Input::read(Layer::Local, local) {
+                Ok(Some(input)) => out.narrow(&input, local),
+                Ok(None) => {}
+                Err(e) => {
+                    out.delegates.clear();
+                    out.warnings.push(format!(
+                        "{} can't be read ({e}), so no delegation applies until it's fixed",
+                        local.display()
+                    ));
+                }
+            }
         }
         Ok(out)
     }
 
+    /// The machine-local file's `authority.delegates`, which may only
+    /// tighten: a null actor entry, or one whose `may` is empty, revokes that
+    /// actor's user grant; anything else in it is ignored with a warning.
+    /// Never an error, since a worker that wrote it could otherwise make
+    /// every delegated decision fail on purpose, which it can already do
+    /// by revoking.
+    fn narrow(&mut self, input: &Input, source: &Path) {
+        let Some(raw) = input.value.pointer("/authority/delegates") else {
+            return;
+        };
+        let mut ignored = !raw.is_object();
+        for (actor, value) in raw.as_object().into_iter().flatten() {
+            let revokes = value.is_null()
+                || value
+                    .get("may")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(Vec::is_empty);
+            if !revokes {
+                ignored = true;
+            } else if self.delegates.remove(actor).is_some() {
+                self.warnings.push(format!(
+                    "{actor}'s delegation is revoked in {}",
+                    source.display()
+                ));
+            }
+        }
+        if ignored {
+            self.warnings.push(format!(
+                "authority.delegates in {} is ignored: grants come only from the user \
+                 settings file, and only a revocation there applies",
+                source.display()
+            ));
+        }
+    }
+
     fn apply(&mut self, input: &Input, source_file: PathBuf) -> Result<(), String> {
-        if !matches!(input.origin.layer, Layer::User | Layer::Local) {
-            return Err("delegation source is not user or machine-local".into());
+        if input.origin.layer != Layer::User {
+            return Err("delegation source is not the user settings file".into());
         }
         let Some(raw) = input.value.pointer("/authority/delegates") else {
             return Ok(());
@@ -727,6 +801,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_launcher_ancestry_walk_starts_from_the_given_pid() {
+        // A launcher (pid 100), its child turn (200) and a grandchild
+        // (300); an unrelated process (400). `mdkg serve` walks from its
+        // caller's pid rather than its own (outside_turn_from).
+        let started = "Fri Oct 30 12:00:00 2026";
+        let record = crate::hooks::TurnProcess {
+            pid: 100,
+            started: started.into(),
+        };
+        let table: ProcessTable = BTreeMap::from([
+            (1, (0, "boot".into())),
+            (100, (1, started.into())),
+            (200, (100, "later".into())),
+            (300, (200, "later".into())),
+            (400, (1, "later".into())),
+        ]);
+        for inside in [100, 200, 300] {
+            assert!(
+                outside_launcher(&record, &table, inside).is_err(),
+                "{inside}"
+            );
+        }
+        assert!(outside_launcher(&record, &table, 400).is_ok());
+        // An ancestry that can't be followed is refused, never trusted.
+        assert!(outside_launcher(&record, &table, 999).is_err());
+        // Pid 0 walks nothing, but the launcher's identity still counts.
+        assert!(outside_launcher(&record, &table, 0).is_ok());
+        let unverified = crate::hooks::TurnProcess {
+            pid: 100,
+            started: "Sat Oct 31 09:00:00 2026".into(),
+        };
+        assert!(outside_launcher(&unverified, &table, 0).is_err());
+    }
+
+    #[test]
     fn a_section_fits_whole_or_not_at_all() {
         let approved = || Approved {
             text: format!("Delegated approvals:\n{FIXED_LIMITS}\nApproved by x.\n"),
@@ -931,10 +1040,60 @@ mod tests {
         ] {
             assert!(grants.apply(&input(Layer::Local, json!({"orchestrator": {"for": "human:nick", "may": ["decision", capability]}})), "/local/config.json".into()).is_err());
         }
+        for capability in ["push", "*"] {
+            assert!(grants.apply(&input(Layer::User, json!({"orchestrator": {"for": "human:nick", "may": ["decision", capability]}})), "/user/config.json".into()).is_err());
+        }
+        // The machine-local file never grants (dec-01a18ee0 item 7), but it
+        // may tighten (item 1): a grant there is ignored with a warning, a
+        // revocation removes the user's grant.
+        assert!(
+            grants
+                .apply(
+                    &input(Layer::Local, json!({"orchestrator": null})),
+                    "/local/config.json".into(),
+                )
+                .is_err()
+        );
+        let local = Path::new("/local/config.local.json");
+        grants.narrow(
+            &input(
+                Layer::Local,
+                json!({"intruder": {"for": "human:nick", "may": ["decision"]}}),
+            ),
+            local,
+        );
+        assert!(!grants.delegates.contains_key("intruder"));
+        assert!(grants.delegates.contains_key("orchestrator"));
+        assert!(
+            grants
+                .warnings
+                .last()
+                .is_some_and(|w| w.contains("is ignored"))
+        );
+        for revocation in [json!(null), json!({"for": "human:nick", "may": []})] {
+            let mut each = Delegations::default();
+            each.apply(
+                &input(
+                    Layer::User,
+                    json!({"orchestrator": {"for": "human:nick", "may": ["decision"]}}),
+                ),
+                "/user/config.json".into(),
+            )
+            .unwrap();
+            each.narrow(
+                &input(Layer::Local, json!({"orchestrator": revocation})),
+                local,
+            );
+            assert!(each.delegates.is_empty(), "{revocation}");
+            assert!(
+                each.warnings.iter().all(|w| !w.contains("is ignored")),
+                "{revocation}"
+            );
+        }
         grants
             .apply(
-                &input(Layer::Local, json!({"orchestrator": null})),
-                "/local/config.json".into(),
+                &input(Layer::User, json!({"orchestrator": null})),
+                "/user/config.json".into(),
             )
             .unwrap();
         assert!(grants.delegates.is_empty());

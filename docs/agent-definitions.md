@@ -36,7 +36,8 @@ The [JSON Schema](../schemas/mdkg.agent.v1.json) describes the fields.
 `harness` is `claude`, `codex` or `opencode`; `role` is `worker` or
 `reviewer`. A worker without `cwd` gets its own worktree. A relative
 `cwd` is resolved from the launcher's checkout. `reports_to` defaults
-to `orchestrator` and names the actor receiving turn receipts.
+to `orchestrator` and names the actor receiving turn receipts and faults,
+including turn errors and refused replies.
 
 `mode` defaults to `auto`, the only supported preset in this release.
 Other presets are reserved and refused. Optional `sandbox` and `approvals`
@@ -79,13 +80,17 @@ one manual pass, including agents with a manual trigger. Without names,
 `mdkg.agents.up.v1` event per line; a turn report is in `data.turn`.
 See [running agents](agents.md) for launching and sessions.
 
-`mdkg install` prepares `.worktrees/graph` on `mdkg-graph`, leaving an
+In checkout mode, `mdkg install` prepares `.worktrees/graph` on `mdkg-graph`, leaving an
 existing graph checkout and branch in place. Launch from it with
 `mdkg --root .worktrees/graph agents up`. If the main branch has no committed
 graph yet, install reports that setup is deferred: commit the initial graph and
 run install again. Worktree creation adds `/.worktrees/` to the primary
 checkout's `.gitignore`, preserving its existing lines. Projection undo
 keeps this rule and the graph worktree, which may hold later work.
+
+In ref mode, definition commands publish through the graph ref. The
+launcher reads that ref's pinned authority without refreshing a graph
+checkout from main; see [Git and the graph ref](git-graph.md).
 
 `mdkg doctor` checks the builds of registered launchers and MCP servers.
 `mdkg agents status` lists those processes and warns about mixed builds or

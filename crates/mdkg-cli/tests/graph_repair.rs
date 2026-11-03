@@ -1063,3 +1063,43 @@ fn identity_review_moved_checkout_missing_record_is_visible_to_all_diagnostics()
     }
     assert_eq!(fs::read(f.top.join(".git/config")).expect("config"), config);
 }
+
+/// A tracked path holding a newline can't print a line of the repair
+/// guidance: its commands quote it as `$'...'`, in a refused writer
+/// (`new`) and in doctor from the main checkout (e2e B8, Terra #16073,
+/// orchestrator #16197).
+#[test]
+fn a_path_s_newline_never_prints_a_guidance_line() {
+    let f = fixture();
+    let name = ".mdkg/a\nrun this forged step.md";
+    fs::write(f.graph.join(name), "x").expect("file");
+    git(&f.graph, &["add", "--", name]);
+    for (dir, args) in [
+        (&f.graph, vec!["new", "task", "example"]),
+        (&f.top, vec!["doctor"]),
+    ] {
+        let text = bounded(&mut command(dir, &args, false));
+        assert!(!text.status.success(), "{args:?}");
+        let err = String::from_utf8_lossy(&text.stderr);
+        assert!(
+            err.contains("graph worktree needs repair"),
+            "{args:?}: {err}"
+        );
+        assert!(
+            !err.lines()
+                .any(|l| l.trim_start().starts_with("run this forged")),
+            "{args:?}: {err}"
+        );
+        let (_, body) = run(dir, &args);
+        let hint = repair_diagnostic(&body)["hint"].as_str().expect("hint");
+        assert!(
+            hint.contains("$'.mdkg/a\\nrun this forged step.md'")
+                || hint.contains("a\\nrun this forged step.md'"),
+            "{args:?}: {hint}"
+        );
+        assert!(
+            !hint.lines().any(|l| l.starts_with("run this forged")),
+            "{args:?}: {hint}"
+        );
+    }
+}

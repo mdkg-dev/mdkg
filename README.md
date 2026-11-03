@@ -22,7 +22,7 @@ explains ids, the two planes, agents and search in a few pages, and
 | Plane | Holds | Lives in |
 |---|---|---|
 | Knowledge | Goals, decisions, designs, rules, skills, task definitions and their final states | Markdown with frontmatter: design in `.mdkg/` and git; work beside the store by default, or in git with shared work |
-| Coordination | Claims and leases, temporary statuses, rooms and messages, and a hash-linked log of every change | A SQLite store in the repository's git folder, never committed |
+| Coordination | Claims and leases, temporary statuses, channels and messages, and a hash-linked log of every change | A SQLite store in the repository's git folder, never committed |
 
 Search indexes are a derived cache: rebuilt from the files, never
 committed.
@@ -49,15 +49,33 @@ name, and reads and migrates 0.6 graphs: see
 
 There are prebuilt binaries for macOS (Apple silicon and Intel) and Linux
 (x86_64 and arm64, glibc and musl). Each release lists their SHA-256
-checksums in `sha256.sum`. Windows is planned for 0.7.1; until then, use
-WSL. Requires Git 2.41 or later.
+checksums in `sha256.sum`. Windows is deferred beyond 0.7.1; use WSL. Requires Git 2.41 or later.
+
+Building from source on Linux (`cargo install`) also needs `pkg-config`
+and the libudev headers, for FIDO2 person keys: `sudo apt-get install
+pkg-config libudev-dev` on Debian and Ubuntu, `sudo dnf install pkgconf
+systemd-devel` on Fedora, or your distribution's equivalent. To use a
+FIDO2 security key on Linux, your user needs access to the key's FIDO
+interface, and nothing else. systemd 244 and later already grant it:
+their `60-fido-id.rules` tag only the hidraw interfaces whose HID
+descriptor says FIDO (`ID_FIDO_TOKEN`). On an older system, add the
+same two rules in a file under `/etc/udev/rules.d/`, then replug the key:
+
+```
+SUBSYSTEM=="hidraw", IMPORT{builtin}="fido_id"
+SUBSYSTEM=="hidraw", ENV{ID_FIDO_TOKEN}=="1", TAG+="uaccess"
+```
+
+Don't match every `hidraw` device, or a key's USB vendor and product
+ids: a security key's keyboard interface shares those ids, and other HID
+devices would open too.
 
 ## Quick start
 
 ```sh
 cd my-project              # a git repository with at least one commit
 mdkg init                  # asks where work lives (below); writes config, a setup guide and one skill inside .mdkg
-mdkg doctor                # checks the binary, PATH, git, the main branch, config and store
+mdkg doctor                # checks the binary, PATH, git, graph, code base, config and store
 mdkg new goal "Ship the importer"
 mdkg new task "Parse the CSV header" --status todo
 mdkg next                  # the next ready item, with its full record
@@ -65,11 +83,17 @@ mdkg claim <id>            # a lease, so no one else takes it
 mdkg done <id>             # records the final state (and, with shared work, commits it)
 ```
 
-Work settles on the repository's main branch, `main` unless you name
-another with `git config mdkg.mainRef <branch>` (on `master`, say). In a
-new repository, make the first commit before `mdkg new`: `git add -A &&
-git commit -m "Start the graph"`. `mdkg init` and `mdkg doctor` say which
-of the two you need.
+In checkout mode, work settles on the repository's main branch, `main`
+unless you name another with `git config mdkg.mainRef <branch>` (on `master`,
+say). With `mdkg.graph.ref` set, work instead settles on that graph ref and
+`mdkg.mainRef` only names the read-only code base; see
+[Git and the graph ref](docs/git-graph.md). In a new checkout-mode repository,
+make the first commit before `mdkg new`: `git add -A && git commit -m "Start
+the graph"`. `mdkg init` and `mdkg doctor` say which of the two you need.
+An explicit `mdkg install --setup local|personal|professional` selects ref
+mode; plain install preserves checkout mode. Settle or abandon open
+changesets before that move. See the [setup choices](docs/git-graph.md#installing-a-setup)
+for the professional setup's existing private remote and the optional view.
 
 Add `--json` to any command for one machine-readable envelope with stable
 diagnostic codes. `mdkg schema <command>` prints its JSON Schema.
@@ -109,15 +133,17 @@ mdkg install --enable agents-md,mcp:claude,skills:.claude/skills
 mdkg install --disable mcp:claude    # removes only mdkg's part
 ```
 
-`mdkg install --undo` puts back every file install changed, the list
-included. Review hooks before enabling them: Claude Code and Codex have
+`mdkg install --undo` puts back every file install changed in this
+checkout. In checkout mode that includes the projection list; in ref mode
+the list lives on the graph ref, which other checkouts and later edits
+share, so undo leaves it as it is and names the entries it left. Review hooks before enabling them: Claude Code and Codex have
 their own trust controls; OpenCode executes project plugins without a trust
 prompt. A graph migrated from 0.6 lists what it already had.
 
 To set up an agent by hand, `mdkg mcp` is a stdio MCP server. Its tools:
 - reads: `show`, `list`, `search`, `next` and `pack`;
 - leases: `lease_claim` and `lease_release`;
-- mail: `room_post`, `room_read`, `inbox`, `inbox_wait` and `ack`.
+- mail: `channel_post`, `channel_read`, `inbox`, `inbox_wait` and `ack`.
 
 Claude Code, in `.mcp.json`:
 
@@ -150,9 +176,10 @@ and Codex use their native automatic approval modes, and OpenCode keeps your
 own permissions. Reviewers remain read-only. See the
 [native settings and their tests](docs/agents.md#native-execution-settings).
 
-Commit the graph and enabled integrations through your normal Git workflow
-first. From the main checkout, create the graph worktree with `mdkg install`,
-then define the agents in that checkout. Choose the harnesses you use:
+In checkout mode, commit the graph and enabled integrations through your
+normal Git workflow first. From the main checkout, create the graph
+worktree with `mdkg install`, then define the agents in that graph checkout.
+Choose the harnesses you use:
 
 ```sh
 mdkg install
@@ -162,25 +189,46 @@ mdkg --root .worktrees/graph agents add opencode-worker --harness opencode --rol
 mdkg --root .worktrees/graph agents up
 ```
 
+If you selected ref mode with `install --setup`, run these commands from
+the code checkout; no `.worktrees/graph` view is needed:
+
+```sh
+mdkg install
+mdkg agents add claude-worker --harness claude --role worker
+mdkg agents add codex-worker --harness codex --role worker
+mdkg agents add opencode-worker --harness opencode --role worker
+mdkg agents up
+```
+
 Definitions are committed `.mdkg/agents/<name>.json` files. `agents add`,
-`agents edit` and `agents rm` commit their changes in the graph checkout
-and report the commit. Each command commits only the affected definition.
-Sessions and mail stay local. The
-launcher reads the graph checkout's definitions, so keep that checkout
-current using the [graph checkout guidance](docs/agents.md#the-graph-checkout).
+`agents edit` and `agents rm` commit their changes to the graph ref in ref
+mode, or in the graph checkout in checkout mode, and report the commit.
+Each command commits only the affected definition. Sessions and mail stay
+local. The launcher reads definitions from committed graph authority. Keep
+a checkout-mode graph current using the
+[graph checkout guidance](docs/agents.md#the-graph-checkout).
 `mdkg init --branch-pattern` and `--worktree-pattern` set the
 branch and worktree each agent gets (default `agent/{agent}` in
-`.worktrees/{agent}`). See [docs/agents.md](docs/agents.md).
+`.worktrees/{agent}`). Inspect layered settings with `mdkg config show` and
+effective agent settings with `mdkg agents status`. Named overrides apply to
+file-backed definitions; projections remain project-only.
+
+Supervisors retain progress when restarting the same unfinished invocation
+and require explicit recovery for interrupted work. Headless turns produce
+advisory receipts for the configured `reports_to` actor. See
+[docs/agents.md](docs/agents.md) for recovery,
+receipt limits and configuration precedence. After upgrading mdkg, restart
+running supervisors to load the new binary.
 
 ## Commands
 
 | Area | Commands |
 |---|---|
-| Setup | `init`, `doctor`, `install`, `migrate` |
+| Setup | `init`, `doctor`, `install`, `migrate`, `config show` |
 | Read | `show`, `list`, `search`, `next`, `validate`, `pack`, `graph refs`, `graph backrefs`, `graph ready`, `graph critical-path` |
 | Write | `new`, `update`, `done`, `format`, `goal`, `retype` |
 | Coordinate | `claim`, `holds`, `release`, `renew`, `status`, `sync`, `abandon` |
-| Talk | `msg send`, `msg inbox`, `msg wait`, `msg ack`, `msg thread`, `msg import`, `room` |
+| Talk | `msg send`, `msg inbox`, `msg wait`, `msg ack`, `msg thread`, `msg import`, `channel` |
 | Skills | `skills list`, `skills show`, `skills validate`, `skills sync`, `skills add` |
 | Agents | `mcp`, `agents add`, `agents edit`, `agents rm`, `agents up`, `agents status`, `agents resume` |
 | Log | `anchor`, `export --work`, `verify` |

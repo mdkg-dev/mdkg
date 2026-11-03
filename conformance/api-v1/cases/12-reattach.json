@@ -1,0 +1,9 @@
+{
+  "name": "12-reattach",
+  "scenario": "reattach",
+  "transports": [
+    "cli"
+  ],
+  "checks": "With a slow fake harness running, read agents status, start msg watch --after its event_cursor and agents logs --follow --after its follow_from, and see the turn end on the output stream and its mail on the event stream.",
+  "cli_driver": "crates/mdkg-cli/tests/agents.rs: conformance_12_a_client_re_attaches_from_agents_status"
+}

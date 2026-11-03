@@ -18,6 +18,8 @@ fn setup(name: &str) -> (PathBuf, CliMail) {
         holder: "launcher@run-1".into(),
         trusted_common: Some(root.join("common")),
         trusted_worktree: Some(root.join("top")),
+        receipts: None,
+        receipt_transport_overridden: false,
     };
     (root, mail)
 }
@@ -28,6 +30,50 @@ fn log(root: &Path) -> Vec<String> {
         .lines()
         .map(String::from)
         .collect()
+}
+
+#[test]
+fn receipt_transport_override_refuses_before_the_installed_callback() {
+    let (root, mut mail) = setup("receipt-override");
+    mail.receipt_transport_overridden = true;
+    mail.receipts = Some(mdkg_run::mail::ReceiptCallbacks {
+        baseline: |_| panic!("must not bypass overridden transport"),
+        activity: |_, _, _| panic!("must not bypass overridden transport"),
+        tasks: |_, _, _| panic!("must not bypass overridden transport"),
+        deliver: |_, _| panic!("must not bypass overridden transport"),
+        fault: |_, _| panic!("must not bypass overridden transport"),
+        clear: |_, _, _| panic!("must not bypass overridden transport"),
+        clears: |_, _, _| panic!("must not bypass overridden transport"),
+    });
+    let error = mail
+        .receipt_send(&mdkg_run::mail::Receipt {
+            id: "unused",
+            agent: "worker",
+            to: "orchestrator",
+            body: "receipt",
+        })
+        .unwrap_err();
+    assert_eq!(
+        error.message,
+        "receipt delivery refused: MDKG_RUN_MDKG overrides the mail transport"
+    );
+    assert!(mail.receipt_baseline().is_err());
+    let fault = mdkg_run::fault::Fault::new(
+        "worker",
+        "run.agent_failed",
+        "turn",
+        vec!["orchestrator".into()],
+        mdkg_run::fault::CLEARS_TURN,
+        "none".into(),
+    );
+    assert!(mail.fault_send(&fault).is_err());
+    assert!(
+        mail.fault_clear("worker", mdkg_run::fault::CLEARS_TURN)
+            .is_err()
+    );
+    assert!(mail.fault_clears("worker", "run.not_logged_in").is_err());
+    assert!(log(&root).is_empty());
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -135,7 +181,11 @@ fn ack_ids_come_after_a_separator() {
 fn a_wait_timeout_is_none_and_a_held_claim_is_a_conflict() {
     let (root, mut mail) = setup("codes");
     assert!(mail.wait("lane", Some(3), 1).expect("wait").is_some());
-    assert!(log(&root)[0].contains("msg wait --timeout 1 --after 3"));
+    let call = &log(&root)[0];
+    assert!(
+        call.contains("msg wait --timeout 1 --channel-kind=") && call.contains(" --after 3"),
+        "{call}"
+    );
     fs::write(root.join("fake-wait"), "").expect("w");
     assert_eq!(mail.wait("lane", None, 1).expect("timeout"), None);
     fs::write(root.join("fake-claim"), "").expect("w");

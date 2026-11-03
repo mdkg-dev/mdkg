@@ -42,6 +42,10 @@ macro_rules! codes {
 
 codes! {
     UsageInvalidArguments => "usage.invalid_arguments", "The arguments couldn't be parsed.";
+    ApiBadCursor => "api.bad_cursor", "The event cursor isn't well formed.";
+    ApiCursorReset => "api.cursor_reset", "The cursor's store history was restored, replaced, or rolled back.";
+    ApiCursorForeign => "api.cursor_foreign", "The cursor names another coordinator store.";
+    ApiCursorExpired => "api.cursor_expired", "The records after the cursor were pruned.";
     UsageEmptyQuery => "usage.empty_query", "A search query is empty.";
     UsageBadLimit => "usage.bad_limit", "A limit (any --limit or --tail) isn't a positive integer.";
     UsageUnsupportedType => "usage.unsupported_type", "A real node type that this command doesn't handle.";
@@ -184,10 +188,10 @@ codes! {
     EdgePrivateTarget => "edge.private_target", "A committed node names a profile C work node, which git never holds, so every fresh clone breaks: work refers to design, never the other way round.";
     EdgeBlocksAncestor => "edge.blocks_ancestor", "A node is blocked by a parent, epic or goal above it (written as its blocked_by, or the ancestor's blocks): the two could only wait on each other, so the ready set ignores the edge.";
 
-    MsgHumanActor => "msg.human_actor", "A command a human:* mailbox can't run (a human only acks, reads their own mail and threads, and leaves rooms as themselves), a $MDKG_ACTOR naming anyone but that human, or a --from naming a human.";
+    MsgHumanActor => "msg.human_actor", "A command a human:* mailbox can't run (a human only acks, reads their own mail and threads, and leaves channels as themselves), a $MDKG_ACTOR naming anyone but that human, or a --from naming a human.";
     MsgReservedActor => "msg.reserved_actor", "An actor can't be named role:* or run:*; hold a role with a lease instead.";
-    MsgBadKind => "msg.bad_kind", "The message kind isn't one v0.1 knows.";
-    MsgBadId => "msg.bad_id", "A message id, mailbox, room, role, turn or agent name isn't well formed; a claimed path, or a node in a folder named like a role or a turn, would overlap one; or a role or turn claim is ambiguous with a workspace alias.";
+    MsgBadKind => "msg.bad_kind", "The message kind isn't one this build knows, or is one only mdkg sends (receipt, fault).";
+    MsgBadId => "msg.bad_id", "A message id, mailbox, channel, role, turn or agent name isn't well formed; a claimed path, or a node in a folder named like a role or a turn, would overlap one; or a role or turn claim is ambiguous with a workspace alias.";
     MsgNoParts => "msg.no_parts", "A message needs at least one part.";
     MsgTooLarge => "msg.too_large", "The message body is over 64 KiB, or an ack's outcome over 500 bytes.";
     MsgSecretRefused => "msg.secret_refused", "The body or an ack's outcome looks like it holds a credential; nothing was stored.";
@@ -197,11 +201,31 @@ codes! {
     MsgUnknownContext => "msg.unknown_context", "No message or context has this id, or a send names a conversation, or replies to a message, the sender isn't part of.";
     MsgNotHolder => "msg.not_holder", "None of your mailboxes received the message.";
     MsgNotShown => "msg.not_shown", "The message hasn't been listed to you yet, so it can't be acked.";
+    MsgNotSender => "msg.not_sender", "A send supersedes a message another sender sent: only its sender replaces a message; nothing was sent.";
     MsgWaitTimeout => "msg.wait_timeout", "No matching mail arrived before the timeout.";
+    ChannelUnknown => "channel.unknown", "No channel has this name.";
+    ChannelExists => "channel.exists", "A channel with this name already exists.";
+    ChannelNotMember => "channel.not_member", "The mailbox isn't a member of the channel.";
+    ChannelHumanMember => "channel.human_member", "Only the human can remove a human:* member from a channel.";
     RoomUnknown => "room.unknown", "No room has this name.";
     RoomExists => "room.exists", "A room with this name already exists.";
     RoomNotMember => "room.not_member", "The mailbox isn't a member of the room: only members post or add and remove others, and an explicit --member must be a member to leave (leaving yourself again only warns).";
     RoomHumanMember => "room.human_member", "Only the human can remove a human:* member from a room.";
+
+    // mdkg flow: the ledger and its gate (edd-01a1878e, A27, A29, A32)
+    EntryBadOp => "entry.bad_op", "A ledger op object doesn't parse: an unknown op or field, a wrong type, or a missing field.";
+    EntryBadText => "entry.bad_text", "An entry's title isn't 1 to 200 bytes on one line, or a text is over 4 KiB.";
+    EntryNotFound => "entry.not_found", "No entry has this id on the node.";
+    EntryNoNode => "entry.no_node", "An entry is named without a node, and none is implied.";
+    EntryBadTransition => "entry.bad_transition", "The entry's state doesn't allow this op; terminal entries take none.";
+    EntryNotAllowed => "entry.not_allowed", "The actor's class (worker, reviewer, person, coordinator, other) may not make this op.";
+    EntryFixAfterRange => "entry.fix_after_range", "A reopen's reviewed SHA doesn't hold the finding's fix: the fix landed after the range.";
+    EntryNotCovered => "entry.not_covered", "A SHA doesn't hold a finding's fix, or the gated head doesn't hold a verified fix or its reviewed chain.";
+    EntryRangeMismatch => "entry.range_mismatch", "A review.complete names a range other than its round's.";
+    EntryUnknownCommit => "entry.unknown_commit", "A SHA isn't in the repository, or an abbreviation isn't unique.";
+    EntryGit => "entry.git", "Git couldn't answer an ancestry or content check.";
+    EntryGateFailed => "entry.gate_failed", "done refused: the node's gate fails, and no residual may settle what fails.";
+    LedgerOutOfScope => "ledger.out_of_scope", "A ledger block's op names a node without a card in the turn, or an entry the turn wasn't shown.";
 
     McpCallTimeout => "mcp.call_timeout", "The tool's CLI call outlasted its timeout and was stopped.";
     McpCliFailed => "mcp.cli_failed", "The tool's CLI call couldn't run or printed no JSON envelope.";
@@ -212,6 +236,8 @@ codes! {
     RunSandboxMismatch => "run.sandbox_mismatch", "The agent ran without the sandbox or approval policy its role needs.";
     RunNoReply => "run.no_reply", "The agent finished without a final message to import.";
     RunMailFailed => "run.mail_failed", "A mail command couldn't run, or didn't print the JSON contract.";
+    RunProgressInvalid => "run.progress_invalid", "Supervisor progress is corrupt, foreign, unsafe or cannot advance.";
+    RunTurnInterrupted => "run.turn_interrupted", "An interrupted turn must be inspected and explicitly resumed before execution.";
     RunIoFailed => "run.io_failed", "The launcher's own files couldn't be read or written.";
     RunUnsupported => "run.unsupported", "v0.1 doesn't run this harness in this role.";
     RunBranchRefused => "run.branch_refused", "A worker's branch is detached or protected, or its turn moved it; or the launcher runs from a checkout of main.";
@@ -227,10 +253,12 @@ codes! {
     SkillMirrorDrift => "skill.mirror_drift", "A mirrored skill is missing or differs from its .mdkg/skills source.";
     SkillMirrorStale => "skill.mirror_stale", "A mirror holds a managed skill whose source is gone.";
     SkillMirrorTargetsUnsupported => "skill.mirror_targets_unsupported", "skills sync writes only .agents/skills and .claude/skills, and the config names other mirror folders.";
+    SkillRefMode => "skill.ref_mode", "skills sync and skills add write a checkout's .mdkg/skills, which a ref-mode checkout lacks; install refreshes the skill mirrors there.";
     SkillExists => "skill.exists", "The skill is already in .mdkg/skills, changed from what the binary ships; it's kept.";
     InitNeedsMigrate => "init.needs_migrate", "The folder has an mdkg 0.6 graph; migrate moves it to 0.7, and init changes nothing.";
     InitConflict => "init.conflict", "init was given a profile or orchestration name that differs from the graph's own; it changes nothing.";
     InitUnexplained => "init.unexplained", "The folder's .mdkg holds files init didn't write and no config; init leaves it alone.";
+    InitGraphFetched => "init.graph_fetched", "A fetched ref (any refs/remotes/* with a committed config) holds a graph of this repository, or git couldn't list them; init starts no second one: a branch that predates a graph the team merges (checkout mode) switches to or merges the default branch, and install adopts a graph kept on its own ref (ref mode).";
 
     // Migration and compatibility with the 0.6.0 command spellings.
     UsageDeprecated => "usage.deprecated", "A 0.6.0 command spelling ran its 0.7.0 equivalent; the spelling goes away in 0.8.0.";
@@ -241,8 +269,144 @@ codes! {
     MigrateMovedOn => "migrate.moved_on", "HEAD names neither the migration's base nor its commit.";
     MigrateStoreChanged => "migrate.store_changed", "The coordinator store changed since the migration; rolling back would lose that.";
     MigrateUnsupported => "migrate.unsupported", "The graph has a shape or a node this migration can't convert.";
-    MigrateAlreadyMigrated => "migrate.already_migrated", "The graph is already on 0.7.0.";
+    MigrateAlreadyMigrated => "migrate.already_migrated", "The graph is already on format 0.7.";
     MigrateStepFailed => "migrate.step_failed", "A migration step failed; the journal says where, and the graph is the old one or the new one.";
+
+    // mdkg serve, client mode and machines (the serve edd, edd-01a18803).
+    // API v1's codes other than its cursor codes, which a-events adds.
+    ApiOutputGone => "api.output_gone", "The turn's output was purged; the receipt is the lasting record.";
+    ApiUnknownResource => "api.unknown_resource", "No resource has this path.";
+    ApiUnsupported => "api.unsupported", "This build, or this coordinator, doesn't implement the operation or capability.";
+    ApiUnauthenticated => "api.unauthenticated", "A remote request without a valid signature from an enrolled machine.";
+    ApiRefusedByCheck => "api.refused_by_check", "The configured outside check refused the request.";
+    ApiServeRunning => "api.serve_running", "A serve process already holds this repository's serve lock.";
+    ApiKeyRequired => "api.key_required", "A write over the network needs an idempotency key.";
+    ApiKeyExpired => "api.key_expired", "The idempotency key is over 23 hours old, so a retry could run as a new write; the client refuses it.";
+    ApiTooLarge => "api.too_large", "A request's body or headers are over serve's limits.";
+    ApiRateLimited => "api.rate_limited", "The machine sent too many requests; retry after the time given.";
+    ApiOriginRefused => "api.origin_refused", "The request carries a browser Origin or Sec-Fetch-* header whose origin serve.allow_origins doesn't list.";
+    ApiDraining => "api.draining", "serve is stopping and takes no new requests; retry once it's back.";
+    ApiCheckFailed => "api.check_failed", "The outside check failed or timed out, so nothing was decided; retry.";
+    ApiMachineRevoked => "api.machine_revoked", "The machine's key was revoked for this graph.";
+    ApiMachinePending => "api.machine_pending", "The machine's enrolment waits for a person to approve it.";
+    ApiEnrollPending => "api.enroll_pending", "An enrolment for this machine id already waits for approval.";
+    ApiEnrollExists => "api.enroll_exists", "The graph already has a machine with this id, in any state; a revoked machine enrols again with a new identity.";
+    ApiEnrollChanged => "api.enroll_changed", "The pending enrolment isn't the one the approval named.";
+    ApiClockSkew => "api.clock_skew", "The request's signing time is outside the coordinator's window.";
+    ApiReplayed => "api.replayed", "The request's nonce was already used, or it was signed for another boot of serve.";
+    ApiGraphUnknown => "api.graph_unknown", "This serve process doesn't serve the graph the request names.";
+    ApiActorNotAllowed => "api.actor_not_allowed", "The actor may not make this request from this machine, turn or interface.";
+    ApiUnreachable => "api.unreachable", "The bound coordinator couldn't be reached; nothing was written locally.";
+    ApiRemoteBound => "api.remote_bound", "This clone is bound to a remote coordinator, and the command runs only on the coordinator's host.";
+    ApiRemoteConflict => "api.remote_conflict", "The store's lease mode or the clone's binding conflicts with the request.";
+    ApiRemoteAttaching => "api.remote_attaching", "remote attach stopped part way; finish or undo it first.";
+    ApiCoordinatorMismatch => "api.coordinator_mismatch", "The coordinator's id differs from the one this clone is bound to.";
+    ApiShownMismatch => "api.shown_mismatch", "The turn's shown set differs from the one the coordinator recorded.";
+    RunNotPlaced => "run.not_placed", "The agent is placed on another machine, or this machine may not take it.";
+    RunMachineLost => "run.machine_lost", "The machine running the turn was marked lost.";
+    RunMachineRevoked => "run.machine_revoked", "The machine running the turn was revoked.";
+    RunTurnEnded => "run.turn_ended", "The turn has already ended.";
+    RunRecoveryFailed => "run.recovery_failed", "A post-turn step couldn't be finished from its recovery record.";
+    RunPushRefused => "run.push_refused", "The turn's branch push was refused by the receiving side.";
+    RunBadAgentName => "run.bad_agent_name", "An agent name can't end in a .g<k> suffix.";
+    CoordCommitUnknown => "coord.commit_unknown", "The coordinator's repository doesn't have the commit on the agent's branch; push it first.";
+    CoordBranchNotPushable => "coord.branch_not_pushable", "The worktree isn't on a branch of an agent placed on this machine, so it can't be pushed or settled remotely.";
+    ApiKeySkewed => "api.key_skewed", "The idempotency key's timestamp is more than 5 minutes from the coordinator's clock at first use.";
+    ApiPersonUnknown => "api.person_unknown", "The person key isn't enrolled in this graph, or was revoked.";
+    ApiPersonSignatureRequired => "api.person_signature_required", "A person's request over the network needs a person signature, except reads, own acks and leaving a channel.";
+    RunNothingToDo => "run.nothing_to_do", "turn.admit found no candidates, so no turn was admitted and nothing was written.";
+    ApiAttestationFailed => "api.attestation_failed", "The key's attestation evidence is present but doesn't verify; approve it at machine grade with --machine-grade, or enrol again.";
+    ApiMachineGradeRequired => "api.machine_grade_required", "The key is machine grade; approve with --machine-grade to acknowledge it.";
+    // a-flow's R33 code, which serve-store's import check already returns
+    // (S29); registered here so every code it returns is one (#10686).
+    LedgerBlockInvalid => "ledger.block_invalid", "A turn's ledger block was refused whole and applied as nothing; the fault says why.";
+
+    // The graph ref (edd-01a18867), every lane's codes in one block.
+    GraphRefMissing => "graph.ref_missing", "The graph ref doesn't exist; run install to create or adopt it.";
+    GraphRefInvalid => "graph.ref_invalid", "The graph ref is symbolic, a protected or tracking branch, the main ref, or not a plain branch.";
+    GraphRefExists => "graph.ref_exists", "A request that creates the graph ref found it already there.";
+    GraphConfigInvalid => "graph.config_invalid", "A clone-local graph setting in the common git config is malformed.";
+    GraphIdentityMismatch => "graph.identity_mismatch", "The graph ref holds another graph than the clone's identity record names.";
+    GraphCheckoutMissing => "graph.checkout_missing", "Checkout mode, and this clone used a graph ref but registers no graph checkout; run install.";
+    GraphIdentityUnrecorded => "graph.identity_unrecorded", "The clone has no identity record for the graph ref; run install.";
+    GraphIdentityUnset => "graph.identity_unset", "No git user identity is configured for graph commits.";
+    GraphAuthorityInvalid => "graph.authority_invalid", "The committed config or an agent definition at the graph tip is a link, oversized, or not valid JSON.";
+    GraphLockRequired => "graph.lock_required", "The op needs the clone's exclusive graph lock, or the filesystem can't give a working one.";
+    GraphWriteInvalid => "graph.write_invalid", "A graph write is malformed: a path outside the graph folders, a bad request id, or a record that doesn't match its commit.";
+    GraphWriteStale => "graph.write_stale", "A path the write touches changed on the graph since the request's base.";
+    GraphWriteContended => "graph.write_contended", "The graph ref kept moving; the write's retry limit was reached.";
+    GraphRequestReused => "graph.request_reused", "A request id was reused with a different payload.";
+    GraphGit => "graph.git", "A local git plumbing command for the graph failed.";
+    GraphIo => "graph.io", "A graph file under the common git folder couldn't be read or written.";
+    GraphCheckoutRead => "graph.checkout_read", "In ref mode, a graph file was read from a code checkout instead of the graph.";
+    GraphCacheEdit => "graph.cache_edit", "A graph cache file differed from the graph tip; it was rescued, or the op was refused.";
+    GraphSessionDiscarded => "graph.session_discarded", "A write session ended without publishing; its files were restored and the op is unfinished.";
+    GraphUnleasedEdit => "graph.unleased_edit", "A write changed a graph path outside its leases or session record.";
+    GraphIntentStale => "graph.intent_stale", "A recorded write can't publish because the graph changed a path it touches.";
+    GraphIntents => "graph.intents", "A graph write intent is pending replay.";
+    GraphSettledElsewhere => "graph.settled_elsewhere", "Another clone settled this node, or last wrote it while this clone holds no ledger for it.";
+    GraphImportStale => "graph.import_stale", "An import's preimage differs from the graph's current blob.";
+    GraphImportUnfinishedOp => "graph.import_unfinished_op", "The folder holds an unfinished or unclassified op's files, which can't be imported.";
+    GraphHandEdits => "graph.hand_edits", "A checkout or the view holds graph changes that differ from the graph.";
+    GraphMigrating => "graph.migrating", "A migration to the graph ref is part-way through; resume it with install.";
+    GraphOverlappingWorkspace => "graph.overlapping_workspace", "A graph folder is not a dedicated folder, or overlaps another graph folder or code.";
+    GraphShape => "graph.shape", "The graph's shape doesn't suit its remote: a full-shape graph on a remote other than the code's.";
+    GraphRemoteInvalid => "graph.remote_invalid", "The graph remote or its remote ref is misconfigured.";
+    GraphRemoteChanged => "graph.remote_changed", "The graph remote's effective destination differs from the pinned one.";
+    GraphOpenChangesets => "graph.open_changesets", "The move to the graph ref waits: changesets are still open, and they settle only on main.";
+    GraphUncommitted => "graph.uncommitted", "The move to the graph ref waits: the checkout's graph has uncommitted changes.";
+    GraphDiverged => "graph.diverged", "The move to the graph ref waits: the checkout's graph has changes the graph branch doesn't.";
+    GraphRemoteIsCode => "graph.remote_is_code", "The graph's remote ref is, or shares history with, a code branch.";
+    GraphRemoteRewritten => "graph.remote_rewritten", "The remote graph ref was rewritten relative to the last accepted tip.";
+    GraphRemoteUnreachable => "graph.remote_unreachable", "The graph remote couldn't be reached.";
+    GraphRemoteAuth => "graph.remote_auth", "The graph remote refused authentication.";
+    GraphPushRefused => "graph.push_refused", "A hook refused the graph push; background sync stopped until a person syncs.";
+    GraphPushLarge => "graph.push_large", "The outgoing graph push is over the size cap.";
+    GraphSecret => "graph.secret", "An outgoing graph blob matches a secret pattern; the push was refused.";
+    GraphSecretScanUnavailable => "graph.secret_scan_unavailable", "The secret scanner is unavailable, so graph pushes are refused.";
+    GraphSyncConflict => "graph.sync_conflict", "A sync took the remote's version of a path; the local version is recorded as a conflict.";
+    GraphSyncContended => "graph.sync_contended", "The graph sync kept losing races and stopped; local writes are unaffected.";
+    GraphSyncInTurn => "graph.sync_in_turn", "A graph sync was asked for inside an agent's turn.";
+    GraphSyncInvalid => "graph.sync_invalid", "A candidate graph tip failed strict validation and wasn't taken.";
+    GraphPublishDisabled => "graph.publish_disabled", "Publishing design is off for this clone.";
+    GraphDesignCurrent => "graph.design_current", "The base's design folders already match the graph tip.";
+    GraphDesignDrift => "graph.design_drift", "The main ref's design folders differ from the graph tip's.";
+    GraphView => "graph.view", "The graph view is checked out on the graph branch, holds hand edits, or is behind.";
+    RunAuthorityOverride => "run.authority_override", "A user or local layer changes an authority field of an agent definition.";
+    CoordAbandonPublished => "coord.abandon_published", "Abandon refuses a changeset the graph ref already holds.";
+    GraphEditPathUnsafe => "graph.edit_path_unsafe", "A link or other unsafe entry is on a node edit copy's path.";
+    GraphEditCopyKept => "graph.edit_copy_kept", "A modified node edit copy was kept.";
+    GraphEditUnexcluded => "graph.edit_unexcluded", "info/exclude can't be written, so git add -A could take the node edit copy.";
+    GraphNothingToSync => "graph.nothing_to_sync", "In ref mode, sync has nothing to bring in.";
+    GraphNoCodeBase => "graph.no_code_base", "Neither the main ref nor a work base resolves, so a changed-only check counts nothing as changed.";
+    GraphUnsupported => "graph.unsupported", "The command isn't supported in ref mode.";
+    GraphWriteNoop => "graph.write_noop", "A graph write's content is what the graph already holds; nothing was written.";
+    MsgReservedId => "msg.reserved_id", "Message ids and new conversations beginning `fault.` are reserved to mdkg's own senders.";
+    StoreIntegrity => "store.integrity", "The store holds a row its own rules forbid, such as a message under a fault's id that isn't that fault; nothing was taken from it.";
+    RunNotLoggedIn => "run.not_logged_in", "The agent's harness reports it isn't logged in, so none of its turns run until it is.";
+    RunSupervisorExited => "run.supervisor_exited", "An agent's supervisor exited with an error, or gave up on its startup sync or lease check.";
+    RunMailSetAside => "run.mail_set_aside", "Mail shown in three turns that failed before acking it was set aside, acked unanswered; the fault's suggested command shows it, to send again once the agent's turns succeed.";
+    RunLoopPaused => "run.loop_paused", "The loop guard paused a thread that used its automatic turns for the hour; it runs again when a person runs the agent or the hour cools down.";
+    // The launch wrapper (API v1 A19).
+    RunWrapperRefused => "run.wrapper_refused", "The launch wrapper refused the turn (exit 125) before starting the harness; the agent isn't run again.";
+    // The base resolver (edd graph-ref-authority, L5b).
+    RunNoBase => "run.no_base", "No commit to start a worker's worktree from: the code base is unborn, or no base, mainRef or checkout branch names one.";
+    // mdkg flow (edd-01a1878e), a-flow's codes.
+    EntryVerdictUnbacked => "entry.verdict_unbacked", "A findings verdict needs a finding the completing reviewer opened, reopened or seconded on the node since the round opened.";
+    EntryFixAbsent => "entry.fix_absent", "A verify's SHA undoes the fix: some fix commit's paths are back as they were at its first parent.";
+    MsgReviewUnranged => "msg.review_unranged", "A review_request with --node needs --range <base>..<sha>; nothing was sent.";
+    MsgReviewMultiNode => "msg.review_multi_node", "A review_request names exactly one node; one naming more is refused whole, with nothing sent.";
+    EntryRoundUnanchored => "entry.round_unanchored", "The review round opened unanchored: its walks need an anchored round before it.";
+    EntryLedgerUnwritten => "entry.ledger_unwritten", "done wrote no # Ledger section: the node file can't take one that compares equal without it, or would go over index.limits.max_file_bytes with it.";
+    // a-flow-p4's requirement lint (A28).
+    ReqMissing => "req.missing", "A task, bug or spike has no requirement items (a warning).";
+    ReqBadLine => "req.bad_line", "A requirement item doesn't parse as R<n>, or Markdown around it may change what parses (a warning).";
+    ReqDuplicateId => "req.duplicate_id", "Two requirement items in one node share an id (a warning).";
+    ReqNotEars => "req.not_ears", "A non-spike requirement matches none of the EARS forms (a warning).";
+    ReqVague => "req.vague", "A requirement uses a vague word and no number (a warning).";
+    ReqNotQuestion => "req.not_question", "A spike's requirement doesn't end with a question mark (a warning).";
+    ReqBadRelation => "req.bad_relation", "A requirement's relation names no edd or prd, or a changed requirement the target lacks (a warning).";
+    ReqRelationOnDesign => "req.relation_on_design", "A design node's own requirement carries a relation (a warning).";
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

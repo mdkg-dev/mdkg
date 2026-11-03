@@ -177,3 +177,36 @@ fn an_ignored_path_is_an_error_not_an_empty_commit() {
     let err = git::commit_paths(&dir.0, &[".mdkg/x.tmp".into()], "x").expect_err("ignored");
     assert!(err.to_string().contains("matches no file"), "{err}");
 }
+
+/// Orchestrator #14475: a workspace prefix is a path, never a pathspec,
+/// so one spelled like pathspec magic reads the folder so named.
+#[test]
+fn a_prefix_spelled_like_pathspec_magic_reads_that_folder() {
+    let dir = Scratch(temp::dir("mdkg-literal"));
+    run(&dir.0, &["init", "-q", "-b", "main"], None);
+    let magic = run(&dir.0, &["hash-object", "-w", "--stdin"], Some("magic\n"));
+    let plain = run(&dir.0, &["hash-object", "-w", "--stdin"], Some("plain\n"));
+    for (oid, path) in [
+        (&magic, ":(top)team/.mdkg/work/a.md"),
+        (&plain, "team/.mdkg/work/b.md"),
+    ] {
+        run(
+            &dir.0,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("100644,{oid},{path}"),
+            ],
+            None,
+        );
+    }
+    let tree = run(&dir.0, &["write-tree"], None);
+    let commit = run(&dir.0, &["commit-tree", &tree, "-m", "magic name"], None);
+    run(&dir.0, &["update-ref", "refs/heads/main", &commit], None);
+
+    let leaves = git::leaves(&dir.0, "main", ":(top)team/.mdkg").expect("leaves");
+    let names: Vec<String> = leaves.keys().map(|s| s.to_string()).collect();
+    assert_eq!(names.len(), 1, "{names:?}");
+    assert!(names[0].starts_with(":(top)team/.mdkg/"), "{names:?}");
+}

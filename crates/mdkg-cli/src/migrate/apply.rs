@@ -1,11 +1,14 @@
 //! Applying and rolling back a migration, so that a crash at any point
 //! leaves the old graph or the new one, never a partially migrated graph.
 //!
-//! The graph changes in one atomic step: the new `.mdkg` folder is built
-//! beside the old one and the two are exchanged with one `rename` call
-//! (`RENAME_EXCHANGE` on Linux, `RENAME_SWAP` on macOS). Everything before
-//! that step is invisible to readers, and everything after it is
-//! bookkeeping that a re-run finishes. A journal in the git common
+//! Each graph folder changes in one atomic step: the new `.mdkg` folder is
+//! built beside the old one and the two are exchanged with one `rename`
+//! call (`RENAME_EXCHANGE` on Linux, `RENAME_SWAP` on macOS). Everything
+//! before that step is invisible to readers, and everything after it is
+//! bookkeeping that a re-run finishes. A graph of several workspaces has a
+//! folder each, exchanged one after another: each carries its own marker,
+//! so a re-run swaps the ones still old and a rollback the ones already
+//! new, and the graph is validated and HEAD moves only once all are new. A journal in the git common
 //! folder names the plan and the steps taken; each step finds out from the
 //! world whether it already happened, so it can always be run again:
 //!
@@ -67,6 +70,20 @@ impl Stage {
     }
 }
 
+/// One graph folder a migration replaces.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Folder {
+    /// The folder (absolute), and relative to the repository's top
+    /// (`aux/.mdkg/`).
+    pub graph_dir: PathBuf,
+    pub rel_prefix: String,
+    /// Where its replacement is built, beside it (absolute).
+    pub staging: PathBuf,
+    /// The digest of its full listing, taken just before its swap.
+    #[serde(default)]
+    pub inventory: Option<String>,
+}
+
 /// The migration's journal: what it set out to do and how far it got.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Journal {
@@ -96,6 +113,20 @@ pub struct Journal {
     /// swap: after it, the old folder must still match, or a write raced.
     #[serde(default)]
     pub inventory: Option<String>,
+    /// The graph's other workspace folders, after the one above (a 0.7.0
+    /// journal has none).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra: Vec<Folder>,
+    /// Set while a graph that didn't validate is swapped back out: until
+    /// it's cleared, a staging folder holding the new graph's marker (the
+    /// live folder holding none) is that rejected graph, edits saved into
+    /// it included, and is kept, never deleted.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rejecting: bool,
+    /// Where rejected graphs were kept: every report on the migration
+    /// names them from then on, a resumed run's or a rollback's too.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kept: Vec<String>,
     pub stage: Stage,
 }
 
@@ -154,6 +185,17 @@ fn replace_if(path: &Path, bytes: &[u8], expected: &str) -> Result<(), GraphErro
     result
 }
 
+/// The test hook: debug builds stop dead after this many folders were
+/// swapped in, as a crash between two folders' swaps would
+/// (`MDKG_MIGRATE_CRASH_AFTER_SWAPS=1`).
+fn crash_after_swaps(swaps: usize) {
+    if cfg!(debug_assertions)
+        && std::env::var("MDKG_MIGRATE_CRASH_AFTER_SWAPS").ok() == Some(swaps.to_string())
+    {
+        std::process::exit(86);
+    }
+}
+
 /// The test hook: debug builds write `MDKG_MIGRATE_RACE_TEXT` to the file
 /// `MDKG_MIGRATE_RACE_FILE` names just before it's replaced, as an editor
 /// saving in that moment would.
@@ -200,6 +242,38 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 
 impl Journal {
+    /// Every graph folder, the first one first.
+    pub fn folders(&self) -> Vec<Folder> {
+        let mut all = vec![Folder {
+            graph_dir: self.graph_dir.clone(),
+            rel_prefix: self.rel_prefix.clone(),
+            staging: self.staging.clone(),
+            inventory: self.inventory.clone(),
+        }];
+        all.extend(self.extra.iter().cloned());
+        all
+    }
+
+    fn set_inventory(&mut self, i: usize, inventory: Option<String>) {
+        match i.checked_sub(1) {
+            None => self.inventory = inventory,
+            Some(j) => {
+                if let Some(f) = self.extra.get_mut(j) {
+                    f.inventory = inventory;
+                }
+            }
+        }
+    }
+
+    /// The backup copy of folder `i`: `mdkg` for the first, `mdkg-<i>`.
+    pub fn copy_of(&self, i: usize) -> PathBuf {
+        if i == 0 {
+            self.folder.join("mdkg")
+        } else {
+            self.folder.join(format!("mdkg-{i}"))
+        }
+    }
+
     pub fn path(folder_root: &Path) -> PathBuf {
         folder_root.join("journal.json")
     }
@@ -379,21 +453,40 @@ fn publish_copy(
     Ok(())
 }
 
-/// Removes the staging folder and its partial build, and their root when
-/// it's this migration's own (`.mdkg.migrate-<plan>`).
+/// The root a folder's replacement is built in, beside it:
+/// `<name>.migrate-<plan>`, holding `<name>` (`.mdkg.migrate-<plan>/.mdkg`).
+pub fn staging_for(graph_dir: &Path, plan: &str) -> PathBuf {
+    let name = graph_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| ".mdkg".into());
+    graph_dir
+        .with_file_name(format!("{name}.migrate-{}", short(plan)))
+        .join(name)
+}
+
+/// Removes every folder's staging folder and its partial build, and their
+/// root when it's this migration's own (`<name>.migrate-<plan>`).
 fn remove_staging(journal: &Journal) -> io::Result<()> {
-    for leftover in [journal.staging.clone(), partial_of(&journal.staging)] {
-        if fs::symlink_metadata(&leftover).is_ok() {
-            fs::remove_dir_all(&leftover)?;
+    for f in journal.folders() {
+        for leftover in [f.staging.clone(), partial_of(&f.staging)] {
+            if fs::symlink_metadata(&leftover).is_ok() {
+                fs::remove_dir_all(&leftover)?;
+            }
         }
-    }
-    if let Some(root) = journal.staging.parent()
-        && root.file_name().is_some_and(|n| {
-            n.to_string_lossy() == format!(".mdkg.migrate-{}", short(&journal.plan))
-        })
-        && fs::symlink_metadata(root).is_ok()
-    {
-        fs::remove_dir_all(root)?;
+        let name = f
+            .staging
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if let Some(root) = f.staging.parent()
+            && root.file_name().is_some_and(|n| {
+                n.to_string_lossy() == format!("{name}.migrate-{}", short(&journal.plan))
+            })
+            && fs::symlink_metadata(root).is_ok()
+        {
+            fs::remove_dir_all(root)?;
+        }
     }
     Ok(())
 }
@@ -464,9 +557,14 @@ pub fn marker(plan: &str) -> String {
     format!(".migrate-{}", short(plan))
 }
 
-/// Whether the new graph is the one in place: its marker is.
-fn swapped(journal: &Journal) -> bool {
-    fs::symlink_metadata(journal.graph_dir.join(marker(&journal.plan))).is_ok()
+/// Whether a folder's new graph is the one in place: its marker is.
+fn swapped(f: &Folder, plan: &str) -> bool {
+    fs::symlink_metadata(f.graph_dir.join(marker(plan))).is_ok()
+}
+
+/// Whether `path` (from the repository's top) lies in one of the folders.
+pub fn inside(path: &str, folders: &[Folder]) -> bool {
+    folders.iter().any(|f| path.starts_with(&f.rel_prefix))
 }
 
 /// Applies `changes` (paths relative to the repository's top, all under
@@ -516,12 +614,9 @@ fn store_error(e: rusqlite::Error) -> GraphError {
 }
 
 fn read_only(path: &Path) -> Result<rusqlite::Connection, GraphError> {
-    use rusqlite::OpenFlags;
-    rusqlite::Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(store_error)
+    mdkg_coord_sqlite::Store::open_raw_read_only(path)
+        .map_err(crate::coord::store_error)?
+        .ok_or_else(|| failure(Code::CoordStoreFailed, "coordinator store is absent"))
 }
 
 fn log_head(conn: &rusqlite::Connection) -> Result<Option<(u64, String)>, GraphError> {
@@ -539,10 +634,11 @@ fn log_head(conn: &rusqlite::Connection) -> Result<Option<(u64, String)>, GraphE
 /// The import of `import_id` in the store at `path`, if it landed.
 fn import_state(path: &Path, import_id: &str) -> Result<Option<ImportState>, GraphError> {
     use rusqlite::OptionalExtension;
-    if fs::symlink_metadata(path).is_err() {
+    let Some(conn) =
+        mdkg_coord_sqlite::Store::open_raw_read_only(path).map_err(crate::coord::store_error)?
+    else {
         return Ok(None);
-    }
-    let conn = read_only(path)?;
+    };
     // A store with no tables yet (an empty file) holds no import.
     let has_meta: bool = conn
         .query_row(
@@ -756,8 +852,6 @@ impl RecordSink for StoreImport<'_> {
 pub struct Ctx<'a> {
     pub repo: &'a Repo,
     pub plan: &'a Plan,
-    /// The graph folder relative to the repository's top (`.mdkg/`).
-    pub rel_prefix: String,
     pub store: PathBuf,
     pub sink: &'a mut dyn RecordSink,
     /// Called after each stage is saved; a test stops the run here.
@@ -799,9 +893,11 @@ pub fn advance(
             journal.snapshot = Some(snapshot_store(&ctx.store, &journal.plan)?);
             journal.save(folder_root)?;
         }
-        let copy = journal.folder.join("mdkg");
-        if !copy.exists() {
-            copy_tree(&journal.graph_dir, &copy).map_err(|e| step_failed("copying .mdkg", e))?;
+        for (i, f) in journal.folders().iter().enumerate() {
+            let copy = journal.copy_of(i);
+            if !copy.exists() {
+                copy_tree(&f.graph_dir, &copy).map_err(|e| step_failed("copying .mdkg", e))?;
+            }
         }
         save(journal, Stage::BackedUp, ctx.after_stage)?;
     }
@@ -838,41 +934,43 @@ pub fn advance(
         save(journal, Stage::Built, ctx.after_stage)?;
     }
     if journal.stage == Stage::Built {
-        // 4. The swap.
-        if swapped(journal) {
-            // Swapped before the journal said so: the old folder is checked
-            // as it would have been, and the new graph validated.
-            raced(journal)?;
-            validate_in_place(&ctx.repo.root, journal)?;
-        } else {
-            let commit = journal.commit.clone().unwrap_or_default();
-            // The graph's changes, and with --rewrite-refs the patch's files
-            // inside the graph folder too (the rest come after the swap).
+        // A rejected graph a stopped swap-back left at a staging path is
+        // kept before anything there is rebuilt.
+        keep_rejected(folder_root, journal)?;
+        // 4. The swap, folder by folder; each one swapped already (before
+        // the journal said so) is checked as it would have been. The first
+        // folder, which holds the config, goes last: until it does, the
+        // graph's config is still the old one.
+        let commit = journal.commit.clone().unwrap_or_default();
+        let mark = marker(&journal.plan);
+        let mut swaps = 0;
+        for (i, f) in journal.folders().iter().enumerate().rev() {
+            if swapped(f, &journal.plan) {
+                raced(f)?;
+                continue;
+            }
+            // The graph's changes in this folder, and with --rewrite-refs
+            // the patch's files inside it too (the rest come after the swap).
             let changes: Vec<&FileChange> = plan
                 .files
                 .iter()
-                .chain(
-                    plan.patch
-                        .iter()
-                        .filter(|c| journal.rewrite_refs && c.path.starts_with(&ctx.rel_prefix)),
-                )
+                .chain(plan.patch.iter().filter(|_| journal.rewrite_refs))
+                .filter(|c| c.path.starts_with(&f.rel_prefix))
                 .collect();
             // Listed first, then checked against the base: an edit before
             // the listing fails the check, and one after it fails the
             // comparison after the swap.
-            let before =
-                inventory(&journal.graph_dir).map_err(|e| step_failed("reading .mdkg", e))?;
-            unchanged_since_base(&top, &ctx.rel_prefix, &journal.graph_dir, &changes)?;
-            let mark = marker(&journal.plan);
-            publish_copy(&journal.graph_dir, &journal.staging, |staged| {
-                apply_files(staged, &ctx.rel_prefix, &changes)?;
-                let mut f = File::create(staged.join(&mark))?;
-                f.write_all(journal.plan.as_bytes())?;
-                f.sync_all()
+            let before = inventory(&f.graph_dir).map_err(|e| step_failed("reading .mdkg", e))?;
+            unchanged_since_base(&top, &f.rel_prefix, &f.graph_dir, &changes)?;
+            publish_copy(&f.graph_dir, &f.staging, |staged| {
+                apply_files(staged, &f.rel_prefix, &changes)?;
+                let mut out = File::create(staged.join(&mark))?;
+                out.write_all(journal.plan.as_bytes())?;
+                out.sync_all()
             })
             .map_err(|e| step_failed("building the new .mdkg", e))?;
             // The staged folder must hold exactly the commit's files.
-            let wrong = tree_mismatches(&top, &commit, &ctx.rel_prefix, &journal.staging, &mark)?;
+            let wrong = tree_mismatches(&top, &commit, &f.rel_prefix, &f.staging, &mark)?;
             if !wrong.is_empty() {
                 return Err(failure(
                     Code::MigrateStepFailed,
@@ -882,23 +980,21 @@ pub fn advance(
                     ),
                 ));
             }
-            journal.inventory = Some(before);
+            journal.set_inventory(i, Some(before));
             journal.save(folder_root)?;
-            exchange(&journal.graph_dir, &journal.staging)
-                .map_err(|e| step_failed("swapping .mdkg in", e))?;
-            raced(journal)?;
-            validate_in_place(&ctx.repo.root, journal)?;
+            exchange(&f.graph_dir, &f.staging).map_err(|e| step_failed("swapping .mdkg in", e))?;
+            raced(&journal.folders()[i])?;
+            swaps += 1;
+            crash_after_swaps(swaps);
         }
+        validate_in_place(&ctx.repo.root, folder_root, journal)?;
         save(journal, Stage::Swapped, ctx.after_stage)?;
     }
     if journal.stage == Stage::Swapped {
         // 5. The patch outside the graph, then HEAD.
+        let folders = journal.folders();
         if journal.rewrite_refs {
-            for c in plan
-                .patch
-                .iter()
-                .filter(|c| !c.path.starts_with(&ctx.rel_prefix))
-            {
+            for c in plan.patch.iter().filter(|c| !inside(&c.path, &folders)) {
                 let path = top.join(&c.path);
                 let now =
                     file_digest(&path).map_err(|e| step_failed("reading a patched file", e))?;
@@ -967,12 +1063,14 @@ pub fn advance(
         }
         gitops::reset_index(&top, &journal.base, &commit).map_err(git_error)?;
         remove_staging(journal).map_err(|e| step_failed("removing the old .mdkg", e))?;
-        // Last: until here the marker tells a resume the swap happened (and
+        // Last: until here the markers tell a resume the swaps happened (and
         // HEAD names the commit from here on).
-        match fs::remove_file(journal.graph_dir.join(marker(&journal.plan))) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(step_failed("removing the swap marker", e)),
+        for f in journal.folders() {
+            match fs::remove_file(f.graph_dir.join(marker(&journal.plan))) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(step_failed("removing the swap marker", e)),
+            }
         }
         save(journal, Stage::Done, ctx.after_stage)?;
     }
@@ -984,7 +1082,11 @@ pub fn advance(
 /// config as they really are), before HEAD moves. A graph that fails is
 /// swapped back out, in one rename, so readers see the old graph again,
 /// and the migration stops.
-fn validate_in_place(root: &Path, journal: &Journal) -> Result<(), GraphError> {
+fn validate_in_place(
+    root: &Path,
+    folder_root: &Path,
+    journal: &mut Journal,
+) -> Result<(), GraphError> {
     // The test hooks: debug builds break the new graph's config here, as a
     // planner bug would, or save a 0.6.0 node into it, as an editor might.
     if cfg!(debug_assertions) {
@@ -1006,27 +1108,32 @@ fn validate_in_place(root: &Path, journal: &Journal) -> Result<(), GraphError> {
     let Some(d) = problem else {
         return Ok(());
     };
-    let mut kept = String::new();
-    if journal.staging.exists() {
-        exchange(&journal.graph_dir, &journal.staging)
+    journal.rejecting = true;
+    journal.save(folder_root)?;
+    for f in journal.folders() {
+        if !(f.staging.exists() && swapped(&f, &journal.plan)) {
+            continue;
+        }
+        exchange(&f.graph_dir, &f.staging)
             .map_err(|e| step_failed("swapping the old .mdkg back", e))?;
-        // The rejected graph, now at the staging path, would be deleted by
-        // a retry or a rollback, with any edit saved into it while it was
-        // in place (ignored files too): it's always kept, out of their way.
-        let dest = journal.folder.join(format!(
-            "kept-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis())
-                .unwrap_or_default()
-        ));
-        move_dir(&journal.staging, &dest)
-            .map_err(|e| step_failed("keeping the rejected .mdkg", e))?;
-        kept = format!(
-            "; the rejected graph, with anything saved into it while it was in place, is kept in {}",
-            dest.display()
-        );
     }
+    // The test hook: debug builds stop dead here, as a crash between the
+    // swap back and keeping the rejected graph would.
+    if cfg!(debug_assertions) && std::env::var_os("MDKG_MIGRATE_CRASH_IN_SWAP_BACK").is_some() {
+        std::process::exit(86);
+    }
+    // The rejected graph, now at the staging path, would be deleted by a
+    // retry or a rollback, with any edit saved into it while it was in
+    // place (ignored files too): it's always kept, out of their way.
+    let kept = keep_rejected(folder_root, journal)?;
+    let kept = if kept.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; the rejected graph, with anything saved into it while it was in place, is kept in {}",
+            kept.join(", ")
+        )
+    };
     let at = d
         .path
         .as_ref()
@@ -1043,6 +1150,46 @@ fn validate_in_place(root: &Path, journal: &Journal) -> Result<(), GraphError> {
     .with_hint(
         "the old graph is back in place: roll back with `migrate --rollback`, and report the plan",
     ))
+}
+
+/// While `journal.rejecting`, moves each folder's rejected graph (at its
+/// staging path, with the new graph's marker, the live folder holding
+/// none) to `kept-<ms>[-<i>]` in the migration's folder, then clears the
+/// flag. Returns where they went.
+fn keep_rejected(folder_root: &Path, journal: &mut Journal) -> Result<Vec<String>, GraphError> {
+    let mut kept = Vec::new();
+    if !journal.rejecting {
+        return Ok(kept);
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or_default();
+    let mark = marker(&journal.plan);
+    for (i, f) in journal.folders().iter().enumerate() {
+        let rejected = f.staging.join(&mark).exists() && !swapped(f, &journal.plan);
+        if !rejected {
+            continue;
+        }
+        let dest = journal.folder.join(match i {
+            0 => format!("kept-{stamp}"),
+            _ => format!("kept-{stamp}-{i}"),
+        });
+        // Recorded before the move, so a crash between the two can't leave
+        // a kept graph no report names (one recorded but never moved isn't
+        // there, and reports leave it out).
+        journal.kept.push(dest.display().to_string());
+        journal.save(folder_root)?;
+        move_dir(&f.staging, &dest).map_err(|e| step_failed("keeping the rejected .mdkg", e))?;
+        kept.push(dest.display().to_string());
+        // The test hook: debug builds stop dead after keeping one folder.
+        if cfg!(debug_assertions) && std::env::var_os("MDKG_MIGRATE_CRASH_AFTER_KEEP").is_some() {
+            std::process::exit(86);
+        }
+    }
+    journal.rejecting = false;
+    journal.save(folder_root)?;
+    Ok(kept)
 }
 
 /// Moves a folder: one rename when it can, else a whole copy, then the
@@ -1073,7 +1220,8 @@ fn unchanged_since_base(
     for c in changes {
         let now = file_digest(&graph_dir.join(&c.path[rel_prefix.len()..]))
             .map_err(|e| step_failed("reading .mdkg", e))?;
-        if now.as_deref() != Some(c.before.as_str()) {
+        // An empty `before`: a file the plan makes, which isn't there yet.
+        if now.as_deref() != Some(c.before.as_str()).filter(|b| !b.is_empty()) {
             changed.push(c.path.clone());
         }
     }
@@ -1105,12 +1253,12 @@ fn unchanged_since_base(
 fn restore_needed(
     top: &Path,
     journal: &Journal,
-    rel_prefix: &str,
+    f: &Folder,
     force: bool,
 ) -> Result<bool, GraphError> {
     let mark = marker(&journal.plan);
     let is = |commit: &str| -> Result<Vec<String>, GraphError> {
-        tree_mismatches(top, commit, rel_prefix, &journal.graph_dir, &mark)
+        tree_mismatches(top, commit, &f.rel_prefix, &f.graph_dir, &mark)
     };
     if is(&journal.base)?.is_empty() {
         return Ok(false);
@@ -1123,7 +1271,7 @@ fn restore_needed(
         return Ok(true);
     }
     let head = gitops::head(top).map_err(git_error)?;
-    if !(swapped(journal) || head == commit) {
+    if !(swapped(f, &journal.plan) || head == commit) {
         return Ok(false);
     }
     if force {
@@ -1144,22 +1292,22 @@ fn restore_needed(
 /// as it was listed before: a write, an addition or a removal that raced
 /// the swap would otherwise be lost with it. If anything changed, the swap
 /// is undone and the migration stops.
-fn raced(journal: &Journal) -> Result<(), GraphError> {
-    let Some(before) = &journal.inventory else {
+fn raced(f: &Folder) -> Result<(), GraphError> {
+    let Some(before) = &f.inventory else {
         return Err(failure(
             Code::MigrateStepFailed,
             "the journal has no listing of the old .mdkg to check the swap against",
         ));
     };
-    if !journal.staging.exists() {
+    if !f.staging.exists() {
         // Tidied up already (a stage later than this one).
         return Ok(());
     }
-    let after = inventory(&journal.staging).map_err(|e| step_failed("reading the old .mdkg", e))?;
+    let after = inventory(&f.staging).map_err(|e| step_failed("reading the old .mdkg", e))?;
     if after == *before {
         return Ok(());
     }
-    exchange(&journal.graph_dir, &journal.staging)
+    exchange(&f.graph_dir, &f.staging)
         .map_err(|e| step_failed("swapping .mdkg back after a racing write", e))?;
     Err(failure(
         Code::MigrateDirty,
@@ -1301,13 +1449,20 @@ fn take_tag(top: &Path, base: &str) -> Result<(String, bool), GraphError> {
 fn commit_message(plan: &Plan, rewrite_refs: bool) -> String {
     let stays = plan.nodes.iter().filter(|n| n.id.is_some()).count();
     let left = plan.nodes.iter().filter(|n| n.record.is_some()).count();
+    let history = match plan.history {
+        super::plan::History::Git => {
+            "the work history stays in git (checkpoints and finished tests stay nodes)".to_string()
+        }
+        super::plan::History::Store => format!(
+            "{left} checkpoints and finished tests become log records; {} records in all",
+            plan.records.len()
+        ),
+    };
     let mut m = format!(
-        "mdkg: migrate the graph to 0.7.0 (plan {})\n\n\
-         {stays} nodes get UUIDv7 ids with their legacy_id; {left} checkpoints and \
-         finished tests become log records; {} records in all. Rollback: \
+        "mdkg: migrate the graph to format 0.7 (plan {})\n\n\
+         {stays} nodes get UUIDv7 ids with their legacy_id; {history}. Rollback: \
          `mdkg migrate --rollback`.\n",
         plan.hash(),
-        plan.records.len()
     );
     if rewrite_refs && !plan.patch.is_empty() {
         m.push_str(&format!(
@@ -1342,6 +1497,9 @@ pub fn roll_back(
         &journal.plan,
         force,
     )?;
+    // A rejected graph a stopped swap-back left at a staging path is kept
+    // before the rollback clears those paths.
+    keep_rejected(folder_root, journal)?;
     if journal.stage != Stage::RollingBack {
         // A finished migration's worktree must be as it left it.
         if journal.stage == Stage::Done {
@@ -1374,8 +1532,15 @@ pub fn roll_back(
     // backup copy goes back exactly: a folder at the staging path is used
     // only when it lists just as the copy does (the old folder, left there
     // by a crash after the swap); else the copy is copied in afresh.
-    if restore_needed(&top, journal, &ctx.rel_prefix, force)? {
-        let copy = journal.folder.join("mdkg");
+    // Every folder is judged before any is swapped, so a refusal in one
+    // leaves them all as they were.
+    let folders = journal.folders();
+    let mut needed = Vec::new();
+    for f in &folders {
+        needed.push(restore_needed(&top, journal, f, force)?);
+    }
+    for (i, f) in folders.iter().enumerate().filter(|(i, _)| needed[*i]) {
+        let copy = journal.copy_of(i);
         if !copy.exists() {
             return Err(failure(
                 Code::MigrateStepFailed,
@@ -1383,23 +1548,17 @@ pub fn roll_back(
             ));
         }
         let wanted = inventory(&copy).map_err(|e| step_failed("reading the backup copy", e))?;
-        let staged = journal.staging.exists()
-            && inventory(&journal.staging)
-                .map_err(|e| step_failed("reading the staging folder", e))?
+        let staged = f.staging.exists()
+            && inventory(&f.staging).map_err(|e| step_failed("reading the staging folder", e))?
                 == wanted;
         if !staged {
-            publish_copy(&copy, &journal.staging, |_| Ok(()))
+            publish_copy(&copy, &f.staging, |_| Ok(()))
                 .map_err(|e| step_failed("restoring .mdkg", e))?;
         }
-        exchange(&journal.graph_dir, &journal.staging)
-            .map_err(|e| step_failed("swapping .mdkg back", e))?;
+        exchange(&f.graph_dir, &f.staging).map_err(|e| step_failed("swapping .mdkg back", e))?;
     }
-    // The patch undone (its files inside the graph folder came back with it).
-    for c in plan
-        .patch
-        .iter()
-        .filter(|c| !c.path.starts_with(&ctx.rel_prefix))
-    {
+    // The patch undone (its files inside the graph folders came back with them).
+    for c in plan.patch.iter().filter(|c| !inside(&c.path, &folders)) {
         let path = top.join(&c.path);
         let now = file_digest(&path).map_err(|e| step_failed("reading a patched file", e))?;
         if now == c.after && now.as_ref() != Some(&c.before) {
@@ -1494,6 +1653,9 @@ mod tests {
             tag_created: false,
             rewrite_refs: false,
             inventory,
+            extra: Vec::new(),
+            rejecting: false,
+            kept: Vec::new(),
             stage: Stage::Built,
         }
     }
@@ -1510,10 +1672,10 @@ mod tests {
         exchange(&graph, &staging).expect("swap");
         // Unchanged: fine.
         let j = journal(graph.clone(), staging.clone(), Some(before.clone()));
-        assert!(raced(&j).is_ok());
+        assert!(raced(&j.folders()[0]).is_ok());
         // A new file written into the old folder after the listing.
         fs::write(staging.join("work/task-3.md"), "racing").expect("race");
-        let e = raced(&j).expect_err("raced");
+        let e = raced(&j.folders()[0]).expect_err("raced");
         assert_eq!(e.code(), Code::MigrateDirty);
         // Swapped back: the racing write is in the live folder again.
         assert!(graph.join("work/task-3.md").exists());

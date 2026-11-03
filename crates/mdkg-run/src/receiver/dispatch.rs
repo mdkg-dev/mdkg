@@ -13,7 +13,7 @@ use crate::{
     Mail, RunError, hooks, identity,
     policy::Policy,
     state,
-    supervise::{Event, Guard, Supervised, Up},
+    supervise::{self, Event, Guard, Progress, Supervised, Up, progress},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -48,6 +48,129 @@ impl Report {
             self.status,
             WakeStatus::Queued | WakeStatus::DeliveryUnknown
         )
+    }
+}
+
+/// Dispatch accounting survives errors in route bookkeeping or lease release.
+/// The supervisor must adopt this progress, never recount the public result.
+#[must_use]
+#[derive(Debug)]
+pub struct WatchedDispatch {
+    pub result: Result<Report, RunError>,
+    pub progress: Progress,
+}
+
+// This borrow keeps the watch's progress lock held until after lease release.
+// There is no drop-time completion: a panic or crash preserves the admission.
+struct DispatchWatch<'a> {
+    saved: &'a mut progress::Locked,
+    before: Progress,
+    admitted: Option<progress::Receiver>,
+    completed: Option<Progress>,
+    failure: Option<RunError>,
+}
+impl<'a> DispatchWatch<'a> {
+    fn new(saved: &'a mut progress::Locked, actor: &str) -> Result<Self, RunError> {
+        saved.context_archive_path()?;
+        let record = saved.record().ok_or_else(|| {
+            RunError::failure("run.progress_invalid", "receiver progress has not started")
+        })?;
+        record.require_ready()?;
+        if record.finished || record.agent != actor || record.progress.ran == u64::MAX {
+            return Err(RunError::failure(
+                "run.progress_invalid",
+                "receiver progress is finished, exhausted, or names another actor",
+            ));
+        }
+        let before = record.progress;
+        Ok(Self {
+            saved,
+            before,
+            admitted: None,
+            completed: None,
+            failure: None,
+        })
+    }
+
+    fn fail<T>(&mut self, error: RunError) -> Result<T, RunError> {
+        Err(self.failure.get_or_insert(error).clone())
+    }
+
+    fn check_admission(&mut self, admission: &progress::Receiver) -> Result<(), RunError> {
+        if let Some(error) = &self.failure {
+            return Err(error.clone());
+        }
+        if let Err(error) = self.saved.check_receiver_admission(admission) {
+            return self.fail(error);
+        }
+        Ok(())
+    }
+
+    fn admit(&mut self, admission: progress::Receiver) -> Result<(), RunError> {
+        if let Some(error) = &self.failure {
+            return Err(error.clone());
+        }
+        if self.admitted.is_some() || self.completed.is_some() {
+            return self.fail(RunError::failure(
+                "run.progress_invalid",
+                "receiver admitted twice",
+            ));
+        }
+        if let Err(error) = self.saved.begin_receiver(admission.clone()) {
+            return self.fail(error);
+        }
+        self.admitted = Some(admission);
+        Ok(())
+    }
+
+    fn complete(&mut self, delivery: route::Delivery) -> Result<(), RunError> {
+        if let Some(error) = &self.failure {
+            return Err(error.clone());
+        }
+        if self.completed.is_some() {
+            return self.fail(RunError::failure(
+                "run.progress_invalid",
+                "receiver completed twice",
+            ));
+        }
+        let Some(admission) = &self.admitted else {
+            // Preparation and final ownership refusals cannot have spawned.
+            if delivery == route::Delivery::NotSent {
+                return Ok(());
+            }
+            return self.fail(RunError::failure(
+                "run.progress_invalid",
+                "receiver delivered without admission",
+            ));
+        };
+        let next = Progress {
+            ran: self.before.ran + u64::from(delivery != route::Delivery::NotSent),
+            seen: self.before.seen,
+            check_inbox: true,
+        };
+        if let Err(error) = self.saved.complete_receiver(admission, delivery, next) {
+            return self.fail(error);
+        }
+        self.completed = Some(next);
+        Ok(())
+    }
+
+    fn into_outcome(self, result: Result<Report, RunError>) -> Result<WatchedDispatch, RunError> {
+        if let Some(error) = self.failure {
+            return Err(error);
+        }
+        if self.admitted.is_some() && self.completed.is_none()
+            || self.admitted.is_none() && result.as_ref().is_ok_and(Report::launched)
+        {
+            return Err(RunError::failure(
+                "run.progress_invalid",
+                "receiver returned without durable completion",
+            ));
+        }
+        Ok(WatchedDispatch {
+            result,
+            progress: self.completed.unwrap_or(self.before),
+        })
     }
 }
 
@@ -171,6 +294,25 @@ impl QueueCommand {
             deadline: self.spec.deadline,
         })
     }
+}
+
+// Called only after the final route/lease checks, with those locks still held.
+// An admission error is separate from proven non-delivery: its rename may
+// already have succeeded, so the caller must retain the queue reservation.
+fn spawn_watched(
+    command: Result<QueueCommand, route::Delivery>,
+    deadline: u64,
+    watch: Option<&mut DispatchWatch<'_>>,
+    admission: progress::Receiver,
+) -> Result<Result<QueueChild, route::Delivery>, RunError> {
+    let command = match command {
+        Ok(command) => command,
+        Err(delivery) => return Ok(Err(delivery)),
+    };
+    if let Some(watch) = watch {
+        watch.admit(admission)?;
+    }
+    Ok(command.spawn_before(deadline))
 }
 
 #[cfg(test)]
@@ -298,6 +440,55 @@ pub(super) fn step(
     policy: &Policy,
     program: &Path,
 ) -> Result<Report, RunError> {
+    step_inner(mail, (root, common, dir), actor, policy, program, None)
+}
+
+/// One dispatch with durable admission and completion. `saved` must already
+/// be started and checkpointed with the caller's mail-wait cursor. All outer
+/// errors are fatal: drain sibling workers and forbid re-exec. Inner errors
+/// retain the ordinary receiver retry policy and the returned saved count.
+/// This API does not start a supervisor or finish its watch.
+pub fn dispatch_watched(
+    mail: &mut dyn Mail,
+    dir: &Path,
+    agent: &Supervised,
+    saved: &mut progress::Locked,
+) -> Result<WatchedDispatch, RunError> {
+    let root = agent
+        .opts
+        .graph_root
+        .as_deref()
+        .ok_or_else(|| invalid("receiver graph root is missing"))?;
+    let common = agent
+        .opts
+        .common_dir
+        .as_deref()
+        .ok_or_else(|| invalid("receiver common directory is missing"))?;
+    let program = agent
+        .opts
+        .program
+        .clone()
+        .unwrap_or_else(|| crate::Harness::Codex.program());
+    let mut watch = DispatchWatch::new(saved, &agent.name)?;
+    let result = step_inner(
+        mail,
+        (root, common, dir),
+        &agent.name,
+        &agent.policy,
+        &program,
+        Some(&mut watch),
+    );
+    watch.into_outcome(result)
+}
+
+fn step_inner(
+    mail: &mut dyn Mail,
+    (root, common, dir): (&Path, &Path, &Path),
+    actor: &str,
+    policy: &Policy,
+    program: &Path,
+    mut watch: Option<&mut DispatchWatch<'_>>,
+) -> Result<Report, RunError> {
     let not_sent = |_| Ok(Report::new(WakeStatus::NotSent));
     with_mode_on_renewal_failure(mail, root, dir, actor, root, not_sent, |mode, mail| {
         if mode != Mode::Interactive {
@@ -335,17 +526,7 @@ pub(super) fn step(
         }
         let floor = hooks::try_reminded_through(common, actor, session)
             .map_err(|_| invalid("receiver reminder record is unreadable"))?;
-        let page = mail.headers(actor, Some(floor), policy.batch_max().min(200))?;
-        let headers: Vec<_> = page
-            .messages
-            .into_iter()
-            .map(|h| hooks::Mail {
-                seq: h.seq,
-                kind: h.kind,
-                sender: h.sender,
-                room: h.room,
-            })
-            .collect();
+        let headers = super::wake_page(mail, actor, floor, policy.batch_max().min(200))?;
         let session_id =
             Uuid::parse_str(session).map_err(|_| invalid("receiver session isn't a UUID"))?;
         let attempt_id = Uuid::now_v7().to_string();
@@ -377,6 +558,22 @@ pub(super) fn step(
                 {
                     result.status = WakeStatus::Paused;
                     return Ok(());
+                }
+                // reserve_payload uses this same maximum wake-worthy sequence.
+                // Refuse capacity/metadata before consuming the reminder; a
+                // later uncertain admission write must still keep it reserved.
+                if let Some(watch) = watch.as_deref_mut()
+                    && let Some(through) = headers
+                        .iter()
+                        .filter(|h| hooks::wakes(h))
+                        .map(|h| h.seq)
+                        .max()
+                {
+                    watch.check_admission(&progress::Receiver {
+                        attempt_id: attempt_id.clone(),
+                        session: session.clone(),
+                        through,
+                    })?;
                 }
                 reserved = reserve_payload(common, actor, &session_id, &headers);
                 if let Some(batch) = &reserved {
@@ -439,14 +636,28 @@ pub(super) fn step(
                     renewal_failed = true;
                 })
             },
-            |deadline| command.and_then(|c| c.spawn_before(deadline)),
+            |deadline| {
+                spawn_watched(
+                    command,
+                    deadline,
+                    watch.as_deref_mut(),
+                    progress::Receiver {
+                        attempt_id: attempt_id.clone(),
+                        session: session.clone(),
+                        through: batch.through,
+                    },
+                )
+            },
         );
         let (delivery, refused) = match started {
-            Ok(Ok(Ok(child))) => (
+            Ok(Ok(Ok(Ok(child)))) => (
                 wait_queue_held(child, || mail.renew_held(&scope).map(|_| ())),
                 None,
             ),
-            Ok(Ok(Err(delivery))) => (delivery, None),
+            Ok(Ok(Ok(Err(delivery)))) => (delivery, None),
+            // A failed durable write may already have published admission.
+            // Never roll back its reservation or retry after this error.
+            Ok(Ok(Err(error))) => return Err(error),
             Ok(Err(status)) => (route::Delivery::NotSent, Some(status)),
             // Renewal refusal before process creation is definite non-delivery.
             // Let the common completion path record NotSent and unclaim once.
@@ -458,6 +669,11 @@ pub(super) fn step(
                 return Err(e);
             }
         };
+        // Save accounting before either cleanup can fail, and before a
+        // NotSent rollback makes these headers eligible for another attempt.
+        if let Some(watch) = watch {
+            watch.complete(delivery)?;
+        }
         if delivery == route::Delivery::NotSent {
             hooks::unclaim_reminder(common, actor, session, batch.through, batch.previous);
         }
@@ -500,43 +716,143 @@ pub fn supervise(
         .program
         .clone()
         .unwrap_or_else(|| crate::Harness::Codex.program());
-    let mut ran = 0;
-    let mut seen = None;
+    supervise_steps(mail, &a.name, how, on, |mail| {
+        step(mail, root, common, dir, &a.name, &a.policy, &program)
+    })
+}
+
+/// The receiver watch uses saved dispatch accounting, never recounting a public
+/// result whose cleanup may have failed after durable completion.
+pub fn supervise_durable(
+    mail: &mut dyn Mail,
+    dir: &Path,
+    a: &Supervised,
+    how: &Up,
+    on: &(dyn Fn(&str, Event<'_>) + Sync),
+    saved: &mut progress::Locked,
+) -> Result<u64, RunError> {
+    let mut current = saved
+        .record()
+        .ok_or_else(|| invalid("watch not started"))?
+        .progress;
     let mut last = None;
     loop {
-        if how.max_turns.is_some_and(|n| ran >= n) {
-            return ran;
+        // Each step reads the repository fresh (#13066 D2).
+        mdkg_git::fresh_reads();
+        supervise::checkpoint(Some(saved), current)?;
+        supervise::save_progress(&a.name, current);
+        if supervise::stop_requested() || how.max_turns.is_some_and(|n| current.ran >= n) {
+            return Ok(current.ran);
         }
-        match step(mail, root, common, dir, &a.name, &a.policy, &program) {
+        let outcome = dispatch_watched(mail, dir, a, saved)?;
+        current = outcome.progress;
+        match outcome.result {
             Ok(report) => {
                 if last.as_ref() != Some(&report) {
                     on(&a.name, Event::Wake(&report));
                 }
+                if report.status == WakeStatus::ModeChanged || how.once {
+                    return Ok(current.ran);
+                }
+                if report.status == WakeStatus::NotSent {
+                    supervise::pause(how.pause);
+                }
+                last = Some(report);
+            }
+            Err(error) => {
+                on(&a.name, Event::Trouble(&error));
+                if how.once {
+                    return Ok(current.ran);
+                }
+                supervise::pause(how.pause);
+            }
+        }
+        if supervise::stop_requested() {
+            return Ok(current.ran);
+        }
+        match mail.wait_headers(
+            &a.name,
+            current.seen,
+            supervise::wait_secs(how.wait_secs.clamp(1, 5)),
+        ) {
+            Ok(Some(page)) => current.seen = current.seen.max(page.cursor),
+            Ok(None) => (),
+            Err(error) => {
+                on(&a.name, Event::Trouble(&error));
+                supervise::pause(how.pause);
+            }
+        }
+    }
+}
+
+fn supervise_steps(
+    mail: &mut dyn Mail,
+    name: &str,
+    how: &Up,
+    on: &(dyn Fn(&str, Event<'_>) + Sync),
+    mut step: impl FnMut(&mut dyn Mail) -> Result<Report, RunError>,
+) -> u64 {
+    let previous = supervise::load_progress(name);
+    let mut ran = previous.ran;
+    let mut seen = previous.seen;
+    let mut last = None;
+    loop {
+        // Each step reads the repository fresh (#13066 D2).
+        mdkg_git::fresh_reads();
+        supervise::save_progress(
+            name,
+            Progress {
+                ran,
+                seen,
+                check_inbox: true,
+            },
+        );
+        if supervise::stop_requested() || how.max_turns.is_some_and(|n| ran >= n) {
+            return ran;
+        }
+        // Never stop a step after it has reserved delivery. Drain it and
+        // record its result before observing stop again at the boundary.
+        match step(mail) {
+            Ok(report) => {
                 if report.launched() {
                     ran += 1;
+                }
+                supervise::save_progress(
+                    name,
+                    Progress {
+                        ran,
+                        seen,
+                        check_inbox: true,
+                    },
+                );
+                if last.as_ref() != Some(&report) {
+                    on(name, Event::Wake(&report));
                 }
                 if report.status == WakeStatus::ModeChanged || how.once {
                     return ran;
                 }
                 if report.status == WakeStatus::NotSent {
-                    std::thread::sleep(how.pause);
+                    supervise::pause(how.pause);
                 }
                 last = Some(report);
             }
             Err(e) => {
-                on(&a.name, Event::Trouble(&e));
+                on(name, Event::Trouble(&e));
                 if how.once {
                     return ran;
                 }
-                std::thread::sleep(how.pause);
+                supervise::pause(how.pause);
             }
         }
-        match mail.wait_headers(&a.name, seen, how.wait_secs.clamp(1, 5)) {
+        if supervise::stop_requested() {
+            return ran;
+        }
+        match mail.wait_headers(name, seen, supervise::wait_secs(how.wait_secs.clamp(1, 5))) {
             Ok(Some(page)) => seen = seen.max(page.cursor),
             Ok(None) => (),
             Err(e) => {
-                on(&a.name, Event::Trouble(&e));
-                std::thread::sleep(how.pause);
+                on(name, Event::Trouble(&e));
+                supervise::pause(how.pause);
             }
         }
     }
@@ -550,6 +866,808 @@ mod tests {
     // retain their own short deadlines.
     const STARTUP_ALLOWANCE: Duration = Duration::from_secs(30);
     const QUEUE_WATCHDOG: Duration = Duration::from_secs(60);
+
+    struct LoopMail {
+        ready: std::sync::mpsc::Sender<()>,
+        waits: usize,
+        fail_wait: bool,
+    }
+    impl Mail for LoopMail {
+        fn wait_headers(
+            &mut self,
+            _: &str,
+            after: Option<u64>,
+            seconds: u64,
+        ) -> Result<Option<crate::mail::Headers>, RunError> {
+            assert_eq!(after, Some(17));
+            assert_eq!(seconds, 1);
+            self.waits += 1;
+            self.ready.send(()).unwrap();
+            supervise::pause(Duration::from_secs(600));
+            if self.fail_wait {
+                return Err(invalid("fixture header wait failure"));
+            }
+            Ok(Some(crate::mail::Headers {
+                cursor: Some(23),
+                ..Default::default()
+            }))
+        }
+        fn inbox(&mut self, _: &str, _: usize) -> Result<crate::Inbox, RunError> {
+            panic!("body read")
+        }
+        fn wait(
+            &mut self,
+            _: &str,
+            _: Option<u64>,
+            _: u64,
+        ) -> Result<Option<crate::Inbox>, RunError> {
+            panic!("body wait")
+        }
+        fn import(&mut self, _: &crate::mail::Import<'_>) -> Result<String, RunError> {
+            panic!("import")
+        }
+        fn ack(&mut self, _: &str, _: &[String], _: &str) -> Result<(), RunError> {
+            panic!("ack")
+        }
+        fn claim(&mut self, _: &str) -> Result<(), RunError> {
+            panic!("claim")
+        }
+        fn release(&mut self, _: &str) -> Result<(), RunError> {
+            panic!("release")
+        }
+        fn holder(&self) -> String {
+            "fixture".into()
+        }
+        fn release_as(&mut self, _: &str, _: &str) -> Result<(), RunError> {
+            panic!("reclaim")
+        }
+        fn holds(&mut self, _: &str, _: &str, _: Option<&str>) -> Result<bool, RunError> {
+            panic!("holds")
+        }
+        fn note(&mut self, _: &crate::mail::Note<'_>) -> Result<String, RunError> {
+            panic!("note")
+        }
+    }
+    const PROGRESS_GRAPH: &str = "01900000-0000-7000-8000-000000000001";
+    const PROGRESS_INVOCATION: &str =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    struct DispatchMail {
+        run: PathBuf,
+        expected_charge: u64,
+        expected_seen: u64,
+        release_fails: bool,
+        break_route: bool,
+        pending_on_release: bool,
+        held: bool,
+        releases: usize,
+        /// `fresh_reads_count()` at each claim, where a step starts.
+        claimed_at: Vec<u64>,
+        /// Checks each release's saved progress; off for a run of several
+        /// steps, whose counts move on.
+        check_release: bool,
+        /// Asks the loop to stop at this claim, so a test runs that many
+        /// steps.
+        stop_at: Option<(usize, supervise::Control)>,
+    }
+    impl Mail for DispatchMail {
+        fn claim(&mut self, _: &str) -> Result<(), RunError> {
+            assert!(!self.held);
+            self.held = true;
+            self.claimed_at.push(mdkg_git::fresh_reads_count());
+            if let Some((at, control)) = &self.stop_at
+                && self.claimed_at.len() == *at
+            {
+                control.request_stop();
+            }
+            Ok(())
+        }
+        fn renew_held(&mut self, _: &str) -> Result<u64, RunError> {
+            assert!(self.held);
+            Ok(u64::MAX)
+        }
+        fn release(&mut self, _: &str) -> Result<(), RunError> {
+            assert!(self.held);
+            if !self.check_release {
+                self.held = false;
+                self.releases += 1;
+                return Ok(());
+            }
+            let record: progress::Record = if self.pending_on_release {
+                serde_json::from_slice(
+                    &fs::read(self.run.join("progress/alice.json.admitted")).unwrap(),
+                )
+                .unwrap()
+            } else {
+                progress::inspect(&self.run, PROGRESS_GRAPH.parse().unwrap(), "alice")
+                    .unwrap()
+                    .unwrap()
+            };
+            assert_eq!(record.progress.ran, 4 + self.expected_charge);
+            assert_eq!(record.progress.seen, Some(self.expected_seen));
+            assert_eq!(record.current_receiver.is_some(), self.pending_on_release);
+            self.held = false;
+            self.releases += 1;
+            if self.release_fails {
+                Err(invalid("fixture release failed"))
+            } else {
+                Ok(())
+            }
+        }
+        fn headers(
+            &mut self,
+            _: &str,
+            after: Option<u64>,
+            _: usize,
+        ) -> Result<crate::mail::Headers, RunError> {
+            assert!(self.held);
+            if self.break_route {
+                // This is consumed by the fake executable, after admission.
+                fs::write(self.run.join("break-route"), "").unwrap();
+            }
+            Ok(crate::mail::Headers {
+                cursor: Some(29),
+                more: false,
+                messages: if after.is_some_and(|seq| seq >= 23) {
+                    vec![]
+                } else {
+                    vec![crate::mail::Header {
+                        seq: 23,
+                        kind: "note".into(),
+                        sender: "peer".into(),
+                        room: None,
+                        reference_ids: Vec::new(),
+                    }]
+                },
+            })
+        }
+        fn holder(&self) -> String {
+            "dispatch-fixture".into()
+        }
+        fn inbox(&mut self, _: &str, _: usize) -> Result<crate::Inbox, RunError> {
+            panic!("body read")
+        }
+        fn wait(
+            &mut self,
+            _: &str,
+            _: Option<u64>,
+            _: u64,
+        ) -> Result<Option<crate::Inbox>, RunError> {
+            panic!("body wait")
+        }
+        fn import(&mut self, _: &crate::mail::Import<'_>) -> Result<String, RunError> {
+            panic!("import")
+        }
+        fn ack(&mut self, _: &str, _: &[String], _: &str) -> Result<(), RunError> {
+            panic!("ack")
+        }
+        fn release_as(&mut self, _: &str, _: &str) -> Result<(), RunError> {
+            panic!("reclaim")
+        }
+        fn holds(&mut self, _: &str, _: &str, _: Option<&str>) -> Result<bool, RunError> {
+            panic!("holds")
+        }
+        fn note(&mut self, _: &crate::mail::Note<'_>) -> Result<String, RunError> {
+            panic!("note")
+        }
+    }
+
+    fn dispatch_fixture(
+        script: &str,
+    ) -> (Fake, Supervised, PathBuf, progress::Locked, DispatchMail) {
+        let f = Fake::new(script);
+        idle_route(&f);
+        let root = fs::canonicalize(&f.0).unwrap();
+        // Receiver admission reads the committed graph, not the fixture's
+        // checkout file. Keep the same legacy config, but commit it in a real
+        // repository without inheriting an outer Git index, hooks or config.
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .current_dir(&root)
+                .env_clear()
+                .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+                .env("HOME", &root)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_ATTR_NOSYSTEM", "1")
+                .args([
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-c",
+                    "init.templateDir=",
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["add", "--", ".mdkg/config.json"]);
+        git(&["commit", "-q", "-m", "fixture authority"]);
+        // The linked worktree below checks out this branch.
+        git(&["branch", "agent/alice"]);
+        let common = root.join(".git");
+        let cwd = root.join(".worktrees/alice");
+        let admin = common.join("worktrees/alice");
+        fs::create_dir_all(&admin).unwrap();
+        fs::create_dir_all(cwd.join(".mdkg")).unwrap();
+        fs::write(admin.join("HEAD"), "ref: refs/heads/agent/alice\n").unwrap();
+        fs::write(admin.join("commondir"), "../..\n").unwrap();
+        fs::write(
+            admin.join("gitdir"),
+            format!("{}\n", cwd.join(".git").display()),
+        )
+        .unwrap();
+        fs::write(cwd.join(".git"), format!("gitdir: {}\n", admin.display())).unwrap();
+        fs::write(
+            cwd.join(".mdkg/config.json"),
+            r#"{"projections":["hooks:codex"]}"#,
+        )
+        .unwrap();
+        route::observe(
+            &common,
+            "alice",
+            SESSION_A,
+            &cwd,
+            hooks::ThreadState::Idle,
+            &observation(hooks::HarnessEvent::SessionStart),
+        )
+        .unwrap();
+        let dir = common.join("mdkg/run");
+        fs::create_dir_all(&dir).unwrap();
+        let mut saved =
+            progress::Locked::open(&dir, PROGRESS_GRAPH.parse().unwrap(), "alice").unwrap();
+        saved.start(PROGRESS_INVOCATION, None).unwrap();
+        saved
+            .checkpoint(Progress {
+                ran: 4,
+                seen: Some(17),
+                check_inbox: true,
+            })
+            .unwrap();
+        let agent = Supervised {
+            name: "alice".into(),
+            policy: Policy::default(),
+            opts: crate::TurnOptions {
+                graph_root: Some(root.clone()),
+                common_dir: Some(common),
+                program: Some(root.join("fake")),
+                ..Default::default()
+            },
+        };
+        let mail = DispatchMail {
+            run: dir.clone(),
+            expected_charge: 1,
+            expected_seen: 17,
+            release_fails: false,
+            break_route: false,
+            pending_on_release: false,
+            held: false,
+            releases: 0,
+            claimed_at: Vec::new(),
+            check_release: true,
+            stop_at: None,
+        };
+        (f, agent, dir, saved, mail)
+    }
+
+    #[test]
+    fn durable_receiver_supervisor_uses_saved_count_even_after_release_error() {
+        let (_fixture, agent, dir, mut saved, mut mail) = dispatch_fixture("exit 0");
+        mail.release_fails = true;
+        let how = Up {
+            wait_secs: 1,
+            max_turns: Some(5),
+            once: true,
+            pause: Duration::ZERO,
+            fresh: false,
+        };
+        let count =
+            supervise_durable(&mut mail, &dir, &agent, &how, &|_, _| (), &mut saved).unwrap();
+        assert_eq!(count, 5);
+        assert_eq!(mail.releases, 1);
+        assert_eq!(saved.record().unwrap().progress.ran, 5);
+        assert!(saved.record().unwrap().current_receiver.is_none());
+        // A reconstructed loop with the same durable budget cannot dispatch a
+        // sixth time, regardless of the previous public cleanup error.
+        let count =
+            supervise_durable(&mut mail, &dir, &agent, &how, &|_, _| (), &mut saved).unwrap();
+        assert_eq!(count, 5);
+        assert_eq!(mail.releases, 1);
+    }
+
+    #[test]
+    fn durable_receiver_supervisor_reads_fresh_each_step() {
+        let (_fixture, agent, dir, mut saved, mut mail) = dispatch_fixture("exit 0");
+        mail.check_release = false;
+        let how = Up {
+            wait_secs: 1,
+            max_turns: Some(6),
+            once: false,
+            pause: Duration::ZERO,
+            fresh: false,
+        };
+        // Two steps: the loop stops at the second claim.
+        let control = supervise::Control::default();
+        mail.stop_at = Some((2, control.clone()));
+        // Each pass reports the mock's missing header wait as trouble. More
+        // than a few means the steps aren't reaching the claim: stop then,
+        // rather than retry until the runner kills the test.
+        let troubles = std::sync::Mutex::new(Vec::new());
+        let on = |_: &str, event: Event<'_>| {
+            if let Event::Trouble(error) = event {
+                let mut troubles = troubles.lock().unwrap();
+                troubles.push(format!("{error:?}"));
+                if troubles.len() > 4 {
+                    control.request_stop();
+                }
+            }
+        };
+        let before = mdkg_git::fresh_reads_count();
+        supervise::with_control(Some(&control), || {
+            supervise_durable(&mut mail, &dir, &agent, &how, &on, &mut saved).unwrap()
+        });
+        assert_eq!(
+            mail.claimed_at.len(),
+            2,
+            "two steps ran: {:?}",
+            troubles.lock().unwrap()
+        );
+        assert!(mail.claimed_at[0] > before, "the first step reads fresh");
+        assert!(
+            mail.claimed_at[1] > mail.claimed_at[0],
+            "the second step reads fresh again"
+        );
+    }
+
+    #[test]
+    fn watched_dispatch_saves_charge_before_release_and_never_recounts_cleanup_errors() {
+        for (exit, release_fails, break_route) in [
+            (0, false, false),
+            (1, false, false),
+            (0, true, false),
+            (0, false, true),
+        ] {
+            let script = format!(
+                r#"
+progress="$(dirname "$0")/.git/mdkg/run/progress/alice.json"
+# Admission must be durable before the child gets control.
+[ -f "$progress" ] || exit 7
+cp "$progress" "$0.admission"
+if [ -f "$(dirname "$0")/.git/mdkg/run/break-route" ]; then
+    rm "$(dirname "$0")/.git/mdkg/hooks/receiver/alice.json"
+    mkdir "$(dirname "$0")/.git/mdkg/hooks/receiver/alice.json"
+fi
+exit {exit}
+"#
+            );
+            let (f, agent, dir, mut saved, mut mail) = dispatch_fixture(&script);
+            mail.release_fails = release_fails;
+            mail.break_route = break_route;
+            let out = dispatch_watched(&mut mail, &dir, &agent, &mut saved).unwrap();
+            assert_eq!(out.progress.ran, 5);
+            assert_eq!(out.progress.seen, Some(17));
+            assert_eq!(mail.releases, 1);
+            assert!(!mail.held);
+            let admitted: progress::Record =
+                serde_json::from_slice(&fs::read(f.0.join("fake.admission")).unwrap()).unwrap();
+            let receiver = admitted.current_receiver.unwrap();
+            assert_eq!(receiver.session, SESSION_A);
+            assert_eq!(receiver.through, 23);
+            assert_eq!(admitted.progress.ran, 4);
+            assert!(admitted.current.is_none());
+            assert_eq!(out.result.is_err(), release_fails || break_route);
+            if let Ok(report) = out.result {
+                assert_eq!(
+                    report.status,
+                    if exit == 0 {
+                        WakeStatus::Queued
+                    } else {
+                        WakeStatus::DeliveryUnknown
+                    }
+                );
+                // Successful and ambiguous dispatches both consume the queue reservation.
+                let again = dispatch_watched(&mut mail, &dir, &agent, &mut saved).unwrap();
+                assert_eq!(again.result.unwrap().status, WakeStatus::NoMail);
+                assert_eq!(again.progress.ran, 5);
+            }
+        }
+    }
+
+    #[test]
+    fn watched_dispatch_completion_error_preserves_reservation_and_attempts_release() {
+        let script = r#"
+progress="$(dirname "$0")/.git/mdkg/run/progress/alice.json"
+cp "$progress" "$progress.admitted"
+rm "$progress"
+mkdir "$progress"
+exit 0
+"#;
+        let (f, agent, dir, mut saved, mut mail) = dispatch_fixture(script);
+        mail.pending_on_release = true;
+        mail.expected_charge = 0;
+        // Even a cleanup error must not replace the sticky persistence error.
+        mail.release_fails = true;
+        let error = dispatch_watched(&mut mail, &dir, &agent, &mut saved).unwrap_err();
+        assert_ne!(error.message, "fixture release failed");
+        assert_eq!(mail.releases, 1);
+        assert!(!mail.held);
+        let common = agent.opts.common_dir.as_ref().unwrap();
+        assert_eq!(
+            hooks::try_reminded_through(common, "alice", SESSION_A).unwrap(),
+            23
+        );
+        let path = dir.join("progress/alice.json");
+        fs::remove_dir(&path).unwrap();
+        fs::rename(dir.join("progress/alice.json.admitted"), &path).unwrap();
+        drop(saved);
+        let mut reopened =
+            progress::Locked::open(&dir, PROGRESS_GRAPH.parse().unwrap(), "alice").unwrap();
+        let pending = reopened.record().unwrap().current_receiver.clone().unwrap();
+        assert_eq!(pending.through, 23);
+        assert!(dispatch_watched(&mut mail, &dir, &agent, &mut reopened).is_err());
+        assert_eq!(mail.releases, 1); // Restart never even claims a turn.
+        reopened.resume(None).unwrap();
+        reopened.start(PROGRESS_INVOCATION, None).unwrap();
+        mail.pending_on_release = false;
+        mail.expected_charge = 1;
+        mail.expected_seen = 23;
+        mail.release_fails = false;
+        fs::remove_file(f.0.join("fake.started")).unwrap();
+        let out = dispatch_watched(&mut mail, &dir, &agent, &mut reopened).unwrap();
+        assert_eq!(out.result.unwrap().status, WakeStatus::NoMail);
+        assert_eq!(out.progress.ran, 5);
+        assert!(!f.0.join("fake.started").exists());
+        assert_eq!(reopened.record().unwrap().receiver_recovery, vec![pending]);
+    }
+
+    #[test]
+    fn receiver_capacity_refusal_preserves_wake_for_dispatch_after_archive() {
+        let (f, agent, dir, saved, mut mail) = dispatch_fixture("exit 0");
+        let mut record = saved.record().unwrap().clone();
+        drop(saved);
+        let old_attempt = progress::Receiver {
+            attempt_id: Uuid::now_v7().to_string(),
+            session: SESSION_A.into(),
+            through: 11,
+        };
+        // Fill the documented inline-context bound with valid retained data,
+        // leaving room for the current record but not another interruption.
+        loop {
+            record.receiver_recovery.push(old_attempt.clone());
+            if serde_json::to_vec(&(&record.recovery, &record.receiver_recovery))
+                .unwrap()
+                .len()
+                > 144 * 1024
+            {
+                record.receiver_recovery.pop();
+                break;
+            }
+        }
+        let path = dir.join("progress/alice.json");
+        let before = serde_json::to_vec(&record).unwrap();
+        fs::write(&path, &before).unwrap();
+        let mut saved =
+            progress::Locked::open(&dir, PROGRESS_GRAPH.parse().unwrap(), "alice").unwrap();
+        mail.expected_charge = 0;
+        let error = dispatch_watched(&mut mail, &dir, &agent, &mut saved).unwrap_err();
+        assert!(error.hint.as_deref().unwrap().contains("--archive-context"));
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert!(!f.0.join("fake.started").exists());
+        assert_eq!(mail.releases, 1);
+        let common = agent.opts.common_dir.as_ref().unwrap();
+        assert_eq!(
+            hooks::try_reminded_through(common, "alice", SESSION_A).unwrap(),
+            0,
+            "capacity refusal must not consume the wake reservation"
+        );
+
+        let archive = saved.archive_context(None).unwrap().archive.unwrap();
+        assert_eq!(fs::read(archive).unwrap(), before);
+        saved.start(PROGRESS_INVOCATION, None).unwrap();
+        mail.expected_charge = 1;
+        let out = dispatch_watched(&mut mail, &dir, &agent, &mut saved).unwrap();
+        assert_eq!(out.result.unwrap().status, WakeStatus::Queued);
+        assert_eq!(out.progress.ran, 5);
+        assert!(f.0.join("fake.started").exists());
+        assert_eq!(
+            hooks::try_reminded_through(common, "alice", SESSION_A).unwrap(),
+            23
+        );
+        let again = dispatch_watched(&mut mail, &dir, &agent, &mut saved).unwrap();
+        assert_eq!(again.result.unwrap().status, WakeStatus::NoMail);
+        assert_eq!(again.progress.ran, 5);
+    }
+
+    #[test]
+    fn watched_dispatch_missing_program_does_not_admit_or_charge() {
+        let (_f, mut agent, dir, mut saved, mut mail) = dispatch_fixture("exit 0");
+        agent.opts.program = Some(dir.join("missing"));
+        mail.expected_charge = 0;
+        let before = fs::read(dir.join("progress/alice.json")).unwrap();
+        let out = dispatch_watched(&mut mail, &dir, &agent, &mut saved).unwrap();
+        assert_eq!(out.result.unwrap().status, WakeStatus::NotSent);
+        assert_eq!(out.progress.ran, 4);
+        assert_eq!(fs::read(dir.join("progress/alice.json")).unwrap(), before);
+        assert_eq!(
+            hooks::try_reminded_through(
+                agent.opts.common_dir.as_ref().unwrap(),
+                "alice",
+                SESSION_A
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn watched_spawn_failure_completes_zero_charge_and_pending_admission_refuses_restart() {
+        let (f, _agent, dir, mut saved, _) = dispatch_fixture("exit 0");
+        let admission = progress::Receiver {
+            attempt_id: Uuid::now_v7().to_string(),
+            session: SESSION_A.into(),
+            through: 23,
+        };
+        let mut watch = DispatchWatch::new(&mut saved, "alice").unwrap();
+        let command = f.prepare().unwrap();
+        // A proved expired deadline after durable admission cannot spawn.
+        assert!(matches!(
+            spawn_watched(Ok(command), 0, Some(&mut watch), admission.clone()).unwrap(),
+            Err(route::Delivery::NotSent)
+        ));
+        watch.complete(route::Delivery::NotSent).unwrap();
+        let out = watch
+            .into_outcome(Ok(Report::new(WakeStatus::NotSent)))
+            .unwrap();
+        assert_eq!(out.progress.ran, 4);
+        assert!(!f.0.join("fake.started").exists());
+        let mut watch = DispatchWatch::new(&mut saved, "alice").unwrap();
+        watch.admit(admission.clone()).unwrap();
+        drop(watch); // Process death/early return does not synthesize completion.
+        drop(saved);
+        let mut reopened =
+            progress::Locked::open(&dir, PROGRESS_GRAPH.parse().unwrap(), "alice").unwrap();
+        assert_eq!(
+            reopened.record().unwrap().current_receiver.as_ref(),
+            Some(&admission)
+        );
+        assert!(DispatchWatch::new(&mut reopened, "alice").is_err());
+        reopened.resume(None).unwrap();
+        reopened.start(PROGRESS_INVOCATION, None).unwrap();
+        assert_eq!(reopened.record().unwrap().progress.ran, 5);
+        assert!(DispatchWatch::new(&mut reopened, "alice").is_ok());
+    }
+
+    #[test]
+    fn watched_write_failure_is_fatal_and_preserves_not_sent_reservation() {
+        for completion in [false, true] {
+            let (f, _agent, dir, mut saved, _) = dispatch_fixture("exit 0");
+            let common = f.0.join(".git");
+            let previous = hooks::reserve_reminder(&common, "alice", SESSION_A, 23).unwrap();
+            assert_eq!(previous, 0);
+            let mut watch = DispatchWatch::new(&mut saved, "alice").unwrap();
+            let admission = progress::Receiver {
+                attempt_id: Uuid::now_v7().to_string(),
+                session: SESSION_A.into(),
+                through: 23,
+            };
+            if completion {
+                watch.admit(admission.clone()).unwrap();
+            }
+            let progress_path = dir.join("progress/alice.json");
+            let old = fs::read(&progress_path).unwrap();
+            fs::rename(&progress_path, dir.join("original-progress")).unwrap();
+            fs::create_dir(&progress_path).unwrap(); // Invalid record prevents publication.
+            let error = if completion {
+                watch.complete(route::Delivery::NotSent).unwrap_err()
+            } else {
+                spawn_watched(f.prepare(), u64::MAX, Some(&mut watch), admission)
+                    .err()
+                    .unwrap()
+            };
+            fs::remove_dir(&progress_path).unwrap();
+            fs::rename(dir.join("original-progress"), &progress_path).unwrap();
+            assert_eq!(
+                watch
+                    .into_outcome(Err(invalid("later release failure")))
+                    .unwrap_err(),
+                error
+            );
+            assert_eq!(fs::read(&progress_path).unwrap(), old);
+            assert_eq!(
+                hooks::try_reminded_through(&common, "alice", SESSION_A).unwrap(),
+                23
+            );
+            assert!(!f.0.join("fake.started").exists());
+            drop(saved);
+            let mut reopened =
+                progress::Locked::open(&dir, PROGRESS_GRAPH.parse().unwrap(), "alice").unwrap();
+            assert_eq!(
+                reopened.record().unwrap().current_receiver.is_some(),
+                completion
+            );
+            if completion {
+                assert!(DispatchWatch::new(&mut reopened, "alice").is_err());
+            }
+        }
+    }
+
+    struct Stop(supervise::Control);
+    impl Drop for Stop {
+        fn drop(&mut self) {
+            self.0.request_stop();
+        }
+    }
+    fn loop_options() -> Up {
+        Up {
+            wait_secs: 600,
+            max_turns: Some(3),
+            once: false,
+            pause: Duration::from_secs(600),
+            fresh: false,
+        }
+    }
+    fn loop_control() -> supervise::Control {
+        supervise::Control::from_progress(std::collections::BTreeMap::from([(
+            "worker".into(),
+            Progress {
+                ran: 2,
+                seen: Some(17),
+                check_inbox: true,
+            },
+        )]))
+    }
+
+    #[test]
+    fn supervise_steps_reads_fresh_each_step() {
+        let mut mail = DispatchMail {
+            run: PathBuf::new(),
+            expected_charge: 0,
+            expected_seen: 0,
+            release_fails: false,
+            break_route: false,
+            pending_on_release: false,
+            held: false,
+            releases: 0,
+            claimed_at: Vec::new(),
+            check_release: true,
+            stop_at: None,
+        };
+        let how = Up {
+            pause: Duration::ZERO,
+            max_turns: Some(2),
+            ..loop_options()
+        };
+        let before = mdkg_git::fresh_reads_count();
+        let mut seen = Vec::new();
+        let ran = supervise_steps(&mut mail, "worker", &how, &|_, _| (), |_| {
+            seen.push(mdkg_git::fresh_reads_count());
+            Ok(Report::new(WakeStatus::Queued))
+        });
+        assert_eq!(ran, 2);
+        assert_eq!(seen.len(), 2);
+        assert!(seen[0] > before, "the first step reads fresh");
+        assert!(seen[1] > seen[0], "the second step reads fresh again");
+    }
+
+    #[test]
+    fn supervise_stop_drains_current_dispatch_and_saves_its_count() {
+        supervise::bounded_test(
+            "receiver::dispatch::tests::supervise_stop_drains_current_dispatch_and_saves_its_count",
+            || {
+                let control = loop_control();
+                std::thread::scope(|scope| {
+                    let (release, released) = std::sync::mpsc::channel::<()>();
+                    // Disconnect the step before joining even if readiness fails.
+                    let release = release;
+                    let _stop = Stop(control.clone());
+                    let (entered, pending) = std::sync::mpsc::channel();
+                    let (finished, returned) = std::sync::mpsc::channel();
+                    let worker_control = control.clone();
+                    scope.spawn(move || {
+                        supervise::with_control(Some(&worker_control), || {
+                            let mut mail = LoopMail {
+                                ready: entered.clone(),
+                                waits: 0,
+                                fail_wait: false,
+                            };
+                            let mut calls = 0;
+                            let ran = supervise_steps(
+                                &mut mail,
+                                "worker",
+                                &loop_options(),
+                                &|_, _| (),
+                                |_| {
+                                    calls += 1;
+                                    entered.send(()).unwrap();
+                                    let _ = released.recv();
+                                    Ok(Report {
+                                        status: WakeStatus::Queued,
+                                        session: Some("known-session".into()),
+                                        through: Some(19),
+                                    })
+                                },
+                            );
+                            let _ = finished.send((ran, calls, mail.waits));
+                        })
+                    });
+                    pending.recv_timeout(STARTUP_ALLOWANCE).unwrap();
+                    control.request_stop();
+                    assert!(matches!(
+                        returned.try_recv(),
+                        Err(std::sync::mpsc::TryRecvError::Empty)
+                    ));
+                    drop(release);
+                    assert_eq!(returned.recv_timeout(STARTUP_ALLOWANCE).unwrap(), (3, 1, 0));
+                });
+                assert_eq!(control.progress()["worker"].ran, 3);
+                assert_eq!(control.progress()["worker"].seen, Some(17));
+            },
+        );
+    }
+
+    #[test]
+    fn supervise_stop_wakes_header_wait_and_both_backoffs() {
+        supervise::bounded_test(
+            "receiver::dispatch::tests::supervise_stop_wakes_header_wait_and_both_backoffs",
+            || {
+                for mode in ["headers", "headers-error", "not-sent", "failure"] {
+                    let control = loop_control();
+                    std::thread::scope(|scope| {
+                        let _stop = Stop(control.clone());
+                        let (ready, waiting) = std::sync::mpsc::channel();
+                        let (done, returned) = std::sync::mpsc::channel();
+                        let worker_control = control.clone();
+                        scope.spawn(move || {
+                            supervise::with_control(Some(&worker_control), || {
+                                let mut mail = LoopMail {
+                                    ready: ready.clone(),
+                                    waits: 0,
+                                    fail_wait: mode == "headers-error",
+                                };
+                                let ran = supervise_steps(
+                                    &mut mail,
+                                    "worker",
+                                    &loop_options(),
+                                    &|_, _| {
+                                        if !mode.starts_with("headers") {
+                                            ready.send(()).unwrap();
+                                        }
+                                    },
+                                    |_| match mode {
+                                        "headers" | "headers-error" => {
+                                            Ok(Report::new(WakeStatus::NoMail))
+                                        }
+                                        "not-sent" => Ok(Report::new(WakeStatus::NotSent)),
+                                        _ => Err(invalid("fixture dispatch failure")),
+                                    },
+                                );
+                                let _ = done.send((ran, mail.waits));
+                            })
+                        });
+                        waiting.recv_timeout(STARTUP_ALLOWANCE).unwrap();
+                        control.request_stop();
+                        assert_eq!(
+                            returned.recv_timeout(STARTUP_ALLOWANCE).unwrap(),
+                            (2, usize::from(mode.starts_with("headers")))
+                        );
+                    });
+                    assert_eq!(
+                        control.progress()["worker"].seen,
+                        Some(if mode == "headers" { 23 } else { 17 })
+                    );
+                }
+            },
+        );
+    }
 
     fn check_queue_watchdog(started: Instant, budget: Duration) {
         assert!(

@@ -1,0 +1,291 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "mdkg.api.machine.v1",
+  "description": "Draft (mdkg API v1; see docs/api.md). May change until the release that first emits it. A machine that runs supervisors or turns (A8).",
+  "x-mdkg-status": "draft",
+  "type": "object",
+  "properties": {
+    "schema": {
+      "const": "mdkg.api.machine.v1"
+    },
+    "ok": {
+      "type": "boolean",
+      "description": "False exactly when there is an error diagnostic."
+    },
+    "data": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Machine"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "diagnostics": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/DiagnosticOut"
+      }
+    }
+  },
+  "required": [
+    "schema",
+    "ok",
+    "diagnostics"
+  ],
+  "$defs": {
+    "Machine": {
+      "type": "object",
+      "properties": {
+        "uri": {
+          "type": "string",
+          "description": "The resource's path at its coordinator, beginning `/v1/`."
+        },
+        "machine_id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string",
+          "description": "The host name; display only."
+        },
+        "local": {
+          "type": "boolean"
+        },
+        "enrolled_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "RFC 3339 UTC to the millisecond, or null."
+        },
+        "key_fingerprint": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Null for the local machine."
+        },
+        "harnesses": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Harness"
+          }
+        },
+        "checkouts": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "description": "The resource's path at its coordinator, beginning `/v1/`."
+          }
+        },
+        "capacity": {
+          "type": "object",
+          "properties": {
+            "max_turns": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0,
+              "description": "Null for no cap."
+            },
+            "running_turns": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "max_turns",
+            "running_turns"
+          ]
+        },
+        "seen_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "RFC 3339 UTC to the millisecond, or null."
+        }
+      },
+      "required": [
+        "uri",
+        "machine_id",
+        "name",
+        "local",
+        "harnesses",
+        "checkouts",
+        "capacity"
+      ]
+    },
+    "Harness": {
+      "type": "object",
+      "properties": {
+        "harness": {
+          "type": "string",
+          "description": "A harness id. An open set: accept values not listed.",
+          "x-mdkg-open": true,
+          "examples": [
+            "claude",
+            "codex",
+            "opencode"
+          ]
+        },
+        "installed": {
+          "type": "boolean"
+        },
+        "version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "program": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "logged_in": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Yes or no; null when it can't be checked. Never which account."
+        },
+        "checked_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "RFC 3339 UTC to the millisecond, or null."
+        },
+        "capabilities": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "From the harness adapter (A17, A20)."
+        }
+      },
+      "required": [
+        "harness",
+        "installed",
+        "logged_in"
+      ]
+    },
+    "Checkout": {
+      "type": "object",
+      "properties": {
+        "uri": {
+          "type": "string",
+          "description": "The resource's path at its coordinator, beginning `/v1/`."
+        },
+        "checkout_id": {
+          "type": "string"
+        },
+        "machine": {
+          "type": "string",
+          "description": "The resource's path at its coordinator, beginning `/v1/`."
+        },
+        "path": {
+          "type": "string"
+        },
+        "branch": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "head": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "type": "string",
+          "description": "What the checkout is for. An open set: accept values not listed.",
+          "x-mdkg-open": true,
+          "examples": [
+            "graph",
+            "agent",
+            "review",
+            "other"
+          ]
+        }
+      },
+      "required": [
+        "uri",
+        "checkout_id",
+        "machine",
+        "path",
+        "kind"
+      ]
+    },
+    "DiagnosticOut": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string",
+          "description": "A stable diagnostic code."
+        },
+        "severity": {
+          "type": "string",
+          "description": "Severity.",
+          "enum": [
+            "error",
+            "warning",
+            "info"
+          ]
+        },
+        "path": {
+          "type": "string"
+        },
+        "line": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "node": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "hint": {
+          "type": "string"
+        },
+        "holders": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "related": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string"
+              },
+              "line": {
+                "type": "integer",
+                "minimum": 0
+              }
+            },
+            "required": [
+              "path"
+            ]
+          }
+        }
+      },
+      "required": [
+        "code",
+        "severity",
+        "message"
+      ],
+      "description": "A diagnostic, as every command's envelope writes it."
+    }
+  }
+}

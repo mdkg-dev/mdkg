@@ -13,14 +13,21 @@
 //!   another branch's commit (`sync`).
 //! - [`mail`] keeps rooms and messages beside the leases (harness v0.1 M1),
 //!   without touching the lease journal.
+//! - [`ledger`] keeps the flow tables beside the mail: which nodes a message
+//!   is about, what it supersedes and when it expires; [`entries`] is the
+//!   ledger itself, typed entries on each node and the gate they feed.
 //! - [`Store::observe_main`] reads main and applies it inside the write
 //!   transaction, so no other change can land between the read and the apply.
 
 mod activity;
 mod digest_cache;
+pub mod entries;
+pub mod events;
 pub mod git;
+pub mod ledger;
 pub mod log;
 pub mod mail;
+pub mod serve;
 mod store;
 
 pub use activity::{
@@ -28,7 +35,7 @@ pub use activity::{
 };
 
 pub use store::{
-    BackupInfo, ChainOutcomes, Chained, LogReport, Restored, Store, StoreError, Upgrade,
-    allow_store_upgrades, backups, build_label, copy_of, has_cargo_markers, in_build_folder,
-    restore, restore_if_head, snapshot, store_upgrades_allowed,
+    BackupInfo, BeforeCommit, ChainOutcomes, Chained, LogReport, PLAIN_FSYNC_ENV, Restored, Store,
+    StoreError, Upgrade, allow_store_upgrades, backups, build_label, copy_of, has_cargo_markers,
+    in_build_folder, restore, restore_if_head, snapshot, store_upgrades_allowed, stored_label,
 };

@@ -19,6 +19,20 @@ use serde_json::{Map, Value};
 
 use super::glob::Glob;
 
+/// A Cargo test scope.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RustTarget {
+    pub package: String,
+    pub kind: RustTargetKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RustTargetKind {
+    Lib,
+    Test(String),
+    Bin(String),
+}
+
 /// Files every test depends on: a change runs everything. The config's
 /// `global` list adds to these; it can't remove them. Built-in paths match
 /// ignoring ASCII case, since the tools can open those names on such hosts.
@@ -66,6 +80,7 @@ pub enum RuleSelect {
     Targets {
         go: Vec<String>,
         rust: Vec<String>,
+        rust_targets: Vec<RustTarget>,
         suites: Vec<String>,
     },
 }
@@ -184,7 +199,7 @@ fn parse_rule(rule: &Value, at: &str) -> Result<Rule, String> {
         Value::String(s) if s == "none" => RuleSelect::None,
         Value::Object(o) => {
             let at = format!("{at}.select");
-            only_keys(o, &at, &["go", "rust", "suites"])?;
+            only_keys(o, &at, &["go", "rust", "rust_targets", "suites"])?;
             let field = |key: &str, check: fn(&str) -> bool, what: &str| match o.get(key) {
                 Some(v) => strings(v, &format!("{at}.{key}"), check, what),
                 None => Ok(Vec::new()),
@@ -195,13 +210,22 @@ fn parse_rule(rule: &Value, at: &str) -> Result<Rule, String> {
                 "a `./dir` or `./dir/...` package pattern",
             )?;
             let rust = field("rust", is_name, "a crate name")?;
+            let rust_targets = match o.get("rust_targets") {
+                Some(v) => parse_rust_targets(v, &format!("{at}.rust_targets"))?,
+                None => Vec::new(),
+            };
             let suites = field("suites", is_name, "a suite name ([A-Za-z0-9._-])")?;
-            if go.is_empty() && rust.is_empty() && suites.is_empty() {
+            if go.is_empty() && rust.is_empty() && rust_targets.is_empty() && suites.is_empty() {
                 return Err(format!(
                     "{at} selects nothing; use \"none\" for paths that need no tests"
                 ));
             }
-            RuleSelect::Targets { go, rust, suites }
+            RuleSelect::Targets {
+                go,
+                rust,
+                rust_targets,
+                suites,
+            }
         }
         other => {
             return Err(format!(
@@ -210,6 +234,45 @@ fn parse_rule(rule: &Value, at: &str) -> Result<Rule, String> {
         }
     };
     Ok(Rule { paths, select })
+}
+
+fn parse_rust_targets(value: &Value, at: &str) -> Result<Vec<RustTarget>, String> {
+    let targets = value.as_array().ok_or(format!("{at} must be a list"))?;
+    if targets.is_empty() {
+        return Err(format!("{at} is empty"));
+    }
+    targets
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            let at = format!("{at}[{i}]");
+            let o = v.as_object().ok_or(format!("{at} must be an object"))?;
+            only_keys(o, &at, &["package", "test", "bin", "lib"])?;
+            let package = o
+                .get("package")
+                .and_then(Value::as_str)
+                .filter(|s| is_name(s))
+                .ok_or(format!("{at}.package must be a crate name"))?;
+            let kind = match (o.get("test"), o.get("bin"), o.get("lib")) {
+                (Some(Value::String(test)), None, None) if is_name(test) => {
+                    RustTargetKind::Test(test.clone())
+                }
+                (None, Some(Value::String(bin)), None) if is_name(bin) => {
+                    RustTargetKind::Bin(bin.clone())
+                }
+                (None, None, Some(Value::Bool(true))) => RustTargetKind::Lib,
+                _ => {
+                    return Err(format!(
+                        "{at} needs exactly one of `test`, `bin` (a target name) or `lib: true`"
+                    ));
+                }
+            };
+            Ok(RustTarget {
+                package: package.into(),
+                kind,
+            })
+        })
+        .collect()
 }
 
 /// `.`, `./...`, `./dir` or `./dir/...`, with no `..` or empty segments.
@@ -275,6 +338,7 @@ mod tests {
             RuleSelect::Targets {
                 go: vec!["./internal/repositories/...".into()],
                 rust: vec![],
+                rust_targets: vec![],
                 suites: vec!["migrations".into()],
             }
         );

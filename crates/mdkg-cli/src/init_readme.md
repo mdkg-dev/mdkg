@@ -49,6 +49,7 @@ and writes its managed files; select the rows for your harnesses. Run
 | `mdkg install --enable hooks:claude` | Mail context, stop audit and structured-edit lease checks in `.claude/settings.json`. |
 | `mdkg install --enable hooks:codex` | Mail context, stop audit and structured-edit lease checks in `.codex/hooks.json`. |
 | `mdkg install --enable hooks:opencode` | Mail context, completion wake and structured-edit lease checks in `.opencode/plugins/mdkg/server.ts`. |
+| `mdkg install --enable hooks:git` | git's own pre-commit and pre-push run mdkg's rules (protected branches, staged files without a lease), through `core.hooksPath`; the hooks it named before keep running. It changes every commit in the checkout. |
 
 For all integrations together:
 
@@ -83,9 +84,13 @@ mdkg --root .worktrees/graph agents up worker
 ```
 
 This definition commit exists only on `mdkg-graph` until you
-[merge it into `main` through review](https://github.com/mdkg-dev/mdkg/blob/main/docs/agents.md);
-use a regular merge that preserves the graph commits, not a squash or rebase
-merge. Workers created from `main` will inherit the definition after that merge.
+[merge it into `main` through review](https://github.com/mdkg-dev/mdkg/blob/main/docs/agents.md).
+Workers created from `main` will inherit the definition after that merge.
+Merge `mdkg-graph` with a merge commit: the graph checkout follows `main`
+only by fast-forward, so after a squash or rebase merge `mdkg install`
+reports `graph not synced: diverged` and the graph checkout stops picking up
+`main`'s changes. Code branches merge however the project merges them. Ref
+mode (`mdkg install --setup`) has no graph branch to merge.
 
 From the primary checkout, `mdkg --root .worktrees/graph agents up` starts
 all configured agents. The default policy waits for new mail; send the

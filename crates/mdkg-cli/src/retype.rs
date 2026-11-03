@@ -453,6 +453,7 @@ pub fn retype(root: &Path, actor: Option<String>, target: &str, new_type: &str, 
                 now,
                 &check,
                 None,
+                None,
             );
             // Only once recorded is the plan finished. A refused or undone
             // attempt leaves it, since files an earlier stopped run wrote

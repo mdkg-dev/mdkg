@@ -1,0 +1,309 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "mdkg.hook.event.v1",
+  "description": "A canonical event: what happened, in which harness, by whom.",
+  "type": "object",
+  "properties": {
+    "schema": {
+      "description": "Always `mdkg.hook.event.v1`.",
+      "type": "string",
+      "const": "mdkg.hook.event.v1"
+    },
+    "event": {
+      "$ref": "#/$defs/EventName"
+    },
+    "harness": {
+      "$ref": "#/$defs/HarnessName"
+    },
+    "session": {
+      "description": "The harness's session, when it names one.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "turn": {
+      "description": "The harness's turn, when it names one.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "cwd": {
+      "description": "The folder the agent works in.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "actor": {
+      "$ref": "#/$defs/Actor"
+    },
+    "tool": {
+      "description": "The tool, for `tool.before` and `tool.after`.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Tool"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "stop_active": {
+      "description": "`turn.stop` only: the harness says this stop already follows a block.",
+      "type": "boolean"
+    },
+    "native": {
+      "$ref": "#/$defs/Native"
+    }
+  },
+  "required": [
+    "schema",
+    "event",
+    "harness",
+    "actor",
+    "native"
+  ],
+  "$defs": {
+    "EventName": {
+      "description": "The events of v1.",
+      "oneOf": [
+        {
+          "description": "A session or turn begins.",
+          "type": "string",
+          "const": "session.start"
+        },
+        {
+          "description": "A user or launcher prompt arrives.",
+          "type": "string",
+          "const": "prompt.submit"
+        },
+        {
+          "description": "A tool is about to run.",
+          "type": "string",
+          "const": "tool.before"
+        },
+        {
+          "description": "A tool finished (0.7.2; no rule uses it yet).",
+          "type": "string",
+          "const": "tool.after"
+        },
+        {
+          "description": "The agent is about to stop.",
+          "type": "string",
+          "const": "turn.stop"
+        },
+        {
+          "description": "An idle session waits for something to do.",
+          "type": "string",
+          "const": "session.idle"
+        },
+        {
+          "description": "The git adapter's event, before a commit.",
+          "type": "string",
+          "const": "git.pre-commit"
+        },
+        {
+          "description": "The git adapter's event, before a push.",
+          "type": "string",
+          "const": "git.pre-push"
+        },
+        {
+          "description": "The git adapter's event, before a merge that needs no resolving\ncommits (a conflicted one's commit is `git.pre-commit`).",
+          "type": "string",
+          "const": "git.pre-merge-commit"
+        },
+        {
+          "description": "The git adapter's event, when git has prepared a ref update.",
+          "type": "string",
+          "const": "git.reference-transaction"
+        }
+      ]
+    },
+    "HarnessName": {
+      "description": "The adapters: three agent harnesses, and git's own hooks.",
+      "type": "string",
+      "enum": [
+        "claude",
+        "codex",
+        "opencode",
+        "git"
+      ]
+    },
+    "Actor": {
+      "description": "Who an event is for. Rules name the kinds they apply to.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "description": "The mdkg actor, when the session has one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "$ref": "#/$defs/ActorKind"
+        }
+      },
+      "required": [
+        "kind"
+      ]
+    },
+    "ActorKind": {
+      "oneOf": [
+        {
+          "description": "Any agent session: an `agents up` worker or an interactive one.",
+          "type": "string",
+          "const": "agent"
+        },
+        {
+          "description": "A reviewer turn, which loads no project hooks (SEC7).",
+          "type": "string",
+          "const": "reviewer"
+        },
+        {
+          "description": "An agent whose definition says it orchestrates.",
+          "type": "string",
+          "const": "orchestrator"
+        },
+        {
+          "description": "A commit or push with no agent marker: only the git adapter sees one.",
+          "type": "string",
+          "const": "human"
+        }
+      ]
+    },
+    "Tool": {
+      "description": "The tool an event is about, classified so a rule never needs a\nharness's tool names.",
+      "type": "object",
+      "properties": {
+        "class": {
+          "$ref": "#/$defs/ToolClass"
+        },
+        "name": {
+          "description": "The harness's own name for it.",
+          "type": "string",
+          "default": ""
+        },
+        "command": {
+          "description": "A shell command's text.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "paths": {
+          "description": "The paths an edit would write.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "git": {
+          "description": "What a shell command does with git, when it runs git.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GitCall"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "class",
+        "name"
+      ]
+    },
+    "ToolClass": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "other"
+          ]
+        },
+        {
+          "description": "A file write.",
+          "type": "string",
+          "const": "edit"
+        },
+        {
+          "description": "A command.",
+          "type": "string",
+          "const": "shell"
+        },
+        {
+          "description": "A file read.",
+          "type": "string",
+          "const": "read"
+        },
+        {
+          "description": "An MCP call.",
+          "type": "string",
+          "const": "mcp"
+        }
+      ]
+    },
+    "GitCall": {
+      "description": "A git commit or push a shell command (or the git adapter) makes.",
+      "type": "object",
+      "properties": {
+        "verb": {
+          "$ref": "#/$defs/GitVerb"
+        },
+        "force": {
+          "description": "A force push: `--force`, `-f`, `--force-with-lease`, `--mirror`, or\na refspec starting with `+`.",
+          "type": "boolean"
+        },
+        "remote": {
+          "description": "The remote a push names.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "branches": {
+          "description": "The branches a push updates, as short names; `HEAD` for the current\nbranch. Empty when the push names none (git's default applies).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "all": {
+          "description": "`--all` or `--mirror`: every branch.",
+          "type": "boolean"
+        },
+        "skips_hooks": {
+          "description": "It skips git's own hooks: `--no-verify` (`-n` for a commit), or\na `core.hooksPath` set for the one command (`-c`, `--config-env`).",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "verb"
+      ]
+    },
+    "GitVerb": {
+      "type": "string",
+      "enum": [
+        "commit",
+        "push",
+        "other"
+      ]
+    },
+    "Native": {
+      "description": "The native event the adapter read.",
+      "type": "object",
+      "properties": {
+        "event": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "event"
+      ]
+    }
+  }
+}

@@ -15,10 +15,14 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use mdkg_run::hooks::AgentId;
+use crate::hooks::AgentId;
 use serde_json::Value;
 
 use super::{Event, HarnessEvent, Input, Outcome, Rendered, StartProvenance};
+
+/// Codex's names for a shell tool in PreToolUse: `Bash` in 0.164's hook
+/// docs; `shell` and `exec_command` are its tools' own names.
+const SHELL_TOOLS: &[&str] = &["Bash", "shell", "exec_command", "local_shell"];
 
 /// Required wire text. Diagnostics name fields, never their contents: prompts,
 /// transcripts, assistant messages and patch bodies must not become context.
@@ -31,7 +35,7 @@ fn text<'a>(v: &'a Value, key: &str) -> Result<&'a str, String> {
 
 /// Preserve only validated observation metadata in the shared input. A
 /// SessionStart is an observation, not proof of the TUI's selected thread.
-pub(super) fn parse(event: Event, v: &Value) -> Result<Input, String> {
+pub(crate) fn parse(event: Event, v: &Value) -> Result<Input, String> {
     let name = text(v, "hook_event_name")?;
     let matches = match event {
         Event::Start => matches!(name, "SessionStart" | "UserPromptSubmit"),
@@ -95,6 +99,22 @@ pub(super) fn parse(event: Event, v: &Value) -> Result<Input, String> {
     } else {
         Vec::new()
     };
+    // A shell tool's command, as text; an argv list is joined with spaces.
+    let command = match tool.as_deref() {
+        Some(t) if SHELL_TOOLS.contains(&t) => {
+            match v.get("tool_input").and_then(|input| input.get("command")) {
+                Some(Value::String(c)) => Some(c.clone()),
+                Some(Value::Array(argv)) => Some(
+                    argv.iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                ),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
     Ok(Input {
         cwd: Some(cwd.into()),
         session: Some(session.to_string()),
@@ -102,6 +122,7 @@ pub(super) fn parse(event: Event, v: &Value) -> Result<Input, String> {
         harness_event,
         start_provenance,
         stop_active,
+        command,
         tool,
         paths,
     })
@@ -229,15 +250,15 @@ fn patch_paths(patch: &str) -> Result<Vec<String>, String> {
 /// maps through saved locations or the configured worktree pattern when
 /// available. A plain session with no mapping uses the core's effective actor
 /// for mail, without acquiring receiver authority. Identity errors still refuse.
-pub(super) fn bound_actor(root: &Path, input: &Input) -> Result<Option<String>, String> {
+pub(crate) fn bound_actor(root: &Path, input: &Input) -> Result<Option<String>, String> {
     let cwd = input
         .cwd
         .as_deref()
         .ok_or("Codex hook has no cwd for actor resolution")?;
-    mdkg_run::identity::actor_for_cwd(root, cwd).map_err(|e| e.to_string())
+    crate::identity::actor_for_cwd(root, cwd).map_err(|e| e.to_string())
 }
 
-pub(super) fn render(event: Event, outcome: &Outcome) -> Rendered {
+pub(crate) fn render(event: Event, outcome: &Outcome) -> Rendered {
     match (event, outcome) {
         (Event::Start, Outcome::Context(line)) => Rendered {
             stdout: format!("{line}\n"),

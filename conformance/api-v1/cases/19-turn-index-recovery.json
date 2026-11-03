@@ -1,0 +1,9 @@
+{
+  "name": "19-turn-index-recovery",
+  "scenario": "turn_index_recovery",
+  "transports": [
+    "cli"
+  ],
+  "checks": "Crash right after spawn: readers report interrupted, never running, and an agent follow sends the derived turn.ended; the next turn appends the missing end line without rerunning the harness. A torn tail is never a line and numbering continues. Run four turns and the first journal expires while the turn keeps its outcome. Unit tests cover not_started after the start line only, trim past 2000 turns, and a complete line whose fsync failed read as committed (a_complete_line_whose_fsync_failed_reads_as_committed_and_derives_right).",
+  "cli_driver": "crates/mdkg-cli/tests/agents.rs: conformance_16_and_19_retention_and_recovery_from_the_turn_index, a_turn_whose_launcher_died_after_the_spawn_reads_interrupted_never_running; crates/mdkg-run/src/turn/index.rs tests"
+}

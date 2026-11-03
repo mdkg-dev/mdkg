@@ -11,20 +11,42 @@ impl Fixture {
     fn new() -> Self {
         let root =
             std::env::temp_dir().join(format!("mdkg-codex-identity-{}", uuid::Uuid::now_v7()));
-        for dir in [".git/objects", ".git/refs", ".mdkg", "src"] {
+        for dir in [".mdkg", "src"] {
             fs::create_dir_all(root.join(dir)).expect("identity test fixture succeeds");
         }
-        fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n")
-            .expect("identity test fixture succeeds");
-        fs::write(
-            root.join(".git/config"),
-            "[core]\nrepositoryformatversion = 0\nbare = false\n",
-        )
-        .expect("identity test fixture succeeds");
         fs::write(root.join("src/lib.rs"), "// test\n").expect("identity test fixture succeeds");
         let f = Self(fs::canonicalize(root).expect("identity test fixture succeeds"));
+        f.git(&["init", "-q", "-b", "main"]);
         f.config(json!({"alice":{"cwd":f.0}}));
         f
+    }
+    fn git(&self, args: &[&str]) {
+        let output = Command::new("git")
+            .current_dir(&self.0)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", &self.0)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_ATTR_NOSYSTEM", "1")
+            .args([
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "init.templateDir=",
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+            ])
+            .args(args)
+            .output()
+            .expect("fixture git");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
     fn config(&self, agents: Value) {
         let mut config: Value =
@@ -33,6 +55,8 @@ impl Fixture {
         config["agents"] = agents;
         fs::write(self.0.join(".mdkg/config.json"), config.to_string())
             .expect("identity test fixture succeeds");
+        self.git(&["add", ".mdkg/config.json"]);
+        self.git(&["commit", "-q", "--allow-empty", "-m", "fixture authority"]);
     }
     fn mdkg(&self, args: &[&str], vars: &[(&str, &str)]) -> Output {
         self.mdkg_as("alice", args, vars)
@@ -300,6 +324,9 @@ fn stale_pins_do_not_disable_mail_lease_checks_or_the_stop_audit() {
     let unheld = f.call_hook_env("edit", None, &edit, WRONG_PINS);
     assert_eq!(unheld.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&unheld.stderr).contains("no lease of yours"));
+    // The hook only inspects a proposed edit; it does not create the file.
+    // Make a real unleased change so the stop audit has evidence to report.
+    fs::write(f.0.join("src/unleased.rs"), "// unleased fixture change\n").unwrap();
     let stop = f.call_hook_env(
         "stop",
         None,

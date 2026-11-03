@@ -119,4 +119,6 @@ fi
 # prints it. fake-leak: it carries the key the turn bills.
 reply='{"summary": "codex reply", "findings": []}'
 [ -f fake-leak ] && reply="{\"summary\": \"key $CODEX_API_KEY\", \"findings\": []}"
+# A fake-reply file holds the final message instead.
+[ -f fake-reply ] && reply=$(cat fake-reply)
 if [ -n "$out" ]; then echo "$reply" > "$out"; else echo "$reply"; fi

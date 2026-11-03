@@ -1,0 +1,9 @@
+{
+  "name": "15-output-order",
+  "scenario": "output_order",
+  "transports": [
+    "cli"
+  ],
+  "checks": "A fake harness interleaves stdout and stderr: two concurrent readers and a reader that reconnects with --after see identical events and seq, order within each pipe is kept, and --native changes only which events appear, never their seq.",
+  "cli_driver": "crates/mdkg-cli/tests/agents.rs: conformance_15_every_reader_sees_the_same_events_and_seq"
+}

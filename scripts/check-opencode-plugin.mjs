@@ -76,6 +76,19 @@ try {
   assert.equal(allow.calls.length, 1, "read tools do not invoke the edit hook");
   checks += 2;
 
+  // Both shell tool names (2.1's bash, 2.2's shell) reach the hook with
+  // their command; a refusal throws, and a failed check lets it run.
+  for (const tool of ["bash", "shell"]) {
+    const input = { command: "git push origin main" };
+    const refused = await fixture(() => response('{"deny":"KNOWN_PUSH_GUARD"}'));
+    await assert.rejects(refused.callbacks["execute.before"]({ sessionID: "s", tool, input }), { message: "KNOWN_PUSH_GUARD" });
+    assert.deepEqual(refused.calls[0].input, { cwd: "/fixture", sessionID: "s", tool, args: input });
+    const failed = await fixture(() => response("", 1));
+    await failed.callbacks["execute.before"]({ sessionID: "s", tool, input });
+    assert.equal(failed.calls.length, 1, `${tool}: checked`);
+    checks += 2;
+  }
+
   const start = await fixture(() => response('{"context":"KNOWN_CONTEXT"}'));
   const context = { sessionID: "s", system: [{ text: "existing" }] };
   await start.callbacks.context(context);

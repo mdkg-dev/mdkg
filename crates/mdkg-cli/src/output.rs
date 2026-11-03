@@ -228,6 +228,10 @@ pub struct NodeRecord {
     /// otherwise the lasting status in the file.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
+    /// `false` for a node that reads `done (unsettled)` (A29, "A done
+    /// file that didn't settle reads as unsettled"); absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub priority: Option<i64>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -267,6 +271,7 @@ pub const NODE_FIELDS: &[&str] = &[
     "type",
     "title",
     "status",
+    "settled",
     "priority",
     "tags",
     "owners",
@@ -339,6 +344,7 @@ impl NodeRecord {
             node_type: Some(node.node_type.clone()),
             title: Some(node.title.clone()),
             status: node.status.clone(),
+            settled: (node.status.as_deref() == Some(crate::entry::UNSETTLED)).then_some(false),
             priority: node.priority,
             tags: node.tags.clone(),
             owners: node.owners.clone(),
@@ -357,7 +363,8 @@ impl NodeRecord {
     }
 
     /// The record with only `fields` (empty means all). `id` and `ws` are
-    /// always kept, so records from different workspaces stay distinct.
+    /// always kept, so records from different workspaces stay distinct;
+    /// `settled` comes with `status`.
     pub fn select(&self, fields: &[String]) -> Value {
         let value = serde_json::to_value(self).unwrap_or(Value::Null);
         if fields.is_empty() {
@@ -366,7 +373,13 @@ impl NodeRecord {
         match value {
             Value::Object(map) => Value::Object(
                 map.into_iter()
-                    .filter(|(k, _)| k == "id" || k == "ws" || fields.iter().any(|f| f == k))
+                    .filter(|(k, _)| {
+                        k == "id"
+                            || k == "ws"
+                            || fields
+                                .iter()
+                                .any(|f| f == k || (k == "settled" && f == "status"))
+                    })
                     .collect(),
             ),
             other => other,
@@ -484,6 +497,15 @@ pub fn notice(d: Diagnostic) {
     }
 }
 
+/// The notices raised so far, taken: a command that prints its own text
+/// output instead of [`emit`] prints these too.
+pub fn take_notices() -> Vec<Diagnostic> {
+    NOTICES
+        .lock()
+        .map(|mut n| std::mem::take(&mut *n))
+        .unwrap_or_default()
+}
+
 /// Prints the envelope (JSON) or the diagnostics (text) and returns the
 /// exit code. `text` prints the data in text mode.
 pub fn emit<T: Serialize>(
@@ -492,11 +514,7 @@ pub fn emit<T: Serialize>(
     report: Report<T>,
     text: impl FnOnce(&T),
 ) -> u8 {
-    let notices = NOTICES
-        .lock()
-        .map(|mut n| std::mem::take(&mut *n))
-        .unwrap_or_default();
-    let report = report.with(notices);
+    let report = report.with(take_notices());
     let code = report.exit_code();
     if json {
         let envelope = Envelope {
@@ -571,34 +589,59 @@ pub fn shown_path(s: &str) -> String {
         .collect()
 }
 
+/// A diagnostic's hint for a terminal: each line as [`shown_path`] shows
+/// it, so every control, format and bidirectional character stays
+/// escaped, but a `\n` in mdkg's own multi-line guidance starts a new
+/// line, indented by `indent` so it reads as part of the hint (e2e B8).
+/// Only hints: a message's file name can hold a newline, and printed as
+/// a line break it could forge a line of mdkg's own (review of
+/// 58b3610e). A producer of multi-line guidance escapes the newlines in
+/// the data it interpolates.
+pub fn shown_lines(s: &str, indent: &str) -> String {
+    s.split('\n')
+        .map(shown_path)
+        .collect::<Vec<_>>()
+        .join(&format!("\n{indent}"))
+}
+
 pub fn eprint_diagnostic(d: &Diagnostic) {
+    for line in diagnostic_lines(d) {
+        eprintln!("{line}");
+    }
+}
+
+/// A diagnostic's text lines, as [`eprint_diagnostic`] prints them: every
+/// text view of a diagnostic renders through this one function, so none
+/// prints a message unescaped (Terra #15588).
+pub fn diagnostic_lines(d: &Diagnostic) -> Vec<String> {
     // As `Diagnostic` displays itself, with the location escaped: a path
     // can come from another actor's lease.
     // Escape the message and hint too: a file name can reach them.
-    // Readable text is kept.
-    match d.location() {
-        Some(loc) => eprintln!(
+    // Readable text is kept, and a hint's line breaks.
+    let mut lines = vec![match d.location() {
+        Some(loc) => format!(
             "{}: {} {}: {}",
             shown_path(&loc),
             d.severity.as_str(),
             d.code.as_str(),
             shown_path(&d.message)
         ),
-        None => eprintln!(
+        None => format!(
             "{} {}: {}",
             d.severity.as_str(),
             d.code.as_str(),
             shown_path(&d.message)
         ),
-    }
+    }];
     if let Some(hint) = &d.hint {
-        eprintln!("  hint: {}", shown_path(hint));
+        lines.push(format!("  hint: {}", shown_lines(hint, "        ")));
     }
     // Other actors' names, escaped: no control character reaches the
     // terminal.
     for h in &d.holders {
-        eprintln!("  holder: {}", shown(h));
+        lines.push(format!("  holder: {}", shown(h)));
     }
+    lines
 }
 
 /// Milliseconds since the Unix epoch as RFC 3339 UTC.
@@ -627,6 +670,13 @@ pub fn rfc3339(ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shown_lines_keeps_line_breaks_and_escapes_the_rest() {
+        let shown = shown_lines("one \u{1b}[2J\ntwo \u{202e}\r\u{9b}", "    ");
+        assert_eq!(shown, "one \\u{1b}[2J\n    two \\u{202e}\\u{d}\\u{9b}");
+        assert_eq!(shown_lines("single", "  "), "single");
+    }
 
     #[test]
     fn rfc3339_matches_known_instants() {

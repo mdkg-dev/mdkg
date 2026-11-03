@@ -1,0 +1,369 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "mdkg.api.event.v1",
+  "description": "Draft (mdkg API v1; see docs/api.md). May change until the release that first emits it. One event of the coordinator's event stream: one NDJSON line from `msg watch --json`, or one SSE `data:` line from `mdkg serve`.",
+  "x-mdkg-status": "draft",
+  "type": "object",
+  "properties": {
+    "schema": {
+      "const": "mdkg.api.event.v1"
+    },
+    "id": {
+      "type": "string",
+      "description": "The log record's hash (`sha256:\u2026`) for a durable event, a UUIDv7 for an ephemeral one. Dedupe on it."
+    },
+    "cursor": {
+      "type": "string",
+      "description": "Resumes the stream just after this event. An ephemeral event repeats the last durable cursor."
+    },
+    "type": {
+      "type": "string",
+      "description": "`mdkg.<resource>.<past-tense verb>`. Skip types you don't know and re-read their `subjects`. An open set: accept values not listed.",
+      "x-mdkg-open": true,
+      "examples": [
+        "mdkg.lease.claimed",
+        "mdkg.lease.refused",
+        "mdkg.lease.renewed",
+        "mdkg.lease.released",
+        "mdkg.lease.expired",
+        "mdkg.lease.reconciled",
+        "mdkg.changeset.committed",
+        "mdkg.changeset.abandoned",
+        "mdkg.main.observed",
+        "mdkg.node.status_changed",
+        "mdkg.message.sent",
+        "mdkg.message.acked",
+        "mdkg.message.purged",
+        "mdkg.channel.created",
+        "mdkg.channel.joined",
+        "mdkg.channel.left",
+        "mdkg.record.appended",
+        "mdkg.turn.started",
+        "mdkg.turn.ended",
+        "mdkg.supervisor.started",
+        "mdkg.supervisor.stopped",
+        "mdkg.agent.defined",
+        "mdkg.machine.enrolled",
+        "mdkg.graph.head_changed",
+        "mdkg.stream.heartbeat",
+        "mdkg.stream.error"
+      ]
+    },
+    "time": {
+      "type": "string",
+      "description": "RFC 3339 UTC to the millisecond."
+    },
+    "actor": {
+      "type": "string",
+      "description": "Who caused it: the record's actor."
+    },
+    "subjects": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Paths of every resource the event changes."
+    },
+    "durable": {
+      "type": "boolean",
+      "description": "False only for heartbeats, `mdkg.graph.head_changed` and `mdkg.stream.error`, which are never replayed."
+    },
+    "data": {
+      "type": "object",
+      "description": "The type's payload (A9's table), as of the record: replaying rebuilds history. Only a message's body is shown as it is at delivery (`purged` once purged). `mdkg.record.appended` carries {kind, record, refused, code} or, inside an imported span, {kind, record, imported: true}. A lease or changeset record of a store whose pre-log journal doesn't replay adds `opaque: true`, and its `log.genesis` record carries `opaque: true` and `diverged_at`."
+    }
+  },
+  "required": [
+    "schema",
+    "id",
+    "cursor",
+    "type",
+    "time",
+    "actor",
+    "subjects",
+    "durable",
+    "data"
+  ],
+  "$comment": "For `mdkg.stream.error`, data is {diagnostics, head}; for `mdkg.stream.heartbeat`, {head}; for `mdkg.record.appended`, {kind, record}.",
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "enum": [
+              "mdkg.lease.claimed",
+              "mdkg.lease.refused",
+              "mdkg.lease.renewed",
+              "mdkg.lease.released",
+              "mdkg.lease.reconciled"
+            ]
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "mdkg.api.event_data.v1.json#/$defs/LeaseData"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "enum": [
+              "mdkg.lease.expired"
+            ]
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "mdkg.api.event_data.v1.json#/$defs/LeasesData"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "enum": [
+              "mdkg.changeset.committed"
+            ]
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "mdkg.api.event_data.v1.json#/$defs/ChangesetData"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "enum": [
+              "mdkg.changeset.abandoned"
+            ]
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "mdkg.api.event_data.v1.json#/$defs/ChangesetsData"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "enum": [
+              "mdkg.message.sent"
+            ]
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "mdkg.api.event_data.v1.json#/$defs/MessageData"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "enum": [
+              "mdkg.channel.created",
+              "mdkg.channel.joined",
+              "mdkg.channel.left"
+            ]
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "mdkg.api.event_data.v1.json#/$defs/ChannelData"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "enum": [
+              "mdkg.message.acked"
+            ]
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "mdkg.api.event_data.v1.json#/$defs/AckData"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "enum": [
+              "mdkg.message.purged"
+            ]
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "mdkg.api.event_data.v1.json#/$defs/PurgeData"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "enum": [
+              "mdkg.main.observed"
+            ]
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "mdkg.api.event_data.v1.json#/$defs/MainData"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "enum": [
+              "mdkg.node.status_changed"
+            ]
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "mdkg.api.event_data.v1.json#/$defs/StatusData"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "enum": [
+              "mdkg.record.appended"
+            ]
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "mdkg.api.event_data.v1.json#/$defs/RecordData"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "enum": [
+              "mdkg.stream.heartbeat"
+            ]
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "mdkg.api.event_data.v1.json#/$defs/HeartbeatData"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "enum": [
+              "mdkg.stream.error"
+            ]
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "mdkg.api.event_data.v1.json#/$defs/ErrorData"
+          }
+        }
+      }
+    }
+  ]
+}

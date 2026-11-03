@@ -1,0 +1,181 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "mdkg.api.graph.v1",
+  "description": "Draft (mdkg API v1; see docs/api.md). May change until the release that first emits it. A graph or subgraph the coordinator hosts (A3).",
+  "x-mdkg-status": "draft",
+  "type": "object",
+  "properties": {
+    "schema": {
+      "const": "mdkg.api.graph.v1"
+    },
+    "ok": {
+      "type": "boolean",
+      "description": "False exactly when there is an error diagnostic."
+    },
+    "data": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Graph"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "diagnostics": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/DiagnosticOut"
+      }
+    }
+  },
+  "required": [
+    "schema",
+    "ok",
+    "diagnostics"
+  ],
+  "$defs": {
+    "Graph": {
+      "type": "object",
+      "properties": {
+        "uri": {
+          "type": "string",
+          "description": "The resource's path at its coordinator, beginning `/v1/`."
+        },
+        "graph_id": {
+          "type": "string",
+          "description": "The graph's UUID."
+        },
+        "format_version": {
+          "type": "string"
+        },
+        "workspaces": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "alias": {
+                "type": "string",
+                "description": "The `ws` of `ws:id` handles."
+              },
+              "path": {
+                "type": "string"
+              },
+              "enabled": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "alias",
+              "path",
+              "enabled"
+            ]
+          },
+          "description": "Partitions of this graph, sharing its graph_id; not graphs."
+        },
+        "parent": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "A resource path, or null."
+        },
+        "mount": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "A mounted graph's alias; null for the root graph (A3)."
+        },
+        "head": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The commit the graph's checkout serves now."
+        },
+        "checkout": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "A resource path, or null."
+        }
+      },
+      "required": [
+        "uri",
+        "graph_id",
+        "format_version",
+        "workspaces",
+        "parent",
+        "mount",
+        "head",
+        "checkout"
+      ]
+    },
+    "DiagnosticOut": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string",
+          "description": "A stable diagnostic code."
+        },
+        "severity": {
+          "type": "string",
+          "description": "Severity.",
+          "enum": [
+            "error",
+            "warning",
+            "info"
+          ]
+        },
+        "path": {
+          "type": "string"
+        },
+        "line": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "node": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "hint": {
+          "type": "string"
+        },
+        "holders": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "related": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string"
+              },
+              "line": {
+                "type": "integer",
+                "minimum": 0
+              }
+            },
+            "required": [
+              "path"
+            ]
+          }
+        }
+      },
+      "required": [
+        "code",
+        "severity",
+        "message"
+      ],
+      "description": "A diagnostic, as every command's envelope writes it."
+    }
+  }
+}

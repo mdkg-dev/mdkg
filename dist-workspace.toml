@@ -10,14 +10,15 @@ cargo-dist-version = "0.32.0"
 # CI backends to support
 ci = "github"
 # The installers to generate for each app. "powershell" joins when the
-# Windows target does (0.7.1).
+# Windows target does (0.7.2).
 installers = ["shell", "npm", "homebrew"]
 # A GitHub repo to push Homebrew formulas to
 tap = "mdkg-dev/homebrew-tap"
-# Publish jobs to run in CI
-publish-jobs = ["homebrew", "npm"]
+# Publish jobs to run in CI. npm publishes from .github/workflows/publish.yml
+# instead, through trusted publishing: dist's own npm job needs NPM_TOKEN.
+publish-jobs = ["homebrew"]
 # Target platforms to build apps for (Rust target-triple syntax). Windows
-# waits for 0.7.1: the coordinator's git and file handling are Unix-only
+# waits for 0.7.2: the coordinator's git and file handling are Unix-only
 # today. To turn it on, swap the two `targets` lines, add "powershell" to
 # `installers`, and run `dist generate`.
 targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-musl", "x86_64-unknown-linux-musl"]

@@ -1,77 +1,121 @@
-//! `mdkg hook <event> --harness <h>`: the one command every harness hook
-//! calls for mail delivery and the edit guard. It reads the
-//! harness's hook input on stdin and prints that harness's output; all the
-//! logic is here, and each harness module only parses its input and
-//! renders the outcome.
+//! `mdkg hooks run --harness <h> --native <event>`: the router every
+//! harness hook entry calls. It reads the harness's native hook input on
+//! stdin, turns it into a canonical event ([`event`]), runs the rules for
+//! that event ([`rules`]), and prints that harness's output for the
+//! decision. Each harness module only parses its input and renders the
+//! outcome; the rules are harness-neutral.
 //!
-//! - `start`: turn or session start, and each user prompt. Context naming
+//! `hooks start|stop|wait|edit --harness <h>` are the 0.7.0 commands,
+//! kept as aliases of the router for one release. The built-in rules:
+//!
+//! - `mail.notice` (`session.start`, `prompt.submit`): context naming
 //!   unread mail by number, kind and sender, never a body: harness-injected
 //!   context is trusted more than tool output, so bodies stay behind
 //!   `msg inbox`'s untrusted framing.
-//! - `stop`: blocks a stop once while wake-worthy mail is unread.
-//! - `wait`: an idle session's wait, ending in a wake when wake-worthy mail
-//!   arrives.
-//! - `edit`: refuses an edit to a path the actor holds no lease on. A
-//!   guardrail against an agent forgetting to claim, not isolation: a
-//!   worker that runs code can write anything (option C).
+//! - `mail.stop` (`turn.stop`): blocks a stop once while wake-worthy mail
+//!   is unread.
+//! - `mail.wake` (`session.idle`): an idle session's wait, ending in a
+//!   wake when wake-worthy mail arrives.
+//! - `lease.edit` (`tool.before`, an edit): refuses an edit to a path the
+//!   actor holds no lease on. A guardrail against an agent forgetting to
+//!   claim, not isolation: a worker that runs code can write anything
+//!   (option C).
+//! - `lease.audit` (`turn.stop`): blocks once per set of files changed
+//!   without a lease.
+//! - `lease.done` (`turn.stop`): blocks once while leases are still held
+//!   after `done`.
+//! - `git.protect` (`tool.before`, a git push): refuses a push to a
+//!   protected branch, and any force push.
+//! - `secret.scan` (`tool.before`, a git commit or push): refuses one that
+//!   would add a credential-shaped string, naming the path, never the
+//!   match; a scan that can't run refuses too.
 //!
 //! A hook never breaks the harness: where there's no graph, or the mail
-//! can't be read, it says nothing. Only the edit guard refuses, and only
-//! inside a graph.
+//! can't be read, it says nothing. Only the edit guard, `git.protect` and
+//! `secret.scan` refuse, and only inside a graph.
 
-mod claude;
-mod codex;
-mod opencode;
+pub mod event;
+pub(crate) mod git;
+pub mod rules;
+pub(crate) mod secret;
 
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use clap::{Args, ValueEnum};
+use clap::{Args, Subcommand, ValueEnum};
 use serde_json::Value;
 
 use crate::coord::Repo;
 use mdkg_format::program::BIN;
-pub use mdkg_run::hooks::{
-    HarnessEvent, HookEvent, Mail, StartProvenance, mail_line, printable, wakes,
-};
+pub use mdkg_run::hooks::{HarnessEvent, Mail, mail_line, printable, wakes};
 
-/// The events a hook entry names.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum Event {
-    /// Turn or session start, and each user prompt: the mail line.
-    Start,
-    /// Before the agent stops: block once on unread wake-worthy mail.
-    Stop,
-    /// An idle session's wait: wake it when wake-worthy mail arrives.
-    Wait,
-    /// Before a tool call: refuse an edit to a path the agent doesn't hold.
-    Edit,
-}
+pub use mdkg_run::harness::hook::{Event, Input, Outcome, Rendered};
 
-impl Event {
-    fn observation(self) -> Option<HookEvent> {
-        match self {
-            Self::Start => Some(HookEvent::Start),
-            Self::Stop => Some(HookEvent::Stop),
-            Self::Wait | Self::Edit => None,
-        }
-    }
-}
-
-/// The harness whose hook input and output a call speaks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum Harness {
-    Claude,
-    Codex,
-    #[value(name = "opencode")]
-    OpenCode,
-}
+pub use crate::run::HarnessArg as Harness;
 
 #[derive(Debug, Args)]
 pub struct HookArgs {
-    /// The event: start, stop, wait or edit.
-    pub event: Event,
+    #[command(subcommand)]
+    pub command: HookCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum HookCommand {
+    /// The router each native hook entry calls: reads the harness's hook
+    /// input on stdin, runs the rules for its event, prints the harness's
+    /// output.
+    Run(RunArgs),
+    /// Turn or session start, and each prompt (alias of `run`, for one
+    /// release).
+    Start(LegacyArgs),
+    /// Before the agent stops (alias of `run`, for one release).
+    Stop(LegacyArgs),
+    /// An idle session's wait for mail (alias of `run`, for one release).
+    Wait(LegacyArgs),
+    /// Before a tool call (alias of `run`, for one release).
+    Edit(LegacyArgs),
+}
+
+macro_rules! hook_adapters {
+    ($(($variant:ident, $id:literal, $adapter:ident)),* $(,)?) => {
+        /// The adapters `hooks run` speaks for: the agent harnesses, and git.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+        pub enum Adapter {
+            $(#[value(name = $id)] $variant,)*
+            Git,
+        }
+        impl Adapter {
+            fn harness(self) -> Option<Harness> {
+                match self { $(Self::$variant => Some(Harness::$variant),)* Self::Git => None }
+            }
+        }
+    };
+}
+mdkg_run::harness_registry!(hook_adapters);
+
+#[derive(Debug, Args)]
+pub struct RunArgs {
+    /// The adapter calling: claude, codex, opencode, or git (its own
+    /// `pre-commit` and `pre-push` hooks).
+    #[arg(long)]
+    pub harness: Adapter,
+    /// The harness's own name for the event: Claude's and Codex's
+    /// `SessionStart`, `UserPromptSubmit`, `PreToolUse` and `Stop`, OpenCode's
+    /// `context`, `tool.execute.before` and `session.execution.succeeded`,
+    /// and `idle` for an idle session's wait.
+    #[arg(long)]
+    pub native: String,
+    /// The idle wait only: how long to wait for mail, in seconds.
+    #[arg(long, default_value_t = 3_000)]
+    pub timeout: u64,
+    /// git only: the hook's own arguments (pre-push's remote and URL).
+    #[arg(last = true)]
+    pub args: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct LegacyArgs {
     /// The harness calling: claude, codex or opencode.
     #[arg(long)]
     pub harness: Harness,
@@ -80,49 +124,49 @@ pub struct HookArgs {
     pub timeout: u64,
 }
 
-/// What a harness's hook input says, harness-neutrally.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct Input {
-    /// The folder the agent works in, when the harness says.
-    pub cwd: Option<PathBuf>,
-    /// The harness's session, for the stop guard's memory.
-    pub session: Option<String>,
-    /// The harness's turn, where it names one (Codex's `turn_id`).
-    pub turn: Option<String>,
-    /// The validated harness event, distinct from mdkg's start/stop event.
-    pub harness_event: Option<HarnessEvent>,
-    /// Only a SessionStart carries this whitelisted provenance.
-    pub start_provenance: Option<StartProvenance>,
-    /// The harness says this stop already follows a block (Claude's
-    /// `stop_hook_active`).
-    pub stop_active: bool,
-    /// The tool about to run (`edit`).
-    pub tool: Option<String>,
-    /// The paths that tool would write: empty for a tool that writes none.
-    pub paths: Vec<String>,
+/// One hook call, however it was spelled: the harness, the adapter's kind
+/// of input (`event`), and the canonical event when the native name says.
+#[derive(Debug, Clone)]
+pub struct Call {
+    pub harness: Harness,
+    pub event: Event,
+    /// The canonical event; a legacy call's is read from its input.
+    pub name: Option<event::EventName>,
+    pub native: String,
+    pub timeout: u64,
 }
 
-/// What a hook decides, harness-neutrally.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Outcome {
-    /// Nothing to say: the harness goes on.
-    Silent,
-    /// Context for the agent's turn.
-    Context(String),
-    /// Keep the agent from stopping, with why.
-    Block(String),
-    /// Refuse the tool call, with why.
-    Deny(String),
-    /// Wake an idle session with this line.
-    Wake(String),
+impl Call {
+    fn legacy(event: Event, a: &LegacyArgs) -> Self {
+        Self {
+            harness: a.harness,
+            event,
+            name: None,
+            native: String::new(),
+            timeout: a.timeout,
+        }
+    }
+
+    /// The canonical event, once the input is read: a legacy `start` is a
+    /// prompt when the harness says so, else a session start.
+    fn canonical(&self, input: &Input) -> event::EventName {
+        use event::EventName as E;
+        self.name.unwrap_or(match self.event {
+            Event::Start if input.harness_event == Some(HarnessEvent::UserPromptSubmit) => {
+                E::PromptSubmit
+            }
+            Event::Start => E::SessionStart,
+            Event::Stop => E::TurnStop,
+            Event::Wait => E::SessionIdle,
+            Event::Edit => E::ToolBefore,
+        })
+    }
 }
 
-/// A harness's output for an outcome.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct Rendered {
-    pub stdout: String,
-    pub stderr: String,
-    pub exit: u8,
+/// A native event's adapter input and canonical event: what `hooks run
+/// --native` routes, per harness. `None` for one mdkg doesn't route.
+pub fn native_event(h: Harness, native: &str) -> Option<(Event, event::EventName)> {
+    h.0.adapter().hook_native_event(native)
 }
 
 struct Decision {
@@ -181,6 +225,9 @@ pub trait Reminded {
     /// Claims the audit's block for a set of files: true when the set
     /// differs from the session's last and is now recorded.
     fn claim_audit(&self, session: &str, fingerprint: u64) -> bool;
+    /// Claims `lease.done`'s block, as [`Reminded::claim_audit`] does the
+    /// audit's, in a record of its own.
+    fn claim_done(&self, session: &str, fingerprint: u64) -> bool;
 }
 
 /// `start`: the mail line, as context; the session is then told through
@@ -220,53 +267,113 @@ fn fingerprint(files: &[String]) -> u64 {
     h.finish().max(1)
 }
 
-/// `stop`: blocks once while wake-worthy mail newer than what the session
-/// was told of is unread, and once per set of files changed without a
-/// lease, asking the agent to claim or revert them. A stop the harness
-/// says already follows a block goes on.
+#[cfg(test)]
+/// `stop`, as the 0.7.0 command decided it: `mail.stop`, then
+/// `lease.audit`, in one block. A stop the harness says already follows a
+/// block goes on.
 pub fn stop(
     input: &Input,
     mail: &dyn MailSource,
     reminded: &dyn Reminded,
     changes: &dyn Changes,
 ) -> Outcome {
-    if input.stop_active {
-        return Outcome::Silent;
-    }
-    let session = input.session.as_deref().unwrap_or("");
-    let mut parts: Vec<String> = Vec::new();
-    if let Ok(unread) = mail.unread() {
-        let waking: Vec<Mail> = unread.into_iter().filter(wakes).collect();
-        let newest = waking.iter().map(|m| m.seq).max().unwrap_or(0);
-        // Only a claimed reminder blocks: one another producer gave, or
-        // one whose record failed, would come again at every stop.
-        if newest > reminded.last(session)
-            && reminded.claim(session, newest)
-            && let Some(line) = mail_line(&waking)
-        {
-            parts.push(format!(
-                "{line} Handle it before you stop, or say why it can wait."
-            ));
-        }
-    }
-    if let Ok(files) = changes.unleased()
-        && !files.is_empty()
-        && reminded.claim_audit(session, fingerprint(&files))
-    {
-        let noun = if files.len() == 1 { "file" } else { "files" };
-        parts.push(format!(
-            "mdkg shows no lease of yours on {} changed {noun} in this worktree. \
-             Run `git status --short` to inspect the paths. \
-             Claim each (`{BIN} claim <path>`, `--new` for a new file) or revert it \
-             before you stop; a change made through a shell counts too.",
-            files.len()
-        ));
-    }
+    let parts: Vec<String> = [
+        stop_mail(input, mail, reminded),
+        stop_audit(input, reminded, changes),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
     if parts.is_empty() {
         Outcome::Silent
     } else {
         Outcome::Block(parts.join("\n\n"))
     }
+}
+
+/// `mail.stop`: blocks once while wake-worthy mail newer than what the
+/// session was told of is unread; the block's reason.
+pub fn stop_mail(input: &Input, mail: &dyn MailSource, reminded: &dyn Reminded) -> Option<String> {
+    if input.stop_active {
+        return None;
+    }
+    let session = input.session.as_deref().unwrap_or("");
+    let unread = mail.unread().ok()?;
+    let waking: Vec<Mail> = unread.into_iter().filter(wakes).collect();
+    let newest = waking.iter().map(|m| m.seq).max().unwrap_or(0);
+    // Only a claimed reminder blocks: one another producer gave, or one
+    // whose record failed, would come again at every stop.
+    if newest > reminded.last(session) && reminded.claim(session, newest) {
+        let line = mail_line(&waking)?;
+        return Some(format!(
+            "{line} Handle it before you stop, or say why it can wait."
+        ));
+    }
+    None
+}
+
+/// `lease.audit`: blocks once per set of files changed without a lease,
+/// asking the agent to claim or revert them; the block's reason.
+pub fn stop_audit(input: &Input, reminded: &dyn Reminded, changes: &dyn Changes) -> Option<String> {
+    if input.stop_active {
+        return None;
+    }
+    let session = input.session.as_deref().unwrap_or("");
+    let files = changes.unleased().ok().filter(|f| !f.is_empty())?;
+    if !reminded.claim_audit(session, fingerprint(&files)) {
+        return None;
+    }
+    let noun = if files.len() == 1 { "file" } else { "files" };
+    Some(format!(
+        "mdkg shows no lease of yours on {} changed {noun} in this worktree. \
+         Run `git status --short` to inspect the paths. \
+         Claim each (`{BIN} claim <path>`, `--new` for a new file) or revert it \
+         before you stop; a change made through a shell counts too.",
+        files.len()
+    ))
+}
+
+/// What `lease.done` reads: the leases an actor still holds after its
+/// latest `done`.
+pub trait Finished {
+    /// The scopes of the path leases still held after a `done` at or after
+    /// `since_ms` (milliseconds since the epoch), sorted, with that done's
+    /// time; `None` when there was no such done, or the actor holds a node
+    /// (it has taken new work). `Err` skips the rule for this stop.
+    fn held_after_done(&self, since_ms: u64) -> Result<Option<(u64, Vec<String>)>, String>;
+}
+
+/// `lease.done`: blocks once per `done` while leases are still held after it,
+/// asking the agent to release what it's finished with; the block's
+/// reason. Scopes are never echoed: names are other people's data.
+pub fn stop_done(
+    input: &Input,
+    reminded: &dyn Reminded,
+    finished: &dyn Finished,
+    since_ms: u64,
+) -> Option<String> {
+    if input.stop_active {
+        return None;
+    }
+    let session = input.session.as_deref().unwrap_or("");
+    let (done_ms, held) = finished.held_after_done(since_ms).ok()??;
+    if held.is_empty() {
+        return None;
+    }
+    // Once per `done`: releasing some leases and keeping others, with a
+    // reason, doesn't block again.
+    if !reminded.claim_done(session, fingerprint(&[done_ms.to_string()])) {
+        return None;
+    }
+    let (n, noun) = match held.len() {
+        1 => ("1".to_string(), "lease"),
+        n => (n.to_string(), "leases"),
+    };
+    Some(format!(
+        "You finished work with `{BIN} done` but still hold {n} {noun} on paths. \
+         Run `{BIN} status` to see them, and release each you're finished with \
+         (`{BIN} release <path>`) before you stop, or say why you keep it."
+    ))
 }
 
 /// `wait`: polls until wake-worthy mail newer than what the session was
@@ -359,16 +466,19 @@ fn read_input() -> Result<Value, String> {
 /// `apply_patch` it can't parse): an edit is then refused, never read as
 /// one that writes nothing.
 fn parse(h: Harness, event: Event, v: &Value) -> Result<Input, String> {
-    match h {
-        Harness::Claude => claude::parse(event, v),
-        Harness::Codex => codex::parse(event, v),
-        Harness::OpenCode => opencode::parse(event, v),
-    }
+    h.0.adapter().hook_parse(event, v)
 }
 
 /// The actor a harness has bound this session or folder to, if any; an
-/// error when a binding exists but can't be read.
-fn bound_actor(root: &Path, h: Harness, input: &Input) -> Result<Option<String>, String> {
+/// error when a binding exists but can't be read. Codex's own binding is
+/// the worktree's identity, read from the invocation's pinned snapshot, not
+/// a second read of the graph (#6484 major 3).
+fn bound_actor(
+    root: &Path,
+    h: Harness,
+    input: &Input,
+    identity: &git::LazyPin<'_>,
+) -> Result<Option<String>, String> {
     // An attached thread in the central record binds its session, on any
     // harness (`mdkg agents attach`); then the harness's own binding.
     if let (Some(session), Some(common)) = (input.session.as_deref(), common_dir(root))
@@ -384,10 +494,18 @@ fn bound_actor(root: &Path, h: Harness, input: &Input) -> Result<Option<String>,
     {
         return Ok(Some(actor));
     }
-    match h {
-        Harness::Codex => codex::bound_actor(root, input),
-        Harness::Claude | Harness::OpenCode => Ok(None),
+    if h == Harness::Codex {
+        input
+            .cwd
+            .as_deref()
+            .ok_or("Codex hook has no cwd for actor resolution")?;
+        return identity
+            .get()
+            .as_ref()
+            .map(|s| s.actor.clone())
+            .map_err(|e| e.to_string());
     }
+    h.0.adapter().hook_bound_actor(root, input)
 }
 
 /// The repository's git common dir, where the hooks' records live.
@@ -397,22 +515,18 @@ fn common_dir(root: &Path) -> Option<PathBuf> {
 }
 
 impl Harness {
-    /// The harness's name, as the thread record and `--harness` spell it.
+    /// Its adapter, as canonical events name it.
+    pub fn adapter(self) -> event::HarnessName {
+        self.0.into()
+    }
+
     pub fn name(self) -> &'static str {
-        match self {
-            Harness::Claude => "claude",
-            Harness::Codex => "codex",
-            Harness::OpenCode => "opencode",
-        }
+        self.0.as_str()
     }
 }
 
 fn render(h: Harness, event: Event, o: &Outcome) -> Rendered {
-    match h {
-        Harness::Claude => claude::render(event, o),
-        Harness::Codex => codex::render(event, o),
-        Harness::OpenCode => opencode::render(event, o),
-    }
+    h.0.adapter().hook_render(event, o)
 }
 
 /// Recording failures are visible without discarding context already
@@ -438,24 +552,80 @@ fn report_observation(mut out: Rendered, decision: &Decision) -> Rendered {
 }
 
 /// The graph a hook speaks for: `--root`, else the nearest folder up from
-/// where the harness started it that has one, as `mcp` finds it.
+/// where the harness started it that has one, as `mcp` finds it. A
+/// checkout with no `.mdkg` of its own is bound to its clone's graph ref
+/// (#6484 major 5): in ref mode the graph comes from the common config and
+/// the graph ref, so the worktree's top is the root. Graph-ref settings
+/// that can't be read bind it too, so the hook fails closed there rather
+/// than go silent. In checkout mode with no config, there's no graph.
 fn graph_root(root: Option<&Path>, input: &Input) -> Option<PathBuf> {
     let start = root
         .map(Path::to_path_buf)
         .or_else(|| input.cwd.clone())
         .or_else(|| std::env::current_dir().ok())?;
     let start = std::fs::canonicalize(&start).unwrap_or(start);
-    if root.is_some() {
-        return mdkg_graph::config::has_config(&start).then_some(start);
+    let found = if root.is_some() {
+        mdkg_graph::config::has_config(&start).then(|| start.clone())
+    } else {
+        start
+            .ancestors()
+            .find(|d| mdkg_graph::config::has_config(d))
+            .map(Path::to_path_buf)
+    };
+    found.or_else(|| graphless_root(&start))
+}
+
+/// A graphless checkout's root: its worktree's top, when its clone is in
+/// ref mode or its graph-ref settings can't be read; in checkout mode,
+/// when the clone's main ref commits a graph (an orphan or pre-graph
+/// branch, orchestrator #11871) or that can't be read.
+fn graphless_root(start: &Path) -> Option<PathBuf> {
+    let top = mdkg_coord_sqlite::git::toplevel(start).ok()?;
+    let top = std::fs::canonicalize(&top).unwrap_or(top);
+    match mdkg_graph::graphref::resolve(&top) {
+        Ok(None) => match git::main_ref_graph(&top) {
+            Ok(None) => None,
+            Ok(Some(_)) | Err(_) => Some(top),
+        },
+        Ok(Some(_)) | Err(_) => Some(top),
     }
-    start
-        .ancestors()
-        .find(|d| mdkg_graph::config::has_config(d))
-        .map(Path::to_path_buf)
 }
 
 /// Runs a hook, printing the harness's output; its exit code.
 pub fn run(root: Option<&Path>, actor: Option<String>, a: &HookArgs) -> u8 {
+    let a = match &a.command {
+        HookCommand::Run(r) if r.harness == Adapter::Git => {
+            return git::run(root, actor, &r.native, &r.args);
+        }
+        HookCommand::Run(r) => match r
+            .harness
+            .harness()
+            .and_then(|h| Some((h, native_event(h, &r.native)?)))
+        {
+            Some((harness, (event, name))) => Call {
+                harness,
+                event,
+                name: Some(name),
+                native: r.native.clone(),
+                timeout: r.timeout,
+            },
+            // A native event mdkg doesn't route: say so, and never break
+            // the harness.
+            None => {
+                eprintln!(
+                    "mdkg routes no {} event named {}; nothing ran",
+                    r.harness.harness().map_or("git", Harness::name),
+                    printable(&r.native)
+                );
+                return 0;
+            }
+        },
+        HookCommand::Start(l) => Call::legacy(Event::Start, l),
+        HookCommand::Stop(l) => Call::legacy(Event::Stop, l),
+        HookCommand::Wait(l) => Call::legacy(Event::Wait, l),
+        HookCommand::Edit(l) => Call::legacy(Event::Edit, l),
+    };
+    let a = &a;
     // Codex hooks run in the shared daemon's environment. Give the entire
     // synchronous request (identity, mail, leases, audit, records, delegated
     // authority) an explicit discovery context instead of inherited pins.
@@ -469,7 +639,7 @@ pub fn run(root: Option<&Path>, actor: Option<String>, a: &HookArgs) -> u8 {
     run_scoped(root, actor, a)
 }
 
-fn run_scoped(root: Option<&Path>, actor: Option<String>, a: &HookArgs) -> u8 {
+fn run_scoped(root: Option<&Path>, actor: Option<String>, a: &Call) -> u8 {
     let raw = read_input();
     // A bad tool payload must not lose the harness's folder: a shared
     // daemon may have started the hook outside the graph it serves.
@@ -501,7 +671,7 @@ fn run_scoped(root: Option<&Path>, actor: Option<String>, a: &HookArgs) -> u8 {
     r.exit
 }
 
-fn decide(root: &Path, actor: Option<String>, a: &HookArgs, input: &Input) -> Decision {
+fn decide(root: &Path, actor: Option<String>, a: &Call, input: &Input) -> Decision {
     let observed_at = crate::coord::now_ms();
     // In a launcher's turn (`mdkg run`, `agents up`) the launcher shows the
     // turn's mail, acks it after the reply and wakes the agent itself, so
@@ -523,6 +693,9 @@ fn decide(root: &Path, actor: Option<String>, a: &HookArgs, input: &Input) -> De
             )
         });
     let launcher_turn = launcher_actor.is_some();
+    // One authority and actor for the whole invocation (#6945): every rule
+    // and the receiver read this snapshot, never a later graph tip.
+    let identity = git::LazyPin::new(root, input.cwd.as_deref().unwrap_or(root));
     // Invalidate admission before any status write or fallible hook work.
     // Receiver authority is independent of the best-effort thread listing.
     let receiver =
@@ -536,9 +709,12 @@ fn decide(root: &Path, actor: Option<String>, a: &HookArgs, input: &Input) -> De
             {
                 return Ok(None);
             }
-            let Some(canonical_actor) = mdkg_run::identity::actor_for_cwd(
-                root, input.cwd.as_deref().unwrap_or(root),
-            ).map_err(|e| e.to_string())? else {
+            let Some(canonical_actor) = identity
+                .get()
+                .as_ref()
+                .map_err(|e| e.to_string())?
+                .actor
+                .clone() else {
                 // A person's plain session has no receiver registration.
                 // Mail still uses its effective actor below.
                 return Ok(None);
@@ -575,15 +751,19 @@ fn decide(root: &Path, actor: Option<String>, a: &HookArgs, input: &Input) -> De
     // be read, or an `--as` naming someone else, is refused rather than
     // read as another actor. An unbound session takes `--as`, then
     // $MDKG_ACTOR, then the repository's default.
+    // Only an edit needs the actor to be sure: a tool that writes no path
+    // (a read, a shell command) runs, with no rule needing the binding.
+    let edits = a.event == Event::Edit && !input.paths.is_empty();
     let refuse = |why: &'static str| match a.event {
-        Event::Edit => Outcome::Deny(why.into()).into(),
+        Event::Edit if edits => Outcome::Deny(why.into()).into(),
+        Event::Edit => Outcome::Silent.into(),
         Event::Start | Event::Stop => Decision {
             outcome: Outcome::Silent,
             recording: Err(why.into()),
         },
         Event::Wait => Outcome::Silent.into(),
     };
-    let binding = bound_actor(root, a.harness, input).and_then(|bound| {
+    let binding = bound_actor(root, a.harness, input, &identity).and_then(|bound| {
         if let (Some(bound), Some(launcher)) = (&bound, &launcher_actor)
             && bound != launcher
         {
@@ -601,7 +781,7 @@ fn decide(root: &Path, actor: Option<String>, a: &HookArgs, input: &Input) -> De
         },
         // Mail may use a plain session's effective actor; an edit still
         // requires a canonical mapping or a live session binding.
-        Ok(None) if a.harness == Harness::Codex && a.event == Event::Edit => {
+        Ok(None) if a.harness == Harness::Codex && edits => {
             return refuse("mdkg can't read this session's binding");
         }
         // An unbound Codex session outside a launcher's turn runs its hooks
@@ -626,25 +806,16 @@ fn decide(root: &Path, actor: Option<String>, a: &HookArgs, input: &Input) -> De
         actor: actor.clone(),
         cwd: input.cwd.clone(),
     };
-    let outcome = match a.event {
-        Event::Start if launcher_turn => Outcome::Silent,
-        Event::Start => start(input, &live, &live),
-        Event::Stop if launcher_turn => stop(input, &NoMail, &live, &live),
-        Event::Stop => stop(input, &live, &live, &live),
-        // One wait per session: a harness starts one at every stop.
-        Event::Wait => match live.waiting(input.session.as_deref().unwrap_or("")) {
-            Some(_guard) => wait(
-                input,
-                &live,
-                &live,
-                Duration::from_secs(a.timeout),
-                live::poll_interval(),
-                &std::thread::sleep,
-            ),
-            None => Outcome::Silent,
-        },
-        Event::Edit => edit(input, &live),
+    let canonical = canonical_event(a, input, &actor);
+    let ctx = Builtins {
+        call: a,
+        input,
+        identity: &identity,
+        live: &live,
+        launcher_turn,
+        since_ms: session_start(root, a, input, observed_at),
     };
+    let outcome = outcome(&evaluate(&rules::defaults(), &canonical, &ctx));
     let recording = record_thread(root, a, input, &actor, &outcome, observed_at).and_then(|()| {
         let Some((common, canonical_actor, ticket)) = receiver? else {
             return Ok(());
@@ -663,9 +834,206 @@ fn decide(root: &Path, actor: Option<String>, a: &HookArgs, input: &Input) -> De
     Decision { outcome, recording }
 }
 
+/// The canonical event for a call: the harness's input, the actor the
+/// session resolved to (an agent: only the git adapter sees people), and
+/// the tool classified, with what a shell command does with git.
+pub fn canonical_event(a: &Call, input: &Input, actor: &str) -> event::HookEvent {
+    use event::{Tool, ToolClass};
+    let tool = (a.event == Event::Edit).then(|| Tool {
+        // A tool naming paths it writes is an edit, whatever else it says,
+        // so the edit guard never depends on an adapter's choice of fields.
+        class: if !input.paths.is_empty() {
+            ToolClass::Edit
+        } else if input.command.is_some() {
+            ToolClass::Shell
+        } else {
+            ToolClass::Other
+        },
+        name: input.tool.clone().unwrap_or_default(),
+        command: input.command.clone(),
+        paths: input.paths.clone(),
+        git: input.command.as_deref().and_then(event::git_call),
+    });
+    event::HookEvent {
+        schema: event::EVENT_SCHEMA.into(),
+        event: a.canonical(input),
+        harness: a.harness.adapter(),
+        session: input.session.clone(),
+        turn: input.turn.clone(),
+        cwd: input.cwd.clone(),
+        actor: event::Actor {
+            id: Some(actor.to_string()),
+            kind: event::ActorKind::Agent,
+        },
+        tool,
+        stop_active: input.stop_active,
+        native: event::Native {
+            event: a.native.clone(),
+        },
+    }
+}
+
+/// What the built-in rules read.
+struct Builtins<'a> {
+    call: &'a Call,
+    input: &'a Input,
+    /// The invocation's one identity (#6945).
+    identity: &'a git::LazyPin<'a>,
+    live: &'a live::Live,
+    /// In a launcher's turn the launcher handles mail itself.
+    launcher_turn: bool,
+    /// Where this session began, for `lease.done`.
+    since_ms: u64,
+}
+
+/// When the session began, by its thread record; without one, a lease's
+/// length before now, so a `done` from another day never blocks.
+fn session_start(root: &Path, a: &Call, input: &Input, now_ms: u64) -> u64 {
+    const LEASE_MS: u64 = 2 * 60 * 60 * 1000;
+    let fallback = now_ms.saturating_sub(LEASE_MS);
+    let (Some(session), Some(common)) = (input.session.as_deref(), common_dir(root)) else {
+        return fallback;
+    };
+    mdkg_run::hooks::threads(&common)
+        .into_iter()
+        .find(|t| t.harness == a.harness.name() && t.session == session)
+        .map(|t| t.first_seen_ms)
+        .filter(|ms| *ms > 0)
+        .unwrap_or(fallback)
+}
+
+/// Runs the rules that apply to the event, in order, as one decision.
+fn evaluate(rules: &[rules::Rule], e: &event::HookEvent, ctx: &Builtins<'_>) -> event::Decision {
+    let git = e.tool.as_ref().and_then(|t| t.git.as_ref());
+    let mut said = Vec::new();
+    for rule in rules {
+        if !rules::applies(rule, e, git) {
+            continue;
+        }
+        let Some(name) = rule.uses.strip_prefix("builtin:") else {
+            continue;
+        };
+        if let Some((verdict, text, code)) = builtin(rule, name, e, ctx) {
+            said.push(rules::Said {
+                rule: rule.id.clone(),
+                verdict: rules::moded(rule, verdict),
+                text,
+                code: Some(code.to_string()),
+            });
+        }
+    }
+    rules::combine(said)
+}
+
+/// A built-in rule's verdict, text and stable code; `None` when it has
+/// nothing to say.
+fn builtin(
+    rule: &rules::Rule,
+    name: &str,
+    e: &event::HookEvent,
+    c: &Builtins<'_>,
+) -> Option<(event::Verdict, String, &'static str)> {
+    use event::Verdict as V;
+    let session = c.input.session.as_deref().unwrap_or("");
+    match name {
+        "mail.notice" if !c.launcher_turn => match start(c.input, c.live, c.live) {
+            Outcome::Context(line) => Some((V::Context, line, "hook.mail_notice.context")),
+            _ => None,
+        },
+        "mail.stop" if !c.launcher_turn => {
+            stop_mail(c.input, c.live, c.live).map(|t| (V::BlockStop, t, "hook.mail_stop.blocked"))
+        }
+        // One wait per session: a harness starts one at every stop.
+        "mail.wake" if !c.launcher_turn => {
+            let _guard = c.live.waiting(session)?;
+            match wait(
+                c.input,
+                c.live,
+                c.live,
+                Duration::from_secs(c.call.timeout),
+                live::poll_interval(),
+                &std::thread::sleep,
+            ) {
+                Outcome::Wake(line) => Some((V::Wake, line, "hook.mail_wake.wake")),
+                _ => None,
+            }
+        }
+        "lease.edit" => match edit(c.input, c.live) {
+            Outcome::Deny(why) => Some((V::Deny, why, "hook.lease_edit.denied")),
+            _ => None,
+        },
+        "lease.audit" => stop_audit(c.input, c.live, c.live)
+            .map(|t| (V::BlockStop, t, "hook.lease_audit.blocked")),
+        "lease.done" => stop_done(c.input, c.live, c.live, c.since_ms)
+            .map(|t| (V::BlockStop, t, "hook.lease_done.blocked")),
+        "git.protect" => {
+            let git = e.tool.as_ref()?.git.as_ref()?;
+            git::protect_tool(
+                rule,
+                &c.live.root,
+                c.input.cwd.as_deref(),
+                &c.live.actor,
+                git,
+                c.identity.get(),
+            )
+        }
+        "secret.scan" => {
+            let git = e.tool.as_ref()?.git.as_ref()?;
+            git::secret_scan_tool(&c.live.root, c.input.cwd.as_deref(), git)
+        }
+        _ => None,
+    }
+}
+
+/// A canonical decision as the adapters render it.
+fn outcome(d: &event::Decision) -> Outcome {
+    let text = d.text.clone().unwrap_or_default();
+    match d.decision {
+        event::Verdict::Allow => Outcome::Silent,
+        event::Verdict::Context => Outcome::Context(text),
+        event::Verdict::BlockStop => Outcome::Block(text),
+        event::Verdict::Deny => Outcome::Deny(text),
+        event::Verdict::Wake => Outcome::Wake(text),
+    }
+}
+
+/// The default rules a harness can't run, for doctor's capability matrix:
+/// `codex lacks mail.wake (session.idle)`; `None` when it runs them all or
+/// isn't an adapter.
+pub fn unsupported_line(harness: &str) -> Option<String> {
+    let h = event::HarnessName::ALL
+        .into_iter()
+        .find(|h| h.as_str() == harness)?;
+    let lacking = rules::unsupported(&rules::defaults(), h);
+    if lacking.is_empty() {
+        return None;
+    }
+    let rules: Vec<String> = lacking
+        .iter()
+        .map(|(id, events)| {
+            let events: Vec<&str> = events.iter().map(|e| e.as_str()).collect();
+            format!("{id} ({})", events.join(", "))
+        })
+        .collect();
+    Some(format!("{harness} lacks {}", rules.join(", ")))
+}
+
+/// The default rules this build doesn't run yet, for doctor:
+/// `secret.scan isn't in this build yet`; `None` for none.
+pub fn not_built_line() -> Option<String> {
+    let ids: Vec<String> = rules::defaults()
+        .into_iter()
+        .filter(|r| r.mode != rules::Mode::Off && rules::NOT_BUILT.contains(&r.id.as_str()))
+        .map(|r| r.id)
+        .collect();
+    (!ids.is_empty()).then(|| format!("{} isn't in this build yet", ids.join(", ")))
+}
+
 /// The mail source for a launcher's turn, whose mail the launcher handles.
+#[cfg(test)]
 struct NoMail;
 
+#[cfg(test)]
 impl MailSource for NoMail {
     fn unread(&self) -> Result<Vec<Mail>, String> {
         Ok(Vec::new())
@@ -678,7 +1046,7 @@ impl MailSource for NoMail {
 /// reports it separately from the harness's mail or guard decision.
 fn record_thread(
     root: &Path,
-    a: &HookArgs,
+    a: &Call,
     input: &Input,
     actor: &str,
     outcome: &Outcome,
@@ -723,8 +1091,84 @@ mod live;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mdkg_run::hooks::HookEvent;
     use std::cell::RefCell;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn each_harness_shell_tool_is_a_canonical_shell_call_with_its_git() {
+        use serde_json::json;
+        let cwd = std::env::temp_dir();
+        for (harness, native, input) in [
+            (
+                Harness::Claude,
+                "PreToolUse",
+                json!({"session_id": "s", "cwd": cwd, "hook_event_name": "PreToolUse",
+                       "tool_name": "Bash", "tool_input": {"command": "git push origin main"}}),
+            ),
+            (
+                Harness::Codex,
+                "PreToolUse",
+                json!({"session_id": "s", "cwd": cwd, "hook_event_name": "PreToolUse",
+                       "turn_id": "t", "tool_name": "Bash",
+                       "tool_input": {"command": "git push origin main"}}),
+            ),
+            // OpenCode 2.1's shell tool, and 2.2's.
+            (
+                Harness::OpenCode,
+                "tool.execute.before",
+                json!({"sessionID": "s", "cwd": cwd, "tool": "bash",
+                       "args": {"command": "git push origin main"}}),
+            ),
+            (
+                Harness::OpenCode,
+                "tool.execute.before",
+                json!({"sessionID": "s", "cwd": cwd, "tool": "shell",
+                       "args": {"command": "git push origin main"}}),
+            ),
+        ] {
+            let (event, name) = native_event(harness, native).expect("routed");
+            let call = Call {
+                harness,
+                event,
+                name: Some(name),
+                native: native.into(),
+                timeout: 0,
+            };
+            let parsed = parse(harness, event, &input).expect("parse");
+            let e = canonical_event(&call, &parsed, "worker");
+            assert_eq!(e.event, event::EventName::ToolBefore);
+            assert_eq!(e.harness, harness.adapter());
+            assert_eq!(e.actor.kind, event::ActorKind::Agent);
+            let tool = e.tool.expect("tool");
+            assert_eq!(tool.class, event::ToolClass::Shell, "{harness:?}");
+            let git = tool.git.expect("git");
+            assert_eq!(
+                (git.verb, git.branches),
+                (event::GitVerb::Push, vec!["main".to_string()])
+            );
+            assert_eq!(e.native.event, native);
+        }
+        // A legacy `start` is a prompt when the harness says so.
+        let prompt = parse(
+            Harness::Claude,
+            Event::Start,
+            &json!({"hook_event_name": "UserPromptSubmit"}),
+        )
+        .expect("parse");
+        let legacy = Call::legacy(
+            Event::Start,
+            &LegacyArgs {
+                harness: Harness::Claude,
+                timeout: 0,
+            },
+        );
+        assert_eq!(legacy.canonical(&prompt), event::EventName::PromptSubmit);
+        assert_eq!(
+            legacy.canonical(&Input::default()),
+            event::EventName::SessionStart
+        );
+    }
 
     #[test]
     fn failed_observations_are_visible_without_losing_a_mail_or_guard_decision() {
@@ -766,9 +1210,11 @@ mod tests {
                 );
             }
         }
-        let args = HookArgs {
-            event: Event::Start,
+        let args = Call {
             harness: Harness::Claude,
+            event: Event::Start,
+            name: None,
+            native: String::new(),
             timeout: 0,
         };
         assert!(
@@ -850,6 +1296,7 @@ mod tests {
             kind: kind.into(),
             sender: sender.into(),
             room: room.map(Into::into),
+            own_reply: false,
         }
     }
 
@@ -904,6 +1351,15 @@ mod tests {
             m.insert(key, print);
             true
         }
+        fn claim_done(&self, s: &str, print: u64) -> bool {
+            let key = format!("done:{s}");
+            let mut m = self.0.borrow_mut();
+            if m.get(&key) == Some(&print) {
+                return false;
+            }
+            m.insert(key, print);
+            true
+        }
     }
 
     struct Leases(Vec<(&'static str, Result<Lease, &'static str>)>);
@@ -950,6 +1406,9 @@ mod tests {
             }
             fn claim_audit(&self, s: &str, fingerprint: u64) -> bool {
                 mdkg_run::hooks::claim_audit(&self.0, "a", s, fingerprint)
+            }
+            fn claim_done(&self, s: &str, fingerprint: u64) -> bool {
+                mdkg_run::hooks::claim_done(&self.0, "a", s, fingerprint)
             }
         }
         let nonce = std::time::SystemTime::now()
@@ -1067,6 +1526,9 @@ mod tests {
             Err("could not persist reminder".into())
         }
         fn claim_audit(&self, _: &str, _: u64) -> bool {
+            false
+        }
+        fn claim_done(&self, _: &str, _: u64) -> bool {
             false
         }
     }

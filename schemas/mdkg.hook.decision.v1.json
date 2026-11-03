@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "mdkg.hook.decision.v1",
+  "description": "A canonical decision: what the rules say, and which rules said it.",
+  "type": "object",
+  "properties": {
+    "schema": {
+      "description": "Always `mdkg.hook.decision.v1`.",
+      "type": "string",
+      "const": "mdkg.hook.decision.v1"
+    },
+    "decision": {
+      "$ref": "#/$defs/Verdict"
+    },
+    "text": {
+      "description": "The reason or context, for anything but `allow`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "codes": {
+      "description": "A stable dotted code (`hook.git_protect.denied`), for a\nrefusal or a warning.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "rules": {
+      "description": "The rules that matched and said something, in rule order.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "schema",
+    "decision"
+  ],
+  "$defs": {
+    "Verdict": {
+      "description": "The decisions, least severe first.",
+      "oneOf": [
+        {
+          "description": "Silent.",
+          "type": "string",
+          "const": "allow"
+        },
+        {
+          "description": "Wake an idle session, with a line.",
+          "type": "string",
+          "const": "wake"
+        },
+        {
+          "description": "Text for the agent's turn.",
+          "type": "string",
+          "const": "context"
+        },
+        {
+          "description": "Keep the agent from stopping, with a reason.",
+          "type": "string",
+          "const": "block_stop"
+        },
+        {
+          "description": "Refuse the tool call, commit or push, with a reason.",
+          "type": "string",
+          "const": "deny"
+        }
+      ]
+    }
+  }
+}

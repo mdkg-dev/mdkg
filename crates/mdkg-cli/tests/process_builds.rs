@@ -232,7 +232,46 @@ fn mixed_live_builds_warn_in_doctor_and_status_text_and_json() {
     );
     let data = status(&f.graph);
     assert_eq!(data["processes"].as_array().unwrap().len(), 2);
-    assert_eq!(data["build_warnings"].as_array().unwrap().len(), 2);
+    assert_eq!(data["build_warnings"].as_array().unwrap().len(), 1);
+    let summary = check["summary"].as_str().unwrap();
+    assert!(
+        summary.contains("2 stale launcher/MCP process(es)"),
+        "{summary}"
+    );
+    assert_eq!(summary.matches("sample-old-build").count(), 1, "{summary}");
+    assert!(
+        summary.contains(&format!("launcher pids [{}]", std::process::id())),
+        "{summary}"
+    );
+    assert!(
+        summary.contains(&format!("MCP pids [{}]", std::process::id())),
+        "{summary}"
+    );
+    let doctor = output(&f.graph, &["doctor"]);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&doctor.stdout),
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+    assert_eq!(
+        combined.matches("mixed mdkg builds").count(),
+        1,
+        "{combined}"
+    );
+    assert!(
+        combined.contains("restart stale launcher and MCP"),
+        "{combined}"
+    );
+    let json = envelope(&f.graph, &["doctor", "--json"]);
+    assert!(
+        json["diagnostics"].as_array().unwrap().iter().any(|d| {
+            d["code"] == "doctor.check_warned"
+                && d["message"]
+                    .as_str()
+                    .is_some_and(|s| s.starts_with("builds: "))
+        }),
+        "{json}"
+    );
     let text = output(&f.graph, &["agents", "status"]);
     assert!(String::from_utf8_lossy(&text.stdout).contains("warning: mixed mdkg builds"));
     assert!(
@@ -679,9 +718,25 @@ fn unsafe_registry_directories_are_refused_by_inventory_and_publish() {
                 builds::publish(&dir, Kind::Mcp, Path::new(BIN), current.clone(), vec![]).is_err()
             );
             assert_eq!(build_check(&f.graph)["status"], "warning");
-            let data = status(&f.graph);
+            let status = envelope(&f.graph, &["agents", "status", "--json"]);
+            assert_eq!(status["ok"], true, "{status}");
+            let data = &status["data"];
             assert!(data["processes"].as_array().unwrap().is_empty());
             assert!(!data["build_warnings"].as_array().unwrap().is_empty());
+            if path != dir.join("builds") {
+                assert!(
+                    status["diagnostics"].as_array().unwrap().iter().any(|d| {
+                        d["code"] == "run.progress_invalid"
+                            && d["severity"] == "warning"
+                            && d["message"]
+                                .as_str()
+                                .unwrap()
+                                .contains("unsafe supervisor progress folder")
+                    }),
+                    "{status}"
+                );
+            }
+            assert!(!dir.join("progress").exists());
             assert_eq!(
                 fs::metadata(&path).unwrap().permissions().mode() & 0o777,
                 mode | writable,
@@ -689,6 +744,59 @@ fn unsafe_registry_directories_are_refused_by_inventory_and_publish() {
             );
             fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
         }
+    }
+}
+
+#[test]
+fn unreadable_progress_keeps_build_inventory_and_refuses_execution_and_recovery() {
+    let f = inventory_fixture();
+    let dir = mdkg_run::state::run_dir(&f.graph).unwrap();
+    let config_path = f.graph.join(".mdkg/config.json");
+    let config: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+    let graph_id = uuid::Uuid::parse_str(config["graph_id"].as_str().unwrap()).unwrap();
+    let mut saved = mdkg_run::supervise::progress::Locked::open(&dir, graph_id, "worker")
+        .expect("progress owner");
+    saved.start(&"a".repeat(64), None).unwrap();
+    drop(saved);
+    let path = dir.join("progress/worker.json");
+    let before = fs::read(&path).unwrap();
+    let _build = builds::publish(
+        &dir,
+        Kind::Mcp,
+        Path::new(BIN),
+        current_build(&f.graph),
+        vec![],
+    )
+    .unwrap();
+    fs::set_permissions(dir.join("progress"), fs::Permissions::from_mode(0o770)).unwrap();
+    let expected = "unsafe supervisor progress folder";
+    let status = envelope(&f.graph, &["agents", "status", "--json"]);
+    assert_eq!(status["ok"], true, "{status}");
+    assert_eq!(status["data"]["processes"].as_array().unwrap().len(), 1);
+    assert!(status["data"]["progress"].as_array().unwrap().is_empty());
+    assert!(
+        status["diagnostics"].as_array().unwrap().iter().any(|d| {
+            d["severity"] == "warning" && d["message"].as_str().unwrap().contains(expected)
+        }),
+        "{status}"
+    );
+    let text = output(&f.graph, &["agents", "status"]);
+    assert!(text.status.success());
+    assert!(String::from_utf8_lossy(&text.stdout).contains("Mcp pid"));
+    assert!(String::from_utf8_lossy(&text.stderr).contains(expected));
+    for args in [
+        vec!["agents", "up", "worker", "--once", "--json"],
+        vec!["agents", "resume", "worker", "--json"],
+    ] {
+        let refused = envelope(&f.graph, &args);
+        assert_eq!(refused["ok"], false, "{refused}");
+        assert!(
+            refused["diagnostics"].as_array().unwrap().iter().any(|d| {
+                d["severity"] == "error" && d["message"].as_str().unwrap().contains(expected)
+            }),
+            "{refused}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
     }
 }
 

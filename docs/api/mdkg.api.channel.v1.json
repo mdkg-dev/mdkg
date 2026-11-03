@@ -1,0 +1,153 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "mdkg.api.channel.v1",
+  "description": "Draft (mdkg API v1; see docs/api.md). May change until the release that first emits it. A channel: a named group of mailboxes (A5).",
+  "x-mdkg-status": "draft",
+  "type": "object",
+  "properties": {
+    "schema": {
+      "const": "mdkg.api.channel.v1"
+    },
+    "ok": {
+      "type": "boolean",
+      "description": "False exactly when there is an error diagnostic."
+    },
+    "data": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Channel"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "diagnostics": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/DiagnosticOut"
+      }
+    }
+  },
+  "required": [
+    "schema",
+    "ok",
+    "diagnostics"
+  ],
+  "$defs": {
+    "Channel": {
+      "type": "object",
+      "properties": {
+        "uri": {
+          "type": "string",
+          "description": "The resource's path at its coordinator, beginning `/v1/`."
+        },
+        "name": {
+          "type": "string"
+        },
+        "createdBy": {
+          "type": "string"
+        },
+        "createdAt": {
+          "type": "string",
+          "description": "RFC 3339 UTC to the millisecond."
+        },
+        "members": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Mailbox names."
+        },
+        "unacked": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "The caller's unacked messages posted here."
+        },
+        "defaultContext": {
+          "type": "string",
+          "description": "The context a post with no context joins. Opaque."
+        },
+        "last_seq": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "The highest message `seq` posted here: a mail position, not a stream cursor."
+        }
+      },
+      "required": [
+        "uri",
+        "name",
+        "createdBy",
+        "createdAt",
+        "members",
+        "defaultContext",
+        "last_seq"
+      ],
+      "description": "Mail records keep A2A's camelCase."
+    },
+    "DiagnosticOut": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string",
+          "description": "A stable diagnostic code."
+        },
+        "severity": {
+          "type": "string",
+          "description": "Severity.",
+          "enum": [
+            "error",
+            "warning",
+            "info"
+          ]
+        },
+        "path": {
+          "type": "string"
+        },
+        "line": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "node": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "hint": {
+          "type": "string"
+        },
+        "holders": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "related": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string"
+              },
+              "line": {
+                "type": "integer",
+                "minimum": 0
+              }
+            },
+            "required": [
+              "path"
+            ]
+          }
+        }
+      },
+      "required": [
+        "code",
+        "severity",
+        "message"
+      ],
+      "description": "A diagnostic, as every command's envelope writes it."
+    }
+  }
+}

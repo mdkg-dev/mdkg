@@ -22,8 +22,8 @@ import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-# Release workflows hold publishing tokens; CI also runs repository code.
-WORKFLOWS = [ROOT / ".github" / "workflows" / n for n in ("release.yml", "pypi.yml", "ci.yml")]
+# Release workflows publish (some with tokens); CI also runs repository code.
+WORKFLOWS = [ROOT / ".github" / "workflows" / n for n in ("release.yml", "pypi.yml", "publish.yml", "ci.yml")]
 DIST_VERSION = "0.32.0"
 DIST_INSTALL = f"cargo install cargo-dist --version {DIST_VERSION} --locked"
 # action@tag -> the commit that tag named when it was pinned, looked up
@@ -47,6 +47,9 @@ PINS = {
     # pypa's own advice is a full version tag pinned by commit, not its
     # moving `release/v1` branch.
     "pypa/gh-action-pypi-publish@v1.13.0": "ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e",
+    # A lightweight tag; resolved by the orchestrator 2026-10-29. v1.0.6
+    # (2026-10-21) changes the bundled code and waits for its own review.
+    "rust-lang/crates-io-auth-action@v1.0.5": "c6f97d42243bad5fab37ca0427f495c86d5b1a18",
 }
 # Moving refs, replaced by a pinned tag of the same line.
 RETAG = {"pypa/gh-action-pypi-publish@release/v1": "pypa/gh-action-pypi-publish@v1.13.0"}

@@ -17,6 +17,7 @@ use crate::discovery;
 use crate::error::GraphError;
 use crate::graph_checks;
 use crate::index::{Index, IndexNode, RefTarget, relative_label, relative_path};
+use crate::requirements::{self, RelationKind};
 use crate::templates;
 use mdkg_format::program::BIN;
 
@@ -451,7 +452,10 @@ pub fn validate(root: &Path, config: &Config) -> Result<Receipt, GraphError> {
                     tpl.fallback_types.join(", ")
                 ),
             )
-            .with_hint("preview the built-in templates with `mdkg upgrade`"),
+            .with_hint(format!(
+                "preview the built-in templates with `{} upgrade`",
+                mdkg_format::program::BIN
+            )),
         );
     }
     let opts = ParseOptions {
@@ -470,6 +474,8 @@ pub fn validate(root: &Path, config: &Config) -> Result<Receipt, GraphError> {
     let mut checked = 0;
     // Workspaces in sorted alias order, as the reference iterates them.
     let mut template_recommended: HashMap<String, Vec<String>> = HashMap::new();
+    // Each node's file lines before its body, by qid, for requirement lines.
+    let mut body_offsets: HashMap<String, usize> = HashMap::new();
     for (ws, files) in &documents.by_workspace {
         let mut first_paths: Vec<(String, String)> = Vec::new();
         let mut first_legacy: HashMap<String, String> = HashMap::new();
@@ -586,6 +592,11 @@ pub fn validate(root: &Path, config: &Config) -> Result<Receipt, GraphError> {
             warnings.extend(manifest_compat_warnings(&node_ref, file, &node));
             if v07 {
                 warnings.extend(v07_node_warnings(&node_ref, &node));
+                let lines = |text: &str| text.bytes().filter(|b| *b == b'\n').count();
+                body_offsets.insert(
+                    qid.clone(),
+                    lines(&content).saturating_sub(lines(&node.body)),
+                );
             }
             nodes.push(IndexNode::from_parsed(node, &ws.alias, rel));
         }
@@ -599,6 +610,7 @@ pub fn validate(root: &Path, config: &Config) -> Result<Receipt, GraphError> {
     index.private_work = config.work_committed == crate::config::WorkCommitted::None;
     if v07 {
         v07_index_checks(&index, config.graph_id, &mut errors, &mut warnings);
+        warnings.extend(requirement_warnings(&index, &body_offsets));
     }
 
     let known_skills = skills(root, &mut errors, &mut warnings);
@@ -694,6 +706,213 @@ fn v07_node_warnings(node_ref: &NodeRef<'_>, node: &mdkg_format::Node) -> Vec<Di
                     )
                     .with_hint("rename it x-<namespace>.<field>"),
             );
+        }
+    }
+    out
+}
+
+/// Words a requirement may use only with a number beside them (A28).
+const VAGUE_WORDS: &[&str] = &[
+    "fast",
+    "quickly",
+    "robust",
+    "user-friendly",
+    "easy",
+    "efficient",
+    "flexible",
+    "appropriate",
+    "adequate",
+    "reasonable",
+    "seamless",
+    "intuitive",
+    "minimal",
+    "as needed",
+];
+
+/// Types whose requirements are durable, and the only relation targets.
+const DESIGN_TYPES: &[&str] = &["edd", "prd"];
+
+/// The types that hold requirements (A28, "Where requirements live"): the
+/// design types and the work items. Other types, such as rules, may have a
+/// `# Requirements` section of their own prose, which the lint leaves alone.
+const REQUIREMENT_TYPES: &[&str] = &["task", "bug", "feat", "spike", "edd", "prd"];
+
+/// Whether `statement` holds the vague `term` as a whole term. A hyphen
+/// joins words here, so "fast-forward" never counts as "fast", as
+/// `user-friendly` is one term.
+fn contains_vague_term(statement: &str, term: &str) -> bool {
+    let hay = statement.to_ascii_lowercase();
+    let joined = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'-';
+    let bytes = hay.as_bytes();
+    hay.match_indices(term).any(|(i, _)| {
+        let end = i + term.len();
+        (i == 0 || !joined(bytes[i - 1])) && (end >= bytes.len() || !joined(bytes[end]))
+    })
+}
+
+/// The node a requirement relation names, as written: a format 0.7 ref,
+/// or an id in the node's own workspace. `None` when it names nothing
+/// here, and `Some(None)` for a ref into another graph, which isn't
+/// checked.
+fn relation_target<'a>(
+    index: &'a Index,
+    from: &IndexNode,
+    written: &str,
+) -> Option<Option<&'a IndexNode>> {
+    match index.target(written) {
+        RefTarget::Local { node, .. } => Some(Some(node)),
+        RefTarget::Foreign => Some(None),
+        RefTarget::Missing => None,
+        RefTarget::NotARef => index
+            .get(&format!("{}:{}", from.ws, written.to_ascii_lowercase()))
+            .or_else(|| index.get(&format!("{}:{written}", from.ws)))
+            .map(Some),
+    }
+}
+
+/// The EARS lint over every node's `# Requirements` items (A28). Every
+/// finding is a warning: requirements are a body convention, and the lint
+/// never refuses a node.
+fn requirement_warnings(index: &Index, body_offsets: &HashMap<String, usize>) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    for node in &index.nodes {
+        if !REQUIREMENT_TYPES.contains(&node.node_type.as_str()) {
+            continue;
+        }
+        let parsed = requirements::parse(&node.body);
+        let offset = body_offsets.get(&node.qid).copied().unwrap_or(0);
+        let at = |code: Code, line: usize, message: String| {
+            Diagnostic::warning(code, message)
+                .at(node.path.clone(), Some(line + offset))
+                .for_node(node.qid.clone())
+        };
+        let work = matches!(node.node_type.as_str(), "task" | "bug" | "spike");
+        if work && parsed.items == 0 && node.status.as_deref() != Some("done") {
+            out.push(
+                Diagnostic::warning(
+                    Code::ReqMissing,
+                    format!("this {} has no requirement items", node.node_type),
+                )
+                .at(node.path.clone(), None)
+                .for_node(node.qid.clone())
+                .with_hint("add a `# Requirements` section with `- R1: ...` items"),
+            );
+        }
+        for line in &parsed.bad_lines {
+            out.push(
+                at(
+                    Code::ReqBadLine,
+                    *line,
+                    "this requirement item doesn't parse as `R<n>: ...`".into(),
+                )
+                .with_hint(
+                    "write `- R<n>: <statement>`, with relations in parentheses before the colon",
+                ),
+            );
+        }
+        for issue in &parsed.issues {
+            let mut d = at(Code::ReqBadLine, issue.line, issue.message.into());
+            for related in &issue.related {
+                d = d.also_at(node.path.clone(), Some(related + offset));
+            }
+            out.push(d);
+        }
+        let mut first: HashMap<&str, usize> = HashMap::new();
+        let design = DESIGN_TYPES.contains(&node.node_type.as_str());
+        let spike = node.node_type == "spike";
+        for r in &parsed.requirements {
+            if let Some(line) = first.get(r.id.as_str()) {
+                out.push(
+                    at(
+                        Code::ReqDuplicateId,
+                        r.line,
+                        format!("{} is already used on body line {line}", r.id),
+                    )
+                    .also_at(node.path.clone(), Some(line + offset)),
+                );
+            } else {
+                first.insert(r.id.as_str(), r.line);
+            }
+            if r.retired {
+                continue;
+            }
+            if spike {
+                if !r.statement.trim_end().ends_with('?') {
+                    out.push(at(
+                        Code::ReqNotQuestion,
+                        r.line,
+                        format!(
+                            "{}: a spike's requirement is a question ending in `?`",
+                            r.id
+                        ),
+                    ));
+                }
+            } else if r.ears.is_none() {
+                let mut d = at(
+                    Code::ReqNotEars,
+                    r.line,
+                    format!("{} matches no EARS form", r.id),
+                );
+                if ["should", "must", "will"]
+                    .iter()
+                    .any(|w| contains_word(&r.statement, w))
+                {
+                    d = d.with_hint("EARS uses shall");
+                } else {
+                    d = d.with_hint(
+                        "write `[While/When/Where/If ... then] the <system> shall <response>`",
+                    );
+                }
+                out.push(d);
+            }
+            if !r.statement.bytes().any(|b| b.is_ascii_digit())
+                && let Some(word) = VAGUE_WORDS
+                    .iter()
+                    .find(|w| contains_vague_term(&r.statement, w))
+            {
+                out.push(
+                    at(
+                        Code::ReqVague,
+                        r.line,
+                        format!("{} says \"{word}\" without a number", r.id),
+                    )
+                    .with_hint("state the quantity it means"),
+                );
+            }
+            if design && !r.relations.is_empty() {
+                out.push(at(
+                    Code::ReqRelationOnDesign,
+                    r.line,
+                    format!("{} is a durable requirement and carries a relation", r.id),
+                ));
+                continue;
+            }
+            for rel in &r.relations {
+                let message = match relation_target(index, node, &rel.node) {
+                    None => Some(format!("{}: {} names no node here", r.id, rel.node)),
+                    Some(None) => None,
+                    Some(Some(target)) if !DESIGN_TYPES.contains(&target.node_type.as_str()) => {
+                        Some(format!(
+                            "{}: {} is a {}, not an edd or prd",
+                            r.id, rel.node, target.node_type
+                        ))
+                    }
+                    Some(Some(target)) => match (&rel.kind, &rel.requirement) {
+                        (RelationKind::Changes, Some(id))
+                            if !requirements::parse(&target.body)
+                                .requirements
+                                .iter()
+                                .any(|t| t.id == *id) =>
+                        {
+                            Some(format!("{}: {} has no {id} to change", r.id, rel.node))
+                        }
+                        _ => None,
+                    },
+                };
+                if let Some(message) = message {
+                    out.push(at(Code::ReqBadRelation, r.line, message));
+                }
+            }
         }
     }
     out

@@ -1,0 +1,144 @@
+{
+  "name": "22-same-envelope",
+  "scenario": "same_envelope",
+  "transports": [
+    "cli-local",
+    "mcp",
+    "http-socket"
+  ],
+  "fixture": {
+    "format_version": "0.7",
+    "graph_id": "01a18fd1-7b2b-70b1-8d2f-f4ece2360596",
+    "files": {
+      "work.txt": "initial content\n"
+    }
+  },
+  "operations": [
+    {
+      "op": "node.list",
+      "actor": "a",
+      "args": {},
+      "expect": {
+        "schema": "mdkg.list.v1",
+        "ok": true
+      },
+      "outcomes": {
+        "cli-local": 0,
+        "mcp": false,
+        "http-socket": 200
+      }
+    },
+    {
+      "op": "node.show",
+      "actor": "a",
+      "args": {
+        "id": "task-nope"
+      },
+      "expect": {
+        "schema": "mdkg.show.v1",
+        "ok": false,
+        "diagnostics": [
+          {
+            "code": "node.not_found"
+          }
+        ]
+      },
+      "outcomes": {
+        "cli-local": 3,
+        "mcp": true,
+        "http-socket": 404
+      }
+    },
+    {
+      "op": "lease.claim",
+      "actor": "a",
+      "args": {
+        "target": "work.txt"
+      },
+      "expect": {
+        "schema": "mdkg.claim.v1",
+        "ok": true
+      },
+      "outcomes": {
+        "cli-local": 0,
+        "mcp": false,
+        "http-socket": 201
+      }
+    },
+    {
+      "op": "lease.claim",
+      "actor": "b",
+      "args": {
+        "target": "work.txt"
+      },
+      "expect": {
+        "schema": "mdkg.claim.v1",
+        "ok": false,
+        "diagnostics": [
+          {
+            "code": "coord.lease_held"
+          }
+        ]
+      },
+      "outcomes": {
+        "cli-local": 5,
+        "mcp": true,
+        "http-socket": 409
+      }
+    },
+    {
+      "op": "msg.send",
+      "actor": "a",
+      "args": {
+        "to": [
+          "b"
+        ],
+        "kind": "note",
+        "id": "same-envelope-1",
+        "text": "fixture message"
+      },
+      "expect": {
+        "schema": "mdkg.msg.send.v1",
+        "ok": true
+      },
+      "outcomes": {
+        "cli-local": 0,
+        "mcp": false,
+        "http-socket": 201
+      }
+    },
+    {
+      "op": "msg.inbox",
+      "actor": "b",
+      "args": {},
+      "expect": {
+        "schema": "mdkg.msg.inbox.v1",
+        "ok": true
+      },
+      "outcomes": {
+        "cli-local": 0,
+        "mcp": false,
+        "http-socket": 200
+      },
+      "per_copy": [
+        "/data/event_cursor"
+      ]
+    },
+    {
+      "op": "lease.release",
+      "actor": "a",
+      "args": {
+        "target": "work.txt"
+      },
+      "expect": {
+        "schema": "mdkg.release.v1",
+        "ok": true
+      },
+      "outcomes": {
+        "cli-local": 0,
+        "mcp": false,
+        "http-socket": 200
+      }
+    }
+  ]
+}

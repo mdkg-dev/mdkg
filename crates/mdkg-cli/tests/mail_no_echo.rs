@@ -101,7 +101,7 @@ fn mail_refusals_quote_no_typed_mailbox_room_or_actor() {
     let not_json = repo.0.join("markerjson7.json");
     fs::write(&not_json, "{ not json").expect("write");
     let not_json = not_json.to_str().expect("utf-8");
-    let cases: [&[&str]; 7] = [
+    let cases: [&[&str]; 13] = [
         // A mailbox the actor doesn't hold.
         &["msg", "inbox", "--mailbox", "role:markerrole7"],
         // Leaving a room the actor isn't in: a warning.
@@ -151,6 +151,24 @@ fn mail_refusals_quote_no_typed_mailbox_room_or_actor() {
             "note",
             "markerfile7",
         ],
+        // A sender filter that isn't a name, and one nobody sent as.
+        &["msg", "inbox", "--from", "markerbad7 x"],
+        // A bulk ack through something that isn't a number.
+        &["msg", "ack", "--through", "markerbad7"],
+        // Forwarding: an unknown message, one to a malformed mailbox,
+        // and a mailbox the actor doesn't hold.
+        &["msg", "forward", "markermsg7", "--to", "owner-a"],
+        &["msg", "forward", "markermsg7", "--to", "markerbad7 x"],
+        &[
+            "msg",
+            "forward",
+            "markermsg7",
+            "--to",
+            "owner-a",
+            "--mailbox",
+            "role:markerrole7",
+        ],
+        &["msg", "forward", "markermsg7", "--room", "markerroom7"],
     ];
     for args in cases {
         let (_, out) = run(&repo.0, actor, args);
@@ -163,6 +181,7 @@ fn mail_refusals_quote_no_typed_mailbox_room_or_actor() {
             "markerbad7",
             "markerfile7",
             "markerjson7",
+            "markermsg7",
         ] {
             assert!(!said.contains(marker), "{args:?} quoted {marker}: {said}");
         }
@@ -242,19 +261,31 @@ fn coordinator_refusals_have_hints_and_quote_nothing_typed() {
 #[test]
 fn unresolved_handles_use_one_wording_and_quote_nothing() {
     let repo = repo("handles");
-    for args in [
-        &["show", "markerhandle7"][..],
-        &["claim", "markerhandle7"],
-        &["task", "start", "markerhandle7"],
+    // A claim reads a name that's no node and no path as a path it may be
+    // about to create (friction item 43): its own code and wording, still
+    // quoting nothing. The 0.6.0 `task start` takes only tasks.
+    for (args, code_name, message) in [
+        (
+            &["show", "markerhandle7"][..],
+            "node.not_found",
+            "no node matches that handle",
+        ),
+        (
+            &["claim", "markerhandle7"],
+            "coord.path_missing",
+            "no node matches that handle, and no worktree has that path",
+        ),
+        (
+            &["task", "start", "markerhandle7"],
+            "node.not_found",
+            "no node matches that handle",
+        ),
     ] {
         let (code, out) = run(&repo.0, "owner-a", args);
         assert_eq!(code, 3, "{args:?}: {out}");
         let d = &out["diagnostics"][0];
-        assert_eq!(d["code"], "node.not_found", "{args:?}: {out}");
-        assert_eq!(
-            d["message"], "no node matches that handle",
-            "{args:?}: {out}"
-        );
+        assert_eq!(d["code"], code_name, "{args:?}: {out}");
+        assert_eq!(d["message"], message, "{args:?}: {out}");
         assert!(d["hint"].is_string(), "{args:?}: {out}");
         assert!(!texts(&out).contains("markerhandle7"), "{args:?}: {out}");
     }

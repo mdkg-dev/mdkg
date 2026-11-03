@@ -45,7 +45,7 @@ fn json_lines(stdout: &str) -> impl Iterator<Item = Value> + '_ {
 
 /// Claude's `stream-json`: the last `result` event has the final text, the
 /// session id and whether the turn failed.
-fn claude(stdout: &str) -> Result<Parsed, RunError> {
+pub(crate) fn claude(stdout: &str) -> Result<Parsed, RunError> {
     let mut session = None;
     let mut result = None;
     for v in json_lines(stdout) {
@@ -164,7 +164,7 @@ pub(crate) fn codex_header_check_settings(
 
 /// Codex without `--json`: the header on stderr names the session and the
 /// sandbox; `-o` holds the final message.
-fn codex(
+pub(crate) fn codex(
     stderr: &str,
     output_file: Option<&str>,
     role: Role,
@@ -208,7 +208,7 @@ fn codex(
 
 /// OpenCode's `run --format json`: events carry `sessionID`; text parts
 /// hold the answer. Unverified: taken from OpenCode's docs.
-fn opencode(stdout: &str) -> Result<Parsed, RunError> {
+pub(crate) fn opencode(stdout: &str) -> Result<Parsed, RunError> {
     let mut session = None;
     let mut texts: Vec<String> = Vec::new();
     let mut usage = Usage::default();
@@ -293,11 +293,9 @@ pub(crate) fn parse_with_settings(
     output_file: Option<&str>,
     settings: CodexSettings<'_>,
 ) -> Result<Parsed, RunError> {
-    let parsed = match harness {
-        Harness::Claude => claude(stdout)?,
-        Harness::Codex => codex(stderr, output_file, role, settings)?,
-        Harness::OpenCode => opencode(stdout)?,
-    };
+    let parsed = harness
+        .adapter()
+        .parse_output(role, stdout, stderr, output_file, settings)?;
     if parsed.reply.trim().is_empty() {
         return Err(RunError::failure(
             CODE_NO_REPLY,

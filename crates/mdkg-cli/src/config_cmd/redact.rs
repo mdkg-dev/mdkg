@@ -208,7 +208,7 @@ fn url_credential(text: &str) -> bool {
 
 fn contents(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
-    if crate::msg::looks_secret(text)
+    if crate::credentials::looks_secret(text)
         || additional_token(text)
         || (lower.contains("-----begin ") && lower.contains("private key"))
         || authorization(text)

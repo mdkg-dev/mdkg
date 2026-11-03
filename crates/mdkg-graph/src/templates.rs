@@ -258,7 +258,36 @@ pub struct Templates {
 
 /// Loads template schemas for every allowed type.
 pub fn load(root: &Path, config: &Config) -> Result<Templates, GraphError> {
-    // Format 0.7's validity is its node schema; templates only seed `new`.
+    // Format 0.7 does not read custom templates when validating nodes.
+    if config.format == mdkg_format::node::FormatVersion::V07 {
+        return from_documents(config, std::iter::empty());
+    }
+    let set_dir = root
+        .join(&config.templates_root)
+        .join(&config.templates_set);
+    let files = if set_dir.is_dir() {
+        fs_walk::markdown_files(&set_dir, config.limits.max_depth)?
+    } else {
+        Vec::new()
+    };
+    from_documents(
+        config,
+        files
+            .into_iter()
+            .filter_map(|file| match read_template(root, &file) {
+                Ok(Some(content)) => Some(Ok((relative_path(root, &file), content))),
+                Ok(None) => None,
+                Err(error) => Some(Err(error)),
+            }),
+    )
+}
+
+/// Parse ordered template sources, with the same merge and bundled fallback
+/// rules for filesystem and committed-tree callers.
+pub(crate) fn from_documents(
+    config: &Config,
+    documents: impl IntoIterator<Item = Result<(String, String), GraphError>>,
+) -> Result<Templates, GraphError> {
     if config.format == mdkg_format::node::FormatVersion::V07 {
         return Ok(Templates {
             schemas: mdkg_format::schema07::schemas().clone(),
@@ -267,17 +296,9 @@ pub fn load(root: &Path, config: &Config) -> Result<Templates, GraphError> {
     }
     let mut schemas = HashMap::new();
     let mut fallback_types = Vec::new();
-    let set_dir = root
-        .join(&config.templates_root)
-        .join(&config.templates_set);
-    if set_dir.is_dir() {
-        for file in fs_walk::markdown_files(&set_dir, config.limits.max_depth)? {
-            // Gone since it was listed: as if it never was.
-            let Some(content) = read_template(root, &file)? else {
-                continue;
-            };
-            merge(&mut schemas, &content, &relative_path(root, &file))?;
-        }
+    for document in documents {
+        let (path, content) = document?;
+        merge(&mut schemas, &content, &path)?;
     }
     for node_type in ALLOWED_TYPES {
         if schemas.contains_key(*node_type) {

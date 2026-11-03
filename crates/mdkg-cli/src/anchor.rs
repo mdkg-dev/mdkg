@@ -3,6 +3,7 @@
 //! `.mdkg/anchors/<store-id>.json`, by hand, when a goal is done, and
 //! before a release. Committing it is the caller's step.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use mdkg_coord_sqlite::{Store, StoreError};
@@ -50,6 +51,8 @@ pub struct CheckpointData {
     pub to: u64,
     /// At most 150 words, citing the first and last records' hashes.
     pub summary: String,
+    /// Every distinct actor in the checkpoint range, sorted by name.
+    pub actors: Vec<String>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -199,12 +202,60 @@ pub fn write_anchor(
         diagnostics.push(Diagnostic::warning(Code::LogAnchorMismatch, e.to_string()));
     }
     let checkpoint = store.checkpoint().map_err(chain_error)?;
+    // Read after checkpointing: another writer may have appended records
+    // between the initial verification and the checkpoint transaction.
+    let actors = if let Some(c) = &checkpoint {
+        let (_, records, _) = verified_chain(store)?;
+        records
+            .into_iter()
+            .filter(|(r, _)| (c.from..=c.to).contains(&r.seq))
+            .map(|(r, _)| r.actor)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    } else {
+        Vec::new()
+    };
     let (last, head) = store.log_head().map_err(chain_error)?;
     let anchor = Anchor::new(&id, last, &head, crate::coord::now_ms());
     let text = anchor
         .to_text()
         .map_err(|e| GraphError::failure(Code::IoWriteFailed, e.to_string()))?;
-    write_whole(&path, &text)?;
+    match crate::coord::graph_git::for_root(root) {
+        // Ref mode: the anchor is published on the graph ref through the
+        // write path; nothing is left in the cache for anyone to commit.
+        // The request id is the chain position, so a rerun at the same seq
+        // returns the first publish.
+        Some(mode) => {
+            use crate::coord::graph_git::{Publish, prepare_record_publish};
+            let rel = format!("{ANCHOR_DIR}/{id}.json");
+            let request = format!("anchor-{id}-{last}");
+            let actor = std::env::var("MDKG_ACTOR")
+                .ok()
+                .filter(|a| !a.trim().is_empty())
+                .unwrap_or_else(|| "mdkg".into());
+            prepare_record_publish(
+                &mode,
+                store,
+                (&request, "anchor", &actor),
+                |w, _| {
+                    w.write(&rel, text.as_bytes())?;
+                    Ok((
+                        Publish {
+                            message: format!("anchor {id}"),
+                            leases: Vec::new(),
+                            allowed: vec![mdkg_coord::Scope::new(rel.as_str())],
+                            trailers: Vec::new(),
+                        },
+                        (),
+                    ))
+                },
+                // An anchor holds no lease: there's no changeset to record.
+                |_, _| Ok(()),
+            )?;
+        }
+        None => write_whole(&path, &text)?,
+    }
     Ok(Report::ok(AnchorData {
         store: id.clone(),
         seq: last,
@@ -220,6 +271,7 @@ pub fn write_anchor(
             from: c.from,
             to: c.to,
             summary: c.summary,
+            actors,
         }),
     })
     .with(diagnostics))
@@ -259,12 +311,47 @@ pub fn run(root: &Path, force: bool, json: bool) -> u8 {
     })()
     .unwrap_or_else(Report::failed);
     output::emit("anchor", json, report, |d| {
-        if let Some(c) = &d.checkpoint {
-            println!("checkpoint {}: {}", c.seq, c.summary);
-        }
+        let next = if crate::coord::graph_git::bound().is_some() {
+            "published on the graph ref"
+        } else {
+            "commit it"
+        };
         println!(
-            "anchored store {} at seq {} ({}) in {}; commit it",
+            "anchored store {} at seq {} ({}) in {}; {next}",
             d.store, d.seq, d.head, d.path
         );
+        if let Some(c) = &d.checkpoint {
+            println!(
+                "checkpoint {}: records {} to {}; actors: {} (full list: --json)",
+                c.seq,
+                c.from,
+                c.to,
+                actor_counts(&c.actors)
+            );
+        }
     })
+}
+
+/// Launcher actors use <selected-actor>@run-<uuid>; ordinary named actors share a
+/// category so a large set of worker names does not become another long list.
+fn actor_counts(actors: &[String]) -> String {
+    let mut counts = BTreeMap::new();
+    for actor in actors {
+        let kind = if actor
+            .rsplit_once("@run-")
+            .is_some_and(|(name, id)| !name.is_empty() && uuid::Uuid::parse_str(id).is_ok())
+        {
+            "launcher"
+        } else if actor == mdkg_coord_sqlite::log::SYSTEM_ACTOR {
+            "system"
+        } else {
+            "named"
+        };
+        *counts.entry(kind).or_insert(0usize) += 1;
+    }
+    counts
+        .into_iter()
+        .map(|(kind, count)| format!("{kind} {count}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }

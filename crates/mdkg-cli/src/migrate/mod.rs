@@ -7,7 +7,13 @@
 //!   backing up the graph, the store and the base commit.
 //! - `--rollback` reverts it from the backups.
 //! - `--status` shows how far the last migration got.
+//! - `--restore-history` with `--dry-run` or `--apply <hash>` brings back
+//!   into git the work history a migration moved to the store.
 
+// Migrating a branch against an already-migrated main: cut from 0.7.1
+// (decided 2026-10-28), kept for 0.7.2. Only `migrated_main_of` is used.
+#[allow(dead_code)]
+mod against;
 pub mod apply;
 mod classify;
 mod gather;
@@ -15,6 +21,7 @@ mod gitops;
 mod mint;
 pub mod plan;
 mod records;
+mod restore;
 mod rewrite;
 
 use std::collections::BTreeMap;
@@ -27,6 +34,7 @@ use mdkg_graph::GraphError;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::BIN;
 use crate::coord::{Repo, git_error};
 use crate::output::{self, Report};
 use apply::{Ctx, Journal, Stage, StoreImport};
@@ -57,9 +65,38 @@ pub struct MigrateArgs {
     /// migration (the changes since are lost).
     #[arg(long, requires = "rollback")]
     pub force: bool,
+    /// With --dry-run or --apply: where the work history goes. `git` keeps
+    /// checkpoints, finished tests, event logs and progress sections in
+    /// git; `store` moves them to the coordinator store's log, as 0.7.0
+    /// did. Default: `git` when the graph commits its work (its config's
+    /// `work.location`, which is `git` for every 0.6 graph).
+    #[arg(long, value_name = "WHERE", value_enum)]
+    pub work_history: Option<WorkHistory>,
+    /// With --dry-run or --apply: on a graph already migrated, bring back
+    /// into git, in one commit, the checkpoints, finished tests and event
+    /// logs the migration moved to the store, read from the migration
+    /// commit's parent.
+    #[arg(long, conflicts_with_all = ["rollback", "status", "work_history", "rewrite_refs"])]
+    pub restore_history: bool,
     /// Print JSON.
     #[arg(long)]
     pub json: bool,
+}
+
+/// `--work-history`'s values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum WorkHistory {
+    Git,
+    Store,
+}
+
+impl From<WorkHistory> for plan::History {
+    fn from(w: WorkHistory) -> Self {
+        match w {
+            WorkHistory::Git => plan::History::Git,
+            WorkHistory::Store => plan::History::Store,
+        }
+    }
 }
 
 /// How many of each.
@@ -67,6 +104,8 @@ pub struct MigrateArgs {
 pub struct Counts {
     /// Nodes that stay, with new ids.
     pub nodes: usize,
+    /// Of those, checkpoints and finished tests kept in git as nodes.
+    pub kept_in_git: usize,
     /// Of those, tier C nodes kept as plain nodes.
     pub tier_c: usize,
     /// Checkpoints that became log records.
@@ -104,6 +143,17 @@ pub struct MigrateData {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub commit: Option<String>,
     pub graph_id: String,
+    /// Where the work history goes: `git` (it stays) or `store` (it
+    /// becomes log records and leaves git). The plan's hash covers it.
+    pub work_history: String,
+    /// Why the work history goes there.
+    pub work_history_reason: String,
+    /// The workspaces the migration converts, each in place; the hash
+    /// covers them.
+    pub workspaces: Vec<plan::PlanWorkspace>,
+    /// What the plan took from the migrated main it was made against.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub against: Option<against::Against>,
     pub counts: Counts,
     /// Changes inside the graph.
     pub files: Vec<FileChange>,
@@ -118,6 +168,9 @@ pub struct MigrateData {
     pub patch_file: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backups: Option<Backups>,
+    /// With --restore-history: what comes back into git, and from where.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restore: Option<restore::Restored>,
 }
 
 /// A plan as it's kept on disk: the plan, and every new file's content.
@@ -145,6 +198,27 @@ fn store_plan(path: &Path, p: &Plan, hash: &str) -> Result<(), GraphError> {
         .map_err(|e| GraphError::failure(Code::IoWriteFailed, format!("writing the plan: {e}")))
 }
 
+/// Refuses to carry on a plan made against a migrated main by an earlier
+/// build: that mode is cut from 0.7.1, and its records may not be safe to
+/// import. `--status` still reads it, and `--rollback` undoes it.
+fn resumable(p: &Plan) -> Result<(), GraphError> {
+    match &p.against {
+        None => Ok(()),
+        Some(a) => Err(GraphError::conflict(
+            Code::MigrateUnsupported,
+            format!(
+                "this unfinished migration was planned against {}, which this release \
+                 doesn't carry out",
+                a.reference
+            ),
+        )
+        .with_hint(
+            "undo it with `migrate --rollback`, then see the guide's \"Branches that merge \
+             later\"",
+        )),
+    }
+}
+
 fn load_plan(path: &Path, hash: &str) -> Result<Plan, GraphError> {
     let bad = |why: String| {
         GraphError::failure(
@@ -170,6 +244,11 @@ fn counts(p: &Plan) -> Counts {
     let kind = |k: RecordKind| p.records.iter().filter(|r| r.kind == k).count();
     Counts {
         nodes: p.nodes.iter().filter(|n| n.id.is_some()).count(),
+        kept_in_git: p
+            .nodes
+            .iter()
+            .filter(|n| n.id.is_some() && matches!(n.plane.as_str(), "checkpoint" | "check-result"))
+            .count(),
         tier_c: p.nodes.iter().filter(|n| n.plane == "tier-c").count(),
         checkpoints: kind(RecordKind::LegacyCheckpoint),
         check_results: kind(RecordKind::CheckResult),
@@ -205,10 +284,33 @@ fn data(
         base: p.base.clone(),
         commit: journal.and_then(|j| j.commit.clone()),
         graph_id: p.graph_id.clone(),
+        work_history: p.history.as_str().to_string(),
+        work_history_reason: p.history_reason.clone(),
+        workspaces: p.workspaces.clone(),
+        against: p.against.clone(),
         counts: counts(p),
         files: p.files.clone(),
         patch: p.patch.clone(),
-        warnings: p.warnings.clone(),
+        warnings: {
+            let mut w = p.warnings.clone();
+            // A path recorded before its move that a crash stopped isn't
+            // there: the next run moves the graph there, or records anew.
+            for kept in journal
+                .into_iter()
+                .flat_map(|j| &j.kept)
+                .filter(|k| Path::new(k).exists())
+            {
+                w.push(plan::PlanWarning {
+                    code: "migrate.rejected_kept".into(),
+                    path: None,
+                    message: format!(
+                        "a graph that didn't validate, with anything saved into it while it \
+                         was in place, is kept in {kept}: check it for edits to bring back"
+                    ),
+                });
+            }
+            w
+        },
         plan_file: file("plan.json"),
         patch_file: file("rewrite-refs.patch"),
         backups: journal.map(|j| Backups {
@@ -216,20 +318,142 @@ fn data(
             store_snapshot: j.snapshot.as_ref().map(|s| s.display().to_string()),
             graph_copy: j.folder.join("mdkg").display().to_string(),
         }),
+        restore: None,
+    }
+}
+
+fn restore_data(p: &restore::RestorePlan, stage: &str, commit: Option<String>) -> MigrateData {
+    MigrateData {
+        plan: p.hash(),
+        stage: stage.to_string(),
+        base: p.base.clone(),
+        commit,
+        graph_id: p.graph_id.clone(),
+        work_history: plan::History::Git.as_str().to_string(),
+        work_history_reason: "restoring it to git".into(),
+        workspaces: Vec::new(),
+        against: None,
+        counts: Counts {
+            kept_in_git: p.restored.checkpoints + p.restored.check_results,
+            files_written: p.files.len(),
+            ..Counts::default()
+        },
+        files: p.files.clone(),
+        patch: Vec::new(),
+        warnings: p.warnings.clone(),
+        plan_file: None,
+        patch_file: None,
+        backups: None,
+        restore: Some(p.restored.clone()),
+    }
+}
+
+/// Text a repository or its config supplies (workspace names and folders,
+/// paths, refs), escaped for the terminal (Terra #15894).
+fn shown(s: &str) -> String {
+    crate::output::shown_path(s)
+}
+
+/// The report's first lines: plan, stage, base, graph id and commit. A
+/// `--status` reads them from the journal, which a worker can edit, so
+/// each is escaped (Terra #15997).
+fn print_head(what: &str, d: &MigrateData) {
+    println!("{what} plan {} ({})", shown(&d.plan), shown(&d.stage));
+    println!("  base {}, graph_id {}", shown(&d.base), shown(&d.graph_id));
+    if let Some(commit) = &d.commit {
+        println!("  commit {}", shown(commit));
+    }
+}
+
+fn print_restore(d: &MigrateData, r: &restore::Restored) {
+    print_head("restore-history", d);
+    if r.migrations.is_empty() {
+        println!("  no migration commit on HEAD's history moved anything out of git");
+    } else {
+        println!(
+            "  from the migration commit(s) {}",
+            shown(&r.migrations.join(", "))
+        );
+    }
+    println!(
+        "  back into git: {} checkpoints and {} finished tests as nodes, {} event logs as they were",
+        r.checkpoints, r.check_results, r.event_logs
+    );
+    for f in &d.files {
+        println!("    {}", crate::output::shown_path(&f.path));
+    }
+    for w in &d.warnings {
+        println!(
+            "  warning {}: {}",
+            w.code,
+            crate::output::shown_path(&w.message)
+        );
+    }
+    if d.stage == "planned" && !d.files.is_empty() {
+        println!(
+            "apply with: {} migrate --restore-history --apply {}",
+            crate::BIN,
+            shown(&d.plan)
+        );
     }
 }
 
 fn print(d: &MigrateData) {
-    let c = &d.counts;
-    println!("migrate plan {} ({})", d.plan, d.stage);
-    println!("  base {}, graph_id {}", d.base, d.graph_id);
-    if let Some(commit) = &d.commit {
-        println!("  commit {commit}");
+    if let Some(r) = &d.restore {
+        return print_restore(d, r);
     }
+    let c = &d.counts;
+    print_head("migrate", d);
     println!(
         "  nodes: {} keep their place with new ids ({} tier C kept as plain nodes)",
         c.nodes, c.tier_c
     );
+    if d.workspaces.len() > 1 {
+        let listed: Vec<String> = d
+            .workspaces
+            .iter()
+            .map(|w| {
+                format!(
+                    "{} ({}, {} nodes)",
+                    shown(&w.alias),
+                    shown(&w.folder),
+                    w.nodes
+                )
+            })
+            .collect();
+        println!("  workspaces, each kept in place: {}", listed.join(", "));
+    }
+    let why = if d.work_history_reason.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", shown(&d.work_history_reason))
+    };
+    if d.work_history == "git" {
+        println!(
+            "  work history: stays in git{why}: {} checkpoints and finished tests stay \
+             nodes; progress sections and event logs stay as they are",
+            c.kept_in_git
+        );
+    } else {
+        println!("  work history: moves to the coordinator store's log, out of git{why}");
+    }
+    if let Some(a) = &d.against {
+        println!(
+            "  against {} ({}, migrated in {}): this branch forked at {}",
+            shown(&a.reference),
+            shown(&a.tip),
+            shown(&a.migration),
+            shown(&a.fork)
+        );
+        println!(
+            "    {} graph files it hasn't changed since come out as main has them, and {} \
+             nodes main made since are added; {} nodes it changed that were there at the \
+             fork keep main's ids; the rest are its own. Records main's migration moved to \
+             the log are imported here too, once. Merge main after this: only the branch's \
+             own edits can conflict",
+            a.adopted, a.added, a.shared
+        );
+    }
     println!(
         "  to the log: {} records ({} checkpoints, {} check results, {} legacy events, {} review records)",
         c.records, c.checkpoints, c.check_results, c.legacy_events, c.review_records
@@ -245,32 +469,54 @@ fn print(d: &MigrateData) {
     for (code, n) in by_code {
         println!("  warning {code}: {n}");
     }
+    // A kept graph may hold someone's edit: each one is named.
+    for w in d
+        .warnings
+        .iter()
+        .filter(|w| w.code == "migrate.rejected_kept")
+    {
+        println!("    {}", crate::output::shown_path(&w.message));
+    }
     // Key conversions change what a node holds: each one is listed.
     for w in d
         .warnings
         .iter()
         .filter(|w| w.code == "migrate.key_converted")
     {
-        println!("    {}", w.message);
+        println!("    {}", crate::output::shown_path(&w.message));
     }
     if let Some(f) = &d.plan_file {
-        println!("  full plan: {f}");
+        println!("  full plan: {}", shown(f));
     }
     if let Some(f) = &d.patch_file {
-        println!("  patch: {f}");
+        println!("  patch: {}", shown(f));
     }
     if let Some(b) = &d.backups {
         if let Some(t) = &b.tag {
-            println!("  backup tag: {t}");
+            println!("  backup tag: {}", shown(t));
         }
         if let Some(s) = &b.store_snapshot {
-            println!("  backup store: {s}");
+            println!("  backup store: {}", shown(s));
         }
-        println!("  backup graph: {}", b.graph_copy);
+        println!("  backup graph: {}", shown(&b.graph_copy));
     }
     if d.stage == "planned" {
-        println!("apply with: mdkg migrate --apply {}", d.plan);
+        println!(
+            "apply with: {} migrate --apply {}{}",
+            crate::BIN,
+            shown(&d.plan),
+            history_flag(d)
+        );
     }
+}
+
+/// The options an apply of this plan needs: none for the defaults.
+fn history_flag(d: &MigrateData) -> String {
+    let mut flags = String::new();
+    if d.work_history_reason == "chosen with --work-history" {
+        flags.push_str(&format!(" --work-history {}", shown(&d.work_history)));
+    }
+    flags
 }
 
 fn emit(json: bool, report: Report<MigrateData>) -> u8 {
@@ -278,10 +524,33 @@ fn emit(json: bool, report: Report<MigrateData>) -> u8 {
 }
 
 pub fn run(root: &Path, args: &MigrateArgs) -> u8 {
-    let result = if args.dry_run {
-        dry_run(root)
+    let history = args.work_history.map(plan::History::from);
+    let result = if args.restore_history {
+        match &args.apply {
+            Some(hash) => restore::apply_restore(root, hash).map(|(p, commit)| {
+                let stage = if commit.is_some() {
+                    "done"
+                } else {
+                    "nothing-to-restore"
+                };
+                Report::ok(restore_data(&p, stage, commit))
+            }),
+            None => restore::plan_restore(root).map(|(_, p)| {
+                let stage = if p.files.is_empty() {
+                    "nothing-to-restore"
+                } else {
+                    "planned"
+                };
+                let mut data = restore_data(&p, stage, None);
+                // Not the plan's (nor its hash's): the apply finishes it first.
+                data.warnings.extend(restore::unfinished_warning(root));
+                Report::ok(data)
+            }),
+        }
+    } else if args.dry_run {
+        dry_run(root, history)
     } else if let Some(hash) = &args.apply {
-        apply_plan(root, hash, args.rewrite_refs)
+        apply_plan(root, hash, args.rewrite_refs, history)
     } else if args.rollback {
         rollback(root, args.force)
     } else {
@@ -293,71 +562,81 @@ pub fn run(root: &Path, args: &MigrateArgs) -> u8 {
     }
 }
 
-/// The single graph folder this migration replaces, relative to the
-/// repository's top (`.mdkg/` or `sub/.mdkg/`). 0.7.0 migrates a graph of
-/// one workspace, `.mdkg` at the graph's root; it reads and writes any
-/// other in its 0.6 form, and a migration that keeps workspaces is planned
-/// for 0.7.1.
-fn graph_folder(repo: &Repo, root: &Path) -> Result<(String, PathBuf), GraphError> {
+/// The graph folders this migration replaces, one per enabled workspace:
+/// relative to the repository's top (`.mdkg/`, `aux/.mdkg/`), and
+/// absolute. The workspace at the graph's root comes first, then the rest
+/// in alias order. An identity v2 graph must have one workspace, since its
+/// reader doesn't say which workspace a node is in.
+fn graph_folders(repo: &Repo, root: &Path) -> Result<Vec<(String, PathBuf)>, GraphError> {
     let v2 = mdkg_graph::identity_v2::is_identity_v2(root);
     let cfg = if v2 {
         mdkg_graph::config::load_identity_v2(root)?
     } else {
         mdkg_graph::config::load(root)?
     };
-    let enabled: Vec<_> = cfg.workspaces.iter().filter(|w| w.enabled).collect();
-    // What to do meanwhile: 0.7.0 reads and writes a 0.6 graph as it is,
-    // but refuses an identity v2 one everywhere but here.
-    let meanwhile = if v2 {
-        "keep using mdkg 0.6.x on this graph: it's in identity format v2, which \
-         0.7.0's other commands refuse"
-    } else {
-        "keep using this graph as it is: 0.7.0 reads and writes it in its 0.6 form"
-    };
-    let unsupported = |why: String| {
-        GraphError::failure(Code::MigrateUnsupported, why).with_hint(format!(
-            "mdkg 0.7.0 migrates only a graph of one workspace, .mdkg at the graph's \
-             root. Until a migration that keeps workspaces (planned for 0.7.1), \
-             {meanwhile}. See docs/migrating-from-0.6.md"
-        ))
-    };
-    match enabled.as_slice() {
-        [ws] if Path::new(&ws.path) == Path::new(".") && ws.mdkg_dir == ".mdkg" => {}
-        [_] => {
-            return Err(unsupported(
-                "the graph's workspace isn't .mdkg at the graph root".into(),
-            ));
-        }
-        _ => {
-            return Err(unsupported(format!(
-                "the graph has {} enabled workspaces",
-                enabled.len()
-            )));
-        }
-    }
-    let dir = root.join(".mdkg");
-    let meta = fs::symlink_metadata(&dir)
-        .map_err(|e| GraphError::failure(Code::IoReadFailed, format!("reading .mdkg: {e}")))?;
-    if !meta.is_dir() {
+    let dirs = gather::workspace_folders(&cfg, &repo.prefix);
+    if dirs.is_empty() {
         return Err(GraphError::failure(
             Code::MigrateUnsupported,
-            ".mdkg is a link or a file, not a folder",
+            "the graph has no enabled workspace",
         ));
     }
-    let links = apply::links_in(&dir)
-        .map_err(|e| GraphError::failure(Code::IoReadFailed, format!("reading .mdkg: {e}")))?;
-    if !links.is_empty() {
-        let shown: Vec<&str> = links.iter().take(5).map(String::as_str).collect();
+    if v2 && dirs.len() > 1 {
         return Err(GraphError::failure(
             Code::MigrateUnsupported,
             format!(
-                "the graph folder holds symbolic links: {}",
-                shown.join(", ")
+                "the identity v2 graph has {} enabled workspaces",
+                dirs.len()
             ),
         )
-        .with_hint("replace each link with the file or folder it names, commit, and plan again"));
+        .with_hint(
+            "migrate migrates an identity v2 graph of one workspace; keep using mdkg 0.6.x \
+             on this graph, since 0.7's other commands refuse identity format v2. See \
+             docs/migrating-from-0.6.md",
+        ));
     }
-    Ok((format!("{}.mdkg/", repo.prefix), dir))
+    let home = format!("{}.mdkg", repo.prefix);
+    let mut ordered: Vec<&(String, String)> = dirs.iter().filter(|(_, d)| *d == home).collect();
+    ordered.extend(dirs.iter().filter(|(_, d)| *d != home));
+    let mut out = Vec::new();
+    for (alias, rel) in ordered {
+        let rel_prefix = format!("{rel}/");
+        if let Some((other, _)) = dirs
+            .iter()
+            .find(|(a, d)| a != alias && rel_prefix.starts_with(&format!("{d}/")))
+        {
+            return Err(GraphError::failure(
+                Code::MigrateUnsupported,
+                format!("workspace {alias}'s folder {rel} is inside workspace {other}'s"),
+            ));
+        }
+        let dir = repo.top.join(rel);
+        let meta = fs::symlink_metadata(&dir)
+            .map_err(|e| GraphError::failure(Code::IoReadFailed, format!("reading {rel}: {e}")))?;
+        if !meta.is_dir() {
+            return Err(GraphError::failure(
+                Code::MigrateUnsupported,
+                format!("{rel} is a link or a file, not a folder"),
+            ));
+        }
+        let links = apply::links_in(&dir)
+            .map_err(|e| GraphError::failure(Code::IoReadFailed, format!("reading {rel}: {e}")))?;
+        if !links.is_empty() {
+            let shown: Vec<&str> = links.iter().take(5).map(String::as_str).collect();
+            return Err(GraphError::failure(
+                Code::MigrateUnsupported,
+                format!(
+                    "the graph folder {rel} holds symbolic links: {}",
+                    shown.join(", ")
+                ),
+            )
+            .with_hint(
+                "replace each link with the file or folder it names, commit, and plan again",
+            ));
+        }
+        out.push((rel_prefix, dir));
+    }
+    Ok(out)
 }
 
 /// Refuses a graph that's already on 0.7.0.
@@ -379,12 +658,57 @@ fn not_migrated(p: &plan::Source) -> Result<(), GraphError> {
     Ok(())
 }
 
-fn dry_run(root: &Path) -> Result<Report<MigrateData>, GraphError> {
-    let (repo, source) = gather::gather(root, true)?;
+/// The graph's source. A branch whose main is already migrated is refused:
+/// migrating it against main is cut from 0.7.1 (decided 2026-10-28) and
+/// waits for 0.7.2 in `against`.
+fn source_for(
+    root: &Path,
+    history: Option<plan::History>,
+) -> Result<(Repo, plan::Source), GraphError> {
+    let (repo, source) = gather::gather(root, true, history)?;
     not_migrated(&source)?;
-    let (rel_prefix, _) = graph_folder(&repo, root)?;
+    if let Some(main) = against::migrated_main_of(&repo, &source)? {
+        return Err(GraphError::conflict(
+            Code::MigrateUnsupported,
+            format!(
+                "{main} is already migrated: this release can't migrate a branch cut \
+                 before main's migration"
+            ),
+        )
+        .with_hint(branch_cut_hint()));
+    }
+    Ok((repo, source))
+}
+
+/// How to go on with a branch cut before main's migration.
+fn branch_cut_hint() -> String {
+    format!(
+        "merge main into this branch first, taking main's file for each node that conflicts \
+         and redoing this branch's change in it; a node only this branch has must be made \
+         again on 0.7 (`{} new`). 0.7.2 migrates such a branch against main",
+        crate::BIN
+    )
+}
+
+/// What `migrate` would say about this checkout's graph with no
+/// `graph_id`, for `doctor` (e2e 0.7.1 B14): a branch cut before main's
+/// migration is refused, so it gets that guidance, not `migrate`.
+pub(crate) fn unmigrated_hint(repo: &Repo) -> String {
+    let config_rel = format!("{}{}", repo.prefix, mdkg_graph::config::CONFIG_PATH);
+    match against::migrated_main_at(&repo.top, &config_rel) {
+        Ok(Some(main)) => format!(
+            "{main} is already migrated, so `{BIN} migrate` refuses this branch: {}",
+            branch_cut_hint()
+        ),
+        _ => format!("`{BIN} migrate` moves a 0.6.0 graph to 0.7 (dry run first)"),
+    }
+}
+
+fn dry_run(root: &Path, history: Option<plan::History>) -> Result<Report<MigrateData>, GraphError> {
+    let (repo, source) = source_for(root, history)?;
+    let folders = graph_folders(&repo, root)?;
     let p = plan::plan(&source).map_err(plan_error)?;
-    check_inside(&p, &rel_prefix)?;
+    check_inside(&p, &folders)?;
     let hash = p.hash();
     let folder = apply::folder_root(&repo)?.join(apply::short(&hash));
     fs::create_dir_all(&folder).map_err(|e| {
@@ -402,12 +726,16 @@ fn plan_error(e: plan::PlanError) -> GraphError {
     GraphError::failure(Code::MigrateUnsupported, e.message).at(e.path, None)
 }
 
-/// Every change inside the graph lies in its folder.
-fn check_inside(p: &Plan, rel_prefix: &str) -> Result<(), GraphError> {
-    if let Some(f) = p.files.iter().find(|f| !f.path.starts_with(rel_prefix)) {
+/// Every change inside the graph lies in one of its folders.
+fn check_inside(p: &Plan, folders: &[(String, PathBuf)]) -> Result<(), GraphError> {
+    if let Some(f) = p
+        .files
+        .iter()
+        .find(|f| !folders.iter().any(|(rel, _)| f.path.starts_with(rel)))
+    {
         return Err(GraphError::failure(
             Code::MigrateUnsupported,
-            format!("{} lies outside the graph folder", f.path),
+            format!("{} lies outside the graph's folders", f.path),
         ));
     }
     Ok(())
@@ -452,6 +780,7 @@ fn apply_plan(
     root: &Path,
     hash: &str,
     rewrite_refs: bool,
+    history: Option<plan::History>,
 ) -> Result<Report<MigrateData>, GraphError> {
     let repo = Repo::open(root)?;
     let root_dir = apply::folder_root(&repo)?;
@@ -491,7 +820,9 @@ fn apply_plan(
                     "finish the migration with the same --rewrite-refs choice it started with",
                 ));
             }
-            (load_plan(&folder.join("plan.json"), hash)?, j.clone())
+            let p = load_plan(&folder.join("plan.json"), hash)?;
+            resumable(&p)?;
+            (p, j.clone())
         }
         None => {
             if let Some(j) = &journal
@@ -501,18 +832,23 @@ fn apply_plan(
                 let p = load_plan(&folder.join("plan.json"), hash)?;
                 return Ok(Report::ok(data(&p, hash, "done", Some(&folder), Some(j))));
             }
-            let (_, source) = gather::gather(root, true)?;
-            not_migrated(&source)?;
-            let (rel_prefix, graph_dir) = graph_folder(&repo, root)?;
+            let (_, source) = source_for(root, history)?;
+            let graph_folders = graph_folders(&repo, root)?;
             let p = plan::plan(&source).map_err(plan_error)?;
-            check_inside(&p, &rel_prefix)?;
+            check_inside(&p, &graph_folders)?;
             let now = p.hash();
             if now != hash {
                 return Err(GraphError::conflict(
                     Code::MigratePlanMismatch,
-                    format!("the graph's plan is {now}, not the one given"),
+                    format!(
+                        "the graph's plan is {now}, not the one given (work history: {})",
+                        p.history.as_str()
+                    ),
                 )
-                .with_hint("run `migrate --dry-run` again and review the new plan"));
+                .with_hint(
+                    "run `migrate --dry-run` again and review the new plan; a plan made \
+                     with --work-history needs the same option on --apply",
+                ));
             }
             // Staged changes git status doesn't show (a submodule pointer,
             // with submodules ignored) would be dropped by the index reset
@@ -555,19 +891,50 @@ fn apply_plan(
                     format!("creating {}: {e}", folder.display()),
                 )
             })?;
-            // The new graph is built one level down, in a root of its own
-            // beside the graph (`.mdkg.migrate-<plan>/.mdkg`), so it can be
-            // validated as a graph before the swap.
-            let staging = graph_dir
-                .with_file_name(format!(".mdkg.migrate-{}", apply::short(hash)))
-                .join(".mdkg");
-            // An earlier attempt's copy (rolled back since) is of an older
-            // folder: this attempt takes its own.
-            for stale in [
-                folder.join("mdkg"),
-                folder.join("mdkg.partial"),
-                staging.parent().map(Path::to_path_buf).unwrap_or_default(),
-            ] {
+            // Each folder's new graph is built one level down, in a root of
+            // its own beside it (`.mdkg.migrate-<plan>/.mdkg`).
+            let mut folders: Vec<apply::Folder> = graph_folders
+                .iter()
+                .map(|(rel_prefix, graph_dir)| apply::Folder {
+                    graph_dir: graph_dir.clone(),
+                    rel_prefix: rel_prefix.clone(),
+                    staging: apply::staging_for(graph_dir, hash),
+                    inventory: None,
+                })
+                .collect();
+            let first = folders.remove(0);
+            let mut j = Journal {
+                plan: hash.to_string(),
+                base: p.base.clone(),
+                commit: None,
+                graph_dir: first.graph_dir,
+                rel_prefix: first.rel_prefix,
+                staging: first.staging,
+                folder: folder.clone(),
+                snapshot: None,
+                tag: None,
+                tag_created: false,
+                rewrite_refs,
+                inventory: None,
+                extra: folders,
+                rejecting: false,
+                kept: Vec::new(),
+                stage: Stage::Started,
+            };
+            // An earlier attempt's copies (rolled back since) are of older
+            // folders: this attempt takes its own.
+            let mut stale = Vec::new();
+            for (i, f) in j.folders().iter().enumerate() {
+                stale.push(j.copy_of(i));
+                stale.push(apply::partial_of(&j.copy_of(i)));
+                stale.push(
+                    f.staging
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_default(),
+                );
+            }
+            for stale in stale {
                 if fs::symlink_metadata(&stale).is_ok() {
                     fs::remove_dir_all(&stale).map_err(|e| {
                         GraphError::failure(
@@ -579,33 +946,17 @@ fn apply_plan(
             }
             store_plan(&folder.join("plan.json"), &p, hash)?;
             write_patch(&repo, &p, &folder)?;
-            let j = Journal {
-                plan: hash.to_string(),
-                base: p.base.clone(),
-                commit: None,
-                graph_dir: graph_dir.clone(),
-                rel_prefix: rel_prefix.clone(),
-                staging,
-                folder: folder.clone(),
-                snapshot: None,
-                tag: None,
-                tag_created: false,
-                rewrite_refs,
-                inventory: None,
-                stage: Stage::Started,
-            };
+            j.stage = Stage::Started;
             j.save(&root_dir)?;
             (p, j)
         }
     };
     let store = store_path(&repo)?;
-    let rel_prefix = journal.rel_prefix.clone();
     let mut sink = StoreImport { repo: &repo };
     let mut hook = crash_hook();
     let mut ctx = Ctx {
         repo: &repo,
         plan: &p,
-        rel_prefix,
         store,
         sink: &mut sink,
         after_stage: &mut hook,
@@ -630,7 +981,6 @@ fn rollback(root: &Path, force: bool) -> Result<Report<MigrateData>, GraphError>
             "this worktree has no migration to roll back",
         ));
     };
-    let rel_prefix = journal.rel_prefix.clone();
     let p = load_plan(&journal.folder.join("plan.json"), &journal.plan)?;
     let store = store_path(&repo)?;
     let mut sink = StoreImport { repo: &repo };
@@ -638,7 +988,6 @@ fn rollback(root: &Path, force: bool) -> Result<Report<MigrateData>, GraphError>
     let mut ctx = Ctx {
         repo: &repo,
         plan: &p,
-        rel_prefix,
         store,
         sink: &mut sink,
         after_stage: &mut hook,
@@ -683,4 +1032,38 @@ fn status(root: &Path) -> Result<Report<MigrateData>, GraphError> {
         ))]);
     }
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_unfinished_plan_made_against_main_is_not_carried_on() {
+        let mut p =
+            plan::plan(&plan::tests::source(vec![plan::tests::task(1, "", "")])).expect("plan");
+        assert!(resumable(&p).is_ok());
+        p.against = Some(against::Against {
+            reference: "refs/heads/main".into(),
+            tip: "a".into(),
+            migration: "b".into(),
+            fork: "c".into(),
+            adopted: 0,
+            added: 0,
+            shared: 0,
+            work_history: plan::History::Store,
+            explicit: false,
+            replayed: 0,
+        });
+        let e = resumable(&p).expect_err("refused");
+        assert_eq!(e.diagnostic.code, Code::MigrateUnsupported);
+        assert!(
+            e.diagnostic
+                .hint
+                .as_deref()
+                .is_some_and(|h| h.contains("migrate --rollback")),
+            "{:?}",
+            e.diagnostic.hint
+        );
+    }
 }

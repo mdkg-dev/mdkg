@@ -81,6 +81,10 @@ pub struct Config {
     pub tolerant: bool,
     /// Registered read-only subgraph aliases (not loaded in phase 1).
     pub subgraphs: Vec<String>,
+    /// Each subgraph's `source_path` inside this repository, when it
+    /// declares one (relative, normalized, never leaving the repository):
+    /// its graph folder is `<source_path>/.mdkg`.
+    pub subgraph_sources: Vec<String>,
     /// `work.next.status_preference`: the statuses `next` picks from, best
     /// first.
     pub next_status_preference: Vec<String>,
@@ -402,8 +406,8 @@ fn js_number(n: f64) -> String {
 /// absolute `templates.root_path` or `default_set`, a `..` in one, or a
 /// link on the way out of the repository is an error, like a workspace
 /// path's.
-fn templates_inside(root: &Path, v: &Value, errors: &mut Vec<String>) {
-    let mut folder = root.to_path_buf();
+fn templates_inside(root: Option<&Path>, v: &Value, errors: &mut Vec<String>) {
+    let mut folder = root.unwrap_or_else(|| Path::new("")).to_path_buf();
     let mut bad = false;
     for key in ["root_path", "default_set"] {
         match v.pointer(&format!("/templates/{key}")) {
@@ -423,7 +427,9 @@ fn templates_inside(root: &Path, v: &Value, errors: &mut Vec<String>) {
         return;
     }
     // Only a folder that exists can lead anywhere.
-    if let (Ok(real), Ok(real_root)) = (std::fs::canonicalize(&folder), std::fs::canonicalize(root))
+    if let Some(root) = root
+        && let (Ok(real), Ok(real_root)) =
+            (std::fs::canonicalize(&folder), std::fs::canonicalize(root))
         && !real.starts_with(&real_root)
     {
         errors.push(
@@ -459,7 +465,7 @@ fn document_root_key(path: &str, mdkg_dir: &str) -> String {
 /// `schema_version` 3 needs `format_version` "0.7" and a UUID `graph_id`
 /// (init mints a v7; a migrated identity v2 graph keeps its own), and older
 /// configs may have neither.
-fn read_identity(v: &Value) -> Result<(FormatVersion, Option<Uuid7>), GraphError> {
+pub(crate) fn read_identity(v: &Value) -> Result<(FormatVersion, Option<Uuid7>), GraphError> {
     let fail = |message: &str| {
         Err(GraphError::failure(Code::ConfigInvalid, message.to_string()).at(CONFIG_PATH, None))
     };
@@ -594,6 +600,23 @@ fn load_with(root: &Path, identity_v2: bool) -> Result<Config, GraphError> {
 /// that value; physical-only callers retain their existing discovery behavior.
 fn from_value(
     root: &Path,
+    v: Value,
+    identity_v2: bool,
+    work_dir: impl FnOnce() -> Result<Option<std::path::PathBuf>, String>,
+) -> Result<Config, GraphError> {
+    from_value_at(Some(root), v, identity_v2, work_dir)
+}
+
+/// Parse a captured config value with no filesystem or machine-local reads.
+/// Lexical validation and defaults match `load`; `store_work_dir` is always None.
+/// Callers must validate physical/object-path containment in their own snapshot
+/// before reading template or workspace contents. This is not a filesystem trust check.
+pub fn from_snapshot(value: Value) -> Result<Config, GraphError> {
+    from_value_at(None, value, false, || Ok(None))
+}
+
+fn from_value_at(
+    root: Option<&Path>,
     v: Value,
     identity_v2: bool,
     work_dir: impl FnOnce() -> Result<Option<std::path::PathBuf>, String>,
@@ -766,6 +789,26 @@ fn from_value(
         .and_then(Value::as_object)
         .map(|m| m.keys().cloned().collect())
         .unwrap_or_default();
+    let subgraph_sources = v
+        .get("subgraphs")
+        .and_then(Value::as_object)
+        .map(|m| {
+            m.values()
+                .filter_map(|e| e.get("source_path").and_then(Value::as_str))
+                .filter_map(|p| {
+                    let parts: Vec<&str> = p
+                        .split('/')
+                        .filter(|c| !c.is_empty() && *c != ".")
+                        .collect();
+                    let contained = !p.starts_with('/')
+                        && !p.contains(['\\', '\0'])
+                        && !parts.is_empty()
+                        && !parts.contains(&"..");
+                    contained.then(|| parts.join("/"))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
 
     let location = match v.pointer("/work/location") {
         None => None,
@@ -864,6 +907,7 @@ fn from_value(
         },
         tolerant: bool_at(&v, &["index", "tolerant"]).unwrap_or(false),
         subgraphs,
+        subgraph_sources,
         leases,
         work_committed,
         store_work_dir: match work_committed {
@@ -884,6 +928,40 @@ fn from_value(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn captured_config_matches_filesystem_defaults_and_lexical_validation() {
+        let value = serde_json::json!({
+            "workspaces": {"root": {"path": "."}, "nested": {"path": "packages/nested"}},
+            "templates": {"root_path": "custom", "default_set": "team"},
+            "index": {"tolerant": true, "limits": {"max_files": 7}}
+        });
+        assert_eq!(
+            from_snapshot(value.clone()).expect("snapshot"),
+            load_config(value).expect("filesystem")
+        );
+        for path in ["../escape", "/outside", "C:\\outside"] {
+            let value = serde_json::json!({"templates": {"root_path": path}});
+            let snapshot = from_snapshot(value.clone()).expect_err("snapshot rejects escape");
+            let physical = load_config(value).expect_err("filesystem rejects escape");
+            assert_eq!(snapshot.code(), physical.code());
+            assert_eq!(snapshot.diagnostic.message, physical.diagnostic.message);
+        }
+    }
+
+    #[test]
+    fn captured_local_work_config_has_no_machine_directory() {
+        let config = from_snapshot(serde_json::json!({
+            "schema_version": 3, "format_version": "0.7",
+            "graph_id": "0192f3a0-0000-7000-8000-000000000000",
+            "work": {"location": "local"}
+        }))
+        .expect("captured config");
+        assert_eq!(config.work_committed, WorkCommitted::None);
+        assert!(config.store_work_dir.is_none());
+        assert_eq!(config.workspaces[0].alias, "root");
+        assert!(from_snapshot(serde_json::json!({"schema_version": 2})).is_err());
+    }
 
     fn load_with(workspaces: serde_json::Value) -> Result<Config, GraphError> {
         load_config(serde_json::json!({ "workspaces": workspaces }))

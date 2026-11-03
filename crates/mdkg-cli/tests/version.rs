@@ -57,6 +57,14 @@ fn version_names_the_commit_it_was_built_from() {
     assert_eq!(data["version"], env!("CARGO_PKG_VERSION"));
     assert!(data["dirty"].is_boolean(), "{envelope}");
     assert_eq!(data["lease_authority"], 1);
+    // A17 capabilities this build ships; never removed within v1.
+    let capabilities = data["capabilities"].as_array().expect("capabilities");
+    for shipped in ["channels", "events", "msg.watch", "serve.local"] {
+        assert!(
+            capabilities.iter().any(|c| c == shipped),
+            "{shipped} missing: {envelope}"
+        );
+    }
     let built = data["built"].as_str().expect("built");
     assert!(built.len() == 20 && built.ends_with('Z'), "{built}");
 

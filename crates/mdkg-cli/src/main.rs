@@ -36,8 +36,10 @@ mod backup;
 mod compat;
 mod config_cmd;
 mod coord;
+mod credentials;
 mod derived;
 mod doctor;
+mod entry;
 mod export;
 mod graph;
 mod graph_repair;
@@ -46,14 +48,17 @@ mod init;
 mod mcp;
 mod migrate;
 mod msg;
+mod ops_exec;
 mod output;
 mod pack;
 mod read;
+mod req;
 mod retype;
 mod run;
 mod schema;
 mod scratch;
 mod search;
+mod serve_cli;
 mod skills;
 mod verify;
 mod version;
@@ -330,6 +335,9 @@ enum Command {
     /// Change where work definitions live.
     #[command(subcommand)]
     Work(work::WorkCommand),
+    /// Edit a node's body when the graph lives on the graph ref.
+    #[command(subcommand, after_help = examples!("node edit <id>", "node save <id>"))]
+    Node(coord::node_edit::NodeCommand),
     /// Inspect configuration layers and their sources.
     #[command(subcommand)]
     Config(config_cmd::ConfigCommand),
@@ -371,6 +379,11 @@ enum Command {
         /// Also create a checkpoint node covering it.
         #[arg(long)]
         checkpoint: bool,
+        /// Accept every gate failure a residual may record, for this
+        /// reason, before finishing: a person's (outside turns), or a
+        /// coordinator's on a node no live lease holds.
+        #[arg(long, value_name = "REASON")]
+        residual: Option<String>,
         /// Print JSON.
         #[arg(long)]
         json: bool,
@@ -476,6 +489,9 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Ask about leases others hold: request.
+    #[command(subcommand)]
+    Lease(coord::LeaseCommand),
     /// Renew every active lease you hold.
     #[command(after_help = examples!("renew"))]
     Renew {
@@ -492,37 +508,50 @@ enum Command {
     /// `--all` releases every active lease you hold: run it once your head
     /// has merged and you've committed everything. Each lease is released
     /// on its own, so running it again finishes a run that stopped part
-    /// way.
+    /// way. `--clean` releases only the path leases `renew` lets lapse:
+    /// nothing uncommitted in their paths, and not just claimed. The
+    /// launcher runs it as each agent after every turn.
     #[command(after_help = examples!(
         "release <id>",
         "release src/lib.rs",
-        "release --all"
+        "release --all",
+        "release --clean"
     ))]
     Release {
         /// Node id, file or folder path, `role:<name>`, `run:<name>`, or
         /// lease id.
-        #[arg(required_unless_present_any = ["scope", "all"])]
+        #[arg(required_unless_present_any = ["scope", "all", "clean"])]
         target: Option<String>,
         /// For a lease authority's host: release your lease on this
         /// canonical scope (relative to the repository's top) instead.
         #[arg(long, hide = true, conflicts_with = "target")]
         scope: Option<String>,
         /// Release every active lease you hold.
-        #[arg(long, conflicts_with_all = ["target", "scope"])]
+        #[arg(long, conflicts_with_all = ["target", "scope", "clean"])]
         all: bool,
+        /// Release your path leases whose paths have no uncommitted or
+        /// staged changes in this worktree and that you didn't claim in the
+        /// last 30 minutes: the leases `renew` lets lapse. Never a node,
+        /// role or turn lease.
+        #[arg(long, conflicts_with_all = ["target", "scope"])]
+        clean: bool,
         /// Print JSON.
         #[arg(long)]
         json: bool,
     },
     /// Show leases, the settlement queue and your unacked mail.
     ///
-    /// Leases are yours when the actor is named (--as or $MDKG_ACTOR),
-    /// everyone's with --all; JSON always lists everyone's, marking yours.
-    #[command(after_help = examples!("status", "status --all"))]
+    /// Every active lease, yours first; --mine lists only yours. Expired
+    /// leases are yours, everyone's with --all. JSON always lists everyone's
+    /// active leases, marking yours.
+    #[command(after_help = examples!("status", "status --mine", "status --all"))]
     Status {
-        /// Show everyone's leases and expired leases.
+        /// List everyone's expired leases too, not only yours.
         #[arg(long)]
         all: bool,
+        /// List only your own active leases (text; JSON lists everyone's).
+        #[arg(long)]
+        mine: bool,
         /// Print JSON.
         #[arg(long)]
         json: bool,
@@ -552,11 +581,20 @@ enum Command {
     /// Serve the graph and leases to coding agents over stdio MCP.
     #[command(after_help = examples!("mcp --as <agent>"))]
     Mcp,
+    /// The ledger: entries on a node (findings, questions, decisions, issues, reviews, requirements) and its gate.
+    #[command(subcommand, after_help = examples!("entry list <node>", "entry fix <node> F2 --sha <sha>", "entry gate <node>"))]
+    Entry(entry::EntryCommand),
+    /// The requirements in a node's body, with their ledger states.
+    #[command(subcommand, after_help = examples!("req list <node> --json"))]
+    Req(req::ReqCommand),
     /// Send and read messages: send, inbox, wait, ack, thread, import.
-    #[command(subcommand, after_help = examples!("msg inbox", "msg send --room dev --kind note --text \"Tests pass on main\""))]
+    #[command(subcommand, after_help = examples!("msg inbox", "msg send --channel dev --kind note --text \"Tests pass on main\""))]
     Msg(msg::MsgCommand),
-    /// Manage rooms: create, join, leave, list.
-    #[command(subcommand, after_help = examples!("room list", "room join dev"))]
+    /// Manage channels: create, join, leave, list.
+    #[command(subcommand, after_help = examples!("channel list", "channel join dev"))]
+    Channel(msg::RoomCommand),
+    /// Deprecated alias for channel.
+    #[command(subcommand, hide = true)]
     Room(msg::RoomCommand),
     /// Manage definitions and run agents: add, edit, rm, up, status, resume.
     #[command(subcommand, after_help = examples!("agents status", "agents up --once"))]
@@ -564,52 +602,41 @@ enum Command {
     /// The API key fallback's helper: `auth key <provider>`.
     #[command(subcommand, after_help = examples!("auth key anthropic"))]
     Auth(auth::AuthCommand),
-    /// What an agent harness's hook runs: mail at turn start, a reminder
-    /// before stopping with unread mail, an idle wake, and the edit guard.
+    /// What an agent harness's hooks run: one router (`hooks run`) for the
+    /// mail notice, the stop reminders, the idle wake and the lease guards.
     ///
     /// Reads the harness's hook input on stdin and prints its output. Says
-    /// nothing outside a graph; never shows a message's body.
-    #[command(after_help = examples!("hook start --harness claude", "hook edit --harness opencode"))]
+    /// nothing outside a graph; never shows a message's body. `hook` is an
+    /// alias, and `start|stop|wait|edit` are 0.7.0's commands, kept for one
+    /// release.
+    #[command(
+        name = "hooks",
+        alias = "hook",
+        after_help = examples!(
+            "hooks run --harness claude --native PreToolUse",
+            "hooks run --harness opencode --native context",
+            "hook start --harness claude"
+        )
+    )]
     Hook(hook::HookArgs),
     #[command(name = "__receiver-queue-guard", hide = true)]
     ReceiverQueueGuard { spec: String, owner: u32 },
     /// Set up Claude Code, Codex and OpenCode for this project.
     ///
     /// Writes exactly the projections .mdkg/config.json lists: MCP configs,
-    /// the AGENTS.md block, skill mirrors and hooks. --enable and --disable
-    /// change the list, then sync.
+    /// the AGENTS.md block, skill mirrors and, with --hooks, hooks.
+    /// --enable and --disable change the list, then sync. --setup moves
+    /// the clone to the graph ref (personal, professional or local);
+    /// --checkout-mode moves it back.
     #[command(after_help = examples!(
         "install --enable agents-md,mcp:claude,skills:.claude/skills --dry-run",
         "install",
-        "install --disable mcp:opencode"
+        "install --disable mcp:opencode",
+        "install --setup local --dry-run",
+        "install --setup professional --graph-remote mine",
+        "install --hooks"
     ))]
-    Install {
-        /// Show what would change and write nothing.
-        #[arg(long)]
-        dry_run: bool,
-        /// Put back everything install changed here, exactly as it was;
-        /// refuses where a file was edited since.
-        #[arg(long)]
-        undo: bool,
-        /// The mdkg binary the MCP configs run (default: this one, by its
-        /// bare name when `PATH` finds this same file, else by its path as
-        /// invoked).
-        #[arg(long)]
-        binary: Option<PathBuf>,
-        /// Projections to add to the config's list, comma-separated:
-        /// agents-md, mcp:claude, mcp:codex, mcp:opencode,
-        /// skills:.agents/skills, skills:.claude/skills, hooks:claude,
-        /// hooks:codex, hooks:opencode.
-        #[arg(long, value_name = "LIST", conflicts_with = "undo")]
-        enable: Option<String>,
-        /// Projections to take off the list, comma-separated; mdkg's part
-        /// of their files is removed, the rest kept.
-        #[arg(long, value_name = "LIST", conflicts_with = "undo")]
-        disable: Option<String>,
-        /// Print JSON.
-        #[arg(long)]
-        json: bool,
-    },
+    Install(run::InstallArgs),
     /// List or restore copies of the coordinator store.
     #[command(subcommand, after_help = examples!("store snapshots"))]
     Store(backup::StoreCommand),
@@ -658,7 +685,7 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Bring a 0.6.0 graph onto 0.7.0.
+    /// Bring a 0.6 graph onto format 0.7.
     ///
     /// Plan with --dry-run, then --apply <hash>; --status shows how far it
     /// got, and --rollback reverts it.
@@ -680,7 +707,7 @@ enum Command {
     /// Check this setup: build, PATH, git, config, graph, store, mirrors,
     /// MCP, agents, hooks.
     ///
-    /// Changes nothing.
+    /// Changes nothing, except --repair adds missing clone-local graph identity records.
     #[command(after_help = examples!("doctor", "doctor --json"))]
     Doctor(doctor::DoctorArgs),
     /// List, show, validate, add and sync skills in .mdkg/skills.
@@ -695,6 +722,14 @@ enum Command {
         /// The commit the change ends at; any commit (the checkout isn't read).
         #[arg(long, default_value = "HEAD")]
         head: String,
+        /// The main branch: paths the head has exactly as main had them where
+        /// the two last met came from main, and aren't selected (default:
+        /// `mdkg.mainRef`, else `main`; neither resolving skips nothing).
+        #[arg(long)]
+        main: Option<String>,
+        /// Require verified revisions and metadata before using the test-target plan.
+        #[arg(long)]
+        targets: bool,
         /// Print JSON.
         #[arg(long)]
         json: bool,
@@ -708,11 +743,17 @@ enum Command {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    // serve: `serve`, `machine`, `remote`, `git-serve`, `git-hook`. Their
+    // commands are added in serve_cli, never here.
+    #[command(flatten)]
+    Serve(serve_cli::ServeCommand),
 }
 
 impl Command {
     /// Commands that can mutate graph files, including compatibility routes.
     /// Keep this before config parsing: checkout damage may include config.json.
+    /// Doctor --repair only writes clone-local Git identity, so it stays out
+    /// of this set and can repair the missing identity diagnosed by the gate.
     fn writes_graph(&self) -> bool {
         matches!(
             self,
@@ -734,6 +775,7 @@ impl Command {
                 | Self::Migrate(_)
                 | Self::Work(work::WorkCommand::Localize(_))
                 | Self::Anchor { .. }
+                | Self::Node(coord::node_edit::NodeCommand::Save { .. })
                 | Self::Agents(
                     agents::AgentsCommand::Add(_)
                         | agents::AgentsCommand::Edit(_)
@@ -754,6 +796,7 @@ impl Command {
             Command::Index(c) => c.name(),
             Command::Graph(c) => c.name(),
             Command::Scratch(c) => c.name(),
+            Command::Node(c) => c.name(),
             Command::Work(c) => c.name(),
             Command::Config(c) => c.name(),
             Command::Pack(_) => "pack",
@@ -762,6 +805,7 @@ impl Command {
             Command::Release { .. } => "release",
             Command::Holds { .. } => "holds",
             Command::Renew { .. } => "renew",
+            Command::Lease(l) => l.name(),
             Command::Status { .. } => "status",
             Command::Sync { .. } => "sync",
             Command::Abandon { .. } => "abandon",
@@ -784,11 +828,14 @@ impl Command {
             },
             Command::Format { .. } => "format",
             Command::Retype { .. } => "retype",
+            Command::Entry(e) => e.name(),
+            Command::Req(r) => r.name(),
             Command::Msg(m) => m.name(),
+            Command::Channel(r) => r.channel_name(),
             Command::Room(r) => r.name(),
             Command::Agents(a) => a.name(),
             Command::Auth(a) => a.name(),
-            Command::Hook(_) => "hook",
+            Command::Hook(_) => "hooks",
             Command::ReceiverQueueGuard { .. } => "cli",
             Command::Install { .. } => "install",
             Command::Store(s) => s.name(),
@@ -799,6 +846,7 @@ impl Command {
             Command::Doctor(_) => "doctor",
             Command::Skills(s) => s.name(),
             Command::Migrate(_) => "migrate",
+            Command::Serve(c) => c.name(),
         }
     }
 
@@ -809,6 +857,7 @@ impl Command {
             Command::Index(c) => c.json(),
             Command::Graph(c) => c.json(),
             Command::Scratch(c) => c.json(),
+            Command::Node(c) => c.json(),
             Command::Work(c) => c.json(),
             Command::Config(c) => c.json(),
             Command::Pack(a) => a.json,
@@ -838,13 +887,16 @@ impl Command {
                 | GoalCommand::Done { json, .. }
                 | GoalCommand::Claim { json, .. } => *json,
             },
+            Command::Entry(e) => e.json(),
+            Command::Req(r) => r.json(),
             Command::Msg(m) => m.json(),
-            Command::Room(r) => r.json(),
+            Command::Lease(l) => l.json(),
+            Command::Channel(r) | Command::Room(r) => r.json(),
             Command::Agents(a) => a.json(),
             Command::Auth(_) => false,
             Command::Hook(_) => false,
             Command::ReceiverQueueGuard { .. } => false,
-            Command::Install { json, .. } => *json,
+            Command::Install(a) => a.json,
             Command::Store(s) => s.json(),
             Command::Anchor { json, .. }
             | Command::Export { json, .. }
@@ -856,6 +908,7 @@ impl Command {
             Command::Version { json } => *json,
             Command::Schema { .. } => true,
             Command::Mcp => false,
+            Command::Serve(c) => c.json(),
         }
     }
 }
@@ -876,7 +929,8 @@ fn early_failure(command: &str, json: bool, d: Diagnostic, exit: u8) -> ExitCode
     ExitCode::from(exit)
 }
 
-fn run(cli: Cli, root: &Path) -> u8 {
+/// `gate` is the committed authority the ref-mode config gate read.
+fn run(cli: Cli, root: &Path, gate: Option<mdkg_graph::graphref::Authority>) -> u8 {
     let actor = cli.actor;
     match cli.command {
         Command::List {
@@ -920,8 +974,9 @@ fn run(cli: Cli, root: &Path) -> u8 {
         Command::Done {
             target,
             checkpoint,
+            residual,
             json,
-        } => write::done(root, actor, &target, checkpoint, json),
+        } => write::done_with(root, actor, &target, checkpoint, residual.as_deref(), json),
         Command::Update {
             target,
             status,
@@ -987,7 +1042,10 @@ fn run(cli: Cli, root: &Path) -> u8 {
         }
         Command::Release {
             all: true, json, ..
-        } => coord::release_all(root, actor, json),
+        } => coord::release_all(root, actor, false, json),
+        Command::Release {
+            clean: true, json, ..
+        } => coord::release_all(root, actor, true, json),
         Command::Release {
             target,
             scope,
@@ -1001,42 +1059,29 @@ fn run(cli: Cli, root: &Path) -> u8 {
             };
             coord::release(root, actor, which, json)
         }
-        Command::Status { all, json } => coord::status(root, actor, all, json),
+        Command::Status { all, mine, json } => coord::status(root, actor, all, mine, json),
         Command::Sync { target, json } => coord::sync(root, actor, target.as_deref(), json),
         Command::Abandon {
             changeset,
             branch,
             json,
         } => coord::abandon(root, changeset.as_deref(), branch.as_deref(), json),
-        Command::Mcp => mcp::serve(root, actor),
-        Command::Msg(m) => msg::run(root, actor, &m),
-        Command::Room(r) => msg::room(root, actor, &r),
+        Command::Mcp => mcp::serve(root, actor, gate),
+        Command::Entry(e) => entry::run(root, actor, &e),
+        Command::Req(r) => req::run(root, &r),
+        Command::Msg(mut m) => msg::run(root, actor, &mut m),
+        Command::Lease(l) => coord::lease(root, actor, &l),
+        Command::Channel(r) => msg::room(root, actor, &r, false),
+        Command::Room(r) => msg::room(root, actor, &r, true),
         Command::Agents(a) => agents::run(root, actor, &a),
         Command::Scratch(s) => scratch::run(root, actor, &s),
+        Command::Node(n) => coord::node_edit::run(root, actor, &n),
         Command::Work(w) => work::run(root, actor, &w),
         Command::Config(_) => unreachable!("config inspection runs without the coordinator"),
         Command::Auth(_) => unreachable!("auth runs without a graph"),
         Command::Hook(_) => unreachable!("hooks find their own graph"),
         Command::ReceiverQueueGuard { .. } => unreachable!("guard runs before graph discovery"),
-        Command::Install {
-            dry_run,
-            undo,
-            binary,
-            enable,
-            disable,
-            json,
-        } => run::install(
-            root,
-            actor,
-            run::InstallChoice {
-                dry_run,
-                undo,
-                binary: binary.as_deref(),
-                enable: enable.as_deref(),
-                disable: disable.as_deref(),
-            },
-            json,
-        ),
+        Command::Install(a) => run::install(root, actor, &a),
         Command::Store(s) => backup::run(root, &s),
         Command::Anchor { force, json } => anchor::run(root, force, json),
         Command::Export {
@@ -1061,6 +1106,7 @@ fn run(cli: Cli, root: &Path) -> u8 {
         Command::Affected { .. } => unreachable!("affected reads the committed config"),
         Command::Schema { .. } => unreachable!("schema runs without a graph"),
         Command::Version { .. } => unreachable!("version runs without a graph"),
+        Command::Serve(c) => serve_cli::run(root, actor, gate.as_ref(), &c),
     }
 }
 
@@ -1318,6 +1364,12 @@ fn main() -> ExitCode {
     if let Command::Hook(a) = &cli.command {
         return ExitCode::from(hook::run(cli.root.as_deref(), cli.actor.clone(), a));
     }
+    // serve's commands that need no graph run here; the rest go on.
+    if let Command::Serve(c) = &cli.command
+        && let Some(exit) = serve_cli::early(cli.root.as_deref(), c)
+    {
+        return ExitCode::from(exit);
+    }
     let root = match &cli.root {
         Some(r) => std::path::absolute(r).unwrap_or_else(|_| r.clone()),
         None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -1334,15 +1386,35 @@ fn main() -> ExitCode {
         return early_failure(cli.command.name(), cli.command.json(), *e.diagnostic, exit);
     }
     if cli.command.writes_graph()
-        && let Err(e) = graph_repair::require_writable(&root)
+        && let Err(e) = graph_repair::require_writable(&root).and_then(|()| {
+            if matches!(cli.command, Command::Migrate(_)) {
+                graph_repair::refuse_view(&root)
+            } else {
+                Ok(())
+            }
+        })
     {
         let exit = e.exit_code();
         return early_failure(cli.command.name(), cli.command.json(), *e.diagnostic, exit);
     }
     // Affected reads only committed objects, including its config. Checkout
     // config checks and actor/store discovery must not change that decision.
-    if let Command::Affected { base, head, json } = &cli.command {
-        return ExitCode::from(affected::run(&root, base, head, *json));
+    if let Command::Affected {
+        base,
+        head,
+        main,
+        targets,
+        json,
+    } = &cli.command
+    {
+        return ExitCode::from(affected::run(
+            &root,
+            base,
+            head,
+            main.as_deref(),
+            *targets,
+            *json,
+        ));
     }
     // MCP mutations enter through this same command dispatch. Hold the graph
     // stable from before config/node reads through their last write and commit.
@@ -1366,6 +1438,16 @@ fn main() -> ExitCode {
     match &cli.command {
         Command::Config(c) => return ExitCode::from(config_cmd::run(&root, c)),
         Command::Init(a) => return ExitCode::from(init::run(&root, a)),
+        // Ref mode, or a move to or from it: the graph is the graph ref, or
+        // about to be, so the checkout's config gate doesn't apply.
+        Command::Install(a) if run::installs_ref_mode(&root, a) => {
+            let named = cli
+                .actor
+                .clone()
+                .or_else(|| std::env::var("MDKG_ACTOR").ok())
+                .filter(|a| !a.trim().is_empty());
+            return ExitCode::from(run::install(&root, named, a));
+        }
         Command::Doctor(a) => {
             let root = if cli.root.is_some() {
                 root.clone()
@@ -1376,10 +1458,35 @@ fn main() -> ExitCode {
         }
         _ => {}
     }
+    // In ref mode the graph ref is the graph, whatever this checkout's
+    // `.mdkg` holds (#7923, #7946, #10886): with no --root it's the
+    // repository top, even from a subfolder, and an explicit --root must name
+    // a registered graph (#7928). Install and migrate read the checkout's
+    // prospective config, as before.
+    let ref_top = if matches!(&cli.command, Command::Install { .. } | Command::Migrate(_)) {
+        None
+    } else {
+        match config_cmd::ref_mode_probe(&root) {
+            config_cmd::RefProbe::Ref(top) => Some(top),
+            config_cmd::RefProbe::Checkout => None,
+            // Git can't read the repository, so its mode can't be known:
+            // the checkout's own gate and the command's diagnostics decide.
+            config_cmd::RefProbe::Unreadable(_) => None,
+            // A server still starts, and each tool's call refuses with this
+            // reason as its own gate meets it.
+            config_cmd::RefProbe::Broken(_) if matches!(cli.command, Command::Mcp) => None,
+            // Ref mode may be configured: no checkout copy stands in.
+            config_cmd::RefProbe::Broken(e) => {
+                let exit = e.exit_code();
+                return early_failure(cli.command.name(), cli.command.json(), *e.diagnostic, exit);
+            }
+        }
+    };
     // Agents start an MCP server wherever their session started, often a
     // subfolder, so `mcp` looks upward for the graph, as git does.
-    let root = match (&cli.command, &cli.root) {
-        (Command::Mcp, None) => root
+    let root = match (&cli.command, &cli.root, &ref_top) {
+        (_, None, Some(top)) => top.clone(),
+        (Command::Mcp, None, None) => root
             .ancestors()
             .find(|dir| config::has_config(dir))
             .map_or(root.clone(), Path::to_path_buf),
@@ -1387,10 +1494,15 @@ fn main() -> ExitCode {
     };
     // Frozen diagnostics bypass graph config and the coordinator entirely.
     // No empty inventory is returned when the actual inventory wasn't read.
-    if matches!(
-        &cli.command,
-        Command::Status { .. } | Command::Agents(agents::AgentsCommand::Status { .. })
-    ) {
+    // Only checkout mode has a graph checkout to freeze: in ref mode the
+    // graph is the ref, and a `.worktrees/graph` view is a detached,
+    // read-only convenience that no command writes through.
+    if ref_top.is_none()
+        && matches!(
+            &cli.command,
+            Command::Status { .. } | Command::Agents(agents::AgentsCommand::Status { .. })
+        )
+    {
         match graph_repair::inspect(&root) {
             Ok(Some(state)) => {
                 return ExitCode::from(graph_repair::status(
@@ -1407,14 +1519,94 @@ fn main() -> ExitCode {
             }
         }
     }
-    if !config::has_config(&root) {
+    // Ref mode: one committed authority read stands in for the checkout's
+    // config, whether that's absent, stale or malformed (#7946). It runs the
+    // committed reader's format checks, and MCP keeps it for its identity
+    // (#7987).
+    // Coordination commands (leases and mail) read only the committed
+    // config, so a broken agent definition never refuses them (#15433,
+    // #15706); every other command reads the whole authority.
+    let coordination = matches!(
+        &cli.command,
+        Command::Claim { .. }
+            | Command::Renew { .. }
+            | Command::Release { .. }
+            | Command::Lease(_)
+            | Command::Msg(_)
+    );
+    // A root graph registered in a folder ref mode doesn't read is named
+    // before the gate reads that folder (#16095, Terra #16224). An MCP
+    // server still starts, with no gate read (that folder may hold no
+    // config), and each tool's call refuses with it (Terra #16243, #16260).
+    let mut mcp_unbound = false;
+    if let Some(top) = &ref_top
+        && let Err(e) = config_cmd::check_ref_root_folder(top)
+    {
+        if matches!(cli.command, Command::Mcp) {
+            mcp_unbound = true;
+            mcp::UNBOUND.set(*e.diagnostic).ok();
+        } else {
+            let exit = e.exit_code();
+            return early_failure(cli.command.name(), cli.command.json(), *e.diagnostic, exit);
+        }
+    }
+    let gate = if ref_top.is_some() && !mcp_unbound {
+        let read = if coordination {
+            mdkg_run::orchestration::config_authority(&root)
+        } else {
+            mdkg_run::orchestration::authority(&root)
+        };
+        match read {
+            Ok(authority) => Some(authority),
+            Err(e) => {
+                let e = run::graph_error(e);
+                let exit = e.exit_code();
+                return early_failure(cli.command.name(), cli.command.json(), *e.diagnostic, exit);
+            }
+        }
+    } else {
+        None
+    };
+    // Ref mode (`mdkg.graph.ref` set): the graph is the graph ref, read
+    // from the cache, and every graph command runs against it, never this
+    // checkout's `.mdkg` (edd-01a18867). Setup, launcher and store commands
+    // keep the checkout, as do the servers: their served calls run the CLI,
+    // which binds the graph itself, and git, the store and the machine-local
+    // config are found from the checkout, never the cache.
+    let root = if matches!(
+        &cli.command,
+        Command::Install { .. }
+            | Command::Mcp
+            | Command::Serve(_)
+            | Command::Agents(_)
+            | Command::Migrate(_)
+            | Command::Store(_)
+            | Command::Auth(_)
+            | Command::Version { .. }
+            | Command::Schema { .. }
+    ) {
+        root
+    } else {
+        let bound = if matches!(&cli.command, Command::Status { .. }) {
+            coord::graph_git::bind_status(&root)
+        } else {
+            coord::graph_git::bind(&root)
+        };
+        match bound {
+            Ok(Some(cache)) => cache,
+            Ok(None) => root,
+            Err(e) => {
+                let exit = e.exit_code();
+                return early_failure(cli.command.name(), cli.command.json(), *e.diagnostic, exit);
+            }
+        }
+    };
+    if gate.is_none() && !mcp_unbound && !config::has_config(&root) {
         let d = Diagnostic::error(
             Code::ConfigMissing,
             format!("no .mdkg/config.json at {}", root.display()),
         )
-        .with_hint(format!(
-            "run from the repository root, pass --root <path>, or run `{BIN} init`"
-        ));
+        .with_hint(init::missing_config_hint(&root));
         return early_failure(cli.command.name(), cli.command.json(), d, 1);
     }
     // A config this build can't read (a newer `schema_version` or format)
@@ -1424,6 +1616,10 @@ fn main() -> ExitCode {
     // above. A store's verify opens the store, so it's checked too; migrate
     // reads 0.6.0's identity v2 configs as well, and writes its lock first.
     let checked = match cli.command {
+        // The gate's authority read ran these checks on committed config.
+        _ if gate.is_some() => Ok(()),
+        // Every tool's child refuses at the folder check.
+        _ if mcp_unbound => Ok(()),
         Command::Migrate(_) => config::check_version_for_migrate(&root),
         _ => config::check_version(&root),
     };
@@ -1445,24 +1641,49 @@ fn main() -> ExitCode {
     // so a named one costs no git checks here.
     let actor = match &named {
         Some(_) => named.clone(),
+        // An unnamed MCP server resolves graph identity itself, never the
+        // folder name, so a folder like `role:ops` doesn't stop it (#7875).
+        None if matches!(cli.command, Command::Mcp) => None,
         None => coord::Repo::open(&root)
             .ok()
             .map(|repo| repo.actor(cli.actor.clone())),
     };
     // A human acks their own mail, reads their own mailbox, reads threads
     // and leaves rooms (orchestrator, 2026-10-21); those commands check it
-    // themselves. Nothing else runs as a human.
-    let human_ack = matches!(
+    // themselves. A person also makes ledger ops and runs `done
+    // --residual` (edd-01a1878e, A27 rule 4 and A29; the orchestrator on
+    // #11043), which are refused inside a turn where they're judged.
+    // Nothing else runs as a human.
+    let human = named
+        .as_deref()
+        .is_some_and(|a| a.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("human:")));
+    // A person's ledger ops take the exact lowercase `human:` only, the
+    // spelling the ledger classes as a person and checks turns for, and a
+    // well-formed mailbox name after it, since the name is written into
+    // the ledger and the node's `# Ledger` section; any other is refused
+    // below as `msg.human_actor` (Terra's #11173 and #11205).
+    let person = named
+        .as_deref()
+        .is_some_and(|a| a.starts_with("human:") && msg::check_mailbox(a).is_ok());
+    let human_ack = (matches!(
         &cli.command,
         Command::Msg(
             msg::MsgCommand::Ack(_)
                 | msg::MsgCommand::Inbox(_)
                 | msg::MsgCommand::Wait(_)
                 | msg::MsgCommand::Thread(_)
+                | msg::MsgCommand::Watch(_)
         ) | Command::Room(msg::RoomCommand::Leave(_))
-    ) && named
-        .as_deref()
-        .is_some_and(|a| a.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("human:")));
+            | Command::Channel(msg::RoomCommand::Leave(_))
+    ) && human)
+        || (matches!(
+            &cli.command,
+            Command::Entry(_)
+                | Command::Done {
+                    residual: Some(_),
+                    ..
+                }
+        ) && person);
     if !human_ack
         && let Some(actor) = &actor
         && let Err(e) = msg::check_actor(actor)
@@ -1486,5 +1707,5 @@ fn main() -> ExitCode {
     if let Some(actor) = &actor {
         mdkg_coord_sqlite::log::set_record_actor(actor);
     }
-    ExitCode::from(run(cli, &root))
+    ExitCode::from(run(cli, &root, gate))
 }

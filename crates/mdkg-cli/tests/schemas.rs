@@ -26,10 +26,15 @@ const COMMANDS: &[&str] = &[
     "release",
     "renew",
     "holds",
+    "lease.request",
     "status",
     "sync",
     "abandon",
     "new",
+    "serve",
+    "serve.status",
+    "node.edit",
+    "node.save",
     "done",
     "update",
     "next",
@@ -42,21 +47,32 @@ const COMMANDS: &[&str] = &[
     "format",
     "retype",
     "agent",
+    "hook.event",
+    "hook.decision",
     "agents.add",
     "agents.edit",
     "agents.rm",
     "agents.up",
+    "agents.stop",
+    "agents.logs",
     "agents.status",
     "agents.resume",
+    "agents.use-key",
     "install",
     "cli",
     "msg.send",
     "msg.inbox",
     "msg.wait",
+    "msg.watch",
     "msg.ack",
+    "msg.forward",
     "msg.thread",
     "msg.import",
     "msg.decisions",
+    "channel.create",
+    "channel.join",
+    "channel.leave",
+    "channel.list",
     "room.create",
     "room.join",
     "room.leave",
@@ -76,6 +92,31 @@ const COMMANDS: &[&str] = &[
     "skills.add",
     "migrate",
     "affected",
+    "req.list",
+    "run.fault",
+    "entry.list",
+    "entry.show",
+    "entry.gate",
+    "entry.update",
+    "entry.add",
+    "entry.ask",
+    "entry.answer",
+    "entry.decide",
+    "entry.propose",
+    "entry.complete",
+    "entry.fix",
+    "entry.verify",
+    "entry.reopen",
+    "entry.reject",
+    "entry.dispute",
+    "entry.residual",
+    "entry.duplicate",
+    "entry.outdated",
+    "entry.withdraw",
+    "entry.close",
+    "entry.resolve",
+    "entry.move",
+    "entry.req",
 ];
 
 #[test]
@@ -211,5 +252,59 @@ fn authority_commands_carry_the_contract_marker() {
         } else {
             assert_eq!(marker, &serde_json::json!(1), "{command}");
         }
+    }
+}
+
+/// `mdkg.run.fault.v1` is the data part a fault send emits: every field
+/// `Fault::parts` writes is declared and of its type, with or without a
+/// turn and a worktree, and one it doesn't write breaks it.
+#[test]
+fn a_faults_data_part_conforms_to_its_schema() {
+    use mdkg_run::fault::{CLEARS_TURN, Fault, Worktree};
+    let schema = common::schema("run.fault");
+    let check = |data: &serde_json::Value| {
+        let mut errors = Vec::new();
+        common::api_schema::check_emitted(&schema, &schema, data, "$", &mut errors);
+        errors
+    };
+    let mut turn = Fault::new(
+        "lane",
+        "run.agent_failed",
+        "0193",
+        vec!["orchestrator".into()],
+        CLEARS_TURN,
+        "mdkg agents status lane".into(),
+    );
+    turn.turn_id = Some("01a19078-d386-7ef9-b864-3230f0e22f00".into());
+    turn.nodes = vec!["task-01a1878e-3e6f-710b-9d01-68d002aed3e3".into()];
+    turn.worktree = Some(Worktree {
+        path: "/w/lane".into(),
+        dirty: true,
+        changed: 3,
+    });
+    let plain = Fault::new(
+        "lane",
+        "msg.secret_refused",
+        "0194",
+        vec!["orchestrator".into(), "lane".into()],
+        "the agent's next reply imports",
+        "mdkg agents status lane".into(),
+    );
+    for fault in [&turn, &plain] {
+        let parts = fault.parts(2, "2026-10-30T00:00:00.000Z");
+        let data = &parts[1]["data"];
+        assert_eq!(data["schema"], "mdkg.run.fault.v1");
+        assert_eq!(check(data), Vec::<String>::new(), "{data}");
+    }
+    let data = turn.parts(1, "2026-10-30T00:00:00.000Z")[1]["data"].clone();
+    for (key, value) in [
+        ("count", serde_json::json!(0)),
+        ("worktree", serde_json::json!({"path": "/w", "dirty": true})),
+        ("nodes", serde_json::json!("task-1")),
+        ("paths", serde_json::json!(["src/lib.rs"])),
+    ] {
+        let mut broken = data.clone();
+        broken[key] = value;
+        assert!(!check(&broken).is_empty(), "{key} conformed");
     }
 }

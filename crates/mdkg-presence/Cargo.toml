@@ -1,0 +1,43 @@
+[package]
+name = "mdkg-presence"
+version = "0.7.1"
+description = "Person keys that need their person present: the Secure Enclave and FIDO2 (the serve edd, S41). Internal to mdkg, no stable API; depend on the mdkg binary"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+readme = "README.md"
+
+[dependencies]
+mdkg-format = { path = "../mdkg-format", version = "0.7.1" }
+mdkg-ops = { path = "../mdkg-ops", version = "0.7.1" }
+# wire's shared encodings: fingerprints, the pairing codes, the FIDO2
+# assertion format and the person-grade types (#6731).
+mdkg-wire = { path = "../mdkg-wire", version = "0.7.1" }
+base64.workspace = true
+ring.workspace = true
+rustls-pki-types.workspace = true
+rustls-webpki.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+# The user's uid and O_NOFOLLOW for the key folder's checks, safely.
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, features = ["process"] }
+# The OS user's home directory (getpwuid), for the person-key lock; the
+# workspace's approved safe wrapper.
+nix.workspace = true
+
+# FIDO2 over USB HID on macOS and Linux (decided 2026-10-29). On Linux its
+# hidapi builds against libudev, found by pkg-config: building needs
+# pkg-config and libudev-dev.
+[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
+ctap-hid-fido2.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework.workspace = true
+
+[lints]
+workspace = true

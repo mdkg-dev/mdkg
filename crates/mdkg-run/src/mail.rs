@@ -55,6 +55,9 @@ pub struct Header {
     pub kind: String,
     pub sender: String,
     pub room: Option<String>,
+    /// The messages it replies to, the first being the one it answers.
+    #[serde(default, rename = "referenceIds")]
+    pub reference_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -91,12 +94,102 @@ pub struct Note<'a> {
     pub text: &'a str,
 }
 
+/// Private installed-launcher receipt adapters. No CLI flag selects these.
+#[derive(Debug, Clone, Copy)]
+pub struct ReceiptCallbacks {
+    pub baseline: fn(&CliMail) -> Result<mdkg_coord_sqlite::ActivityCursor, RunError>,
+    pub activity: fn(
+        &CliMail,
+        &mdkg_coord_sqlite::ActivityCursor,
+        &str,
+    ) -> Result<mdkg_coord_sqlite::ActivitySnapshot, RunError>,
+    pub tasks: fn(
+        &crate::state::Pinned,
+        &crate::turn::receipt::GitSpan,
+        &str,
+    ) -> Result<crate::turn::receipt::tasks::Evidence, RunError>,
+    pub deliver: fn(&CliMail, &Receipt<'_>) -> Result<String, RunError>,
+    /// Sends one fault occurrence (A26).
+    pub fault: fn(&CliMail, &crate::fault::Fault) -> Result<FaultSent, RunError>,
+    /// Clears an agent's faults reporting a condition seen to end (their
+    /// `clears`); returns the occurrences cleared.
+    pub clear: fn(&CliMail, &str, &str) -> Result<Vec<String>, RunError>,
+    /// How many occurrences of an agent's code were cleared.
+    pub clears: fn(&CliMail, &str, &str) -> Result<u64, RunError>,
+}
+
+/// What became of a fault send.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FaultSent {
+    /// Stored as this new copy.
+    Sent(String),
+    /// The store's copy stands, under this id: nothing new was stored.
+    Stood(String),
+    /// The occurrence's condition already ended; it is never sent again.
+    Cleared,
+}
+
+#[derive(Debug)]
+pub struct Receipt<'a> {
+    pub id: &'a str,
+    pub agent: &'a str,
+    pub to: &'a str,
+    pub body: &'a str,
+}
+
+fn no_receipts() -> RunError {
+    RunError::failure(
+        CODE_MAIL_FAILED,
+        "receipt delivery unavailable: no installed launcher callback",
+    )
+}
+
 /// The coordinator calls a turn makes.
 pub trait Mail {
     /// Durable coordinator metadata for decisions already retained in this
     /// turn's inbox. Old/mocked clients promote nothing by default.
     fn decision_audit(&mut self, _agent: &str, _ids: &[String]) -> Result<Vec<Value>, RunError> {
         Ok(Vec::new())
+    }
+    fn receipt_baseline(&mut self) -> Result<mdkg_coord_sqlite::ActivityCursor, RunError> {
+        Err(no_receipts())
+    }
+    fn receipt_activity(
+        &mut self,
+        _cursor: &mdkg_coord_sqlite::ActivityCursor,
+        _agent: &str,
+    ) -> Result<mdkg_coord_sqlite::ActivitySnapshot, RunError> {
+        Err(no_receipts())
+    }
+    fn receipt_tasks(
+        &mut self,
+        _pin: &crate::state::Pinned,
+        _span: &crate::turn::receipt::GitSpan,
+        _root: &str,
+    ) -> Result<crate::turn::receipt::tasks::Evidence, RunError> {
+        Err(no_receipts())
+    }
+    fn receipt_send(&mut self, _receipt: &Receipt<'_>) -> Result<String, RunError> {
+        Err(no_receipts())
+    }
+    /// Sends one fault occurrence from `mdkg:supervisor` (A26).
+    fn fault_send(&mut self, _fault: &crate::fault::Fault) -> Result<FaultSent, RunError> {
+        Err(no_receipts())
+    }
+    /// Clears `agent`'s faults reporting `condition` (their `clears`), now
+    /// seen to end; returns the occurrences cleared.
+    fn fault_clear(&mut self, _agent: &str, _condition: &str) -> Result<Vec<String>, RunError> {
+        Err(no_receipts())
+    }
+    /// How many occurrences of `agent`'s `code` were cleared.
+    fn fault_clears(&mut self, _agent: &str, _code: &str) -> Result<u64, RunError> {
+        Err(no_receipts())
+    }
+    /// The agent's unacked receipts, oldest first: hidden from
+    /// [`Mail::inbox`], read only to set them aside (A26). A client with no
+    /// receipt read has none to set aside.
+    fn receipts(&mut self, _agent: &str, _limit: usize) -> Result<Inbox, RunError> {
+        Ok(Inbox::default())
     }
     /// A no-mark header page, oldest first; no fallback to a body listing.
     fn headers(
@@ -144,8 +237,8 @@ pub trait Mail {
             more,
         })
     }
-    /// Blocks until unacked mail newer than `after` exists; `None` on
-    /// timeout.
+    /// Blocks until unacked mail newer than `after` that wakes the agent
+    /// exists (a channel post only in a waking kind); `None` on timeout.
     fn wait(
         &mut self,
         agent: &str,
@@ -172,7 +265,24 @@ pub trait Mail {
             "mail client cannot verify continuous turn ownership",
         ))
     }
+    /// [`Mail::renew_held`] within `budget` for all its lease calls, saying
+    /// whether a failure is a lease call that ran out of it unanswered
+    /// ([`Renewal::timed_out`]): under load, worth trying again before
+    /// anything is held on it (friction 87). A start passes
+    /// [`RECEIVER_START_BUDGET`], a dispatcher [`RECEIVER_RENEWAL_BUDGET`].
+    fn renew_held_checked(&mut self, scope: &str, _budget: Duration) -> Result<u64, Renewal> {
+        self.renew_held(scope).map_err(|error| Renewal {
+            error,
+            timed_out: false,
+        })
+    }
     fn release(&mut self, scope: &str) -> Result<(), RunError>;
+    /// Releases `agent`'s clean path leases (`release --clean`) as the
+    /// agent, judged in its worktree `top`: after every turn, so leases on
+    /// files the turn committed don't wait out their term.
+    fn release_clean(&mut self, _agent: &str, _top: &Path) -> Result<(), RunError> {
+        Ok(())
+    }
     /// Who claims: unique to this launcher process.
     fn holder(&self) -> String;
     /// The actor that imports replies (the launcher's own): a send skips
@@ -190,6 +300,20 @@ pub trait Mail {
     fn holds(&mut self, actor: &str, scope: &str, node: Option<&str>) -> Result<bool, RunError>;
     /// Sends a note from the launcher's own actor; returns its message id.
     fn note(&mut self, note: &Note<'_>) -> Result<String, RunError>;
+    /// Who sent message `id`, read as `agent`; `None` when it can't be
+    /// found. The wake filter asks it of a note that replies.
+    fn sender_of(&mut self, _agent: &str, _id: &str) -> Result<Option<String>, RunError> {
+        Ok(None)
+    }
+}
+
+/// Why [`Mail::renew_held_checked`] failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Renewal {
+    pub error: RunError,
+    /// A lease call ran out of its time budget, or its output cap, and
+    /// was stopped unanswered: nothing it says is known.
+    pub timed_out: bool,
 }
 
 /// [`Mail`] through the mdkg CLI.
@@ -211,14 +335,36 @@ pub struct CliMail {
     /// The worktree `root` is in, which every mdkg it runs must find
     /// there ($MDKG_TRUSTED_WORKTREE).
     pub trusted_worktree: Option<PathBuf>,
+    pub receipts: Option<ReceiptCallbacks>,
+    /// Preserve selection of an overridden transport even if it names this binary.
+    pub receipt_transport_overridden: bool,
 }
+
+/// The most pages of 100 [`CliMail::sender_of`] reads of a conversation
+/// before it gives up, and the note wakes as any direct mail does.
+const SENDER_PAGES: usize = 5;
+
+/// The most bytes one of those pages may print (bodies included).
+const SENDER_PAGE_MAX: u64 = 8 << 20;
+
+/// How long a lookup's pages may take altogether.
+const SENDER_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// `wait` ran out of time (the M1 draft's exit 6, question Q4).
 const EXIT_WAIT_TIMEOUT: i32 = 6;
 
 // One shared cap for holds, the local heartbeat and its verification, not
 // five seconds per subprocess. Initial lookup does not yet know the expiry.
-const RECEIVER_RENEWAL_BUDGET: Duration = Duration::from_secs(5);
+pub(crate) const RECEIVER_RENEWAL_BUDGET: Duration = Duration::from_secs(5);
+
+/// How long the launcher's `release --clean` after a turn may take.
+const RELEASE_CLEAN_BUDGET: Duration = Duration::from_secs(30);
+
+/// The same cap for a start's check of the lease it just claimed, before
+/// anything runs on it: under load a few seconds weren't enough (friction
+/// 87), and the fresh lease has two hours left, so a longer wait can't let
+/// it lapse. [`renewal_deadline`] still keeps half the lease in hand.
+pub(crate) const RECEIVER_START_BUDGET: Duration = Duration::from_secs(60);
 
 fn renewal_deadline(
     cap: Instant,
@@ -237,9 +383,9 @@ fn renewal_deadline(
 
 impl CliMail {
     pub fn new(default_program: PathBuf, root: PathBuf, launcher: String) -> Self {
-        let program = std::env::var_os("MDKG_RUN_MDKG")
-            .filter(|v| !v.is_empty())
-            .map_or(default_program, PathBuf::from);
+        let overridden = std::env::var_os("MDKG_RUN_MDKG").filter(|v| !v.is_empty());
+        let receipt_transport_overridden = overridden.is_some();
+        let program = overridden.map_or(default_program, PathBuf::from);
         let holder = format!("{launcher}@run-{}", uuid::Uuid::now_v7().simple());
         Self {
             program,
@@ -248,7 +394,19 @@ impl CliMail {
             holder,
             trusted_common: None,
             trusted_worktree: None,
+            receipts: None,
+            receipt_transport_overridden,
         }
+    }
+
+    fn receipt_callbacks(&self) -> Result<ReceiptCallbacks, RunError> {
+        if self.receipt_transport_overridden {
+            return Err(RunError::failure(
+                CODE_MAIL_FAILED,
+                "receipt delivery refused: MDKG_RUN_MDKG overrides the mail transport",
+            ));
+        }
+        self.receipts.ok_or_else(no_receipts)
     }
 
     fn header_call(
@@ -326,18 +484,56 @@ impl CliMail {
         ))
     }
 
+    /// One page of `msg thread <id> --no-mark` after `after`, its envelope's
+    /// `data`: at most [`SENDER_PAGE_MAX`] bytes, within `limit`.
+    fn thread_page(
+        &self,
+        agent: &str,
+        id: &str,
+        after: u64,
+        limit: std::time::Duration,
+    ) -> Result<Value, RunError> {
+        let failed = || RunError::failure(CODE_MAIL_FAILED, "receiver sender lookup failed");
+        let mut command = Command::new(&self.program);
+        if let Some(c) = &self.trusted_common {
+            command.env(crate::profile::TRUSTED_COMMON_DIR, c);
+        }
+        if let Some(w) = &self.trusted_worktree {
+            command.env(crate::profile::TRUSTED_WORKTREE, w);
+        }
+        if mdkg_coord_sqlite::store_upgrades_allowed() {
+            command.arg("--allow-store-upgrade");
+        }
+        command
+            .arg("--root")
+            .arg(&self.root)
+            .arg(format!("--as={agent}"))
+            .args(["msg", "thread", "--no-mark", "--limit", "100", "--after"])
+            .arg(after.to_string())
+            .arg("--json")
+            .arg("--")
+            .arg(id);
+        let out = crate::turn::capped_output(&mut command, SENDER_PAGE_MAX, limit)
+            .map_err(|_| failed())?;
+        let envelope: Value = serde_json::from_slice(&out.stdout).map_err(|_| failed())?;
+        if envelope["ok"] != true || !out.status.success() {
+            return Err(failed());
+        }
+        Ok(envelope["data"].clone())
+    }
+
     /// When this holder's lease on a turn ends, or `None` when it holds
     /// none: `holds` answers a turn from the local store alone.
     fn turn_deadline(&self, scope: &str) -> Result<Option<u64>, RunError> {
-        self.turn_deadline_until(scope, None)
+        self.turn_deadline_until(scope, None).map_err(|r| r.error)
     }
 
     fn turn_deadline_until(
         &self,
         scope: &str,
         until: Option<Instant>,
-    ) -> Result<Option<u64>, RunError> {
-        let (_, data) = self.call_until(&self.holder, &["holds", "--", scope], until)?;
+    ) -> Result<Option<u64>, Renewal> {
+        let (_, data) = self.call_bounded(&self.holder, &["holds", "--", scope], until)?;
         Ok(if data["holds"] == true {
             data["lease"]["deadline_ms"].as_u64()
         } else {
@@ -357,6 +553,20 @@ impl CliMail {
         args: &[&str],
         until: Option<Instant>,
     ) -> Result<(i32, Value), RunError> {
+        self.call_bounded(actor, args, until).map_err(|r| r.error)
+    }
+
+    /// [`CliMail::call_until`], saying whether a bounded call timed out.
+    fn call_bounded(
+        &self,
+        actor: &str,
+        args: &[&str],
+        until: Option<Instant>,
+    ) -> Result<(i32, Value), Renewal> {
+        let failed = |error| Renewal {
+            error,
+            timed_out: false,
+        };
         // `--json` goes before any `--`, after which everything is a value.
         let split = args.iter().position(|a| *a == "--").unwrap_or(args.len());
         let mut cmd = Command::new(&self.program);
@@ -381,22 +591,25 @@ impl CliMail {
             Some(until) => bounded_output(&mut cmd, until),
             None => cmd.output(),
         }
-        .map_err(|e| {
-            RunError::failure(
+        .map_err(|e| Renewal {
+            timed_out: e.kind() == std::io::ErrorKind::TimedOut,
+            error: RunError::failure(
                 CODE_MAIL_FAILED,
                 format!("can't run {}: {e}", self.program.display()),
-            )
+            ),
         })?;
         let code = out.status.code().unwrap_or(-1);
         let envelope: Value = serde_json::from_slice(&out.stdout).map_err(|_| {
-            RunError::failure(
-                CODE_MAIL_FAILED,
-                format!(
-                    "`{}` didn't print the JSON contract (exit {code})",
-                    args.first().copied().unwrap_or_default()
-                ),
+            failed(
+                RunError::failure(
+                    CODE_MAIL_FAILED,
+                    format!(
+                        "`{}` didn't print the JSON contract (exit {code})",
+                        args.first().copied().unwrap_or_default()
+                    ),
+                )
+                .with_hint("the messaging commands (M1) may not be in this mdkg build"),
             )
-            .with_hint("the messaging commands (M1) may not be in this mdkg build")
         })?;
         if envelope.get("ok").and_then(Value::as_bool) == Some(true) {
             return Ok((code, envelope.get("data").cloned().unwrap_or(Value::Null)));
@@ -419,7 +632,7 @@ impl CliMail {
         if code == EXIT_WAIT_TIMEOUT {
             e.code = WAIT_TIMEOUT.to_string();
         }
-        Err(e)
+        Err(failed(e))
     }
 
     fn inbox_from(data: Value) -> Result<Inbox, RunError> {
@@ -445,6 +658,36 @@ impl Mail for CliMail {
             .cloned()
             .ok_or_else(|| RunError::failure(CODE_MAIL_FAILED, "unexpected decision audit output"))
     }
+    fn receipt_baseline(&mut self) -> Result<mdkg_coord_sqlite::ActivityCursor, RunError> {
+        (self.receipt_callbacks()?.baseline)(self)
+    }
+    fn receipt_activity(
+        &mut self,
+        cursor: &mdkg_coord_sqlite::ActivityCursor,
+        agent: &str,
+    ) -> Result<mdkg_coord_sqlite::ActivitySnapshot, RunError> {
+        (self.receipt_callbacks()?.activity)(self, cursor, agent)
+    }
+    fn receipt_tasks(
+        &mut self,
+        pin: &crate::state::Pinned,
+        span: &crate::turn::receipt::GitSpan,
+        root: &str,
+    ) -> Result<crate::turn::receipt::tasks::Evidence, RunError> {
+        (self.receipt_callbacks()?.tasks)(pin, span, root)
+    }
+    fn receipt_send(&mut self, receipt: &Receipt<'_>) -> Result<String, RunError> {
+        (self.receipt_callbacks()?.deliver)(self, receipt)
+    }
+    fn fault_send(&mut self, fault: &crate::fault::Fault) -> Result<FaultSent, RunError> {
+        (self.receipt_callbacks()?.fault)(self, fault)
+    }
+    fn fault_clear(&mut self, agent: &str, condition: &str) -> Result<Vec<String>, RunError> {
+        (self.receipt_callbacks()?.clear)(self, agent, condition)
+    }
+    fn fault_clears(&mut self, agent: &str, code: &str) -> Result<u64, RunError> {
+        (self.receipt_callbacks()?.clears)(self, agent, code)
+    }
     fn headers(
         &mut self,
         agent: &str,
@@ -465,6 +708,12 @@ impl Mail for CliMail {
     fn inbox(&mut self, agent: &str, limit: usize) -> Result<Inbox, RunError> {
         let limit = limit.to_string();
         let (_, data) = self.call(agent, &["msg", "inbox", "--limit", &limit])?;
+        Self::inbox_from(data)
+    }
+    fn receipts(&mut self, agent: &str, limit: usize) -> Result<Inbox, RunError> {
+        let limit = limit.to_string();
+        let args = ["msg", "inbox", "--kind", "receipt", "--limit", &limit];
+        let (_, data) = self.call(agent, &args)?;
         Self::inbox_from(data)
     }
 
@@ -492,7 +741,11 @@ impl Mail for CliMail {
     ) -> Result<Option<Inbox>, RunError> {
         let timeout = timeout_secs.to_string();
         let after_s = after.map(|a| a.to_string());
-        let mut args = vec!["msg", "wait", "--timeout", &timeout];
+        // Only mail that wakes the agent ends the wait: a channel post in a
+        // kind that doesn't ([`crate::hooks::wakes`]) waits for a turn
+        // something else starts (friction 83).
+        let kinds = format!("--channel-kind={}", crate::hooks::ROOM_WAKE_KINDS.join(","));
+        let mut args = vec!["msg", "wait", "--timeout", &timeout, &kinds];
         if let Some(a) = &after_s {
             args.extend(["--after", a]);
         }
@@ -583,14 +836,36 @@ impl Mail for CliMail {
         self.claim(scope)
     }
 
+    fn release_clean(&mut self, agent: &str, top: &Path) -> Result<(), RunError> {
+        // In the agent's worktree, which the turn checked: the worktree
+        // pin moves there, the common dir's stays, so it can't leave the
+        // repository.
+        let mut there = self.clone();
+        there.root = top.to_path_buf();
+        there.trusted_worktree = Some(top.to_path_buf());
+        there
+            .call_until(
+                agent,
+                &["release", "--clean"],
+                Some(Instant::now() + RELEASE_CLEAN_BUDGET),
+            )
+            .map(|_| ())
+    }
+
     fn renew_held(&mut self, scope: &str) -> Result<u64, RunError> {
-        let lost = || {
-            RunError::failure(
+        self.renew_held_checked(scope, RECEIVER_RENEWAL_BUDGET)
+            .map_err(|r| r.error)
+    }
+
+    fn renew_held_checked(&mut self, scope: &str, budget: Duration) -> Result<u64, Renewal> {
+        let lost = || Renewal {
+            error: RunError::failure(
                 CODE_MAIL_FAILED,
                 "receiver turn lease expired or changed holder",
-            )
+            ),
+            timed_out: false,
         };
-        let cap = Instant::now() + RECEIVER_RENEWAL_BUDGET;
+        let cap = Instant::now() + budget;
         let before = self
             .turn_deadline_until(scope, Some(cap))?
             .ok_or_else(lost)?;
@@ -599,12 +874,19 @@ impl Mail for CliMail {
         // This path never calls claim, even if the holder disappeared.
         let until = renewal_deadline(cap, before, crate::state::now_ms(), Instant::now())
             .ok_or_else(lost)?;
-        let renewed = self.call_until(&holder, &["renew", "--local-turn", scope], Some(until));
+        let renewed = self.call_bounded(&holder, &["renew", "--local-turn", scope], Some(until));
         let after = self
             .turn_deadline_until(scope, Some(until))?
             .ok_or_else(lost)?;
-        if after <= crate::state::now_ms() || Instant::now() >= until {
+        if after <= crate::state::now_ms() {
             return Err(lost());
+        }
+        // Answered, but past the budget: as slow as a call stopped unanswered.
+        if Instant::now() >= until {
+            return Err(Renewal {
+                timed_out: true,
+                ..lost()
+            });
         }
         match renewed {
             Ok((_, data))
@@ -664,6 +946,32 @@ impl Mail for CliMail {
             .ok_or_else(|| {
                 RunError::failure(CODE_MAIL_FAILED, "msg send didn't return a messageId")
             })
+    }
+
+    fn sender_of(&mut self, agent: &str, id: &str) -> Result<Option<String>, RunError> {
+        // The message's conversation, a page at a time, never counted as
+        // shown; bodies come with it and are never read. Each page is
+        // capped in size, and all of them in time, as a header read is.
+        let until = Instant::now() + SENDER_BUDGET;
+        let mut after = 0u64;
+        for _ in 0..SENDER_PAGES {
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            let data = self.thread_page(agent, id, after, left)?;
+            if let Some(m) = data["messages"]
+                .as_array()
+                .and_then(|ms| ms.iter().find(|m| m["messageId"] == id))
+            {
+                return Ok(m["sender"].as_str().map(String::from));
+            }
+            match data["cursor"].as_u64() {
+                Some(next) if data["more"] == true && next > after => after = next,
+                _ => return Ok(None),
+            }
+        }
+        Ok(None)
     }
 
     fn holds(&mut self, actor: &str, scope: &str, node: Option<&str>) -> Result<bool, RunError> {
@@ -778,6 +1086,7 @@ for a; do case $a in holds|renew|claim) cmd=$a; break;; esac; done
 echo "$cmd" >> "$d/calls"
 case $cmd in
 holds)
+  if [ -f "$d/holds_delay" ]; then /bin/sleep "$(cat "$d/holds_delay")"; fi
   n=$(cat "$d/n" 2>/dev/null || echo 0); echo $((n + 1)) > "$d/n"
   dl=$(sed -n "$((n + 1))p" "$d/deadlines")
   if [ "$dl" = none ]; then echo '{"ok":true,"data":{"holds":false,"lease":null}}'
@@ -923,6 +1232,51 @@ esac
             !dir.join("renew_completed").exists(),
             "the bounded check must stop the blocked command, not merely reject its late reply"
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// friction 87: a start retries only a lease call that ran out of time
+    /// unanswered, so the timeout is told apart from every other failure.
+    #[test]
+    fn a_renewal_stopped_unanswered_says_it_timed_out() {
+        let (dir, mut mail) = fake_mdkg("timed-out", &["9999999999999", "9999999999999"]);
+        std::fs::write(dir.join("renew_block"), "").unwrap();
+        std::fs::write(dir.join("renew_ok"), "").unwrap();
+        let e = mail
+            .renew_held_checked("run:x", RECEIVER_RENEWAL_BUDGET)
+            .expect_err("blocked");
+        assert!(e.timed_out, "{e:?}");
+        // The error itself is unchanged: `renew_held` reports the same.
+        assert_eq!(e.error.code, CODE_MAIL_FAILED);
+        assert!(e.error.message.contains("timed out"), "{e:?}");
+        std::fs::remove_dir_all(dir).unwrap();
+        // An answer that the lease is gone isn't a timeout.
+        let (dir, mut mail) = fake_mdkg("answered-lost", &["none"]);
+        let e = mail
+            .renew_held_checked("run:x", RECEIVER_RENEWAL_BUDGET)
+            .expect_err("lost");
+        assert!(!e.timed_out, "{e:?}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// friction 87: production's checks failed on a slow `holds`, before
+    /// the renewal. Past its budget it's a timeout like a blocked renewal;
+    /// a start's larger budget waits it out.
+    #[test]
+    fn a_slow_holds_times_out_past_its_budget_and_a_start_budget_waits_it_out() {
+        let (dir, mut mail) = fake_mdkg("slow-holds", &["9999999999999", "9999999999999"]);
+        std::fs::write(dir.join("renew_ok"), "").unwrap();
+        std::fs::write(dir.join("holds_delay"), "2").unwrap();
+        let e = mail
+            .renew_held_checked("run:x", Duration::from_millis(500))
+            .expect_err("holds outlasts the budget");
+        assert!(e.timed_out, "{e:?}");
+        let calls = std::fs::read_to_string(dir.join("calls")).unwrap();
+        assert_eq!(calls, "holds\n", "stopped at the first holds");
+        std::fs::write(dir.join("n"), "0").unwrap();
+        mail.renew_held_checked("run:x", RECEIVER_START_BUDGET)
+            .expect("the start's budget waits out two slow holds");
+        assert_eq!(RECEIVER_START_BUDGET, Duration::from_secs(60));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

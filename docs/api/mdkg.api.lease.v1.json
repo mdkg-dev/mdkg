@@ -1,0 +1,213 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "mdkg.api.lease.v1",
+  "description": "Draft (mdkg API v1; A5/A6). The lease record used in event payloads, from its frozen CLI definition plus uri; new API records omit the deprecated compatibility field.",
+  "x-mdkg-status": "draft",
+  "type": "object",
+  "properties": {
+    "schema": {
+      "const": "mdkg.api.lease.v1"
+    },
+    "ok": {
+      "type": "boolean",
+      "description": "False exactly when there is an error diagnostic."
+    },
+    "data": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Lease"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "diagnostics": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/DiagnosticOut"
+      }
+    }
+  },
+  "required": [
+    "schema",
+    "ok",
+    "diagnostics"
+  ],
+  "$defs": {
+    "NodeName": {
+      "description": "The node a profile C scope (`node:<uuid>`) names, so a reader never\nsees a bare UUID alone.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "description": "Its current full id.",
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "title"
+      ]
+    },
+    "Lease": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "owner": {
+          "type": "string"
+        },
+        "scope": {
+          "type": "string"
+        },
+        "node": {
+          "description": "For a profile C scope (`node:<uuid>`): the node it is.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NodeName"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "active",
+            "committed",
+            "released",
+            "expired",
+            "conflict"
+          ]
+        },
+        "until": {
+          "description": "When the lease ends, RFC 3339 UTC.",
+          "type": "string"
+        },
+        "deadline_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "mode": {
+          "description": "`exclusive`, or `shared` when the config lets others share the path.",
+          "type": "string",
+          "enum": [
+            "exclusive",
+            "shared"
+          ]
+        },
+        "shared_with": {
+          "description": "Owners of other active leases overlapping a shared one.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "changeset": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mine": {
+          "description": "In `status`: whether the lease is the acting actor's.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "expiring": {
+          "description": "In `status`: true when an active lease is in the last eighth of its\ntime (15 minutes of the default 2 hours); `mdkg renew` extends\nit.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "uri": {
+          "type": "string",
+          "description": "Canonical coordinator-relative resource path (A2)."
+        }
+      },
+      "required": [
+        "id",
+        "owner",
+        "scope",
+        "status",
+        "until",
+        "deadline_ms",
+        "mode",
+        "uri"
+      ]
+    },
+    "DiagnosticOut": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string",
+          "description": "A stable diagnostic code."
+        },
+        "severity": {
+          "type": "string",
+          "description": "Severity.",
+          "enum": [
+            "error",
+            "warning",
+            "info"
+          ]
+        },
+        "path": {
+          "type": "string"
+        },
+        "line": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "node": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "hint": {
+          "type": "string"
+        },
+        "holders": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "related": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string"
+              },
+              "line": {
+                "type": "integer",
+                "minimum": 0
+              }
+            },
+            "required": [
+              "path"
+            ]
+          }
+        }
+      },
+      "required": [
+        "code",
+        "severity",
+        "message"
+      ],
+      "description": "A diagnostic, as every command's envelope writes it."
+    }
+  }
+}

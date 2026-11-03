@@ -69,4 +69,5 @@ if [ -f fake-commit ]; then
   printf 'Change a file\n' > .mdkg-commit-msg
 fi
 echo '{"type":"step_start","sessionID":"ses_fake","part":{}}'
-echo '{"type":"text","sessionID":"ses_fake","part":{"text":"opencode reply"}}'
+# A fake-reply file holds the final message (one line), else "opencode reply".
+echo "{\"type\":\"text\",\"sessionID\":\"ses_fake\",\"part\":{\"text\":\"$(cat fake-reply 2>/dev/null || echo opencode reply)\"}}"

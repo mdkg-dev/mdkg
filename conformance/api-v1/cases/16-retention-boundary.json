@@ -1,0 +1,9 @@
+{
+  "name": "16-retention-boundary",
+  "scenario": "retention_boundary",
+  "transports": [
+    "cli"
+  ],
+  "checks": "A reader that attaches just after a successful turn ends gets its output; after four turns the first turn's output gives api.output_gone while the turn still reads as ended with its outcome.",
+  "cli_driver": "crates/mdkg-cli/tests/agents.rs: conformance_16_and_19_retention_and_recovery_from_the_turn_index"
+}

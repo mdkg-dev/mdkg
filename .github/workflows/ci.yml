@@ -44,9 +44,19 @@ jobs:
           git config --global user.name "mdkg CI"
           git config --global user.email "ci@mdkg.invalid"
           git config --global init.defaultBranch main
+      # FIDO2 person keys (mdkg-presence): hidapi builds against libudev.
+      - name: Install the Linux build prerequisites
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libudev-dev
       - name: Install the toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      # check.sh runs the tests on cargo-nextest (decided 2026-10-30) and stops
+      # if it's missing. A fixed version from crates.io, built with its lock
+      # file, as release.yml installs dist. rust-cache keeps ~/.cargo/bin, and
+      # cargo install skips a version that's already there.
+      - name: Install cargo-nextest
+        run: cargo install cargo-nextest --version 0.9.150 --locked
       - name: scripts/check.sh
         run: |
           export MDKG_NODE24="$(command -v node)"

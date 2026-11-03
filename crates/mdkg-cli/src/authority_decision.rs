@@ -1,6 +1,7 @@
 //! The decision send gate. No message part or project configuration is authority.
 
-use mdkg_coord_sqlite::{git, mail::DecisionGrant};
+use crate::coord::graph_git::git;
+use mdkg_coord_sqlite::mail::DecisionGrant;
 use mdkg_format::{Code, Diagnostic, Digest, NodeId, NodeRef, settings::Environment};
 use mdkg_graph::{
     GraphError, config, index,
@@ -15,11 +16,44 @@ pub(super) fn refused(message: impl Into<String>) -> GraphError {
     GraphError::usage(Code::UsageInvalidArguments, message)
 }
 
+/// Where a person grants `sender` delegation, with the grant's shape
+/// (docs/delegated-decisions.md), then any warnings from loading the
+/// grants. Only the person's user settings file grants it: never the
+/// project's, nor the machine-local file workers can write
+/// (dec-01a18ee0 item 7).
+fn delegation_hint(
+    sender: &str,
+    home: Option<&Path>,
+    xdg: Option<&Path>,
+    warnings: &[String],
+) -> String {
+    let user = match (xdg.filter(|x| !x.as_os_str().is_empty()), home) {
+        (Some(x), _) => x.join("mdkg/config.json").display().to_string(),
+        (None, Some(h)) => h.join(".config/mdkg/config.json").display().to_string(),
+        (None, None) => "$HOME/.config/mdkg/config.json".into(),
+    };
+    let grant = serde_json::json!({
+        "authority": {"delegates": {sender: {"for": "human:<name>", "may": ["decision"]}}}
+    });
+    let mut hint = format!(
+        "a person grants it in their user config ({user}): {grant}; until then, relay the \
+         answer as --kind resolution --reply-to <id>"
+    );
+    for w in warnings {
+        hint.push_str("; ");
+        hint.push_str(w);
+    }
+    hint
+}
+
+/// `replying`: the send has `--reply-to`, so a refusal for a missing
+/// `--ref` can point at the answer that needs no node.
 pub(super) fn grant(
     repo: &Repo,
     sender: &str,
     action: Option<&str>,
     reference: Option<&str>,
+    replying: bool,
 ) -> Result<(DecisionGrant, Vec<Diagnostic>), GraphError> {
     let common =
         git::common_dir(&repo.top).map_err(|_| refused("cannot identify decision coordinator"))?;
@@ -34,7 +68,16 @@ pub(super) fn grant(
     .map_err(refused)?;
     let action = action.filter(|a| mdkg_coord_sqlite::mail::DECISION_ACTIONS.contains(a))
         .ok_or_else(|| refused("decision requires --action implement|test|commit|design|review; fixed-limit actions cannot be delegated"))?;
-    let reference = reference.ok_or_else(|| refused("decision requires --ref <committed-node>"))?;
+    let reference = reference.ok_or_else(|| {
+        refused("decision requires --ref <committed-node>").with_hint(if replying {
+            "a decision relays a person's approval of a committed node; to answer the \
+             question without one, send --kind resolution --reply-to <id> instead, which \
+             wakes the asker too"
+        } else {
+            "commit a node holding the decision and pass --ref <node>; an answer that \
+             needs no node is --kind resolution --reply-to <question id>"
+        })
+    })?;
     let home = std::env::var_os("HOME")
         .filter(|h| !h.is_empty())
         .map(PathBuf::from)
@@ -50,8 +93,8 @@ pub(super) fn grant(
     )
     .map_err(refused)?;
     let delegate = grants.delegates.get(sender).ok_or_else(|| {
-        refused("decision sender has no user or machine-local delegation; project delegation is refused")
-            .with_hint(grants.warnings.join("; "))
+        refused("decision sender has no delegation in the user settings file; project and machine-local delegations are ignored")
+            .with_hint(delegation_hint(sender, home.as_deref(), xdg.as_deref(), &grants.warnings))
     })?;
     let config = config::load(&repo.root)?;
     let index = index::build(&repo.root, &config)?;
@@ -77,7 +120,12 @@ pub(super) fn grant(
             "decision node must have a safe repository-relative committed path",
         ));
     }
-    let commit = git::commit_of(&repo.top, "HEAD")
+    // The node's commit: the graph tip the cache holds in ref mode, else
+    // the checkout's HEAD.
+    let commit = repo
+        .graph_git()
+        .head()
+        .map(|h| h.commit)
         .map_err(|_| refused("decision node must be committed"))?;
     let graph_path = format!("{}.mdkg/config.json", repo.prefix);
     let graph_bytes =
@@ -103,7 +151,7 @@ pub(super) fn grant(
     }
     // Refuse uncommitted content rather than approve an older version without
     // the sender realizing it. Authority is bound to immutable bytes below.
-    let actual = git::read_capped(&repo.top.join(&path), 1 << 20)
+    let actual = git::read_capped(&repo.disk_base(&path).join(&path), 1 << 20)
         .map_err(|_| refused("cannot read decision node"))?;
     if actual != bytes {
         return Err(refused("decision node has uncommitted changes"));

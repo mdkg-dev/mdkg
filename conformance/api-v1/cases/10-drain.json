@@ -1,0 +1,9 @@
+{
+  "name": "10-drain",
+  "scenario": "drain",
+  "transports": [
+    "cli"
+  ],
+  "checks": "With a fake harness held mid-turn, agents stop --drain lets the turn finish: --wait shorter than the turn returns draining with msg.wait_timeout (exit 6) and kills nothing; the turn ends replied, not interrupted; no run:<agent> lease stays held; an idle agent stops within one poll interval.",
+  "cli_driver": "crates/mdkg-cli/tests/agents.rs: conformance_10_a_drain_lets_the_turn_finish_records_no_interruption_and_holds_nothing, agents_stop_reaches_an_idle_agent_within_a_poll_and_clears_a_dead_supervisors_request"
+}

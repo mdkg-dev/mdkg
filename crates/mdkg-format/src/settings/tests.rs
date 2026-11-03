@@ -870,7 +870,24 @@ fn git_overrides_warn_without_selecting_another_store_or_reading_it() {
 
 #[test]
 fn versioned_defaults_are_valid_and_layers_can_be_absent() {
-    assert_eq!(DEFAULTS_VERSION, env!("CARGO_PKG_VERSION"));
+    // Defaults use a content version: unchanged snapshots survive a patch release.
+    let release_parts = |version: &str| {
+        let core = version.split(['-', '+']).next().expect("version core");
+        let parts: Vec<u64> = core
+            .split('.')
+            .map(|part| part.parse().expect("numeric release component"))
+            .collect();
+        assert_eq!(parts.len(), 3, "three release components: {version}");
+        parts
+    };
+    assert!(release_parts(DEFAULTS_VERSION) <= release_parts(env!("CARGO_PKG_VERSION")));
+    let snapshot = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src/settings")
+        .join(format!("defaults-{DEFAULTS_VERSION}.json"));
+    assert_eq!(
+        std::fs::read_to_string(snapshot).expect("versioned defaults snapshot"),
+        DEFAULTS_JSON
+    );
     let defaults = defaults().expect("shipped defaults");
     assert_eq!(defaults.origin, Origin::value(Layer::BuiltIn));
     let out = empty_layers()

@@ -607,7 +607,8 @@ fn managed(target: &Path) -> Option<Vec<String>> {
 }
 
 /// Whether each mirror matches `.mdkg/skills/`: read-only, warnings only
-/// (a mirror is a copy, so `skills sync` fixes all of these).
+/// (a mirror is a copy, so `skills sync` fixes all of these, and `install`
+/// in ref mode, where the mirrors are in the checkout).
 pub fn mirror_check(root: &Path, config: &Config, only: Option<&str>) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
     let sources: Vec<Folder> = match folders(root) {
@@ -617,22 +618,73 @@ pub fn mirror_check(root: &Path, config: &Config, only: Option<&str>) -> Vec<Dia
             .collect(),
         Err(_) => return diags,
     };
-    let fix = format!("run `{BIN} skills sync`");
+    // In ref mode `root` is the graph cache, which holds the sources; the
+    // mirrors are in the checkout, and install refreshes them.
+    let mode = crate::coord::graph_git::for_root(root);
+    let base = mode.as_ref().map_or(root, |m| m.checkout.as_path());
+    // What install does with a mirror depends on the setup: personal and
+    // local overwrite it, professional leaves tracked and linked mirrors
+    // alone. The ref-mode hint says both rather than promise either.
+    let (fix, drift_fix) = if mode.is_some() {
+        let fix = format!(
+            "run `{BIN} install` to copy the graph ref's skills over the mirrors; it replaces \
+             edits made in a mirror, so commit or set those aside first, and in professional \
+             setup it leaves tracked and linked mirrors alone, so copy those yourself"
+        );
+        (fix.clone(), fix)
+    } else {
+        (
+            format!("run `{BIN} skills sync`"),
+            format!("edit the .mdkg/skills copy, then run `{BIN} skills sync`"),
+        )
+    };
+    let real_roots: Vec<PathBuf> = config
+        .skill_mirror_targets
+        .iter()
+        .map(|t| base.join(t))
+        .filter(|d| has_dir(d))
+        .filter_map(|d| std::fs::canonicalize(d).ok())
+        .collect();
     for target in &config.skill_mirror_targets {
-        let dir = root.join(target);
+        let dir = base.join(target);
         if !has_dir(&dir) {
-            if !sources.is_empty() {
+            // A mirror folder may be a link to another mirror folder
+            // (`.claude/skills -> ../.agents/skills`), the one link install
+            // keeps; a link anywhere else isn't a mirror install manages.
+            let linked = std::fs::symlink_metadata(&dir).is_ok_and(|m| m.file_type().is_symlink());
+            let to_mirror =
+                linked && std::fs::canonicalize(&dir).is_ok_and(|t| real_roots.contains(&t));
+            if linked && !to_mirror {
                 diags.push(
-                    Diagnostic::warning(Code::SkillMirrorMissing, "skill mirror folder is missing")
+                    Diagnostic::warning(
+                        Code::SkillMirrorMissing,
+                        "skill mirror folder is a link to a folder that isn't another mirror",
+                    )
+                    .at(target.clone(), None)
+                    .with_hint(format!(
+                        "replace the link with a folder or a link to another mirror folder, \
+                         then {fix}"
+                    )),
+                );
+                continue;
+            }
+            if !to_mirror {
+                if !sources.is_empty() {
+                    diags.push(
+                        Diagnostic::warning(
+                            Code::SkillMirrorMissing,
+                            "skill mirror folder is missing",
+                        )
                         .at(target.clone(), None)
                         .with_hint(fix.clone()),
-                );
+                    );
+                }
+                continue;
             }
-            continue;
         }
         for s in &sources {
             let mirror = dir.join(&s.slug);
-            let shown = rel(root, &mirror);
+            let shown = rel(base, &mirror);
             let (Some(want), have) = (files_under(&s.dir), files_under(&mirror)) else {
                 continue;
             };
@@ -655,9 +707,7 @@ pub fn mirror_check(root: &Path, config: &Config, only: Option<&str>) -> Vec<Dia
                         "the mirrored skill differs from its source in .mdkg/skills",
                     )
                     .at(shown, None)
-                    .with_hint(format!(
-                        "edit the .mdkg/skills copy, then run `{BIN} skills sync`"
-                    )),
+                    .with_hint(drift_fix.clone()),
                 );
             }
         }
@@ -668,7 +718,7 @@ pub fn mirror_check(root: &Path, config: &Config, only: Option<&str>) -> Vec<Dia
                         Code::SkillMirrorManifestMissing,
                         "skill mirror manifest is missing",
                     )
-                    .at(rel(root, &dir.join(MANAGED_FILE)), None)
+                    .at(rel(base, &dir.join(MANAGED_FILE)), None)
                     .with_hint(fix.clone()),
                 ),
                 Some(slugs) => {
@@ -682,7 +732,7 @@ pub fn mirror_check(root: &Path, config: &Config, only: Option<&str>) -> Vec<Dia
                                     Code::SkillMirrorStale,
                                     "a mirrored skill whose source is gone",
                                 )
-                                .at(rel(root, &dir.join(&slug)), None)
+                                .at(rel(base, &dir.join(&slug)), None)
                                 .with_hint(fix.clone()),
                             );
                         }
@@ -694,8 +744,30 @@ pub fn mirror_check(root: &Path, config: &Config, only: Option<&str>) -> Vec<Dia
     diags
 }
 
+/// In ref mode the skills are on the graph ref and the checkout has no
+/// `.mdkg/skills/`: sync would remove every mirror install wrote, and add
+/// would write only the graph cache. Both refuse before touching a file;
+/// install refreshes the mirrors (publishing an added skill is 0.7.2's).
+fn refuse_in_ref_mode(root: &Path, command: &str) -> Result<(), GraphError> {
+    let Some(mode) = crate::coord::graph_git::for_root(root) else {
+        return Ok(());
+    };
+    Err(GraphError::usage(
+        Code::SkillRefMode,
+        format!(
+            "`{BIN} {command}` works on a checkout-mode graph, and this repository's graph is on {}",
+            mode.graph.name
+        ),
+    )
+    .with_hint(format!(
+        "in ref mode, `{BIN} install` refreshes the skill mirrors; skills add needs a \
+         checkout-mode graph (0.7.2 publishes it to the graph ref)"
+    )))
+}
+
 pub fn sync(root: &Path, dry_run: bool, json: bool) -> u8 {
-    let report = sync_report(root, dry_run)
+    let report = refuse_in_ref_mode(root, "skills sync")
+        .and_then(|()| sync_report(root, dry_run))
         .map(Report::ok)
         .unwrap_or_else(Report::failed);
     output::emit("skills.sync", json, report, |d| {
@@ -821,6 +893,7 @@ pub struct SkillAddData {
 /// differs is the project's own, so it's refused, never replaced.
 pub fn add(root: &Path, slug: &str, json: bool) -> u8 {
     let report = (|| -> Result<Report<SkillAddData>, GraphError> {
+        refuse_in_ref_mode(root, "skills add")?;
         load_config(root)?;
         let Some(text) = bundled(slug) else {
             return Err(GraphError::not_found(

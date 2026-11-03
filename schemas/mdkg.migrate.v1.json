@@ -58,6 +58,32 @@
         "graph_id": {
           "type": "string"
         },
+        "work_history": {
+          "description": "Where the work history goes: `git` (it stays) or `store` (it\nbecomes log records and leaves git). The plan's hash covers it.",
+          "type": "string"
+        },
+        "work_history_reason": {
+          "description": "Why the work history goes there.",
+          "type": "string"
+        },
+        "workspaces": {
+          "description": "The workspaces the migration converts, each in place; the hash\ncovers them.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PlanWorkspace"
+          }
+        },
+        "against": {
+          "description": "What the plan took from the migrated main it was made against.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Against"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "counts": {
           "$ref": "#/$defs/Counts"
         },
@@ -104,6 +130,17 @@
               "type": "null"
             }
           ]
+        },
+        "restore": {
+          "description": "With --restore-history: what comes back into git, and from where.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Restored"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -111,10 +148,118 @@
         "stage",
         "base",
         "graph_id",
+        "work_history",
+        "work_history_reason",
+        "workspaces",
         "counts",
         "files",
         "patch",
         "warnings"
+      ]
+    },
+    "PlanWorkspace": {
+      "description": "A workspace the migration converts: its config entry stays as it is.",
+      "type": "object",
+      "properties": {
+        "alias": {
+          "type": "string"
+        },
+        "folder": {
+          "description": "Its folder, relative to the repository's top (`aux/.mdkg/`).",
+          "type": "string"
+        },
+        "nodes": {
+          "description": "How many of its nodes the plan converts.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "alias",
+        "folder",
+        "nodes"
+      ]
+    },
+    "Against": {
+      "description": "What a plan made against a migrated main took from it (part of the\nplan, so of its hash).",
+      "type": "object",
+      "properties": {
+        "ref": {
+          "description": "The ref the plan was made against (`refs/heads/main`).",
+          "type": "string"
+        },
+        "tip": {
+          "description": "Its commit, and the commit that migrated it.",
+          "type": "string"
+        },
+        "migration": {
+          "type": "string"
+        },
+        "fork": {
+          "description": "Where this branch forked from it.",
+          "type": "string"
+        },
+        "adopted": {
+          "description": "Graph files the branch hasn't changed since the fork, taken as\nmain has them.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "added": {
+          "description": "Nodes main made after the fork, added as main has them.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "shared": {
+          "description": "Nodes the branch changed that main has too (the same legacy id at\nthe fork), given main's ids.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "work_history": {
+          "description": "Where this branch's work history goes: where main's migration put\nit (a `--work-history` that says otherwise is refused).",
+          "$ref": "#/$defs/History"
+        },
+        "explicit": {
+          "description": "Whether `--against` named the ref.",
+          "type": "boolean"
+        },
+        "replayed": {
+          "description": "Records main's migration made that this plan imports again, for a\nstore that doesn't have them (0 when it does, or when main kept its\nhistory in git).",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 0
+        }
+      },
+      "required": [
+        "ref",
+        "tip",
+        "migration",
+        "fork",
+        "adopted",
+        "added",
+        "shared",
+        "work_history",
+        "explicit",
+        "replayed"
+      ]
+    },
+    "History": {
+      "description": "Where a graph's work history goes: checkpoints, finished tests, event\nlogs, and progress and review-ledger sections.",
+      "oneOf": [
+        {
+          "description": "It stays in git, for a graph that commits its work (`work.location`\n\"git\", which a 0.6 config with neither storage key is): checkpoints\nand finished tests stay nodes with new ids, and sections and event\nlogs stay as they are. No log records are written.",
+          "type": "string",
+          "const": "git"
+        },
+        {
+          "description": "It moves to the coordinator store's log, as 0.7.0 migrated, and\nleaves git. The default when a stored plan names neither, since\n0.7.0's plans didn't: a plan 0.7.0 stored in a migration's journal\nkeeps its hash when this build resumes it. A 0.7.0 dry run's hash\nthat no apply started doesn't apply here (the config change differs:\n`work.location` is said now); plan again.",
+          "type": "string",
+          "const": "store"
+        }
       ]
     },
     "Counts": {
@@ -123,6 +268,12 @@
       "properties": {
         "nodes": {
           "description": "Nodes that stay, with new ids.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "kept_in_git": {
+          "description": "Of those, checkpoints and finished tests kept in git as nodes.",
           "type": "integer",
           "format": "uint",
           "minimum": 0
@@ -180,6 +331,7 @@
       },
       "required": [
         "nodes",
+        "kept_in_git",
         "tier_c",
         "checkpoints",
         "check_results",
@@ -203,7 +355,7 @@
           "$ref": "#/$defs/Action"
         },
         "before": {
-          "description": "sha256 of the file before and after.",
+          "description": "sha256 of the file before (empty for a file the change makes) and\nafter.",
           "type": "string"
         },
         "after": {
@@ -274,6 +426,40 @@
         "graph_copy"
       ]
     },
+    "Restored": {
+      "description": "What a restore brings back, by kind.",
+      "type": "object",
+      "properties": {
+        "migrations": {
+          "description": "The migration commits the files come from, newest first.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "checkpoints": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "check_results": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "event_logs": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "migrations",
+        "checkpoints",
+        "check_results",
+        "event_logs"
+      ]
+    },
     "DiagnosticOut": {
       "type": "object",
       "properties": {
@@ -340,6 +526,10 @@
       "type": "string",
       "enum": [
         "usage.invalid_arguments",
+        "api.bad_cursor",
+        "api.cursor_reset",
+        "api.cursor_foreign",
+        "api.cursor_expired",
         "usage.empty_query",
         "usage.bad_limit",
         "usage.unsupported_type",
@@ -482,11 +672,29 @@
         "msg.unknown_context",
         "msg.not_holder",
         "msg.not_shown",
+        "msg.not_sender",
         "msg.wait_timeout",
+        "channel.unknown",
+        "channel.exists",
+        "channel.not_member",
+        "channel.human_member",
         "room.unknown",
         "room.exists",
         "room.not_member",
         "room.human_member",
+        "entry.bad_op",
+        "entry.bad_text",
+        "entry.not_found",
+        "entry.no_node",
+        "entry.bad_transition",
+        "entry.not_allowed",
+        "entry.fix_after_range",
+        "entry.not_covered",
+        "entry.range_mismatch",
+        "entry.unknown_commit",
+        "entry.git",
+        "entry.gate_failed",
+        "ledger.out_of_scope",
         "mcp.call_timeout",
         "mcp.cli_failed",
         "run.unknown_agent",
@@ -494,6 +702,8 @@
         "run.sandbox_mismatch",
         "run.no_reply",
         "run.mail_failed",
+        "run.progress_invalid",
+        "run.turn_interrupted",
         "run.io_failed",
         "run.unsupported",
         "run.branch_refused",
@@ -509,10 +719,12 @@
         "skill.mirror_drift",
         "skill.mirror_stale",
         "skill.mirror_targets_unsupported",
+        "skill.ref_mode",
         "skill.exists",
         "init.needs_migrate",
         "init.conflict",
         "init.unexplained",
+        "init.graph_fetched",
         "usage.deprecated",
         "migrate.plan_mismatch",
         "migrate.dirty",
@@ -522,7 +734,132 @@
         "migrate.store_changed",
         "migrate.unsupported",
         "migrate.already_migrated",
-        "migrate.step_failed"
+        "migrate.step_failed",
+        "api.output_gone",
+        "api.unknown_resource",
+        "api.unsupported",
+        "api.unauthenticated",
+        "api.refused_by_check",
+        "api.serve_running",
+        "api.key_required",
+        "api.key_expired",
+        "api.too_large",
+        "api.rate_limited",
+        "api.origin_refused",
+        "api.draining",
+        "api.check_failed",
+        "api.machine_revoked",
+        "api.machine_pending",
+        "api.enroll_pending",
+        "api.enroll_exists",
+        "api.enroll_changed",
+        "api.clock_skew",
+        "api.replayed",
+        "api.graph_unknown",
+        "api.actor_not_allowed",
+        "api.unreachable",
+        "api.remote_bound",
+        "api.remote_conflict",
+        "api.remote_attaching",
+        "api.coordinator_mismatch",
+        "api.shown_mismatch",
+        "run.not_placed",
+        "run.machine_lost",
+        "run.machine_revoked",
+        "run.turn_ended",
+        "run.recovery_failed",
+        "run.push_refused",
+        "run.bad_agent_name",
+        "coord.commit_unknown",
+        "coord.branch_not_pushable",
+        "api.key_skewed",
+        "api.person_unknown",
+        "api.person_signature_required",
+        "run.nothing_to_do",
+        "api.attestation_failed",
+        "api.machine_grade_required",
+        "ledger.block_invalid",
+        "graph.ref_missing",
+        "graph.ref_invalid",
+        "graph.ref_exists",
+        "graph.config_invalid",
+        "graph.identity_mismatch",
+        "graph.checkout_missing",
+        "graph.identity_unrecorded",
+        "graph.identity_unset",
+        "graph.authority_invalid",
+        "graph.lock_required",
+        "graph.write_invalid",
+        "graph.write_stale",
+        "graph.write_contended",
+        "graph.request_reused",
+        "graph.git",
+        "graph.io",
+        "graph.checkout_read",
+        "graph.cache_edit",
+        "graph.session_discarded",
+        "graph.unleased_edit",
+        "graph.intent_stale",
+        "graph.intents",
+        "graph.settled_elsewhere",
+        "graph.import_stale",
+        "graph.import_unfinished_op",
+        "graph.hand_edits",
+        "graph.migrating",
+        "graph.overlapping_workspace",
+        "graph.shape",
+        "graph.remote_invalid",
+        "graph.remote_changed",
+        "graph.open_changesets",
+        "graph.uncommitted",
+        "graph.diverged",
+        "graph.remote_is_code",
+        "graph.remote_rewritten",
+        "graph.remote_unreachable",
+        "graph.remote_auth",
+        "graph.push_refused",
+        "graph.push_large",
+        "graph.secret",
+        "graph.secret_scan_unavailable",
+        "graph.sync_conflict",
+        "graph.sync_contended",
+        "graph.sync_in_turn",
+        "graph.sync_invalid",
+        "graph.publish_disabled",
+        "graph.design_current",
+        "graph.design_drift",
+        "graph.view",
+        "run.authority_override",
+        "coord.abandon_published",
+        "graph.edit_path_unsafe",
+        "graph.edit_copy_kept",
+        "graph.edit_unexcluded",
+        "graph.nothing_to_sync",
+        "graph.no_code_base",
+        "graph.unsupported",
+        "graph.write_noop",
+        "msg.reserved_id",
+        "store.integrity",
+        "run.not_logged_in",
+        "run.supervisor_exited",
+        "run.mail_set_aside",
+        "run.loop_paused",
+        "run.wrapper_refused",
+        "run.no_base",
+        "entry.verdict_unbacked",
+        "entry.fix_absent",
+        "msg.review_unranged",
+        "msg.review_multi_node",
+        "entry.round_unanchored",
+        "entry.ledger_unwritten",
+        "req.missing",
+        "req.bad_line",
+        "req.duplicate_id",
+        "req.not_ears",
+        "req.vague",
+        "req.not_question",
+        "req.bad_relation",
+        "req.relation_on_design"
       ]
     },
     "SeverityName": {

@@ -47,7 +47,7 @@ impl ErrorKind {
                  doesn't validate"
             }
             ErrorKind::NotFound => {
-                "Something named doesn't exist (a node, workspace, file, lease, changeset, room, \
+                "Something named doesn't exist (a node, workspace, file, lease, changeset, channel, \
                  message or agent), or there's none to act on, such as no active goal"
             }
             ErrorKind::Failure => {

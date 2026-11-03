@@ -132,7 +132,7 @@ fn an_upgrade_copies_the_store_and_a_restore_puts_it_back() {
     set_schema(&db, "1");
 
     // The command that upgrades the store says so, and where the copy is.
-    let (code, out) = run(&repo, &["status"]);
+    let (code, out) = run(&repo, &["renew"]);
     assert_eq!(code, 0, "{out}");
     let notice = out["diagnostics"]
         .as_array()
@@ -140,11 +140,11 @@ fn an_upgrade_copies_the_store_and_a_restore_puts_it_back() {
         .flatten()
         .find(|d| d["code"] == "coord.store_upgraded")
         .unwrap_or_else(|| panic!("no upgrade notice: {out}"));
-    let copy = db.with_file_name("coord.sqlite.pre-1+msg5-to-3+msg5.sqlite");
+    let copy = db.with_file_name("coord.sqlite.pre-1+msg5-to-4+msg5.sqlite");
     assert!(
         notice["message"]
             .as_str()
-            .is_some_and(|m| m.contains("coord.sqlite.pre-1+msg5-to-3+msg5.sqlite")),
+            .is_some_and(|m| m.contains("coord.sqlite.pre-1+msg5-to-4+msg5.sqlite")),
         "{out}"
     );
     assert!(copy.exists());
@@ -177,7 +177,7 @@ fn an_upgrade_copies_the_store_and_a_restore_puts_it_back() {
             &[
                 "store",
                 "restore",
-                "coord.sqlite.pre-1+msg5-to-3+msg5.sqlite",
+                "coord.sqlite.pre-1+msg5-to-4+msg5.sqlite",
             ],
         );
         assert_eq!(
@@ -198,11 +198,11 @@ fn an_upgrade_copies_the_store_and_a_restore_puts_it_back() {
         &[
             "store",
             "restore",
-            "coord.sqlite.pre-1+msg5-to-3+msg5.sqlite",
+            "coord.sqlite.pre-1+msg5-to-4+msg5.sqlite",
         ],
     );
     assert_eq!(code, 0, "{out}");
-    assert_eq!(out["data"]["replaced"], "3+msg5", "{out}");
+    assert_eq!(out["data"]["replaced"], "4+msg5", "{out}");
     assert_eq!(out["data"]["restored"], "1+msg5", "{out}");
     assert!(
         codes(&out).contains(&"coord.store_restored".to_string()),
@@ -211,14 +211,16 @@ fn an_upgrade_copies_the_store_and_a_restore_puts_it_back() {
     let previous = PathBuf::from(out["data"]["previous"].as_str().expect("previous"));
     assert!(previous.exists(), "{out}");
     // The restored store is the copy: task-1 held, task-2 not; it
-    // upgrades again on use, copying first.
-    let (code, out) = run(&repo, &["status", "--all"]);
+    // upgrades again on a writer, copying first.
+    let (code, out) = run(&repo, &["renew"]);
     assert_eq!(code, 0, "{out}");
-    assert_eq!(scopes(&out), vec![".mdkg/work/task-1-basic.md"], "{out}");
     assert!(
         codes(&out).contains(&"coord.store_upgraded".to_string()),
         "{out}"
     );
+    let (code, out) = run(&repo, &["status", "--all"]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(scopes(&out), vec![".mdkg/work/task-1-basic.md"], "{out}");
 
     // Copies it can't trust: a newer build's, another repository's, and a
     // store that isn't a copy.
@@ -234,7 +236,7 @@ fn an_upgrade_copies_the_store_and_a_restore_puts_it_back() {
         "{out}"
     );
     let other = self::repo(&dir, "other");
-    let (code, out) = run(&other, &["status"]);
+    let (code, out) = run(&other, &["renew"]);
     assert_eq!(code, 0, "{out}");
     let (code, out) = run(&other, &["store", "restore", copy.to_str().expect("utf-8")]);
     assert_eq!(code, 5, "{out}");
@@ -270,7 +272,7 @@ fn only_an_installed_build_upgrades_a_store_unasked() {
     // Commands that act on the coordinator fail; reads warn and go on
     // without it.
     for (args, fails) in [
-        (&["status"][..], true),
+        (&["renew"][..], true),
         (&["claim", "task-2"], true),
         (&["show", "task-1"], false),
     ] {
@@ -311,6 +313,23 @@ fn only_an_installed_build_upgrades_a_store_unasked() {
     let installed = bin.join("mdkg");
     fs::copy(built, &installed).expect("install");
     let (code, out) = run_as(&installed, &repo, &["status"]);
+    assert_eq!(
+        code, 4,
+        "status never upgrades even for an installed binary: {out}"
+    );
+    assert!(
+        out["diagnostics"][0]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("needs an upgrade")),
+        "{out}"
+    );
+    assert!(
+        out["diagnostics"][0]["hint"]
+            .as_str()
+            .is_some_and(|m| m.contains("renew")),
+        "{out}"
+    );
+    let (code, out) = run_as(&installed, &repo, &["renew"]);
     assert_eq!(code, 0, "{out}");
     assert!(
         codes(&out).contains(&"coord.store_upgraded".to_string()),

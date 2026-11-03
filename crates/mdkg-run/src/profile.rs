@@ -20,45 +20,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum Harness {
-    Claude,
-    Codex,
-    #[serde(rename = "opencode")]
-    OpenCode,
-}
-
-impl Harness {
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "claude" => Some(Harness::Claude),
-            "codex" => Some(Harness::Codex),
-            "opencode" => Some(Harness::OpenCode),
-            _ => None,
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Harness::Claude => "claude",
-            Harness::Codex => "codex",
-            Harness::OpenCode => "opencode",
-        }
-    }
-
-    /// The program, from `$MDKG_RUN_<HARNESS>` or PATH.
-    pub fn program(self) -> PathBuf {
-        let var = match self {
-            Harness::Claude => "MDKG_RUN_CLAUDE",
-            Harness::Codex => "MDKG_RUN_CODEX",
-            Harness::OpenCode => "MDKG_RUN_OPENCODE",
-        };
-        std::env::var_os(var)
-            .filter(|v| !v.is_empty())
-            .map_or_else(|| PathBuf::from(self.as_str()), PathBuf::from)
-    }
-}
+pub use crate::harness::Harness;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -158,7 +120,7 @@ impl AgentCommand {
     /// unchanged. This starts only a native configuration probe, no model.
     pub fn preflight(&self) -> Result<(), crate::error::RunError> {
         if self.opencode_worker {
-            opencode_preflight(self, std::time::Duration::from_secs(30))?;
+            Harness::OpenCode.adapter().preflight(self)?;
         }
         Ok(())
     }
@@ -199,8 +161,9 @@ pub struct TurnInput<'a> {
     /// The launcher's graph root: every agent's MCP server opens the
     /// repository there (`--root`), never through the agent's checkout.
     pub graph_root: Option<&'a Path>,
-    /// The repository's main branch (`mdkg.mainRef`).
-    pub main_ref: &'a str,
+    /// The repository's main branch (`mdkg.mainRef`); `None` in ref mode
+    /// with no code base.
+    pub main_ref: Option<&'a str>,
     pub harness: Harness,
     pub role: Role,
     pub cwd: &'a Path,
@@ -226,7 +189,7 @@ pub struct TurnInput<'a> {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct CodexSettings<'a> {
+pub struct CodexSettings<'a> {
     pub sandbox: &'a str,
     pub approvals: &'a str,
 }
@@ -253,6 +216,7 @@ pub const MCP_SERVER: &str = "mdkg";
 
 /// Read-only MCP tools any role may use.
 const MCP_READ: &[&str] = &[
+    "channel_read",
     "room_read",
     "inbox",
     "show",
@@ -265,6 +229,7 @@ const MCP_READ: &[&str] = &[
 /// MCP tools that write to the coordinator, or block (`inbox_wait`), for
 /// workers only.
 const MCP_WRITE: &[&str] = &[
+    "channel_post",
     "room_post",
     "inbox_wait",
     "ack",
@@ -308,8 +273,65 @@ const REVIEWER_OUTPUT_DENY: &[&str] = &[
 const MDKG_READ: &[&str] = &["validate"];
 
 /// mdkg commands no role may run, under each of mdkg's names: dropping
-/// another agent's work, and the key helper (crate::auth).
-const MDKG_DENY: &[&str] = &["abandon", "auth"];
+/// another agent's work, the key helper (crate::auth), and billing a turn
+/// on the person's API key (`agents use-key`, a person's choice; its CLI
+/// refuses inside a turn too).
+const MDKG_DENY: &[&str] = &["abandon", "auth", "agents use-key"];
+
+/// Harness subcommands that print a stored credential, or reach what
+/// does, denied to Claude and OpenCode workers alike (a worker's shell can
+/// run any harness's CLI). OpenCode 2.1 and 2.2: `auth export` prints
+/// every stored key as JSON, warning only on a TTY; `service get` prints
+/// the background server's password; `pair` prints session-token links;
+/// `api` and `serve` reach the server's credential API, which returns
+/// values; `debug` prints resolved config. Claude Code: `setup-token`
+/// mints and prints a long-lived token. Codex 0.165 has no such command:
+/// `login status` only reports the login. Spike of 2026-11-01. Like
+/// [`MDKG_DENY`], a guardrail, not isolation: the stores are files and a
+/// Keychain item the user's shell can read.
+const CREDENTIAL_CLI_DENY: &[&str] = &[
+    "opencode auth",
+    "opencode service get",
+    "opencode api",
+    "opencode debug",
+    "opencode pair",
+    "opencode serve",
+    "claude setup-token",
+];
+
+/// [`CREDENTIAL_CLI_DENY`] as `opencode*auth*`, bare or by an absolute,
+/// `./` or `../` path (quoted too). Prefixes start at the executable,
+/// never at an arbitrary argument mentioning its filename. Any
+/// text after the binary's name and between and after its words, so the
+/// desktop app's `opencode-cli`, extra spaces or tabs, quotes and global
+/// options (`opencode --log-level debug auth export`) match too. So does
+/// an invocation of that CLI with the word anywhere after it (`opencode run
+/// "fix the api"`), a refusal a worker can live with.
+fn credential_cli_commands() -> Vec<String> {
+    let mut commands = Vec::new();
+    for command in CREDENTIAL_CLI_DENY {
+        let mut words = command.split(' ');
+        let bin = words.next().expect("a command");
+        let rest: String = words.map(|word| format!("*{word}")).collect();
+        for prefix in [
+            "", "/", "/*/", "./", "./*/", "../", "../*/", "~/", "~/*/", "$HOME/", "$HOME/*/",
+        ] {
+            for quote in ["", "'", "\""] {
+                commands.push(format!("{quote}{prefix}{bin}{rest}*"));
+            }
+        }
+        // Cheap shell prefixes only. These literal patterns are a
+        // guardrail, not executable parsing or credential isolation.
+        for wrapper in ["env ", "command ", "exec ", "nohup ", "timeout ", "*=* "] {
+            commands.push(format!("{wrapper}*{bin}{rest}*"));
+        }
+    }
+    commands
+}
+
+/// mdkg MCP tools no role may call: `agents use-key`'s twin. Codex enables
+/// only [`mcp_tools`], so this binds Claude and OpenCode.
+const MCP_DENY: &[&str] = &["agents_use_key"];
 
 /// The names an agent may call mdkg by: `mdkg`, and the name this turn's
 /// binary is installed under when it's another (`mdkg-next`, beside
@@ -413,8 +435,9 @@ fn names_mdkg(command: &str, mdkg: &Path) -> bool {
 /// naming an mdkg binary must name, next, a fixed subcommand mdkg allows
 /// (`mdkg validate *`): an open one (`mdkg *`, `mdkg:*`, `mdkg --root .
 /// *`) would admit `abandon` and `auth` past any deny written after the
-/// binary. A guardrail against running those directly, not isolation
-/// (see crate::auth).
+/// binary. The same holds one word down for `agents use-key`: `mdkg agents
+/// *` is open, `mdkg agents status *` isn't. A guardrail against running
+/// those directly, not isolation (see crate::auth).
 pub fn passable_allow(rule: &str, mdkg: &Path) -> bool {
     refusal(rule, mdkg).is_none()
 }
@@ -444,7 +467,8 @@ pub fn dropped_allow_fix(rule: &str, mdkg: &Path) -> Option<String> {
              `Bash('/opt/my tools/npm' test *)`"
             .to_string(),
         Refusal::OpenMdkg(bin) => format!(
-            "it would let mdkg run with any arguments, `abandon` and `auth` included; \
+            "it would let mdkg run with any arguments, `abandon`, `auth` and \
+             `agents use-key` included; \
              allow each subcommand the worker needs, as in `Bash({bin} validate *)`, or \
              let the worker use the mdkg MCP server it already has"
         ),
@@ -470,9 +494,11 @@ enum Refusal {
     /// Shell syntax the reader doesn't define in the command word.
     ShellSyntax,
     /// An mdkg binary, spelled as the rule spells it, with no fixed
-    /// subcommand next (`mdkg *`, `mdkg:*`, `mdkg --root . *`).
+    /// subcommand next (`mdkg *`, `mdkg:*`, `mdkg --root . *`), or none
+    /// after the first word of a denied one (`mdkg agents *`).
     OpenMdkg(String),
-    /// An mdkg subcommand no agent may run (`abandon`, `auth`).
+    /// An mdkg subcommand no agent may run (`abandon`, `auth`, `agents
+    /// use-key`).
     Denied(String),
 }
 
@@ -523,19 +549,33 @@ fn refusal(rule: &str, mdkg: &Path) -> Option<Refusal> {
     if !names_mdkg(&words[0], mdkg) {
         return None;
     }
-    let Some(sub) = words.get(1) else {
-        return Some(Refusal::OpenMdkg(spelling));
+    let fixed = |w: &String| {
+        w.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+            && w.starts_with(|c: char| c.is_ascii_lowercase())
     };
-    let fixed = sub
-        .chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-        && sub.starts_with(|c: char| c.is_ascii_lowercase());
-    if !fixed {
+    let subs = &words[1..];
+    if !subs.first().is_some_and(fixed) {
         return Some(Refusal::OpenMdkg(spelling));
     }
-    MDKG_DENY
-        .contains(&sub.as_str())
-        .then(|| Refusal::Denied(sub.clone()))
+    // Each word of a denied command must be fixed for the rule to be read
+    // as another command: `mdkg agents *`, `mdkg agents:*` and `mdkg agents
+    // --json *` could all run `agents use-key`.
+    for denied in MDKG_DENY {
+        let mut differs = false;
+        for (at, word) in denied.split(' ').enumerate() {
+            match subs.get(at) {
+                Some(w) if fixed(w) && w == word => continue,
+                Some(w) if fixed(w) => differs = true,
+                _ => return Some(Refusal::OpenMdkg(spelling)),
+            }
+            break;
+        }
+        if !differs {
+            return Some(Refusal::Denied(denied.to_string()));
+        }
+    }
+    None
 }
 
 /// The rules [`passable_allow`] refuses: never passed to the harness, and
@@ -642,6 +682,13 @@ pub fn claude_rules(
             .map(String::as_str)
             .collect::<Vec<_>>(),
     );
+    deny.extend(bash_rules(
+        &credential_cli_commands()
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+    ));
+    deny.extend(mcp_rules(MCP_DENY));
     if role == Role::Worker {
         // Native worker tools and command permissions remain intact. Only
         // explicitly configured user grants are added, never a default list.
@@ -710,11 +757,7 @@ fn command_with_resolved_mcp(
         mdkg: pin.map_or(t.mdkg, |program| program.as_path()),
         ..t.clone()
     };
-    let mut command = match t.harness {
-        Harness::Claude => claude(&t),
-        Harness::Codex => codex(&t, mdkg.as_deref()),
-        Harness::OpenCode => opencode(&t),
-    };
+    let mut command = t.harness.adapter().launch(&t, mdkg.as_deref());
     // An unresolved bare command must not become a different executable
     // merely because the launcher folder was prepended.
     if mdkg.is_none() {
@@ -762,13 +805,15 @@ fn resolve_mcp(program: &Path, cwd: &Path, inherited: Option<&std::ffi::OsStr>) 
 /// they'd make every mdkg its tests build refuse their own temporary
 /// repositories (review of 6dd1cfd). The MCP server gets its pins from
 /// [`mcp_env`].
-fn agent_env(t: &TurnInput<'_>) -> Vec<(String, String)> {
+pub(crate) fn agent_env(t: &TurnInput<'_>) -> Vec<(String, String)> {
     // git status mustn't refresh an index a reviewer shouldn't write.
-    vec![
+    let mut env = vec![
         ("MDKG_ACTOR".into(), t.agent.to_string()),
         ("GIT_OPTIONAL_LOCKS".into(), "0".into()),
         (TURN_MARK.into(), t.new_session.to_string()),
-    ]
+    ];
+    env.extend(graph_ref(t).map(|g| (GRAPH_REF.to_string(), g)));
+    env
 }
 
 fn launcher_path(folder: &Path, inherited: Option<&std::ffi::OsStr>) -> Option<String> {
@@ -838,7 +883,12 @@ fn mcp_env(t: &TurnInput<'_>) -> serde_json::Map<String, serde_json::Value> {
     if let Some(x) = config {
         env.insert("XDG_CONFIG_HOME".into(), x.display().to_string().into());
     }
-    env.insert("MDKG_MAIN_REF".into(), t.main_ref.into());
+    if let Some(main) = t.main_ref {
+        env.insert("MDKG_MAIN_REF".into(), main.into());
+    }
+    if let Some(g) = graph_ref(t) {
+        env.insert(GRAPH_REF.into(), g.into());
+    }
     if let Some(c) = t.common_dir {
         env.insert(TRUSTED_COMMON_DIR.into(), c.display().to_string().into());
     }
@@ -865,7 +915,7 @@ fn claude_mcp_config(t: &TurnInput<'_>) -> serde_json::Value {
 }
 
 fn toml_string(s: &str) -> String {
-    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+    toml_edit::Value::from(s).to_string()
 }
 
 /// A TOML inline table from keys and TOML values.
@@ -877,25 +927,87 @@ fn toml_table(entries: &[(String, String)]) -> String {
     format!("{{{}}}", body.join(", "))
 }
 
-/// The main branch (short name, when it's a local branch), `main`, and the
-/// named branches.
-pub fn protected(main_ref: &str, names: &[String]) -> Vec<String> {
-    let main = match main_ref.strip_prefix("refs/heads/") {
-        Some(short) => short,
-        None if main_ref.starts_with("refs/") => "",
-        None => main_ref,
-    };
-    let mut all = vec!["main".to_string()];
-    if main != "main" && !main.is_empty() {
-        all.push(main.to_string());
+/// The refs a protected list names beside `main`, `master` and the
+/// configured ones, each from its config value, never the environment
+/// (R33).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ProtectedRefs<'a> {
+    /// `mdkg.mainRef`: a short name, a branch, or a remote-tracking ref.
+    pub main_ref: Option<&'a str>,
+    /// The graph ref (`mdkg.graph.ref`'s full name).
+    pub graph_ref: Option<&'a str>,
+    /// The graph's ref on its remote (`graph.remoteRef`).
+    pub remote_ref: Option<&'a str>,
+}
+
+/// A ref as a protected list names it. A branch (`refs/heads/x`) is `x`.
+/// A remote-tracking ref (`refs/remotes/<remote>/x`) is `x`, and since a
+/// remote's name may hold a `/`, each shorter tail too. A short name is
+/// itself and, when it holds a `/` (`origin/trunk`, which `mainRef` may
+/// mean as a remote-tracking ref), each tail after one, so `trunk` is
+/// protected whichever the name resolves to. Any other full ref is
+/// whole.
+fn protected_names(name: &str) -> Vec<&str> {
+    fn tails(s: &str) -> Vec<&str> {
+        s.match_indices('/')
+            .map(|(i, _)| &s[i + 1..])
+            .filter(|t| !t.is_empty())
+            .collect()
     }
-    for n in names {
-        if !all.contains(n) {
-            all.push(n.clone());
+    let name = name.trim();
+    if let Some(short) = name.strip_prefix("refs/heads/") {
+        vec![short]
+    } else if let Some(rest) = name.strip_prefix("refs/remotes/") {
+        tails(rest)
+    } else if name.starts_with("refs/") {
+        vec![name]
+    } else {
+        std::iter::once(name).chain(tails(name)).collect()
+    }
+}
+
+/// The protected list (R33): `main`, `master`, `mainRef`'s short name
+/// (for a local or remote-tracking ref), the graph ref's branch and
+/// `graph.remoteRef`'s, then the named branches, without repeats.
+pub fn protected_refs(refs: &ProtectedRefs<'_>, names: &[String]) -> Vec<String> {
+    let mut all: Vec<String> = Vec::new();
+    let configured = [refs.main_ref, refs.graph_ref, refs.remote_ref];
+    let given = ["main", "master"]
+        .into_iter()
+        .chain(configured.into_iter().flatten().flat_map(protected_names))
+        .chain(names.iter().map(String::as_str));
+    for n in given {
+        if !n.is_empty() && !all.iter().any(|a| a == n) {
+            all.push(n.to_string());
         }
     }
     all
 }
+
+/// [`protected_refs`] with only the main branch configured.
+pub fn protected(main_ref: &str, names: &[String]) -> Vec<String> {
+    protected_refs(
+        &ProtectedRefs {
+            main_ref: Some(main_ref),
+            ..ProtectedRefs::default()
+        },
+        names,
+    )
+}
+
+/// The graph ref the agent's repository reads its authority from, for the
+/// agent and its MCP server to see (`MDKG_GRAPH_REF`); nothing reads it as
+/// authority. `None` in checkout mode, or when the settings can't be read
+/// (the turn's own authority read reports that).
+fn graph_ref(t: &TurnInput<'_>) -> Option<String> {
+    mdkg_graph::graphref::resolve(t.graph_root.unwrap_or(t.cwd))
+        .ok()
+        .flatten()
+        .map(|g| g.name)
+}
+
+/// The variable naming the graph ref, set for agents in ref mode.
+pub const GRAPH_REF: &str = "MDKG_GRAPH_REF";
 
 /// Claude Code with the user's own login, settings and MCP servers, plus
 /// the launcher's: `-p` with the role's tools and rules, nobody answering
@@ -916,7 +1028,7 @@ pub fn key_helper(mdkg: &Path, service: &str) -> String {
     )
 }
 
-fn claude(t: &TurnInput<'_>) -> AgentCommand {
+pub(crate) fn claude(t: &TurnInput<'_>) -> AgentCommand {
     // A rule that can't be read never reaches Claude (fail closed); the
     // turn and `agents status` name it (TurnReport::dropped_allow).
     let readable: Vec<String> = t
@@ -927,9 +1039,10 @@ fn claude(t: &TurnInput<'_>) -> AgentCommand {
         .collect();
     let (allow, mut deny) =
         claude_rules(t.role, &readable, &mdkg_names_allowing(t.mdkg, &readable));
-    // The helper, and abandon, by the path this turn names mdkg by, too.
+    // The helper, abandon and use-key, by the path this turn names mdkg by,
+    // too.
     let helper = shell_word(&t.mdkg.display().to_string());
-    for sub in ["auth", "abandon"] {
+    for sub in MDKG_DENY {
         deny.push(format!("Bash({helper} {sub})"));
         deny.push(format!("Bash({helper} {sub} *)"));
         deny.push(format!("Bash({} {sub})", t.mdkg.display()));
@@ -995,7 +1108,7 @@ fn claude(t: &TurnInput<'_>) -> AgentCommand {
         program: Harness::Claude.program(),
         args,
         cwd: t.cwd.to_path_buf(),
-        env: agent_env(t),
+        env: t.harness.adapter().environment(t),
         prompt_on_stdin: true,
         output_file: None,
         secret_env: Vec::new(),
@@ -1004,12 +1117,64 @@ fn claude(t: &TurnInput<'_>) -> AgentCommand {
     }
 }
 
+/// Only a linked checkout's own Git administration folder and the
+/// clone's shared objects, refs and logs. Never the common directory
+/// itself (config, hooks, other lanes and coordinator state stay outside).
+/// The common-directory pin comes from the launcher, not the worktree's
+/// `.git` file alone. Failed discovery adds no writable roots.
+fn codex_git_writable_roots(t: &TurnInput<'_>) -> Vec<PathBuf> {
+    let Some(common) = t.common_dir else {
+        return Vec::new();
+    };
+    // The launcher's trusted_worktree pins its graph/MCP checkout. A
+    // worker may run in another linked checkout of that same clone.
+    let Ok(worker_top) = mdkg_git::toplevel(t.cwd) else {
+        return Vec::new();
+    };
+    let trust = mdkg_git::WorktreeTrust {
+        common: Some(common.to_path_buf()),
+        worktree: Some(worker_top),
+    };
+    let Ok(checkout) = mdkg_git::check_worktree_with_trust(t.cwd, &trust) else {
+        return Vec::new();
+    };
+    if checkout.git_dir == checkout.common {
+        return Vec::new();
+    }
+    [
+        checkout.git_dir,
+        checkout.common.join("objects"),
+        checkout.common.join("refs"),
+        checkout.common.join("logs"),
+    ]
+    .into_iter()
+    // A missing or redirected store needs escalation, not a root that
+    // might resolve outside this clone or fail native argument checks.
+    .filter(|path| std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir()))
+    .collect()
+}
+
 /// Codex with the user's own CODEX_HOME (login, config, sessions), in
 /// native worker auto mode or the reviewer's read-only mode, with the
 /// launcher's mdkg server added.
-fn codex(t: &TurnInput<'_>, shell_binary: Option<&Path>) -> AgentCommand {
+pub(crate) fn codex(t: &TurnInput<'_>, shell_binary: Option<&Path>) -> AgentCommand {
     let settings = codex_settings(t.role, t.sandbox, t.approvals);
     let mut args: Vec<String> = vec!["exec".into()];
+    if t.role == Role::Worker {
+        // Parent exec options also apply to resume. Native additive roots
+        // preserve the user's configured writable roots without reading
+        // their config. No path is passed through TOML or a shell.
+        let roots = codex_git_writable_roots(t);
+        if let Some(roots) = roots
+            .iter()
+            .map(|path| path.to_str())
+            .collect::<Option<Vec<_>>>()
+        {
+            for root in roots {
+                args.extend(["--add-dir".into(), root.into()]);
+            }
+        }
+    }
     if let Some(id) = t.resume {
         // `exec resume` has no -s or -C: the sandbox goes in as config, and
         // the folder is the process's working directory. The launcher then
@@ -1137,7 +1302,7 @@ fn codex(t: &TurnInput<'_>, shell_binary: Option<&Path>) -> AgentCommand {
         program: Harness::Codex.program(),
         args,
         cwd: t.cwd.to_path_buf(),
-        env: agent_env(t),
+        env: t.harness.adapter().environment(t),
         prompt_on_stdin: true,
         output_file: t.api_key.is_none().then(|| t.output_file.to_path_buf()),
         secret_env,
@@ -1164,12 +1329,42 @@ fn opencode_agent(t: &TurnInput<'_>) -> String {
     }
 }
 
+/// The OpenCode releases a worker may run on, each checked against what
+/// mdkg relies on (the native configuration API, the plugin hooks, the
+/// shell tool's name, `OPENCODE_CONFIG_CONTENT` and its permission rules):
+/// - 2.1.0: its tagged source (v2.1.0) and the live hook check
+///   (scripts/check-opencode-hooks.py --live);
+/// - 2.2.5: its source at 8bca5329 (spike of 2026-11-01), and the same live
+///   check, which orchestrator runs before this release is used.
+///
+/// An exact list, not a range (orchestrator, 2026-11-02): a release that
+/// stopped reading the inline config would drop every mdkg refusal
+/// silently, and only this gate catches that.
+const OPENCODE_QUALIFIED: &[&str] = &["2.1.0", "2.2.5"];
+
 fn opencode_preflight_error(why: &str) -> crate::error::RunError {
     crate::error::RunError::failure(
         crate::error::CODE_AGENT_FAILED,
         format!("OpenCode worker preflight refused the turn: {why}"),
     )
-    .with_hint("mdkg workers require an enabled build agent and OpenCode's 2.1 native configuration API; check OpenCode's configuration and plugin errors, then retry")
+    .with_hint(format!(
+        "mdkg workers require an enabled build agent and a qualified OpenCode release ({}); check OpenCode's version, configuration and plugin errors, then retry",
+        OPENCODE_QUALIFIED.join(", ")
+    ))
+}
+
+/// The qualified release `--version` reports, as `opencode v2.2.5` or bare.
+fn opencode_cli_version(out: &[u8]) -> Option<&'static str> {
+    let out = std::str::from_utf8(out.trim_ascii()).ok()?;
+    let version = out.strip_prefix("opencode v").unwrap_or(out);
+    OPENCODE_QUALIFIED.iter().copied().find(|q| *q == version)
+}
+
+fn opencode_unqualified(what: &str) -> crate::error::RunError {
+    opencode_preflight_error(&format!(
+        "this {what} version is not qualified (qualified: {})",
+        OPENCODE_QUALIFIED.join(", ")
+    ))
 }
 
 /// The native server's process group belongs to this probe. Holding the
@@ -1265,7 +1460,7 @@ fn opencode_probe_output(
     }
 }
 
-/// OpenCode 2.1 normalizes and resolves user config itself. Never parse
+/// OpenCode normalizes and resolves user config itself. Never parse
 /// those files here. This observes the baseline before mdkg's permission
 /// overlay can recreate a disabled build agent. This is an ordinary native
 /// startup against the worker's HOME/XDG/OPENCODE_DB state, with its normal
@@ -1275,7 +1470,7 @@ fn opencode_probe_output(
 /// its server. This is not an atomic snapshot with the later run: OpenCode
 /// watches config, and the run starts its own server. A concurrent config
 /// or plugin change remains possible.
-fn opencode_preflight(
+pub(crate) fn opencode_preflight(
     command: &AgentCommand,
     limit: std::time::Duration,
 ) -> Result<(), crate::error::RunError> {
@@ -1324,19 +1519,15 @@ fn opencode_preflight(
             .stderr(Stdio::null());
         c
     };
-    // Only 2.1.0's native configuration/activation contract is qualified.
-    // Refuse unsupported or unknown versions before starting the server;
+    // Only the [`OPENCODE_QUALIFIED`] releases' native configuration and
+    // activation contracts are qualified. Refuse other or unknown versions
+    // before starting the server;
     // --version still performs ordinary native CLI initialization/logging.
     // Confirm the running server's version too.
     let mut version = process();
     version.arg("--version");
     let version = opencode_probe_output(version, remaining()?.min(Duration::from_secs(10)))?;
-    let version = version.trim_ascii();
-    if version != b"opencode v2.1.0" && version != b"2.1.0" {
-        return Err(opencode_preflight_error(
-            "this OpenCode version is not qualified (requires 2.1.0)",
-        ));
-    }
+    let version = opencode_cli_version(&version).ok_or_else(|| opencode_unqualified("OpenCode"))?;
     let child = process()
         .args(["serve", "--stdio", "--hostname", "127.0.0.1", "--port", "0"])
         .stdin(Stdio::piped())
@@ -1402,10 +1593,15 @@ fn opencode_preflight(
             "native API did not identify the owned server",
         ));
     }
-    // Check the actual server too, in case a shim selected another binary.
-    if info["version"].as_str() != Some("2.1.0") {
+    // Check the actual server too, in case a shim selected another binary:
+    // it must be qualified, and the release the CLI reported.
+    let served = info["version"].as_str();
+    if !served.is_some_and(|v| OPENCODE_QUALIFIED.contains(&v)) {
+        return Err(opencode_unqualified("native configuration API"));
+    }
+    if served != Some(version) {
         return Err(opencode_preflight_error(
-            "this native configuration API version is not qualified (requires 2.1.0)",
+            "the native configuration API reports another release than the CLI",
         ));
     }
     // model.list awaits activation, with a native 5-second error timeout.
@@ -1426,17 +1622,23 @@ fn opencode_plugins_ready(value: &serde_json::Value) -> Result<(), crate::error:
     let plugins = value["data"]
         .as_array()
         .ok_or_else(|| opencode_preflight_error("plugin inventory is unavailable"))?;
-    if plugins.iter().any(|p| p["state"]["status"] != "active")
-        || ["opencode.agent", "opencode.config.agent"]
-            .iter()
-            .any(|id| {
-                !plugins
-                    .iter()
-                    .any(|p| p["id"] == *id && p["source"]["type"] == "builtin")
-            })
-    {
+    if plugins.iter().any(|p| p["state"]["status"] != "active") {
         return Err(opencode_preflight_error(
             "configuration plugins failed or did not activate",
+        ));
+    }
+    // The built-ins that resolve agents from config. A release without
+    // them resolves agents some other way, which mdkg hasn't checked.
+    if ["opencode.agent", "opencode.config.agent"]
+        .iter()
+        .any(|id| {
+            !plugins
+                .iter()
+                .any(|p| p["id"] == *id && p["source"]["type"] == "builtin")
+        })
+    {
+        return Err(opencode_preflight_error(
+            "OpenCode's built-in agent configuration plugins (opencode.agent, opencode.config.agent) are missing",
         ));
     }
     Ok(())
@@ -1474,13 +1676,15 @@ pub fn opencode_config(t: &TurnInput<'_>) -> serde_json::Value {
         names.push(path);
     }
     let mut cfg = opencode_permissions(t.role, &names);
+    let mut off = MCP_DENY.to_vec();
     if t.role == Role::Reviewer {
-        let off: serde_json::Map<String, serde_json::Value> = MCP_WRITE
-            .iter()
-            .map(|n| (format!("{MCP_SERVER}_{n}"), false.into()))
-            .collect();
-        cfg["tools"] = serde_json::Value::Object(off);
+        off.extend(MCP_WRITE);
     }
+    cfg["tools"] = off
+        .iter()
+        .map(|n| (format!("{MCP_SERVER}_{n}"), false.into()))
+        .collect::<serde_json::Map<_, _>>()
+        .into();
     // 2.1 appends all per-agent rules after all global rules, so a user's
     // per-agent allow beats even our inline global deny. Append our limits
     // to the selected agent too. Keep the legacy spelling: 2.1 normalizes
@@ -1508,7 +1712,10 @@ pub fn opencode_config(t: &TurnInput<'_>) -> serde_json::Value {
 pub fn opencode_permissions(role: Role, names: &[String]) -> serde_json::Value {
     let mut bash = serde_json::Map::new();
     if role == Role::Worker {
-        for command in mdkg_commands(names, MDKG_DENY) {
+        for command in mdkg_commands(names, MDKG_DENY)
+            .into_iter()
+            .chain(credential_cli_commands())
+        {
             bash.insert(command.clone(), "deny".into());
             bash.insert(format!("{command} *"), "deny".into());
         }
@@ -1545,7 +1752,7 @@ pub fn opencode_permissions(role: Role, names: &[String]) -> serde_json::Value {
 /// a background service's), the model the user configured unless the
 /// agent names one. Workers use the user's build agent settings, not a
 /// custom default_agent; reviewers get a dedicated agent for this turn.
-fn opencode(t: &TurnInput<'_>) -> AgentCommand {
+pub(crate) fn opencode(t: &TurnInput<'_>) -> AgentCommand {
     let mut args: Vec<String> = vec![
         "run".into(),
         "--standalone".into(),
@@ -1561,6 +1768,20 @@ fn opencode(t: &TurnInput<'_>) -> AgentCommand {
         args.extend(["--model".into(), m.to_string()]);
     }
     args.push(t.prompt.to_string());
+    AgentCommand {
+        program: Harness::OpenCode.program(),
+        args,
+        cwd: t.cwd.to_path_buf(),
+        env: t.harness.adapter().environment(t),
+        prompt_on_stdin: false,
+        output_file: None,
+        secret_env: Vec::new(),
+        codex_hook_binary: None,
+        opencode_worker: t.role == Role::Worker,
+    }
+}
+
+pub(crate) fn opencode_env(t: &TurnInput<'_>) -> Vec<(String, String)> {
     let mut env = agent_env(t);
     env.push((
         "OPENCODE_CONFIG_CONTENT".into(),
@@ -1575,17 +1796,14 @@ fn opencode(t: &TurnInput<'_>) -> AgentCommand {
         env.push(("OPENCODE_CONFIG_PROJECT_DISABLE".into(), "1".into()));
         env.push(("OPENCODE_DISABLE_PROJECT_CONFIG".into(), "1".into()));
     }
-    AgentCommand {
-        program: Harness::OpenCode.program(),
-        args,
-        cwd: t.cwd.to_path_buf(),
-        env,
-        prompt_on_stdin: false,
-        output_file: None,
-        secret_env: Vec::new(),
-        codex_hook_binary: None,
-        opencode_worker: t.role == Role::Worker,
+    env
+}
+
+pub(crate) fn opencode_check(command: &AgentCommand) -> Result<(), crate::error::RunError> {
+    if command.opencode_worker {
+        opencode_preflight(command, std::time::Duration::from_secs(30))?;
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1639,6 +1857,11 @@ mod tests {
             ),
             ("Bash(mdkg *)", "the mdkg MCP server"),
             ("Bash(mdkg auth key *)", "`auth` is never allowed"),
+            (
+                "Bash(mdkg agents use-key *)",
+                "`agents use-key` is never allowed",
+            ),
+            ("Bash(mdkg agents *)", "`Bash(mdkg validate *)`"),
             ("Bash", "name the command"),
             ("Bash(*)", "name the command"),
             ("Bash('mdkg *)", "fix its quoting"),
@@ -1651,7 +1874,12 @@ mod tests {
         ] {
             assert!(fix(rule).contains(want), "{rule}: {}", fix(rule));
         }
-        for passed in ["Bash(mdkg validate *)", "Bash(npm test *)", "Read"] {
+        for passed in [
+            "Bash(mdkg validate *)",
+            "Bash(mdkg agents status *)",
+            "Bash(npm test *)",
+            "Read",
+        ] {
             assert_eq!(
                 dropped_allow_fix(passed, Path::new("mdkg")),
                 None,
@@ -1673,6 +1901,14 @@ mod tests {
             "Bash('/opt/rc builds/mdkg-next' --root . *)",
             "Bash(mdkg-next abandon *)",
             "Bash(mdkg-next auth key *)",
+            // `agents use-key`, and `agents` open after it.
+            "Bash(mdkg-next agents use-key *)",
+            "Bash(mdkg-next agents use-key)",
+            "Bash(mdkg-next agents *)",
+            "Bash(mdkg-next agents:*)",
+            "Bash(mdkg-next agents)",
+            "Bash(mdkg-next agents --json *)",
+            "Bash('/opt/rc builds/mdkg-next' agents 'use-key' lane)",
             "Read,Bash(/opt/bin/mdkg-rc *)",
             // A list after a first rule with its own `(…)` (round 2).
             "Read(*),Bash(*)",
@@ -1908,7 +2144,7 @@ mod tests {
             common_dir: Some(Path::new("/repo/.git")),
             trusted_worktree: Some(Path::new("/repo")),
             graph_root: None,
-            main_ref: "main",
+            main_ref: Some("main"),
             xdg_config: None,
             harness: h,
             role: r,
@@ -1958,10 +2194,19 @@ mod tests {
                 .expect("semantic refusals");
             let denied = &claude.args[deny + 1..];
             assert!(!denied.is_empty());
+            // mdkg's own refusals, and harness CLIs that print a key.
+            let refusal = |rule: &str| {
+                rule.contains(" auth")
+                    || rule.contains(" abandon")
+                    || rule.contains(" agents use-key")
+                    || credential_cli_commands()
+                        .iter()
+                        .any(|c| rule.contains(c.as_str()))
+            };
             assert!(
                 denied
                     .iter()
-                    .all(|rule| rule.contains(" auth") || rule.contains(" abandon")),
+                    .all(|rule| refusal(rule) || rule == "mcp__mdkg__agents_use_key"),
                 "{denied:?}"
             );
 
@@ -1980,12 +2225,15 @@ mod tests {
             let bash = permissions["bash"].as_object().expect("bash refusals");
             assert!(!bash.is_empty());
             assert!(
-                bash.iter().all(|(rule, value)| (rule.contains(" auth")
-                    || rule.contains(" abandon"))
-                    && value == "deny"),
+                bash.iter()
+                    .all(|(rule, value)| refusal(rule) && value == "deny"),
                 "{cfg}"
             );
-            assert!(cfg.get("tools").is_none(), "{cfg}");
+            assert_eq!(
+                cfg["tools"],
+                serde_json::json!({"mdkg_agents_use_key": false}),
+                "{cfg}"
+            );
             assert_eq!(cfg["mcp"]["mdkg"]["enabled"], true);
         }
 
@@ -2087,9 +2335,116 @@ mod tests {
                 "Bash(mdkg-next auth *)",
                 "Bash(mdkg abandon *)",
                 "Bash(mdkg-next abandon *)",
+                "Bash(mdkg agents use-key)",
+                "Bash(mdkg agents use-key *)",
+                "Bash(mdkg-next agents use-key *)",
+                "mcp__mdkg__agents_use_key",
             ] {
                 assert!(deny.contains(&d.to_string()), "{role:?} {d}");
             }
+        }
+    }
+
+    /// Commands that print a stored credential through a harness's CLI.
+    const CREDENTIAL_PRINTS: &[&str] = &[
+        "opencode auth export",
+        "opencode auth list",
+        "opencode auth",
+        "/opt/homebrew/bin/opencode auth export",
+        "opencode service get password",
+        "opencode service get",
+        "opencode api credential.list",
+        "opencode api GET /api/credential --server http://127.0.0.1:4096",
+        "opencode debug config",
+        "opencode pair",
+        "opencode serve --port 4097",
+        "claude setup-token",
+        "/Users/u/.local/bin/claude setup-token",
+        // The desktop app's CLI, spacing, quoting and global options.
+        "/Applications/OpenCode.app/Contents/Resources/opencode-cli auth export",
+        "opencode-cli auth export",
+        "opencode  auth  export",
+        "opencode\tauth export",
+        "opencode \"auth\" export",
+        "opencode --log-level debug auth export",
+        "opencode service  get password",
+        "claude  setup-token",
+        "./opencode auth export",
+        "../bin/opencode-cli auth export",
+        "'./opencode' auth export",
+        "\"/Applications/OpenCode.app/Contents/Resources/opencode-cli\" auth export",
+        "\"opencode\" auth export",
+        "~/bin/opencode auth export",
+        "$HOME/bin/opencode auth export",
+        "\"$HOME/bin/opencode\" auth export",
+        "env NO_COLOR=1 /opt/homebrew/bin/opencode auth export",
+        "command /opt/homebrew/bin/opencode auth export",
+        "exec opencode auth export",
+        "nohup opencode-cli auth export",
+        "timeout 10 /opt/bin/opencode auth export",
+        "NO_COLOR=1 /opt/homebrew/bin/opencode auth export",
+        "A=1 B=2 opencode auth export",
+        "env claude setup-token",
+    ];
+
+    /// The same CLIs' ordinary commands, which stay the user's to allow.
+    const CREDENTIAL_NEIGHBOURS: &[&str] = &[
+        "opencode --version",
+        "opencode models",
+        "opencode run hello",
+        "opencode service status",
+        "opencode-cli models",
+        "claude --version",
+        "claude auth status",
+        "codex login status",
+        "cat scripts/opencode-catalog-env.py crates/mdkg-run/src/auth.rs",
+        "rg auth scripts/opencode-catalog-env.py",
+        "cat /opt/bin/opencode docs/auth.md",
+        "grep auth ./bin/opencode",
+        "cat scripts/claude-helper.py crates/mdkg-run/src/setup-token.rs",
+    ];
+
+    #[test]
+    fn no_worker_prints_a_harness_credential_through_its_cli() {
+        // Claude: a deny rule wins over any allow, the user's included.
+        for role in [Role::Worker, Role::Reviewer] {
+            let (_, deny) = claude_rules(role, &["Bash(*)".into()], &names());
+            let bash = |r: &String| r.strip_prefix("Bash(")?.strip_suffix(')').map(String::from);
+            let denied = |c: &str| deny.iter().filter_map(bash).any(|p| glob(&p, c));
+            for c in CREDENTIAL_PRINTS {
+                assert!(denied(c), "claude {role:?}: {c}");
+            }
+            if role == Role::Worker {
+                for c in CREDENTIAL_NEIGHBOURS {
+                    assert!(!denied(c), "claude {role:?}: {c}");
+                }
+            }
+        }
+        // OpenCode: a worker's build agent allows everything here, and
+        // mdkg's refusals still come last, fresh or resumed.
+        let user = serde_json::json!({"agents": {"build": {"permissions": [
+            {"action": "shell", "resource": "*", "effect": "allow"}
+        ]}}});
+        for resume in [None, Some("ses_1")] {
+            let launched = command(&input(Harness::OpenCode, Role::Worker, resume));
+            for c in CREDENTIAL_PRINTS {
+                assert_eq!(
+                    opencode_21_effect(&user, &launched, "shell", c),
+                    "deny",
+                    "{c}"
+                );
+            }
+            for c in CREDENTIAL_NEIGHBOURS {
+                assert_eq!(
+                    opencode_21_effect(&user, &launched, "shell", c),
+                    "allow",
+                    "{c}"
+                );
+            }
+        }
+        // Reviewers deny all of it already, by their allowlist.
+        for c in CREDENTIAL_PRINTS {
+            assert!(!opencode_runs(Role::Reviewer, c), "opencode reviewer: {c}");
         }
     }
 
@@ -2116,6 +2471,93 @@ mod tests {
     }
 
     #[test]
+    fn no_harness_lets_an_agent_bill_the_key_with_use_key() {
+        // `agents use-key` is a person's choice: denied as a command under
+        // each of mdkg's names and as the agents_use_key MCP tool, for
+        // every role of each harness (orchestrator, 2026-10-30).
+        for role in [Role::Worker, Role::Reviewer] {
+            let claude = command(&input(Harness::Claude, role, None));
+            let deny = claude
+                .args
+                .iter()
+                .position(|a| a == "--disallowedTools")
+                .expect("deny");
+            let denied = &claude.args[deny + 1..];
+            for d in [
+                "Bash(mdkg agents use-key)",
+                "Bash(mdkg agents use-key *)",
+                "Bash('/bin/mdkg' agents use-key *)",
+                "Bash(/bin/mdkg agents use-key *)",
+                "mcp__mdkg__agents_use_key",
+            ] {
+                assert!(denied.iter().any(|a| a == d), "{role:?} {d}: {denied:?}");
+            }
+
+            // Codex enables only the role's tools, never this one.
+            let codex = command(&input(Harness::Codex, role, None));
+            let enabled = codex
+                .args
+                .iter()
+                .find_map(|a| a.strip_prefix("mcp_servers.mdkg.enabled_tools="))
+                .expect("enabled tools");
+            assert!(enabled.contains("\"show\""), "{enabled}");
+            assert!(!enabled.contains("use_key"), "{role:?} {enabled}");
+            assert!(!mcp_tools(role).contains(&"agents_use_key"));
+            assert!(
+                !codex.args.iter().any(|a| a.contains("agents_use_key")),
+                "{:?}",
+                codex.args
+            );
+
+            let opencode = command(&input(Harness::OpenCode, role, None));
+            let cfg: serde_json::Value = serde_json::from_str(
+                &opencode
+                    .env
+                    .iter()
+                    .find(|(name, _)| name == "OPENCODE_CONFIG_CONTENT")
+                    .expect("config")
+                    .1,
+            )
+            .expect("json");
+            assert_eq!(cfg["tools"]["mdkg_agents_use_key"], false, "{cfg}");
+            let agent = cfg["agent"]
+                .as_object()
+                .and_then(|a| a.values().next())
+                .expect("agent");
+            assert_eq!(agent["tools"]["mdkg_agents_use_key"], false, "{cfg}");
+            assert_eq!(
+                opencode_21_effect(
+                    &serde_json::json!({}),
+                    &opencode,
+                    "mdkg_agents_use_key",
+                    "*"
+                ),
+                "deny",
+                "{role:?}"
+            );
+            for command in ["mdkg agents use-key lane", "/bin/mdkg agents use-key"] {
+                assert_eq!(
+                    opencode_21_effect(&serde_json::json!({}), &opencode, "shell", command),
+                    "deny",
+                    "{role:?} {command}"
+                );
+            }
+            if role == Role::Worker {
+                assert_eq!(
+                    opencode_21_effect(
+                        &serde_json::json!({}),
+                        &opencode,
+                        "shell",
+                        "mdkg agents status"
+                    ),
+                    "allow",
+                    "{cfg}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn every_agent_carries_the_turns_mark_and_its_actor() {
         for h in [Harness::Claude, Harness::Codex, Harness::OpenCode] {
             let c = command(&input(h, Role::Worker, None));
@@ -2123,6 +2565,54 @@ mod tests {
             assert_eq!(env(TURN_MARK), Some("0199a0a0-0000-7000-8000-000000000001"));
             assert_eq!(env("MDKG_ACTOR"), Some("lane"));
         }
+    }
+
+    /// In ref mode every agent, and its MCP server, sees the graph ref
+    /// (`MDKG_GRAPH_REF`); in checkout mode neither does.
+    #[test]
+    fn agents_in_ref_mode_see_the_graph_ref() {
+        let dir = std::env::temp_dir().join(format!("mdkg-profile-graph-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).expect("temp");
+        let top = dir.canonicalize().expect("canonical");
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&top)
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env_remove("GIT_DIR")
+                .output()
+                .expect("git");
+            assert!(out.status.success(), "{args:?}: {out:?}");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        let seen = |h: Harness| {
+            let mut t = input(h, Role::Worker, None);
+            t.cwd = &top;
+            let c = command(&t);
+            let env = c
+                .env
+                .iter()
+                .find(|(n, _)| n == GRAPH_REF)
+                .map(|(_, v)| v.clone());
+            (env, mcp_env(&t).get(GRAPH_REF).cloned())
+        };
+        for h in [Harness::Claude, Harness::Codex, Harness::OpenCode] {
+            assert_eq!(seen(h), (None, None), "{h:?} in checkout mode");
+        }
+        git(&["config", "mdkg.graph.ref", "mdkg-graph"]);
+        for h in [Harness::Claude, Harness::Codex, Harness::OpenCode] {
+            assert_eq!(
+                seen(h),
+                (
+                    Some("refs/heads/mdkg-graph".into()),
+                    Some(serde_json::json!("refs/heads/mdkg-graph"))
+                ),
+                "{h:?}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -2552,6 +3042,78 @@ mod tests {
     }
 
     #[test]
+    fn channel_tools_follow_role_permissions_on_every_harness_and_resume() {
+        for resume in [None, Some("session-1")] {
+            let claude = command(&input(Harness::Claude, Role::Reviewer, resume));
+            let denied = claude
+                .args
+                .iter()
+                .position(|a| a == "--disallowedTools")
+                .expect("Claude deny list");
+            for tool in ["channel_read", "room_read"] {
+                let name = format!("mcp__mdkg__{tool}");
+                assert!(claude.args[..denied].contains(&name), "{tool}: {resume:?}");
+                assert!(!claude.args[denied..].contains(&name));
+            }
+            for tool in ["channel_post", "room_post"] {
+                let name = format!("mcp__mdkg__{tool}");
+                assert!(!claude.args[..denied].contains(&name));
+                assert!(claude.args[denied..].contains(&name), "{tool}: {resume:?}");
+                let worker = command(&input(Harness::Claude, Role::Worker, resume));
+                assert!(
+                    !worker.args.contains(&name),
+                    "worker keeps native permissions"
+                );
+            }
+            for role in [Role::Worker, Role::Reviewer] {
+                let codex = command(&input(Harness::Codex, role, resume));
+                let enabled = codex
+                    .args
+                    .iter()
+                    .find_map(|a| a.strip_prefix("mcp_servers.mdkg.enabled_tools="))
+                    .expect("Codex tools");
+                let tools: Vec<String> = serde_json::from_str(enabled).expect("tools array");
+                for tool in ["channel_read", "room_read"] {
+                    assert!(tools.iter().any(|t| t == tool), "{role:?}: {tool}");
+                }
+                for tool in ["channel_post", "room_post"] {
+                    assert_eq!(tools.iter().any(|t| t == tool), role == Role::Worker);
+                    let approval =
+                        format!("mcp_servers.mdkg.tools.{tool}.approval_mode=\"approve\"");
+                    assert_eq!(codex.args.contains(&approval), role == Role::Worker);
+                }
+                let turn = input(Harness::OpenCode, role, resume);
+                let launched = command(&turn);
+                let config: serde_json::Value = serde_json::from_str(
+                    &launched
+                        .env
+                        .iter()
+                        .find(|(k, _)| k == "OPENCODE_CONFIG_CONTENT")
+                        .expect("OpenCode config")
+                        .1,
+                )
+                .expect("config JSON");
+                for tool in ["mdkg_channel_post", "mdkg_room_post"] {
+                    if role == Role::Reviewer {
+                        // Inherited allows cannot re-enable a disabled tool, globally
+                        // or on the selected reviewer agent.
+                        assert_eq!(config["tools"][tool], false);
+                        assert_eq!(config["agent"][opencode_agent(&turn)]["tools"][tool], false);
+                    } else {
+                        assert!(
+                            config["tools"].get(tool).is_none(),
+                            "worker keeps native permissions"
+                        );
+                    }
+                }
+                for tool in ["mdkg_channel_read", "mdkg_room_read"] {
+                    assert_ne!(config["tools"][tool], false);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn codex_exposes_read_only_scratch_path_to_both_roles_on_new_and_resumed_turns() {
         for role in [Role::Worker, Role::Reviewer] {
             for resume in [None, Some("t-9")] {
@@ -2577,6 +3139,147 @@ mod tests {
     }
 
     #[test]
+    fn codex_workers_can_write_only_their_clones_git_directories() {
+        let fixture = PathFixture::new();
+        let repo = fixture.0.join("clone with '\" quotes\r");
+        let lane = fixture.0.join("linked lane");
+        std::fs::create_dir(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new(&mdkg_git::git_program().0)
+                .env_clear()
+                .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+                .env("HOME", &fixture.0)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .current_dir(&repo)
+                .args([
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{args:?}: {out:?}");
+            out
+        };
+        git(&["init", "-q"]);
+        git(&[
+            "-c",
+            "user.name=fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "fixture",
+        ]);
+        git(&["worktree", "add", "-qb", "lane", lane.to_str().unwrap()]);
+        let common = repo.join(".git").canonicalize().unwrap();
+        let lane_admin = PathBuf::from(
+            String::from_utf8(
+                git(&[
+                    "-C",
+                    lane.to_str().unwrap(),
+                    "rev-parse",
+                    "--absolute-git-dir",
+                ])
+                .stdout,
+            )
+            .unwrap()
+            .trim(),
+        )
+        .canonicalize()
+        .unwrap();
+        for (cwd, expected) in [
+            (&repo, Vec::new()),
+            (
+                &lane,
+                vec![
+                    lane_admin,
+                    common.join("objects"),
+                    common.join("refs"),
+                    common.join("logs"),
+                ],
+            ),
+        ] {
+            for role in [Role::Worker, Role::Reviewer] {
+                for resume in [None, Some("t-9")] {
+                    let mut t = input(Harness::Codex, role, resume);
+                    t.cwd = cwd;
+                    t.common_dir = Some(&common);
+                    // Real launcher input pins the graph checkout,
+                    // which differs from a linked worker's cwd.
+                    t.trusted_worktree = Some(&repo);
+                    assert_eq!(
+                        mcp_env(&t)[TRUSTED_WORKTREE],
+                        repo.display().to_string(),
+                        "the MCP pin still names the launcher's graph checkout"
+                    );
+                    let c = command(&t);
+                    let got: Vec<PathBuf> = c
+                        .args
+                        .windows(2)
+                        .filter(|p| p[0] == "--add-dir")
+                        .map(|p| PathBuf::from(&p[1]))
+                        .collect();
+                    assert!(
+                        !c.args
+                            .iter()
+                            .any(|a| a.starts_with("sandbox_workspace_write.writable_roots=")),
+                        "the user's root list is never replaced"
+                    );
+                    if role == Role::Reviewer {
+                        assert!(got.is_empty(), "{c:?}");
+                    } else {
+                        assert_eq!(got, expected, "{resume:?}");
+                        assert!(got.iter().all(|p| p.starts_with(&common)));
+                        for forbidden in ["config", "hooks", "mdkg", "worktrees/other-lane"] {
+                            assert!(
+                                !got.iter()
+                                    .any(|root| common.join(forbidden).starts_with(root)),
+                                "{forbidden} must not be writable: {got:?}"
+                            );
+                        }
+                        assert!(!got.contains(&common));
+                        if resume.is_some() && !expected.is_empty() {
+                            let at = c.args.iter().position(|a| a == "resume").unwrap();
+                            assert!(c.args[..at].windows(2).any(|p| p[0] == "--add-dir"));
+                            assert!(!c.args[at..].contains(&"--add-dir".into()));
+                        }
+                    }
+                    // A foreign pin, absent pin or unreadable checkout
+                    // never widens the sandbox using unchecked paths.
+                    for pin in [None, Some(fixture.0.as_path())] {
+                        t.common_dir = pin;
+                        assert!(!command(&t).args.iter().any(|a| a == "--add-dir"
+                            || a.starts_with("sandbox_workspace_write.writable_roots=")));
+                    }
+                }
+            }
+        }
+        let mut t = input(Harness::Codex, Role::Worker, None);
+        t.cwd = &fixture.0;
+        t.common_dir = Some(&common);
+        assert!(codex_git_writable_roots(&t).is_empty());
+    }
+
+    #[test]
+    fn toml_config_strings_round_trip_control_characters() {
+        for text in [
+            "plain",
+            "quote\"and\\path",
+            "carriage\rreturn\nnew\tline",
+            "nul\0\u{1f}\u{7f}",
+        ] {
+            let doc: toml_edit::DocumentMut =
+                format!("value={}", toml_string(text)).parse().unwrap();
+            assert_eq!(doc["value"].as_str(), Some(text));
+        }
+    }
+
+    #[test]
     fn codex_states_its_own_sandbox_for_the_role_on_a_new_run_and_on_resume() {
         let first = command(&input(Harness::Codex, Role::Reviewer, None));
         assert!(has_pair(&first.args, "-s", "read-only"));
@@ -2592,7 +3295,7 @@ mod tests {
         assert!(has_pair(
             &first.args,
             "-c",
-            "mcp_servers.mdkg.enabled_tools=[\"room_read\",\"inbox\",\"show\",\"list\",\"search\",\"pack\",\"next\",\"scratch_path\"]"
+            "mcp_servers.mdkg.enabled_tools=[\"channel_read\",\"room_read\",\"inbox\",\"show\",\"list\",\"search\",\"pack\",\"next\",\"scratch_path\"]"
         ));
         // Each tool the role may call is approved for Codex, and only those.
         let approved = |c: &AgentCommand| -> Vec<String> {
@@ -3020,8 +3723,13 @@ case "$1" in
   echo --version >> probe-calls
   case "$mode" in
     bare-cli) echo '2.1.0';;
+    v22|mismatch) echo 'opencode v2.2.5';;
+    bare-22) echo '2.2.5';;
     old-cli) echo 'opencode v1.2.0';;
     newer-cli) echo 'opencode v2.2.0';;
+    next-cli) echo 'opencode v2.2.6';;
+    suffixed-cli) echo 'opencode v2.2.5-beta.1';;
+    prefixed-cli) echo 'opencode v12.2.5';;
     malformed-cli) echo not-a-version;;
     error-cli) echo 'opencode v2.1.0'; exit 1;;
     silent-cli) echo $$ > api-group; while :; do /bin/sleep 1; done;;
@@ -3061,6 +3769,8 @@ api)
   server.info)
     pid=$(cat probe-pid); version=2.1.0
     [ "$mode" != old ] || version=1.2.0
+    [ "$mode" != v22 ] && [ "$mode" != bare-22 ] || version=2.2.5
+    [ "$mode" != served-next ] || version=2.2.6
     [ "$mode" != foreign ] || pid=1
     printf '{"version":"%s","pid":%s}\n' "$version" "$pid"
     ;;
@@ -3086,6 +3796,7 @@ api)
       [ "$mode" != plugin-error ] || state=failed
       data='[{"id":"opencode.agent","source":{"type":"builtin"},"state":{"status":"active"}},{"id":"opencode.config.agent","source":{"type":"builtin"},"state":{"status":"'"$state"'"}}]'
       [ "$mode" != missing-plugin ] || data='[]'
+      [ "$mode" != missing-config-agent ] || data='[{"id":"opencode.agent","source":{"type":"builtin"},"state":{"status":"active"}}]'
       ;;
     agent.list)
       data='[{"id":"build","mode":"primary","permissions":[]}]'
@@ -3151,7 +3862,10 @@ esac
         for resume in [None, Some("existing-session")] {
             let fixture = PathFixture::new();
             let cmd = opencode_probe_fixture(&fixture, resume);
-            for mode in ["normal", "bare-cli", "disabled", "demoted", "wrapped"] {
+            let modes = [
+                "normal", "bare-cli", "v22", "bare-22", "disabled", "demoted", "wrapped",
+            ];
+            for mode in modes {
                 std::fs::write(fixture.0.join("probe-mode"), mode).expect("mode");
                 let result = cmd.preflight();
                 assert_eq!(result.is_ok(), mode != "disabled", "{mode}: {result:?}");
@@ -3159,19 +3873,43 @@ esac
             }
             assert_eq!(
                 std::fs::read_to_string(fixture.0.join("probe-calls")).unwrap(),
-                "--version\nserver.info\nmodel.list\nplugin.list\nagent.list\n".repeat(5)
+                "--version\nserver.info\nmodel.list\nplugin.list\nagent.list\n".repeat(modes.len())
             );
         }
     }
 
     #[test]
     fn opencode_preflight_refuses_unqualified_versions_before_server_start() {
-        for mode in ["old-cli", "newer-cli", "malformed-cli", "error-cli"] {
+        // Exact releases only: no other 2.2 patch, pre-release or prefix.
+        for mode in [
+            "old-cli",
+            "newer-cli",
+            "next-cli",
+            "suffixed-cli",
+            "prefixed-cli",
+            "malformed-cli",
+            "error-cli",
+        ] {
             let fixture = PathFixture::new();
             let cmd = opencode_probe_fixture(&fixture, None);
             std::fs::write(fixture.0.join("probe-mode"), mode).unwrap();
             let error = cmd.preflight().expect_err(mode);
             assert_eq!(error.code, crate::error::CODE_AGENT_FAILED);
+            if mode != "error-cli" {
+                assert!(
+                    error.message.contains("(qualified: 2.1.0, 2.2.5)"),
+                    "{mode}: {}",
+                    error.message
+                );
+            }
+            assert!(
+                error
+                    .hint
+                    .as_deref()
+                    .is_some_and(|h| h.contains("2.1.0, 2.2.5")),
+                "{mode}: {:?}",
+                error.hint
+            );
             assert!(
                 !fixture.0.join("probe-pid").exists(),
                 "{mode} started serve"
@@ -3208,6 +3946,10 @@ esac
             "activation-error",
             "plugin-error",
             "missing-plugin",
+            "missing-config-agent",
+            // The server isn't qualified, or isn't the CLI's release.
+            "served-next",
+            "mismatch",
             "invalid-build",
             "remote",
             "exit",
@@ -3221,6 +3963,28 @@ esac
                     .starts_with("OpenCode worker preflight refused")
             );
             assert!(!error.message.contains("not-json")); // No native output echoed.
+            assert_probe_stopped(&fixture);
+        }
+    }
+
+    #[test]
+    fn opencode_preflight_says_which_release_check_failed() {
+        let fixture = PathFixture::new();
+        let cmd = opencode_probe_fixture(&fixture, None);
+        for (mode, says) in [
+            (
+                "served-next",
+                "native configuration API version is not qualified (qualified: 2.1.0, 2.2.5)",
+            ),
+            ("mismatch", "reports another release than the CLI"),
+            (
+                "missing-config-agent",
+                "built-in agent configuration plugins (opencode.agent, opencode.config.agent) are missing",
+            ),
+        ] {
+            std::fs::write(fixture.0.join("probe-mode"), mode).expect("mode");
+            let error = cmd.preflight().expect_err(mode);
+            assert!(error.message.contains(says), "{mode}: {}", error.message);
             assert_probe_stopped(&fixture);
         }
     }
@@ -3312,15 +4076,19 @@ esac
                 assert_eq!(cfg["agent"][&selected]["permission"], cfg["permission"]);
                 assert!(cfg.get("agents").is_none());
                 assert!(cfg["agent"][&selected].get("permissions").is_none());
+                assert_eq!(cfg["agent"][&selected]["tools"], cfg["tools"]);
                 if role == Role::Reviewer {
                     assert_ne!(selected, "build");
-                    assert_eq!(cfg["agent"][&selected]["tools"], cfg["tools"]);
                     assert_eq!(cfg["agent"][&selected]["mode"], "primary");
                     t.new_session = "another-turn";
                     assert_ne!(opencode_agent(&t), selected);
                 } else {
                     assert_eq!(selected, "build");
-                    assert!(cfg["agent"][&selected].get("tools").is_none());
+                    // Only use-key's MCP tool is turned off for a worker.
+                    assert_eq!(
+                        cfg["tools"],
+                        serde_json::json!({"mdkg_agents_use_key": false})
+                    );
                     assert!(cfg["agent"][&selected].get("model").is_none());
                 }
             }
@@ -3507,7 +4275,63 @@ esac
 
     #[test]
     fn the_main_branch_is_always_protected() {
-        assert_eq!(protected("refs/heads/trunk", &[]), ["main", "trunk"]);
-        assert_eq!(protected("main", &["release".into()]), ["main", "release"]);
+        assert_eq!(
+            protected("refs/heads/trunk", &[]),
+            ["main", "master", "trunk"]
+        );
+        assert_eq!(
+            protected("main", &["release".into()]),
+            ["main", "master", "release"]
+        );
+        // A remote-tracking main ref is its branch's short name (R33).
+        assert_eq!(
+            protected("refs/remotes/origin/trunk", &[]),
+            ["main", "master", "trunk"]
+        );
+        assert_eq!(protected("refs/remotes/origin", &[]), ["main", "master"]);
+        // The short form mainRef may mean as a remote-tracking ref
+        // protects its branch too (review of 68846039), and a remote whose
+        // name holds a `/` protects every tail.
+        assert_eq!(
+            protected("origin/trunk", &[]),
+            ["main", "master", "origin/trunk", "trunk"]
+        );
+        assert_eq!(
+            protected("refs/remotes/team/up/trunk", &[]),
+            ["main", "master", "up/trunk", "trunk"]
+        );
+        assert_eq!(
+            protected("release/1.0", &[]),
+            ["main", "master", "release/1.0", "1.0"]
+        );
+    }
+
+    #[test]
+    fn the_graph_ref_and_its_remote_ref_are_protected() {
+        let refs = ProtectedRefs {
+            main_ref: Some("refs/remotes/upstream/trunk"),
+            graph_ref: Some("refs/heads/mdkg-graph"),
+            remote_ref: Some("refs/heads/team-graph"),
+        };
+        assert_eq!(
+            protected_refs(&refs, &["release".into(), "trunk".into()]),
+            [
+                "main",
+                "master",
+                "trunk",
+                "mdkg-graph",
+                "team-graph",
+                "release"
+            ]
+        );
+        // A graph ref outside `refs/heads/` is kept whole.
+        let refs = ProtectedRefs {
+            graph_ref: Some("refs/graphs/mdkg"),
+            ..ProtectedRefs::default()
+        };
+        assert_eq!(
+            protected_refs(&refs, &[]),
+            ["main", "master", "refs/graphs/mdkg"]
+        );
     }
 }

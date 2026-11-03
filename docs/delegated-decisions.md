@@ -4,9 +4,8 @@ mdkg lets a locally configured delegate relay a human's approval for one action
 on an exact committed node version. It is an advisory boundary against
 same-user processes, not authentication of the human or of the calling process.
 
-Delegation belongs in the user settings file (`$XDG_CONFIG_HOME/mdkg/config.json`,
-or `$HOME/.config/mdkg/config.json`) or the machine-local file
-`<git-common-dir>/mdkg/config.local.json`:
+Delegation belongs only in the user settings file
+(`$XDG_CONFIG_HOME/mdkg/config.json`, or `$HOME/.config/mdkg/config.json`):
 
 ```json
 {
@@ -18,9 +17,15 @@ or `$HOME/.config/mdkg/config.json`) or the machine-local file
 }
 ```
 
-Project settings never grant delegation. A user settings file inside a Git
-worktree or Git metadata is ignored. Machine-local grants replace user grants
-for the same actor; an empty `may` or a null actor entry revokes that actor.
+Project settings never grant delegation. Nor does the machine-local file
+`<git-common-dir>/mdkg/config.local.json`, which agent turns can write, so it
+may only tighten: a null actor entry or an empty `may` there revokes that
+actor's grant from the user settings file, and any grant there is ignored, as a
+refused decision's hint says. If that file exists but can't be read or parsed
+(invalid JSON, a symlink, a file too large), no delegation applies until it's
+fixed, and the refusal names the file. A user settings file inside a Git worktree or Git
+metadata is ignored. In the user settings file, an empty `may` or a null actor
+entry revokes that actor.
 
 The configured delegate sends `msg send --kind decision --action <action>
 --ref <node> --to <actor>` outside an agent turn. The actions are fixed:
@@ -31,6 +36,13 @@ issue decisions.
 
 No delegation authorizes push, publication, tags, credentials, data deletion,
 security-setting changes or wider permissions. Configuration cannot add actions.
+
+A decision's message body is never the decision: the committed node is. To
+answer a lane's question when no node holds the answer, reply with
+`msg send --kind resolution --reply-to <question id>` instead. A resolution
+wakes the asker like a decision does, but grants nothing. The refusal hints
+say so. A send from an actor with no delegation names the user settings file a
+person grants it in, with the JSON above.
 
 ## Checking a decision
 
@@ -99,6 +111,6 @@ other cases, and the audit row. The dry-run fixture
 `next_launcher_turn_promotes_only_revalidated_decisions_and_records_ids`
 covers Claude, Codex, OpenCode, reviewer restriction and revocation.
 `opencode_keeps_the_trusted_section_whole_or_drops_it_and_says_so` pins the
-OpenCode size boundary from both sides. agents up reports promoted and
-dropped decision ids in its turn report (`approved_decisions`,
-`dropped_decisions`); turn-end receipts are planned for a later release.
+OpenCode size boundary from both sides. `agents up` reports promoted and
+dropped decision IDs in its turn report (`approved_decisions`,
+`dropped_decisions`); mailed turn receipts don't list them yet.

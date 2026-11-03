@@ -6,7 +6,7 @@ run everything. Use it to keep test runs small while you iterate, then run
 the full suite before you ask for a merge.
 
 ```sh
-mdkg affected --base <rev> [--head HEAD] [--json]
+mdkg affected --base <rev> [--head HEAD] [--main <ref>] [--targets] [--json]
 ```
 
 The selection is based on committed paths, explicit config rules, and Go/Rust
@@ -16,6 +16,76 @@ The 0.7.0 fixture checks are in
 [`crates/mdkg-cli/tests/affected.rs`](../crates/mdkg-cli/tests/affected.rs):
 `v07_graph_document_rules_select_checks` and `unmapped_v07_graph_document_is_full`.
 
+## Merges of main
+
+A branch that merges main gets every file main changed since `--base` in
+its diff. Main's own runs already tested those changes, so `affected`
+skips a changed path whose content at the head is exactly what main had
+where the two last met: its mode and blob at the head equal those at a
+merge base of the head and main, or it is absent at both. A rename or copy
+is skipped only when both its paths match. Skipped paths leave `paths` and
+are listed in `data.from_main` (path, status, old path), and `data.main`
+names the ref, its commit and the merge bases, so a reviewer can audit the
+selection. A path the branch changed itself, including a conflict
+resolution that differs from main's version or a mode change, stays in
+`paths` and is judged as before; a global file the branch changed still
+makes the run full.
+
+Main is `--main <ref>` (any revision, such as `origin/main` when main
+lands as a pull request on a host and the local branch hasn't been
+updated), else the branch `git config mdkg.mainRef` names (read from the
+repository's own config file only, never the environment or a worktree's
+config), else the branch `main`. When none of them resolves, nothing is
+skipped, and `data.main` is absent.
+
+Under `--targets`, the verified mode `scripts/check.sh --affected` uses,
+only an explicit `--main` naming a branch or remote-tracking ref
+(`refs/heads/*`, `refs/remotes/*`) skips anything, so no ambient setting
+can shrink a verified selection: without `--main` the answer is the one
+without the rule, and a SHA or tag is refused in `data.main.detail`.
+`scripts/check.sh --affected <base> --main main` passes it through and
+prints `affected main:` with the ref, its commit and the `from_main`
+count.
+
+mdkg never requires a main branch. Any doubt skips nothing and `data.main.detail` says why: an
+explicit ref that names no commit, a shallow clone, no shared history, a
+git error, or a head that is on main itself (main's own range is never
+skipped, since main's runs are what the rule relies on). With a stale
+local main, main's newer changes don't match, so they are judged as the
+branch's own and the run is less selective.
+
+What a selective run then misses is the combination: main's change next
+to the branch's own, or a branch that sets a path back to main's version
+(it counts as main's). A full run of the merged result, at integration,
+covers it. `a_lane_merging_main_stays_selective_for_its_own_change` and
+the other `*main*` cases in `crates/mdkg-cli/tests/affected.rs` cover
+the rule, its conflict and mode cases, the no-main fallback, the
+`--targets` rule and the config-only default.
+
+## On a long-lived branch
+
+A branch that hands off its commits one at a time (a lane) runs
+`affected --base <the head its last handoff named>`, not the merge base
+with main: that merge base can be far back and selects the whole
+workspace. Then:
+
+- Run the Rust plan, `data.selected.rust_targets[].cargo_args`
+  (deduplicated), not `cargo test -p` on each of `data.selected.rust`:
+  that list names the packages for older consumers, and a target rule can
+  select one test of a package. A prose edit under `.mdkg/` selects only
+  `--test commands_doc --test schemas` of `mdkg` here, although `rust`
+  says `mdkg`. Text output prints the plan as `cargo:` lines.
+- Run tests with `TMPDIR` reached through a symlink, as
+  `scripts/check.sh` does, so a path bug only a symlinked folder shows
+  fails on the branch, not first at integration. Keep the base short:
+  a Unix socket path must fit in 104 bytes on macOS, and macOS's default
+  `TMPDIR` under `/var/folders` leaves too little room.
+
+  ```sh
+  t=$(mktemp -d /tmp/mck.XXXXXX) && mkdir "$t/real" && ln -s real "$t/linked"
+  TMPDIR="$t/linked" cargo test <the plan's arguments>
+  ```
+
 ## In a review chain
 
 After you commit a fix and before the next review round:
@@ -24,11 +94,20 @@ After you commit a fix and before the next review round:
 2. Run:
 
    ```sh
-   mdkg affected --base <chain-first-commit>^ --json > /tmp/affected.json
+   mdkg affected --targets --base <chain-first-commit>^ --json > /tmp/affected.json
    ```
 
-3. Check `.ok` first: a failure (outside a repository, say) has `ok:
-   false`, no `data`, and a non-zero exit; run the whole suite. Then read
+3. Check `.ok` first. An error has `ok: false`, no `data`, and a nonzero
+   exit: it provides no verified target selection. Read the diagnostic.
+   - For `config.invalid` naming an opt-in or `required-features` target,
+     correct the rule or manifest and retry. A default full-workspace run
+     skips those targets too, so it cannot substitute for correcting that
+     unsupported selection.
+   - For an unverifiable revision or missing metadata, fetch or repair the
+     required local inputs and retry, or perform the repository's complete
+     full-suite verification separately.
+
+   On success, read
    `data.mode`:
    - `full`: run the whole suite. `data.reasons` says why (a global file, a
      path nothing maps, ...).
@@ -46,8 +125,28 @@ After you commit a fix and before the next review round:
        done
        ```
 
-     - Rust: when `jq -e '.data.selected.rust | length > 0'` holds,
+     - Rust (older builds): when `jq -e '.data.selected.rust | length > 0'` holds,
        `cargo test $(jq -r '.data.selected.rust[] | "-p " + .' /tmp/affected.json)`.
+     - Rust target plans: request `--targets` before using
+       `data.selected.rust_targets`, then run each target with nextest from
+       the repository root: `cargo nextest run -p <package> --test <name>` for
+       a `test` target, `cargo nextest run -p <package> --bin <name>` for a
+       `bin` target, and `cargo nextest run -p <package> --lib` for a `lib`
+       target. An entry with `kind: "package"` runs every target of its
+       package: `cargo nextest run -p <package>`. Several scopes also run in
+       one invocation: `cargo nextest run -p <package> -E 'kind(lib) or
+       binary(<name>)'`, which is what `scripts/check.sh --affected` does for
+       the whole plan. nextest runs no doctests, so add `cargo test --doc -p
+       <package>` only when the change touches doc comments. A doc example
+       can also break when the code it calls changes; the wave check, which
+       runs every doctest, catches that. Do not also run
+       `selected.rust`: it preserves the package list for legacy consumers,
+       which covers the supported default test scopes.
+       Empty target lists mean no Cargo invocation. `rust_target_rules_*`
+       in the affected fixture tests cover the plan and legacy projection.
+       On successful output this build always emits `rust_targets` and
+       `warnings`, which may be empty. Their schema fields remain optional
+       for compatibility with older output.
      - Suites in `data.selected.suites` are names from the config's rules;
        run whatever your repository means by them.
      - An empty selection means only paths that need no tests changed.
@@ -55,6 +154,15 @@ After you commit a fix and before the next review round:
    that matter.
 5. Before asking for a merge, run the full suite anyway
    (`scripts/check.sh` here).
+
+`--targets` is the explicit strict mode for consumers of the target plan.
+Unresolvable revisions, incomplete ancestry, partial clones, unreadable
+configuration or snapshots, and unavailable required metadata/adapters fail
+with `ok: false`, no `data`, a named diagnostic and a corrective hint. A
+verified global or unmapped change can still request a full run. Without
+`--targets`, the shipped v1 full-run fallbacks remain unchanged. The
+`rust_target_mode_requires_local_revisions_even_without_rules` fixture and the
+partial-clone, snapshot and metadata fixtures check both modes.
 
 It reads only the two commits, never your checkout: uncommitted, staged
 or untracked files don't count, so commit first to include them. The Go
@@ -186,6 +294,54 @@ In `.mdkg/config.json`:
   package folder `go list` found, workspace crate names, and suite names
   (letters, digits, `.`, `_` and `-`). Targets are taken as named, with
   no dependents added.
+- Rust target rules add `rust_targets` beside `rust`, without changing
+  `affected.version` or the `mdkg.affected.v1` envelope. For example:
+
+  ```json
+  {"paths": ["crates/cli/src/query/**"], "select": {"rust_targets": [
+    {"package": "cli", "test": "query"},
+    {"package": "cli", "lib": true}
+  ]}}
+  ```
+
+  A target rule asserts that only the named targets exercise those paths:
+  list every integration, `lib` and `bin` target that covers them, or use
+  `rust` for the whole package. `lib: true` excludes documentation tests;
+  use `"rust": ["cli"]` when those are required for the example above.
+
+  A target needs a workspace package and exactly one of `test` (an integration
+  target name from Cargo metadata), `bin` (binary unit tests), or `lib: true`.
+  Unknown packages, missing targets and malformed entries fail closed. Cargo metadata is still offline.
+  A matching target rule narrows that package's tests; every dependent package
+  remains selected. A dependent without an explicit target in the matching
+  rules runs whole-crate tests. A matching `rust` whole-package rule, or any
+  unmapped changed source path in that package, wins over finer targets when
+  selections combine. Cargo receives every selected package together to
+  preserve feature unification. Filters apply across that package set, so
+  the union may also run another selected package's same-named target, even
+  when that extra target is unconfigured or marked `test = false`. This is
+  known over-selection; configured scopes still receive the checks below. A
+  whole-package fallback runs the combined package set without target filters,
+  replacing the fine plan conservatively. In 0.7.1, rules cannot select opt-in
+  targets marked `test = false` or guarded by nonempty `required-features`.
+  Such a rule returns `ok: false`, no `data`,
+  a nonzero exit and `config.invalid` with a hint to remove the target entry
+  or enable default testing without a feature gate. This validation precedes path selection, so
+  neither an unrelated path nor a full-run global file hides the refusal.
+  `rust_target_opt_in_rules_are_refused_before_selective_full_and_no_change_decisions`
+  covers those cases; `rust_target_opt_in_library_and_binary_rules_are_refused`
+  covers library and binary targets.
+  `rust_target_feature_gated_rules_are_refused_even_with_default_features` covers
+  feature gates, including ones enabled by default. Opt-in support is deferred.
+  `rust_target_grouped_invocation_preserves_feature_unified_tests`
+  executes the plan and checks feature-gated unit tests still run.
+  `rust_target_rules_do_not_drop_uncovered_dependents` and
+  `rust_target_whole_crate_fallback_dominates_default_scopes_across_paths` cover
+  these safeguards.
+- Paths mapped by the Rust adapter but lacking a test-target rule keep the
+  whole-crate fallback. `data.warnings` names the path and fallback packages;
+  text output prints the warning too. This is selective, not a full-run
+  reason. Paths no adapter or rule accounts for still request a full run.
 - Every matching rule applies, and `all` wins. `none` only says a path
   needs no tests: it never drops an adapter's selection or any reason
   for a full run.
@@ -212,3 +368,102 @@ In `.mdkg/config.json`:
 | `package_removed` | A deleted package's former importers need a full run. |
 | `config_invalid` | The head has no `.mdkg/config.json`, it isn't a supported config object with valid format identity, the `affected` section is malformed, or a matching rule's target names nothing. |
 | `unreadable_path` | A path isn't UTF-8, or git reported an unknown status. |
+
+## Repository rules
+
+This repository maps every source file and individual integration test
+files in `.mdkg/config.json`. Shared test helpers and crate module roots keep
+whole-package coverage. A newly added module without a rule warns and falls
+back; add its integration coverage to the rules as the module grows. Docs and
+node changes select `commands_doc` and `schemas`; `docs/concepts.md` and
+local templates also select the graph `format07` target, which checks the
+generated headings table and template behavior. Local templates additionally
+select `affected`, whose private fixture uses the configured active set's
+14 supported node-type templates, checks dependency preservation and rejects
+malformed task data. Partial overrides use bundled defaults for absent kinds.
+Other spec, loop and skill template files are not exercised by this fixture.
+Shared schema/default inputs
+keep whole-package coverage. The configuration itself remains a global file.
+`.config/nextest.toml` selects everything, like `clippy.toml`: it changes how
+every test runs.
+
+## Running the gates
+
+To run the local gates with the committed target plan:
+
+```sh
+MDKG_BIN=/path/to/pinned/mdkg scripts/check.sh --affected <base-ref>
+```
+
+Both modes run the Cargo tests with `TMPDIR` set to a link the script
+makes to a folder under the run's temp area, on macOS and Linux alike,
+and remove both at exit.
+
+Omit `--affected` for the full gate run. Selective mode keeps format and
+source/script checks, lints the selected packages, and runs one grouped
+`cargo nextest` invocation with four build jobs and four test threads, plus
+`cargo test --doc` for a whole-package scope. An empty Rust selection launches
+no Cargo test or clippy process; formatting still runs. The full run uses
+cargo-nextest for the tests and `cargo test --workspace --doc` for the
+doctests; a missing cargo-nextest stops the gate with an install hint.
+Affected mode pins the checkout, ignores inherited Git routing, refuses
+hidden index flags and compares tracked working bytes with HEAD. It repeats
+the check after execution and prints fallback warnings. These are pre/post
+observations: a write restored during the run is not detected. Ignored files,
+including ignored build configuration, are not verified. The raw comparison
+assumes working bytes match committed blobs; clean/smudge filters or line-ending
+conversion that change those bytes cause a refusal. No filters are executed.
+The gate and its working helpers are trusted programs for one user and one
+writer. Owned Git administrative configuration is trusted; includes are not
+isolated, while external excludes and attributes files are disabled. Concurrent
+same-user replacement of the plan or Git administration is outside this model.
+Tracked inputs are opened through no-follow handles for every parent component.
+Git is pinned once outside both the source checkout and fixture directories;
+Python starts from a trusted system location before PATH is filtered.
+Metadata directory paths resolve symlinks before parent components such as `..`.
+The guard walks that real path through no-follow handles and checks the opened
+directory's device/inode identity and ownership. Metadata files must be owned,
+bounded regular files with one link. A same-user swap between validation and
+Git's own open remains outside this pre/post check. Directory ancestors must be
+readable: a searchable but unreadable parent, such as mode 0711, can be refused
+even when Git can traverse it.
+A `full` decision runs every local gate and reports platform, quint, release
+and scripts checks as outstanding with exit 3, even without explicit suite labels. An
+invalid or failed affected report stops
+the script. The pinned executable must support `--targets`; package-only v1
+plans run their selected packages together. The lint suite runs Clippy for
+its selected packages; a clippy.toml change requests full gates so new crates
+are covered automatically. Workflows use the existing static gates.
+Selected scripts require their own syntax/self-tests, so scripts, platform
+(Ubuntu CI), quint, release and other unhandled suites return an explicit
+incomplete result with exit 3 after local checks. This mode is for
+iteration; full validation before integration remains required.
+
+The runner checks its argument routing and verification with 40 self-test cases
+on every gate run, covering nextest filter scopes, whole-package fallback,
+doctests after a failing test run, empty
+selections, legacy plans, rejected invalid plans and raw-byte refusal of a CRLF
+working copy under `eol=crlf`, symlinked-parent refusal and template-root policy.
+A configured template-root change must also update its explicit affected-test
+or full-coverage rule; the self-test checks this invariant, so the global
+configuration gate catches the mismatch before integration.
+
+`python3 -I scripts/leak-scan.py` finds the Git root and uses
+the literal keep/drop/drop_cases paths in `scripts/export-public.policy` when
+that private data is present. The exporter uses the same confined policy
+reader; revision exports read the policy from that commit, while working
+checks use the working policy. Git-backed scans refuse foreign-owned roots
+or `.git` entries. The scanner confines candidate reads and rejects special files,
+and executes no checkout selection code. Git reads disable configured helpers
+and lazy network access. Selection also works before the first commit.
+Narrowing applies only to the
+scanner's own distribution checkout; external trees are scanned without
+applying their policy files, and the output says so. Git lookup ignores
+relative and checkout-contained PATH entries. A non-isolated bare invocation
+prints the required `python3 -I` command before importing other modules.
+In public source trees it scans tracked and non-ignored new working files.
+`check.sh` calls the same default. `--root` and `--files0-from -` retain
+explicit tree/list selection. Explicit-list paths are relative to `--root`, or
+the current directory when it is omitted, and require no Git repository.
+The scanner's `--self-test` checks both default
+selection paths without reading harness configuration or contacting providers.

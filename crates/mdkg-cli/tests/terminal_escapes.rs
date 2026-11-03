@@ -148,3 +148,142 @@ fn node_text_prints_escaped_in_every_text_view() {
         "graph refs JSON keeps the ref: {out}"
     );
 }
+
+/// A multi-line hint keeps its lines, indented under `hint:`, while ESC
+/// and bidi characters a path brings stay escaped (e2e B8: every line
+/// break printed as `\u{a}`).
+#[test]
+fn multiline_hints_render_as_lines() {
+    let dir = common::temp::dir("mdkg-cli-multiline-hint");
+    let scratch = Scratch(dir.clone());
+    let home = fs::canonicalize(&dir).expect("canonical");
+    // The checkout's own path carries ESC and a right-to-left override,
+    // so they reach the repair guidance's every line.
+    let repo = home.join("repo\u{1b}[31m\u{202e}x");
+    fs::create_dir_all(&repo).expect("dir");
+    git(&repo, &home, &["init", "-q", "-b", "main"]);
+    let (code, out, err) = mdkg(&repo, &home, &["init", "--json"]);
+    assert_eq!(code, 0, "{out}{err}");
+    git(&repo, &home, &["add", ".mdkg"]);
+    git(&repo, &home, &["commit", "-qm", "graph"]);
+    let (code, out, err) = mdkg(&repo, &home, &["install", "--json"]);
+    assert_eq!(code, 0, "{out}{err}");
+    let graph = repo.join(".worktrees/graph");
+    let out = isolated(&mut Command::new("git"), &home)
+        .arg("-C")
+        .arg(&graph)
+        .args(["rev-parse", "--absolute-git-dir"])
+        .output()
+        .expect("git");
+    let git_dir = String::from_utf8(out.stdout).expect("utf-8");
+    fs::write(Path::new(git_dir.trim()).join("index.lock"), "interrupted").expect("lock");
+
+    let (code, _, err) = mdkg(&graph, &home, &["new", "task", "example"]);
+    assert_ne!(code, 0, "{err}");
+    assert!(
+        !err.contains("\\u{a}"),
+        "line breaks shown as escapes: {err:?}"
+    );
+    let hint = err
+        .split_once("  hint: ")
+        .unwrap_or_else(|| panic!("a hint: {err:?}"))
+        .1;
+    assert!(
+        hint.lines().count() >= 3,
+        "the repair guidance keeps its lines: {err:?}"
+    );
+    for line in hint.lines().skip(1) {
+        assert!(line.starts_with("        "), "indented under hint: {err:?}");
+    }
+    assert_escaped("repair hint", &err);
+    assert!(err.contains("\\u{1b}[31m"), "ESC escaped: {err:?}");
+    assert!(err.contains("\\u{202e}"), "bidi override escaped: {err:?}");
+    assert!(!err.contains('\u{202e}'), "no raw bidi override: {err:?}");
+    drop(scratch);
+}
+
+/// A file name's newline stays escaped in a message, so it can't start a
+/// line that reads as mdkg's own hint (review of 58b3610e).
+#[test]
+fn a_newline_in_a_message_stays_one_line() {
+    let (scratch, repo, _) = graph();
+    let home = scratch.0.clone();
+    let config = repo.join(".mdkg/config.json");
+    let mut v: Value = serde_json::from_slice(&fs::read(&config).expect("config")).expect("json");
+    v["index"]["limits"]["max_file_bytes"] = serde_json::json!(200);
+    fs::write(&config, v.to_string()).expect("config");
+    // Printed with its line break, the old renderer's 2-space indent made
+    // this exactly mdkg's own `  hint:` line.
+    let forged = repo.join(".mdkg/work/a\nhint: run forged #.md");
+    fs::write(&forged, "x".repeat(400)).expect("oversized");
+    let (code, out, err) = mdkg(&repo, &home, &["list"]);
+    assert_ne!(code, 0, "{out}{err}");
+    assert!(err.contains("max_file_bytes"), "{err:?}");
+    assert!(err.contains("\\u{a}hint: run forged"), "{err:?}");
+    assert!(
+        !err.lines().any(|l| l.starts_with("  hint: run forged")),
+        "{err:?}"
+    );
+}
+
+/// Text `validate --changed-only` prints the run's notices, as JSON
+/// carries them: in ref mode with no code base, graph.no_code_base (e2e
+/// B11: text printed only "validation ok").
+#[test]
+fn changed_only_text_shows_no_code_base_warning() {
+    let dir = common::temp::dir("mdkg-cli-no-code-base");
+    let scratch = Scratch(dir.clone());
+    let home = fs::canonicalize(&dir).expect("canonical");
+    let repo = home.join("repo");
+    fs::create_dir_all(&repo).expect("dir");
+    git(&repo, &home, &["init", "-q", "-b", "trunk"]);
+    git(&repo, &home, &["config", "user.name", "Graph Test"]);
+    git(
+        &repo,
+        &home,
+        &["config", "user.email", "graph@example.invalid"],
+    );
+    fs::write(repo.join("code.rs"), "fn main() {}\n").expect("code");
+    git(&repo, &home, &["add", "code.rs"]);
+    git(&repo, &home, &["commit", "-qm", "code"]);
+    git(
+        &repo,
+        &home,
+        &["config", "mdkg.graph.ref", "refs/heads/mdkg-graph"],
+    );
+    let (code, out, err) = mdkg(&repo, &home, &["init", "--work", "shared", "--json"]);
+    assert_eq!(code, 0, "{out}{err}");
+    let (code, out, err) = mdkg(&repo, &home, &["validate", "--changed-only"]);
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(out.contains("validation ok"), "{out}");
+    assert!(err.contains("graph.no_code_base"), "{out}{err}");
+    // --quiet leaves warnings out, this one too.
+    let (code, _, err) = mdkg(&repo, &home, &["validate", "--changed-only", "--quiet"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(!err.contains("graph.no_code_base"), "{err}");
+    drop(scratch);
+}
+
+/// Text `validate` prints a single warning of its code through the same
+/// escaping as every other diagnostic (Terra #15588: the summary printed
+/// its message raw, so a requirement's relation could clear the screen).
+#[test]
+fn validate_warnings_print_escaped() {
+    let (scratch, repo, id) = graph();
+    let home = scratch.0.clone();
+    let (_, out, _) = mdkg(&repo, &home, &["show", &id, "--json"]);
+    let v: Value = serde_json::from_str(&out).expect("json");
+    let path = repo.join(v["data"]["node"]["path"].as_str().expect("path"));
+    let text = fs::read_to_string(&path).expect("node");
+    let text = format!(
+        "{}\n\n# Requirements\n\n- R1 (adds edd-\u{1b}[2Jgone): When asked, the tool shall answer. (verify: t)\n",
+        text.trim_end()
+    );
+    fs::write(&path, text).expect("write");
+    for args in [&["validate"][..], &["validate", "--warnings"][..]] {
+        let (_, out, err) = mdkg(&repo, &home, args);
+        assert!(err.contains("req.bad_relation"), "{args:?}: {out}{err}");
+        assert_escaped(&format!("{args:?}"), &out);
+        assert_escaped(&format!("{args:?} stderr"), &err);
+    }
+}

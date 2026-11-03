@@ -30,6 +30,12 @@ fn sorted_entries(dir: &Path) -> Result<Vec<std::fs::DirEntry>, GraphError> {
     Ok(entries)
 }
 
+/// Whether a file is a markdown document by its name: an `md`
+/// extension, exactly.
+pub fn is_markdown(path: &Path) -> bool {
+    path.extension().is_some_and(|x| x == "md")
+}
+
 /// Every regular `.md` file under `dir`, recursively, in name order.
 pub fn markdown_files(dir: &Path, max_depth: u64) -> Result<Vec<PathBuf>, GraphError> {
     let mut out = Vec::new();
@@ -57,7 +63,7 @@ fn walk(dir: &Path, depth: u64, max_depth: u64, out: &mut Vec<PathBuf>) -> Resul
         let path = entry.path();
         if file_type.is_dir() {
             walk(&path, depth + 1, max_depth, out)?;
-        } else if file_type.is_file() && path.extension().is_some_and(|x| x == "md") {
+        } else if file_type.is_file() && is_markdown(&path) {
             out.push(path);
         }
     }

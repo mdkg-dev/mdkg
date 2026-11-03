@@ -25,6 +25,7 @@ use std::process::Command;
 use serde::Deserialize;
 
 use super::MatchKind;
+use super::config::{RustTarget, RustTargetKind};
 use super::select::{Adapter, Mapping, Target};
 
 #[derive(Debug, Deserialize)]
@@ -48,6 +49,11 @@ struct MetaPackage {
 #[derive(Debug, Deserialize)]
 struct MetaTarget {
     src_path: PathBuf,
+    name: String,
+    kind: Vec<String>,
+    test: bool,
+    #[serde(default, rename = "required-features")]
+    required_features: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -59,6 +65,8 @@ struct MetaDependency {
 
 #[derive(Debug, Default)]
 struct Graph {
+    test_targets: BTreeSet<RustTarget>,
+    unsupported_targets: BTreeMap<RustTarget, &'static str>,
     /// Repository-relative member folder to crate name.
     by_dir: BTreeMap<String, String>,
     /// What members claim, to the crates claiming it.
@@ -134,6 +142,21 @@ impl RustAdapter {
                 .collect(),
             graph: None,
         })
+    }
+
+    /// Rule validation happens before changed paths are judged, including
+    /// global-only and empty diffs. Legacy package commands omit these scopes.
+    pub fn unsupported_rule_target(
+        &mut self,
+        targets: &[RustTarget],
+    ) -> Result<Option<(RustTarget, &'static str)>, String> {
+        let graph = self.graph()?;
+        Ok(targets.iter().find_map(|t| {
+            graph
+                .unsupported_targets
+                .get(t)
+                .map(|reason| (t.clone(), *reason))
+        }))
     }
 
     fn graph(&mut self) -> Result<&Graph, String> {
@@ -401,6 +424,37 @@ fn from_metadata(top: &Path, meta: Metadata) -> Result<Graph, String> {
             return Err(format!("two crates in {rel}: {previous} and {}", p.name));
         }
         for target in &p.targets {
+            let kind = if target.kind.iter().any(|k| k == "test") {
+                Some(RustTargetKind::Test(target.name.clone()))
+            } else if target.kind.iter().any(|k| {
+                matches!(
+                    k.as_str(),
+                    "lib" | "rlib" | "dylib" | "staticlib" | "cdylib" | "proc-macro"
+                )
+            }) {
+                Some(RustTargetKind::Lib)
+            } else if target.kind.iter().any(|k| k == "bin") {
+                Some(RustTargetKind::Bin(target.name.clone()))
+            } else {
+                None
+            };
+            if let Some(kind) = kind {
+                let scope = RustTarget {
+                    package: p.name.clone(),
+                    kind,
+                };
+                graph.test_targets.insert(scope.clone());
+                let reason = if !target.test {
+                    Some("test = false")
+                } else if !target.required_features.is_empty() {
+                    Some("required-features")
+                } else {
+                    None
+                };
+                if let Some(reason) = reason {
+                    graph.unsupported_targets.insert(scope, reason);
+                }
+            }
             let src = relative(top, &target.src_path)?;
             let inside = if rel == "." {
                 Some(src.as_str())
@@ -534,6 +588,20 @@ impl Adapter for RustAdapter {
                     Ok(Target::Rust(n.clone()))
                 } else {
                     Err(format!("no workspace crate is named `{n}`"))
+                }
+            })
+            .collect()
+    }
+
+    fn resolve_tests(&mut self, targets: &[RustTarget]) -> Result<BTreeSet<Target>, String> {
+        let graph = self.graph()?;
+        targets
+            .iter()
+            .map(|target| {
+                if graph.test_targets.contains(target) {
+                    Ok(Target::RustTest(target.clone()))
+                } else {
+                    Err(format!("no workspace test target matches {target:?}"))
                 }
             })
             .collect()

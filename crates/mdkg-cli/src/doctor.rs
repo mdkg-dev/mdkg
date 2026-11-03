@@ -1,6 +1,7 @@
 //! `mdkg doctor`: checks the setup. It covers this build,
 //! the `PATH`, git, the config, the graph, the coordinator store, the
-//! skill mirrors and the agents' MCP configs, and changes nothing. The
+//! skill mirrors and the agents' MCP configs. Only --repair writes missing
+//! clone-local graph identity records; projections are never synced. The
 //! store is opened read-only and never upgraded, so doctor is safe to run
 //! with any build, in any repository.
 //!
@@ -33,6 +34,9 @@ const WORK_COMMITTED: &[&str] = &["definitions", "none"];
 
 #[derive(Debug, Args)]
 pub struct DoctorArgs {
+    /// Add missing clone-local graph identity records only; never sync projections.
+    #[arg(long)]
+    pub repair: bool,
     /// Fail on warnings too.
     #[arg(long)]
     pub strict: bool,
@@ -54,12 +58,26 @@ pub enum Status {
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct Check {
     /// The setup component, including `binary`, `path`, `git`, `config`,
-    /// `graph`, `store`, `mirrors`, `mcp`, `agents`, `hooks` or `builds`.
+    /// `graph`, `store`, `mirrors`, `mcp`, `agents`, `hooks` or `builds`;
+    /// in ref mode `code_base` and the `graph.*` checks, in checkout mode
+    /// `main` and a `graph.ref` warning.
     pub name: String,
     pub status: Status,
     pub summary: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
+    /// The `store` check only: the coordinator store's schema version, as
+    /// its summary's `schema <n>` names it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub store_schema: Option<u64>,
+    /// The `store` check only: the store's mail schema version (`+msg<n>`),
+    /// 0 for a store with no mail tables.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mail_schema: Option<u64>,
+    /// The `store` check only: whether this build would upgrade the store
+    /// when it next opens it (copying it first).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upgrade_needed: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -78,6 +96,9 @@ fn check(name: &str, status: Status, summary: impl Into<String>) -> Check {
         status,
         summary: summary.into(),
         hint: None,
+        store_schema: None,
+        mail_schema: None,
+        upgrade_needed: None,
     }
 }
 
@@ -100,28 +121,73 @@ pub fn find_root(start: &Path) -> PathBuf {
 pub fn run(root: &Path, args: &DoctorArgs) -> u8 {
     let mut checks = vec![binary(), path_check()];
     checks.push(git_check());
-    checks.push(main_check(root));
-    checks.push(graph_worktree_check(root));
-    let (config_check, cfg) = config_check(root);
-    checks.push(config_check);
-    match &cfg {
-        Some(cfg) => {
-            checks.push(graph_check(root, cfg));
-            checks.push(mirrors_check(root, cfg));
+    let mode = graph_ref_checks(root, &mut checks);
+    // The projections' files are the checkout's in either mode.
+    let mut files = root.to_path_buf();
+    let projections = match &mode {
+        Mode::Checkout => {
+            checks.push(identity_check(root, args.repair));
+            checks.push(graph_worktree_check(root));
+            let (config_check, cfg) = config_check(root);
+            checks.push(config_check);
+            match &cfg {
+                Some(cfg) => {
+                    checks.push(graph_check(root, cfg));
+                    checks.push(mirrors_check(root, cfg));
+                }
+                None => {
+                    checks.push(check("graph", Status::Skip, "no readable config"));
+                    checks.push(check("mirrors", Status::Skip, "no readable config"));
+                }
+            }
+            // A config with unreadable projections fails the config check;
+            // the checks below then check none.
+            Projections::read(root).unwrap_or_else(|_| Projections::none())
         }
-        None => {
-            checks.push(check("graph", Status::Skip, "no readable config"));
-            checks.push(check("mirrors", Status::Skip, "no readable config"));
+        Mode::Ref(Some(found)) => {
+            files = found.top.clone();
+            let (config_check, _) = judge_config(
+                config::from_snapshot(found.config.clone()),
+                found.config.clone(),
+                Some(Ok(found.config.clone())),
+                None,
+            );
+            checks.push(config_check);
+            // `graph.ref` validated the tip strictly.
+            checks.push(check(
+                "graph",
+                Status::Ok,
+                format!("valid at {} (read from the graph ref)", short(&found.tip)),
+            ));
+            checks.push(check(
+                "mirrors",
+                Status::Skip,
+                "ref mode: install mirrors the skills from the graph tip",
+            ));
+            Projections::from_config(&found.config).unwrap_or_else(|_| Projections::none())
         }
-    }
-    checks.push(store_check(root));
+        Mode::Ref(None) => {
+            for name in ["config", "graph", "mirrors"] {
+                checks.push(check(
+                    name,
+                    Status::Skip,
+                    "the graph ref can't be read (see graph.ref); no checkout copy stands in",
+                ));
+            }
+            Projections::none()
+        }
+    };
+    checks.push(store_check(&files));
     checks.push(builds_check(root));
-    // A config with unreadable projections fails the config check; the
-    // two below then check none.
-    let projections = Projections::read(root).unwrap_or_else(|_| Projections::none());
-    checks.push(mcp_check(root, &projections));
-    checks.push(agents_check(root, &projections));
-    checks.push(hooks_check(root, &projections));
+    checks.push(progress_check(root));
+    checks.push(faults_check(root));
+    checks.push(mcp_check(&files, &projections));
+    checks.push(agents_check(&files, &projections));
+    let hook_graph = match &mode {
+        Mode::Ref(Some(found)) => Some(found.as_ref()),
+        _ => None,
+    };
+    checks.push(hooks_check(&files, &projections, hook_graph));
 
     let errors = checks.iter().filter(|c| c.status == Status::Error).count();
     let warnings = checks
@@ -131,6 +197,11 @@ pub fn run(root: &Path, args: &DoctorArgs) -> u8 {
     let diagnostics = checks
         .iter()
         .filter_map(|c| {
+            // The builds row already carries this summary in text output.
+            // JSON retains the coded diagnostic as well as the check.
+            if c.name == "builds" && !args.json {
+                return None;
+            }
             let d = match c.status {
                 Status::Error => Diagnostic::error(
                     Code::DoctorCheckFailed,
@@ -177,6 +248,11 @@ pub fn run(root: &Path, args: &DoctorArgs) -> u8 {
                 Status::Skip => "skip",
             };
             println!("{mark} {:<8} {}", c.name, output::shown_path(&c.summary));
+            if c.name == "builds"
+                && let Some(hint) = &c.hint
+            {
+                println!("  hint: {}", output::shown_path(hint));
+            }
         }
         println!(
             "{}, {}",
@@ -186,14 +262,101 @@ pub fn run(root: &Path, args: &DoctorArgs) -> u8 {
     })
 }
 
+fn identity_check(root: &Path, repair: bool) -> Check {
+    if mdkg_coord_sqlite::git::common_dir(root).is_err() {
+        return check("graph_identity", Status::Skip, "no git common directory");
+    }
+    match mdkg_run::install::worktree::repair_identities(root, repair) {
+        Ok(writes) if writes.is_empty() => check(
+            "graph_identity",
+            Status::Ok,
+            "no missing graph identity records",
+        ),
+        Ok(writes) if repair => check(
+            "graph_identity",
+            Status::Ok,
+            format!("wrote: {}", writes.join("; ")),
+        ),
+        Ok(writes) => check(
+            "graph_identity",
+            Status::Warning,
+            format!("identity repair would write: {}", writes.join("; ")),
+        )
+        .hint(format!(
+            "run {BIN} doctor --repair to add only these records"
+        )),
+        Err(e) => {
+            let mut c = check("graph_identity", Status::Error, e.message);
+            c.hint = e.hint;
+            c
+        }
+    }
+}
+
 fn graph_worktree_check(root: &Path) -> Check {
     match crate::graph_repair::inspect(root) {
         Ok(Some(state)) => {
-            check("graph_worktree", Status::Error, state.reason).hint(state.guidance.join("\n"))
+            let hint = state.hint();
+            check("graph_worktree", Status::Error, state.reason).hint(hint)
         }
         Ok(None) => check("graph_worktree", Status::Ok, "no frozen graph checkout"),
         Err(e) => check("graph_worktree", Status::Error, e.diagnostic.message)
             .hint("inspect the shared graph checkout with git -C .worktrees/graph status"),
+    }
+}
+
+fn progress_check(root: &Path) -> Check {
+    match crate::agents::progress_status(root) {
+        Ok(records) => {
+            let problems: Vec<_> = records
+                .iter()
+                .filter_map(|r| {
+                    r.problem.as_ref().map(|problem| {
+                        format!(
+                            "{}: {}; {}; metadata {}",
+                            r.agent,
+                            problem,
+                            r.repair.as_deref().unwrap_or("inspect agents status"),
+                            r.record.as_ref().map(Value::to_string).unwrap_or_default()
+                        )
+                    })
+                })
+                .collect();
+            if problems.is_empty() {
+                check(
+                    "supervisor_progress",
+                    Status::Ok,
+                    "no interrupted or unreadable supervisor progress",
+                )
+            } else {
+                check("supervisor_progress", Status::Warning, problems.join("; "))
+            }
+        }
+        Err(e) => check("supervisor_progress", Status::Warning, e.diagnostic.message),
+    }
+}
+
+/// Faults whose send failed, kept for the next loop boundary (A26).
+fn faults_check(root: &Path) -> Check {
+    let Ok(dir) = mdkg_run::state::run_dir(root) else {
+        return check("faults", Status::Skip, "no git common directory");
+    };
+    match mdkg_run::fault::pending_all(&dir) {
+        Ok(agents) if agents.is_empty() => check("faults", Status::Ok, "no pending faults"),
+        Ok(agents) => {
+            let each: Vec<String> = agents
+                .iter()
+                .map(|(agent, count)| match count {
+                    Ok(n) => format!("{agent}: {}", plural(*n, "pending fault")),
+                    Err(e) => format!("{agent}: pending faults unreadable ({})", e.message),
+                })
+                .collect();
+            check("faults", Status::Warning, each.join("; ")).hint(format!(
+                "a running supervisor sends them again at its next loop boundary, and `{BIN} \
+                 agents up` when it starts"
+            ))
+        }
+        Err(e) => check("faults", Status::Warning, e.message),
     }
 }
 
@@ -361,6 +524,643 @@ fn main_check(root: &Path) -> Check {
             ),
         ),
     }
+}
+
+/// The graph doctor reads in ref mode: the committed config at the graph
+/// tip, as git objects. Doctor never binds the command to the graph ref,
+/// which could replay an intent or refresh the cache: it stays a read.
+struct RefGraph {
+    graph: mdkg_graph::graphref::GraphRef,
+    top: PathBuf,
+    tip: String,
+    graph_id: String,
+    config: Value,
+}
+
+/// Which graph the remaining checks read.
+enum Mode {
+    /// 0.7.0's: the checkout's `.mdkg`, settled on main.
+    Checkout,
+    /// The graph ref, or `None` when it can't be read (`graph.ref` says
+    /// why); no checkout copy stands in.
+    Ref(Option<Box<RefGraph>>),
+}
+
+/// A value from the clone's common git config file only.
+fn common_value(top: &Path, common: &Path, key: &str) -> Option<String> {
+    git_out(
+        top,
+        &[
+            "config",
+            "--file",
+            &common.join("config").to_string_lossy(),
+            "--get",
+            key,
+        ],
+    )
+}
+
+/// The graph-ref checks of the Config section's doctor table
+/// (edd-01a18867, R37), and the code base in place of 0.7.0's `main`
+/// check (row 14). In checkout mode: `graph.ref` warns and the `main`
+/// check stays, since checkout mode still settles on main.
+fn graph_ref_checks(root: &Path, checks: &mut Vec<Check>) -> Mode {
+    if git_out(root, &["rev-parse", "--git-dir"]).is_none() {
+        checks.push(main_check(root));
+        return Mode::Checkout;
+    }
+    let graph = match mdkg_graph::graphref::resolve(root) {
+        Ok(Some(graph)) => graph,
+        Ok(None) => {
+            checks.push(
+                // Info, not a warning: checkout mode stays supported until an
+                // explicit `--setup`, so `--strict` passes it (dec-01a18ee0
+                // item 10).
+                check(
+                    "graph.ref",
+                    Status::Ok,
+                    "info: checkout mode: the graph is this checkout's .mdkg, settled on main",
+                )
+                .hint(format!(
+                    "`{BIN} install --setup local` (or `personal`, `professional`) moves this \
+                     clone to the graph ref"
+                )),
+            );
+            checks.push(main_check(root));
+            return Mode::Checkout;
+        }
+        Err(e) => {
+            checks.push(
+                check("graph.ref", Status::Error, e.to_string())
+                    .hint("fix the mdkg.graph.* keys in the repository's own git config"),
+            );
+            return Mode::Ref(None);
+        }
+    };
+    let Ok(top) = mdkg_coord_sqlite::git::toplevel(root) else {
+        checks.push(check(
+            "graph.ref",
+            Status::Error,
+            "can't find this checkout's top folder",
+        ));
+        return Mode::Ref(None);
+    };
+    if let Some(step) = common_value(&top, &graph.common, "mdkg.graph.migrating") {
+        checks.push(
+            check(
+                "graph.migrating",
+                Status::Error,
+                format!("a migration to the graph ref is part-way through (step {step})"),
+            )
+            .hint(format!("run `{BIN} install` to finish it")),
+        );
+    }
+    checks.push(code_base_check(&top, &graph));
+    let read = graph_ref_read(&top, &graph);
+    let found = match read {
+        Ok(found) => {
+            checks.push(check(
+                "graph.ref",
+                Status::Ok,
+                format!(
+                    "{} at {}, graph {}",
+                    graph.name,
+                    short(&found.tip),
+                    found.graph_id
+                ),
+            ));
+            found
+        }
+        Err(e) => {
+            let mut c = check("graph.ref", Status::Error, e.message);
+            c.hint = Some(e.hint);
+            checks.push(c);
+            return Mode::Ref(None);
+        }
+    };
+    checks.extend([
+        shape_check(&found),
+        remote_check(&found),
+        intents_check(&found),
+        cache_check(&found),
+        view_check(&found),
+        hand_edits_check(&found),
+        design_drift_check(&found),
+        exclude_check(&found),
+    ]);
+    Mode::Ref(Some(Box::new(found)))
+}
+
+fn short(sha: &str) -> &str {
+    &sha[..sha.len().min(12)]
+}
+
+struct Refused {
+    message: String,
+    hint: String,
+}
+
+/// The `graph.ref` errors: missing, symbolic, equal to `mainRef`, checked
+/// out on a branch, a tip that doesn't validate strictly, or an identity
+/// this clone doesn't record.
+fn graph_ref_read(top: &Path, graph: &mdkg_graph::graphref::GraphRef) -> Result<RefGraph, Refused> {
+    let refused = |message: String, hint: &str| Refused {
+        message,
+        hint: hint.into(),
+    };
+    let install = format!("run `{BIN} install` to set up the graph ref");
+    if graph.main_ref.as_deref() == Some(graph.name.as_str()) {
+        return Err(refused(
+            format!("{} is also mdkg.mainRef, the code base", graph.name),
+            "name the code base with `git config mdkg.mainRef <ref>`, or another graph ref",
+        ));
+    }
+    let tip = mdkg_graph::graphref::tip(top, graph).map_err(|e| refused(e.message, &install))?;
+    if let Some(branch) = graph.name.strip_prefix("refs/heads/")
+        && let Some(path) = checked_out(top, branch)
+    {
+        return Err(refused(
+            format!("{} is checked out in {path}", graph.name),
+            &format!("detach it: `git -C {} switch --detach`", shell_word(&path)),
+        ));
+    }
+    // Ref mode binds the root graph at `.mdkg`; a registered folder
+    // elsewhere is refused: no command reads it there (#16095).
+    crate::config_cmd::root_graph_folder(top, graph, Some(&tip)).map_err(|e| Refused {
+        message: e.diagnostic.message.clone(),
+        hint: e.diagnostic.hint.clone().unwrap_or_default(),
+    })?;
+    let authority = mdkg_graph::graphref::authority_at(top, &tip)
+        .map_err(|e| refused(e.message, "repair the graph's committed config"))?;
+    graph
+        .check_identity(&authority.graph_id)
+        .map_err(|e| refused(e.message, &install))?;
+    mdkg_graph::committed::load_strict(top, &tip, "", &authority.graph_id).map_err(|e| {
+        refused(
+            format!("the tip doesn't validate: {}", e.diagnostic.message),
+            "repair the graph with a commit to the graph ref",
+        )
+    })?;
+    Ok(RefGraph {
+        graph: graph.clone(),
+        top: top.to_path_buf(),
+        tip,
+        graph_id: authority.graph_id,
+        config: authority.config,
+    })
+}
+
+/// The worktree a branch is checked out in, if any.
+fn checked_out(top: &Path, branch: &str) -> Option<String> {
+    let list = git_out(top, &["worktree", "list", "--porcelain"])?;
+    let mut path = None;
+    for line in list.lines() {
+        if let Some(p) = line.strip_prefix("worktree ") {
+            path = Some(p.to_string());
+        } else if line.strip_prefix("branch ") == Some(&format!("refs/heads/{branch}")) {
+            return path;
+        }
+    }
+    None
+}
+
+/// `code_base`, info only: `mainRef` is what workers branch from, and no
+/// command but worker worktree creation needs it (R2).
+fn code_base_check(top: &Path, graph: &mdkg_graph::graphref::GraphRef) -> Check {
+    let Some(main) = &graph.main_ref else {
+        return check(
+            "code_base",
+            Status::Ok,
+            "none (mdkg.mainRef is unset): nothing needs one but worker worktrees",
+        )
+        .hint("name it with `git config mdkg.mainRef <ref>` (`origin/main` is allowed)");
+    };
+    let Some(at) = git_out(
+        top,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{main}^{{commit}}"),
+        ],
+    ) else {
+        return check(
+            "code_base",
+            Status::Warning,
+            format!("mdkg.mainRef names {main}, which doesn't resolve"),
+        )
+        .hint("fetch it, or name another with `git config mdkg.mainRef <ref>`");
+    };
+    if main.starts_with("refs/remotes/")
+        && let Some(age) = fetched_days_ago(top, main)
+        && age > 7
+    {
+        return check(
+            "code_base",
+            Status::Warning,
+            format!("{main} at {}, last fetched {age} days ago", short(&at)),
+        )
+        .hint("fetch it: `git fetch`");
+    }
+    check("code_base", Status::Ok, format!("{main} at {}", short(&at)))
+}
+
+/// Days since the reflog's newest entry for `name`.
+fn fetched_days_ago(top: &Path, name: &str) -> Option<u64> {
+    let line = git_out(
+        top,
+        &["log", "-g", "-n1", "--date=unix", "--format=%gd", name],
+    )?;
+    let secs: u64 = line.rsplit_once("@{")?.1.strip_suffix('}')?.parse().ok()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    Some(now.saturating_sub(secs) / 86_400)
+}
+
+fn graph_config(found: &RefGraph) -> Option<mdkg_graph::Config> {
+    config::from_snapshot(found.config.clone()).ok()
+}
+
+/// `graph.shape`: graph-only, or the full shape G20 keeps for a personal
+/// graph pushed to the code's own remote (G7).
+fn shape_check(found: &RefGraph) -> Check {
+    let Some(cfg) = graph_config(found) else {
+        return check(
+            "graph.shape",
+            Status::Error,
+            "the committed config can't be read",
+        );
+    };
+    let paths = match mdkg_graph::graphref::graph_paths(&cfg) {
+        Ok(p) => p,
+        Err(e) => {
+            return check("graph.shape", Status::Error, e.message)
+                .hint("give each workspace a graph folder of its own, never `.`");
+        }
+    };
+    let full = match crate::run::setup::full_shape(&found.top, &found.tip, &paths) {
+        Ok(full) => full,
+        Err(e) => return check("graph.shape", Status::Error, e.diagnostic.message),
+    };
+    if !full {
+        return check("graph.shape", Status::Ok, "graph-only");
+    }
+    let code_remote = found
+        .graph
+        .main_ref
+        .as_deref()
+        .and_then(|m| m.strip_prefix("refs/remotes/"))
+        .and_then(|r| r.split('/').next())
+        .unwrap_or("origin");
+    match &found.graph.remote {
+        Some(r) if r.name != code_remote => check(
+            "graph.shape",
+            Status::Error,
+            format!(
+                "the graph ref holds code too (full shape), and graph.remote {} isn't the code's \
+                 remote {code_remote}",
+                r.name
+            ),
+        )
+        .hint("a remote other than the code's must receive a graph-only ref"),
+        _ => check(
+            "graph.shape",
+            Status::Ok,
+            "full shape (kept for a personal graph)",
+        ),
+    }
+}
+
+/// `graph.remote`: local only, or a remote that exists, isn't a code ref,
+/// and keeps its approved destination (G23).
+fn remote_check(found: &RefGraph) -> Check {
+    let Some(remote) = &found.graph.remote else {
+        return check("graph.remote", Status::Ok, "none: local only");
+    };
+    let url = common_value(
+        &found.top,
+        &found.graph.common,
+        &format!("remote.{}.url", remote.name),
+    );
+    if url.is_none() {
+        return check(
+            "graph.remote",
+            Status::Error,
+            format!(
+                "mdkg.graph.remote names {}, which isn't a remote here",
+                remote.name
+            ),
+        )
+        .hint("name an existing remote: mdkg never creates one");
+    }
+    let short_ref = remote
+        .remote_ref
+        .strip_prefix("refs/heads/")
+        .unwrap_or(&remote.remote_ref);
+    // The turn's and the hook's own list (R33), so the three agree on a
+    // mainRef like refs/remotes/origin/release/1.0. Compared without case,
+    // lowercased as the hook does (non-ASCII too): a case-folding disk
+    // makes `Main` `main`.
+    let protected = mdkg_run::profile::protected_refs(
+        &mdkg_run::profile::ProtectedRefs {
+            main_ref: found.graph.main_ref.as_deref(),
+            ..Default::default()
+        },
+        &[],
+    );
+    let short_ref = short_ref.to_lowercase();
+    if protected.iter().any(|p| p.to_lowercase() == short_ref) {
+        return check(
+            "graph.remote",
+            Status::Error,
+            format!(
+                "mdkg.graph.remoteRef {} is a protected code branch",
+                remote.remote_ref
+            ),
+        )
+        .hint(
+            "give the graph its own ref: `git config mdkg.graph.remoteRef refs/heads/mdkg-graph`",
+        );
+    }
+    if remote.pinned.is_none() {
+        // No 0.7.1 command approves a destination: nothing is pushed, and
+        // nothing the user does would clear a warning, so it's reported,
+        // not warned (`doctor --strict` passes after personal setup).
+        return check(
+            "graph.remote",
+            Status::Ok,
+            format!(
+                "{} ({}), not approved: nothing is pushed to it (approving a graph remote \
+                 arrives with graph sync in a later release)",
+                remote.name, remote.remote_ref
+            ),
+        )
+        .hint("approving a graph remote arrives with graph sync in a later release");
+    }
+    check(
+        "graph.remote",
+        Status::Ok,
+        format!("{} ({}), approved", remote.name, remote.remote_ref),
+    )
+}
+
+/// `graph.intents`: writes recorded but not yet published.
+fn intents_check(found: &RefGraph) -> Check {
+    match mdkg_graph::intent::Journal::open(&found.graph.common).and_then(|j| j.pending()) {
+        Ok(p) if p.is_empty() => check("graph.intents", Status::Ok, "none pending"),
+        Ok(p) => check(
+            "graph.intents",
+            Status::Warning,
+            format!("{} pending", plural(p.len(), "intent")),
+        )
+        .hint(format!(
+            "the next graph command replays them; `{BIN} status` runs one"
+        )),
+        Err(e) => check("graph.intents", Status::Warning, format!("can't read: {e}")),
+    }
+}
+
+/// `graph.cache`: folders set aside from the graph cache, by kind, each
+/// with its own advice (one classifier, shared with `status`).
+fn cache_check(found: &RefGraph) -> Check {
+    use crate::coord::graph_git::{Rescue, edit_hint, rescued};
+    let folders = rescued(&found.graph.common);
+    if folders.is_empty() {
+        return check("graph.cache", Status::Ok, "no rescued edits");
+    }
+    let mut kinds: Vec<(Rescue, &str, usize)> = Vec::new();
+    for (kind, label) in [
+        (Rescue::HandEdit, "of hand edits"),
+        (Rescue::Unclassified, "unclassified"),
+        (Rescue::Unfinished, "from an unfinished write"),
+    ] {
+        let n = folders.iter().filter(|(k, _)| *k == kind).count();
+        if n > 0 {
+            kinds.push((kind, label, n));
+        }
+    }
+    let summary: Vec<String> = kinds
+        .iter()
+        .map(|(_, label, n)| format!("{n} {label}"))
+        .collect();
+    let dir = found.graph.common.join("mdkg/graph/rescued");
+    let hint: Vec<String> = kinds
+        .iter()
+        .map(|(kind, _, _)| edit_hint(Some(&dir), *kind))
+        .collect();
+    check(
+        "graph.cache",
+        Status::Warning,
+        format!(
+            "{} rescued from the graph cache ({})",
+            plural(folders.len(), "folder"),
+            summary.join(", ")
+        ),
+    )
+    .hint(hint.join("\n"))
+}
+
+/// `graph.view`: the optional `.worktrees/graph`, detached at the tip.
+fn view_check(found: &RefGraph) -> Check {
+    let view = found.top.join(".worktrees/graph");
+    if !view.join(".git").exists() {
+        return check("graph.view", Status::Ok, "no view");
+    }
+    if let Some(branch) = git_out(&view, &["symbolic-ref", "-q", "HEAD"]) {
+        return check(
+            "graph.view",
+            Status::Error,
+            format!(
+                "{} is checked out on {branch}, not detached",
+                view.display()
+            ),
+        )
+        .hint(format!(
+            "detach it: `git -C {} switch --detach`",
+            shell_word(&view.to_string_lossy())
+        ));
+    }
+    if git_out(&view, &["status", "--porcelain"]).is_some_and(|s| !s.is_empty()) {
+        return check(
+            "graph.view",
+            Status::Warning,
+            "the view holds hand edits, which are never read",
+        );
+    }
+    if git_out(&view, &["rev-parse", "HEAD"]).as_deref() != Some(found.tip.as_str()) {
+        return check("graph.view", Status::Warning, "the view is behind the tip").hint(format!(
+            "`git -C {} switch --detach {}`",
+            shell_word(&view.to_string_lossy()),
+            found.graph.name
+        ));
+    }
+    check("graph.view", Status::Ok, "detached at the tip")
+}
+
+/// `graph.hand_edits`: this checkout's uncommitted graph-folder changes
+/// whose content isn't the graph tip's; they're never read.
+fn hand_edits_check(found: &RefGraph) -> Check {
+    let paths = graph_config(found)
+        .and_then(|c| mdkg_graph::graphref::graph_paths(&c).ok())
+        .unwrap_or_else(|| vec![".mdkg".into()]);
+    let mut args = vec![
+        "status",
+        "--porcelain",
+        "-z",
+        "--no-renames",
+        "--untracked-files=all",
+        "--",
+    ];
+    let specs: Vec<String> = paths.iter().map(|p| format!(":(literal){p}")).collect();
+    args.extend(specs.iter().map(String::as_str));
+    // Untrimmed: the first entry's status may start with a space.
+    let out = mdkg_coord_sqlite::git::command(&found.top)
+        .args(&args)
+        .run(None)
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+    let Some(out) = out else {
+        return check("graph.hand_edits", Status::Skip, "git status failed");
+    };
+    // Of the uncommitted changes, those whose content isn't the tip's: an
+    // edit that matches the graph exactly isn't one.
+    let differ = out
+        .split('\0')
+        .filter_map(|e| e.get(3..))
+        .filter(|p| !p.is_empty())
+        .filter(|p| worktree_blob(&found.top, p) != tip_blob(found, p))
+        .count();
+    if differ == 0 {
+        return check("graph.hand_edits", Status::Ok, "none");
+    }
+    check(
+        "graph.hand_edits",
+        Status::Warning,
+        format!(
+            "{} uncommitted in this checkout's graph folders differ from the graph; they're never read",
+            plural(differ, "path")
+        ),
+    )
+    .hint(crate::coord::graph_git::hand_edit_hint(None))
+}
+
+/// The blob id `path` would have in this checkout, `None` when it's gone.
+fn worktree_blob(top: &Path, path: &str) -> Option<String> {
+    top.join(path)
+        .is_file()
+        .then(|| git_out(top, &["hash-object", "--", path]))
+        .flatten()
+        .map(|s| s.trim().to_owned())
+}
+
+/// The blob id of `path` at the graph tip, `None` when the tip lacks it.
+fn tip_blob(found: &RefGraph, path: &str) -> Option<String> {
+    git_out(
+        &found.top,
+        &[
+            "rev-parse",
+            "--verify",
+            "-q",
+            &format!("{}:{path}", found.tip),
+        ],
+    )
+    .map(|s| s.trim().to_owned())
+    .filter(|s| !s.is_empty())
+}
+
+/// `graph.design_drift`, info only (G16, R43): the code base's design
+/// folders against the graph tip's.
+fn design_drift_check(found: &RefGraph) -> Check {
+    let Some(main) = &found.graph.main_ref else {
+        return check("graph.design_drift", Status::Skip, "no code base");
+    };
+    let Some(cfg) = graph_config(found) else {
+        return check(
+            "graph.design_drift",
+            Status::Skip,
+            "the committed config can't be read",
+        );
+    };
+    let Ok(design) = mdkg_graph::graphref::design_paths(&cfg) else {
+        return check("graph.design_drift", Status::Skip, "no design folders");
+    };
+    let mut args = vec![
+        "diff",
+        "--name-only",
+        "--no-renames",
+        main.as_str(),
+        found.tip.as_str(),
+        "--",
+    ];
+    let specs: Vec<String> = design.iter().map(|p| format!(":(literal){p}")).collect();
+    args.extend(specs.iter().map(String::as_str));
+    let Some(out) = git_out(&found.top, &args) else {
+        return check(
+            "graph.design_drift",
+            Status::Skip,
+            format!("{main} doesn't resolve"),
+        );
+    };
+    let differ: Vec<&str> = out.lines().filter(|l| !l.is_empty()).collect();
+    if differ.is_empty() {
+        return check(
+            "graph.design_drift",
+            Status::Ok,
+            format!("{main}'s design matches the graph"),
+        );
+    }
+    let mut shown = differ
+        .iter()
+        .take(5)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if differ.len() > 5 {
+        shown.push_str(", …");
+    }
+    let c = check(
+        "graph.design_drift",
+        Status::Ok,
+        format!(
+            "info: {} differ from {main}: {shown}",
+            plural(differ.len(), "design file")
+        ),
+    );
+    if found.graph.publish_design {
+        c.hint("publishing design to the code base arrives with a later release")
+    } else {
+        c
+    }
+}
+
+/// The exclusion check: `node edit`'s `.mdkg-edit/` copies stay out of
+/// every commit (R45).
+fn exclude_check(found: &RefGraph) -> Check {
+    let path = found.graph.common.join("info/exclude");
+    // The shared reader, by bytes: a non-UTF-8 file can hold the rule.
+    // Asked of git itself: a rule a later negation undoes isn't one.
+    let held = crate::run::setup::excluded(&found.top, mdkg_run::install::worktree::EDIT_IGNORE)
+        .unwrap_or(false);
+    if held {
+        return check(
+            "graph.exclude",
+            Status::Ok,
+            format!("{} is excluded", mdkg_run::install::worktree::EDIT_IGNORE),
+        );
+    }
+    check(
+        "graph.exclude",
+        Status::Warning,
+        format!(
+            "{} doesn't exclude {}, where `node edit` keeps its copies",
+            path.display(),
+            mdkg_run::install::worktree::EDIT_IGNORE
+        ),
+    )
+    .hint(format!("run `{BIN} install`, which adds it"))
 }
 
 /// This build: version, commit and where it runs from.
@@ -587,13 +1387,32 @@ fn config_check(root: &Path) -> (Check, Option<mdkg_graph::Config>) {
                 Status::Error,
                 format!("no {} here or above", config::CONFIG_PATH),
             )
-            .hint(format!(
-                "run `{BIN} init` to start a graph, or pass --root <path>"
-            )),
+            .hint(crate::init::missing_config_hint(root)),
             None,
         );
     }
-    let cfg = match config::load(root) {
+    let raw: Value = std::fs::read_to_string(root.join(config::CONFIG_PATH))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or(Value::Null);
+    // The mail settings run from the committed authority, not this file.
+    let repo = Repo::open(root).ok();
+    let committed = repo.as_ref().map(crate::msg::committed_config);
+    let unmigrated = repo.as_ref().map(crate::migrate::unmigrated_hint);
+    judge_config(config::load(root), raw, committed, unmigrated)
+}
+
+/// The config check of a loaded config and its raw value: the checkout's
+/// in checkout mode, the graph tip's in ref mode. `committed`, when
+/// known, is the authority the mail settings are read from, and
+/// `unmigrated` the hint for a graph with no `graph_id`.
+fn judge_config(
+    loaded: Result<mdkg_graph::Config, mdkg_graph::GraphError>,
+    raw: Value,
+    committed: Option<Result<Value, mdkg_graph::GraphError>>,
+    unmigrated: Option<String>,
+) -> (Check, Option<mdkg_graph::Config>) {
+    let cfg = match loaded {
         Ok(c) => c,
         Err(e) => {
             let mut c = check("config", Status::Error, e.diagnostic.message.clone());
@@ -603,22 +1422,31 @@ fn config_check(root: &Path) -> (Check, Option<mdkg_graph::Config>) {
             return (c, None);
         }
     };
-    let raw: Value = std::fs::read_to_string(root.join(config::CONFIG_PATH))
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or(Value::Null);
     let mut problems = Vec::new();
     let mut warn = Vec::new();
     let mut hints = Vec::new();
     match raw.get("graph_id") {
         None => {
             warn.push("no graph_id: a 0.6.0-era graph".to_string());
-            hints.push(format!(
-                "`{BIN} migrate` moves a 0.6.0 graph to 0.7 (dry run first)"
-            ));
+            // What `migrate` itself says for this branch (e2e 0.7.1 B14).
+            hints.push(unmigrated.unwrap_or_else(|| {
+                format!("`{BIN} migrate` moves a 0.6.0 graph to 0.7 (dry run first)")
+            }));
         }
         Some(Value::String(s)) if is_graph_id(s) => {}
         Some(_) => problems.push("graph_id isn't a lowercase UUID".to_string()),
+    }
+    match &committed {
+        Some(Ok(config)) => problems.extend(
+            crate::msg::mail_settings_errors(config)
+                .into_iter()
+                .map(|e| format!("committed: {}", e.diagnostic.message)),
+        ),
+        Some(Err(e)) => problems.push(format!(
+            "the committed config can't be read: {}",
+            e.diagnostic.message
+        )),
+        None => {}
     }
     let committed = raw.pointer("/work/committed");
     match committed {
@@ -750,7 +1578,7 @@ fn mirrors_check(root: &Path, cfg: &mdkg_graph::Config) -> Check {
         format!("{}: {}", plural(diags.len(), "problem"), codes.join(", ")),
     )
     .hint(format!(
-        "`{BIN} skills validate` lists them; `{BIN} skills sync` fixes them"
+        "`{BIN} skills validate` lists them, each with its fix"
     ))
 }
 
@@ -780,15 +1608,15 @@ fn store_check(root: &Path) -> Check {
         Ok(p) => p,
         Err(e) => return check("store", Status::Error, format!("can't find the store: {e}")),
     };
-    match path.try_exists() {
-        Ok(false) => {
+    let conn = match mdkg_coord_sqlite::Store::open_raw_read_only(&path) {
+        Ok(None) => {
             return check(
                 "store",
                 Status::Ok,
                 "no store yet: the first claim, `new` or message creates it",
             );
         }
-        Ok(true) => {}
+        Ok(Some(conn)) => conn,
         Err(e) => {
             return check(
                 "store",
@@ -796,13 +1624,9 @@ fn store_check(root: &Path) -> Check {
                 format!("can't read {}: {e}", path.display()),
             );
         }
-    }
+    };
     let read = |key: &str| -> Result<Option<String>, rusqlite::Error> {
-        use rusqlite::{Connection, OpenFlags, OptionalExtension};
-        let conn = Connection::open_with_flags(
-            &path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
+        use rusqlite::OptionalExtension;
         let has_meta = conn
             .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'")?
             .exists([])?;
@@ -853,19 +1677,27 @@ fn store_check(root: &Path) -> Check {
     };
     let have_mail = have_mail.unwrap_or(0);
     let want_mail = want_mail.unwrap_or(0);
-    if have > want || have_mail > want_mail {
+    let upgrade = have <= want && have_mail <= want_mail && (have < want || have_mail < want_mail);
+    let c = if have > want || have_mail > want_mail {
         check(
             "store",
             Status::Error,
             format!("{at}: newer than this build ({build})"),
         )
         .hint("a newer build upgraded this store, so this one refuses it: install that build")
-    } else if have < want || have_mail < want_mail {
+    } else if upgrade {
         check("store", Status::Warning, format!("{at}: older than this build ({build})")).hint(format!(
             "the next coordinator command this build runs upgrades it, copying it first; `{BIN} store restore` puts a copy back"
         ))
     } else {
         check("store", Status::Ok, at)
+    };
+    // Structured, so no reader parses the summary (Omni, #12874).
+    Check {
+        store_schema: Some(have),
+        mail_schema: Some(have_mail),
+        upgrade_needed: Some(upgrade),
+        ..c
     }
 }
 
@@ -1005,33 +1837,85 @@ fn agents_check(root: &Path, projections: &Projections) -> Check {
 /// Whether each enabled hook projection's file holds its canonical hooks.
 /// OpenCode runs a project's plugins without asking, so its file is
 /// checked byte for byte.
-fn hooks_check(root: &Path, projections: &Projections) -> Check {
+fn hooks_check(root: &Path, projections: &Projections, graph: Option<&RefGraph>) -> Check {
     let enabled: Vec<Harness> = Harness::ALL
         .into_iter()
         .filter(|h| projections.hooks(*h))
         .collect();
-    if enabled.is_empty() {
+    if enabled.is_empty() && !projections.git_hooks() {
         return check("hooks", Status::Skip, "no hook projection is enabled").hint(format!(
             "`{BIN} install --enable hooks:claude,hooks:codex,hooks:opencode` writes them"
         ));
     }
-    let problems: Vec<String> = enabled
+    let mut problems: Vec<String> = enabled
         .iter()
-        .filter_map(|h| mdkg_run::install::hook_files::status(root, *h))
+        .filter_map(|h| {
+            if *h == Harness::OpenCode
+                && let Some(found) = graph
+            {
+                // Preserve the exact bytes, including the final newline:
+                // git_out trims output and cannot judge an exact default.
+                let path = h.adapter().hook_layout().canonical;
+                let object = format!("{}:{path}", found.tip);
+                let small_blob = git_out(&found.top, &["cat-file", "-t", &object]).as_deref()
+                    == Some("blob")
+                    && git_out(&found.top, &["cat-file", "-s", &object])
+                        .and_then(|size| size.parse::<u64>().ok())
+                        .is_some_and(|size| size <= mdkg_run::install::hook_files::HOOK_FILE_CAP);
+                // The tip is immutable: check type and size before
+                // collecting the blob's output in memory.
+                let canonical = small_blob
+                    .then(|| {
+                        mdkg_coord_sqlite::git::command(&found.top)
+                            .args(["show", &object])
+                            .run(None)
+                            .ok()
+                            .filter(|out| out.status.success())
+                            .and_then(|out| String::from_utf8(out.stdout).ok())
+                    })
+                    .flatten();
+                mdkg_run::install::hook_files::status_with_canonical(root, *h, canonical.as_deref())
+            } else {
+                mdkg_run::install::hook_files::status(root, *h)
+            }
+        })
         .collect();
+    let git = projections.git_hooks();
+    if git && let Some(p) = mdkg_run::install::hook_files::git_status(root) {
+        problems.push(p);
+    }
+    // The capability matrix: a rule whose events a harness lacks is named,
+    // never silently skipped.
+    let matrix: Vec<String> = enabled
+        .iter()
+        .map(|h| h.name())
+        .chain(git.then_some("git"))
+        .filter_map(crate::hook::unsupported_line)
+        .chain(crate::hook::not_built_line())
+        .collect();
+    let matrix = if matrix.is_empty() {
+        String::new()
+    } else {
+        format!("; unsupported: {}", matrix.join("; "))
+    };
     if problems.is_empty() {
         let names: Vec<String> = enabled
             .iter()
             .map(|h| format!("hooks:{}", h.name()))
+            .chain(git.then(|| "hooks:git".to_string()))
             .collect();
         check(
             "hooks",
             Status::Ok,
-            format!("{} as their canonical files say", names.join(", ")),
+            format!("{} as their canonical files say{matrix}", names.join(", ")),
         )
     } else {
-        check("hooks", Status::Warning, problems.join("; "))
-            .hint(format!("run `{BIN} install` to sync them"))
+        check(
+            "hooks",
+            Status::Warning,
+            format!("{}{matrix}", problems.join("; ")),
+        )
+        .hint(format!("run `{BIN} install` to sync them"))
     }
 }
 

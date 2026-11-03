@@ -14,7 +14,19 @@ use crate::mail::Message;
 pub struct ReplyTarget<'a> {
     pub to: &'a str,
     pub kind: &'a str,
+    /// The channel the answered post went to; the reply goes to its sender
+    /// alone, never to the channel.
+    pub channel: Option<&'a str>,
     pub context: Option<&'a str>,
+}
+
+/// The final message that says a turn has nothing to answer: no reply is
+/// sent, and the mail shown is acked as answered with nothing to say.
+pub const NO_REPLY: &str = "NO_REPLY";
+
+/// Whether an agent's final message is [`NO_REPLY`], on its own.
+pub fn is_no_reply(reply: &str) -> bool {
+    reply.trim() == NO_REPLY
 }
 
 /// A header value on one line: control characters (a newline in a context
@@ -174,7 +186,40 @@ pub fn digest(
     task: Option<&str>,
     note: Option<&str>,
 ) -> String {
+    digest_at(
+        agent,
+        None,
+        messages,
+        more,
+        reply,
+        task,
+        note,
+        &crate::state::Shows::default(),
+    )
+}
+
+/// [`digest`], naming the commit that last changed the agent's committed
+/// definition, so the agent and whoever reads its reply can tell which
+/// definition the turn ran under, and marking each message earlier turns
+/// showed and failed before acking (`shows`, friction 62).
+#[allow(clippy::too_many_arguments)]
+pub fn digest_at(
+    agent: &str,
+    definition: Option<&str>,
+    messages: &[Message],
+    more: bool,
+    reply: Option<&ReplyTarget<'_>>,
+    task: Option<&str>,
+    note: Option<&str>,
+    shows: &crate::state::Shows,
+) -> String {
     let mut out = format!("You are {agent}. The mdkg launcher started this turn.\n");
+    if let Some(commit) = definition {
+        out.push_str(&format!(
+            "Your definition was last committed in {}.\n",
+            clean(commit)
+        ));
+    }
     if let Some(note) = note {
         out.push('\n');
         out.push_str(note.trim_end());
@@ -202,14 +247,28 @@ pub fn digest(
         out.push_str("More unacked mail is waiting; it comes in your next turn.\n");
     }
     if let Some(r) = reply {
+        match r.channel {
+            Some(channel) => out.push_str(&format!(
+                "\nYour final message in this turn is delivered to {} alone, as a `{}` \
+                 reply to their post in channel {}; the channel's other members don't see \
+                 it. Write it for them.\n",
+                clean(r.to),
+                clean(r.kind),
+                clean(channel)
+            )),
+            None => out.push_str(&format!(
+                "\nYour final message in this turn is delivered to {} as a `{}` reply{}. \
+                 Write it for them.\n",
+                clean(r.to),
+                clean(r.kind),
+                r.context
+                    .map(|c| format!(" in context {}", clean(c)))
+                    .unwrap_or_default()
+            )),
+        }
         out.push_str(&format!(
-            "\nYour final message in this turn is delivered to {} as a `{}` reply{}. \
-             Write it for them.\n",
-            clean(r.to),
-            clean(r.kind),
-            r.context
-                .map(|c| format!(" in context {}", clean(c)))
-                .unwrap_or_default()
+            "If nothing here needs an answer from you, make your final message exactly \
+             {NO_REPLY}: no reply is sent, and the mail shown is acked as answered.\n"
         ));
     }
     for (i, m) in messages.iter().enumerate() {
@@ -230,10 +289,18 @@ pub fn digest(
             out.push_str(&format!("context: {}\n", clean(c)));
         }
         if let Some(r) = &m.room {
-            out.push_str(&format!("room: {}\n", clean(r)));
+            out.push_str(&format!("channel: {}\n", clean(r)));
         }
         if let Some(t) = &m.sent_at {
             out.push_str(&format!("sent: {}\n", clean(t)));
+        }
+        match shows.count(&m.message_id) {
+            0 => {}
+            n => out.push_str(&format!(
+                "shown: {n} time{} before, in turns that failed before acking it; check \
+                 whether you already handled it\n",
+                if n == 1 { "" } else { "s" }
+            )),
         }
         out.push_str(&format!("BEGIN BODY {b}\n{text}END BODY {b}\n"));
     }
@@ -279,7 +346,8 @@ mod tests {
         let target = ReplyTarget {
             to: "codex:pr19",
             kind: "note",
-            context: Some("room:review"),
+            channel: Some("review"),
+            context: None,
         };
         let d = digest("go-lane-b", &[m], false, Some(&target), None, None);
         let begin = d.find("BEGIN BODY ").expect("begin");
@@ -297,7 +365,69 @@ mod tests {
                 < begin
         );
         assert!(d.contains("untrusted"));
-        assert!(d.contains("delivered to codex:pr19 as a `note` reply in context room:review"));
+        assert!(d.contains("\nchannel: review\n"));
+        assert!(!d.contains("\nroom: review\n"));
+        assert!(d.contains(
+            "delivered to codex:pr19 alone, as a `note` reply to their post in channel review"
+        ));
+        assert!(d.contains("make your final message exactly NO_REPLY"));
+    }
+
+    #[test]
+    fn a_direct_reply_names_its_context_and_no_channel() {
+        let mut m = msg("m1", vec![serde_json::json!({"kind": "text", "text": "x"})]);
+        m.room = None;
+        m.context_id = Some("ctx-1".into());
+        let target = ReplyTarget {
+            to: "codex:pr19",
+            kind: "note",
+            channel: None,
+            context: Some("ctx-1"),
+        };
+        let d = digest("a", &[m], false, Some(&target), None, None);
+        assert!(d.contains("delivered to codex:pr19 as a `note` reply in context ctx-1."));
+        assert!(!d.contains("their post in channel"));
+        assert!(d.contains("exactly NO_REPLY"));
+        // No mail, no reply target: nothing to decline.
+        assert!(!digest("a", &[], false, None, Some("task"), None).contains("NO_REPLY"));
+    }
+
+    #[test]
+    fn a_message_earlier_turns_failed_on_is_marked_with_its_count() {
+        let text = |t: &str| vec![serde_json::json!({"kind": "text", "text": t})];
+        let mut shows = crate::state::Shows::default();
+        shows.shown([("m1", 1)]);
+        shows.shown([("m1", 1), ("m2", 2)]);
+        let d = digest_at(
+            "a",
+            None,
+            &[
+                msg("m1", text("x")),
+                msg("m2", text("y")),
+                msg("m3", text("z")),
+            ],
+            false,
+            None,
+            None,
+            None,
+            &shows,
+        );
+        let block = |id: &str| {
+            let at = d.find(&format!("id: {id}\n")).expect("message");
+            d[at..d[at..].find("BEGIN BODY").expect("body") + at].to_string()
+        };
+        assert!(block("m1").contains("shown: 2 times before, in turns that failed"));
+        assert!(block("m2").contains("shown: 1 time before, in turns that failed"));
+        assert!(!block("m3").contains("shown:"));
+    }
+
+    #[test]
+    fn no_reply_is_the_word_alone() {
+        assert!(is_no_reply("NO_REPLY"));
+        assert!(is_no_reply("  NO_REPLY\n"));
+        assert!(!is_no_reply("NO_REPLY, nothing for me"));
+        assert!(!is_no_reply("no_reply"));
+        assert!(!is_no_reply("Done.\nNO_REPLY"));
     }
 
     #[test]
@@ -374,6 +504,17 @@ mod tests {
         assert!(d.contains("BEGIN BODY mdkg-"));
         assert!(d.contains("okdone\nEND BODY mdkg-"), "{d:?}");
         assert!(!d.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn the_prompt_names_the_definition_commit_when_known() {
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let shows = crate::state::Shows::default();
+        let d = digest_at("a", Some(sha), &[], false, None, Some("Go."), None, &shows);
+        assert!(d.starts_with(&format!(
+            "You are a. The mdkg launcher started this turn.\nYour definition was last committed in {sha}.\n"
+        )));
+        assert!(!digest("a", &[], false, None, Some("Go."), None).contains("definition"));
     }
 
     #[test]

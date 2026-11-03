@@ -1,0 +1,32 @@
+[package]
+name = "mdkg-wire"
+version = "0.7.1"
+description = "serve's wire: HTTP/1.1 framing, SSE, request signatures, TLS with key pinning, the pairing code and the bound push. Internal to mdkg, no stable API; depend on the mdkg binary"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+readme = "README.md"
+
+[dependencies]
+mdkg-format = { path = "../mdkg-format", version = "0.7.1" }
+mdkg-ops = { path = "../mdkg-ops", version = "0.7.1" }
+# The push runner: graph.ref's hardened git runner (S38; orchestrator on #10729).
+mdkg-git = { path = "../mdkg-git", version = "0.7.1" }
+rustls.workspace = true
+httparse.workspace = true
+ed25519-dalek.workspace = true
+zeroize.workspace = true
+sha2.workspace = true
+uuid.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# Key files opened without following links, our own uid, and the
+# socket's peer user on Linux (SO_PEERCRED).
+rustix = { workspace = true, features = ["process", "net"] }
+
+[lints]
+workspace = true

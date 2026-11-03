@@ -14,49 +14,55 @@ Local-first project memory for humans and agents
 Usage: mdkg [OPTIONS] <COMMAND>
 
 Commands:
-  list      List nodes
-  show      Show one node
-  search    Search ids, titles, fields and bodies, best match first
-  index     Rebuild the derived index, or show its state
-  graph     Query the graph: refs, backrefs, the ready set, a goal's critical path
-  scratch   Locate local scratch shared by the repository's worktrees
-  work      Change where work definitions live
-  config    Inspect configuration layers and their sources
-  pack      Build a markdown context pack around a node or a query, in a token budget
-  validate  Validate the graph
-  new       Create a node
-  done      Finish a work item: record its version and write `status: done`
-  update    Set a temporary status (review or blocked), or clear it
-  next      Show the next work item to pick up (the full record)
-  goal      Show and change goals: current, next, activate, pause, done
-  format    Report files whose frontmatter isn't canonical; `--write` fixes them
-  retype    Change a node's type: its id and every ref to it (format 0.7)
-  claim     Claim a node, file, folder, role or turn
-  holds     Check whether you hold a lease covering a scope
-  renew     Renew every active lease you hold
-  release   Give up your lease without finishing; a lease that already ended is fine
-  status    Show leases, the settlement queue and your unacked mail
-  sync      Stack this worktree on unmerged versions it lacks
-  abandon   Drop a changeset whose branch won't merge, and work built on it
-  mcp       Serve the graph and leases to coding agents over stdio MCP
-  msg       Send and read messages: send, inbox, wait, ack, thread, import
-  room      Manage rooms: create, join, leave, list
-  agents    Manage definitions and run agents: add, edit, rm, up, status, resume
-  auth      The API key fallback's helper: `auth key <provider>`
-  hook      What an agent harness's hook runs: mail at turn start, a reminder before stopping with unread mail, an idle wake, and the edit guard
-  install   Set up Claude Code, Codex and OpenCode for this project
-  store     List or restore copies of the coordinator store
-  anchor    Write the record chain's head hash to an anchor file
-  export    Export work state as a bundle anyone can verify
-  verify    Verify a work bundle, or this repository's store, against an anchor
-  migrate   Bring a 0.6.0 graph onto 0.7.0
-  version   Show which build this is: version, commit, dirty tree, build date
-  init      Start a graph here: config, setup README and the mdkg-workflow skill
-  doctor    Check this setup: build, PATH, git, config, graph, store, mirrors, MCP, agents, hooks
-  skills    List, show, validate, add and sync skills in .mdkg/skills
-  affected  The tests a change needs: a selective run, or a full one when in doubt
-  schema    Print the JSON Schema of a command's output
-  help      Print this message or the help of the given subcommand(s)
+  list       List nodes
+  show       Show one node
+  search     Search ids, titles, fields and bodies, best match first
+  index      Rebuild the derived index, or show its state
+  graph      Query the graph: refs, backrefs, the ready set, a goal's critical path
+  scratch    Locate local scratch shared by the repository's worktrees
+  work       Change where work definitions live
+  node       Edit a node's body when the graph lives on the graph ref
+  config     Inspect configuration layers and their sources
+  pack       Build a markdown context pack around a node or a query, in a token budget
+  validate   Validate the graph
+  new        Create a node
+  done       Finish a work item: record its version and write `status: done`
+  update     Set a temporary status (review or blocked), or clear it
+  next       Show the next work item to pick up (the full record)
+  goal       Show and change goals: current, next, activate, pause, done
+  format     Report files whose frontmatter isn't canonical; `--write` fixes them
+  retype     Change a node's type: its id and every ref to it (format 0.7)
+  claim      Claim a node, file, folder, role or turn
+  holds      Check whether you hold a lease covering a scope
+  lease      Ask about leases others hold: request
+  renew      Renew every active lease you hold
+  release    Give up your lease without finishing; a lease that already ended is fine
+  status     Show leases, the settlement queue and your unacked mail
+  sync       Stack this worktree on unmerged versions it lacks
+  abandon    Drop a changeset whose branch won't merge, and work built on it
+  mcp        Serve the graph and leases to coding agents over stdio MCP
+  entry      The ledger: entries on a node (findings, questions, decisions, issues, reviews, requirements) and its gate
+  req        The requirements in a node's body, with their ledger states
+  msg        Send and read messages: send, inbox, wait, ack, thread, import
+  channel    Manage channels: create, join, leave, list
+  agents     Manage definitions and run agents: add, edit, rm, up, status, resume
+  auth       The API key fallback's helper: `auth key <provider>`
+  hooks      What an agent harness's hooks run: one router (`hooks run`) for the mail notice, the stop reminders, the idle wake and the lease guards
+  install    Set up Claude Code, Codex and OpenCode for this project
+  store      List or restore copies of the coordinator store
+  anchor     Write the record chain's head hash to an anchor file
+  export     Export work state as a bundle anyone can verify
+  verify     Verify a work bundle, or this repository's store, against an anchor
+  migrate    Bring a 0.6 graph onto format 0.7
+  version    Show which build this is: version, commit, dirty tree, build date
+  init       Start a graph here: config, setup README and the mdkg-workflow skill
+  doctor     Check this setup: build, PATH, git, config, graph, store, mirrors, MCP, agents, hooks
+  skills     List, show, validate, add and sync skills in .mdkg/skills
+  affected   The tests a change needs: a selective run, or a full one when in doubt
+  schema     Print the JSON Schema of a command's output
+  serve      Serve this graph's coordinator over its socket and, when asked, TLS; `serve status` tells whether it runs
+  git-serve  The receiving side of git between machines: the ssh forced command `authorized_keys` names for a machine's key, run by sshd as the repository owner
+  help       Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help
@@ -655,6 +661,119 @@ Examples:
   mdkg work localize --apply sha256:<plan-hash>
 ```
 
+### `mdkg node`
+
+```text
+Edit a node's body when the graph lives on the graph ref
+
+Usage: mdkg node [OPTIONS] <COMMAND>
+
+Commands:
+  edit  Take the node's lease and write an editable copy outside `.git`: `--dir`, else `<worktree>/.mdkg-edit/<graph path>`. An unsaved copy is kept, never overwritten
+  save  Publish the edited copy under the node's lease; refused as stale when the graph changed the node since `node edit`
+  help  Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+  -r, --root <ROOT>
+          Run against this repository root (default: the current directory)
+
+      --as <ACTOR>
+          Act as this actor in coordination commands (default: $MDKG_ACTOR, then the worktree's folder name)
+
+      --allow-store-upgrade
+          Let a development build upgrade the coordinator store.
+
+          The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+Examples:
+  mdkg node edit <id>
+  mdkg node save <id>
+```
+
+#### `mdkg node edit`
+
+```text
+Take the node's lease and write an editable copy outside `.git`: `--dir`, else `<worktree>/.mdkg-edit/<graph path>`. An unsaved copy is kept, never overwritten
+
+Usage: mdkg node edit [OPTIONS] <ID>
+
+Arguments:
+  <ID>
+          The node: an id, a legacy id, a unique prefix or a title
+
+Options:
+      --dir <FOLDER>
+          The folder to put the copy under
+
+      --discard
+          Start over from the graph's bytes, replacing an unsaved copy
+
+      --json
+          Print JSON
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+  -r, --root <ROOT>
+          Run against this repository root (default: the current directory)
+
+      --as <ACTOR>
+          Act as this actor in coordination commands (default: $MDKG_ACTOR, then the worktree's folder name)
+
+      --allow-store-upgrade
+          Let a development build upgrade the coordinator store.
+
+          The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+```
+
+#### `mdkg node save`
+
+```text
+Publish the edited copy under the node's lease; refused as stale when the graph changed the node since `node edit`
+
+Usage: mdkg node save [OPTIONS] <ID>
+
+Arguments:
+  <ID>
+          The node: an id, a legacy id, a unique prefix or a title
+
+Options:
+      --dir <FOLDER>
+          The folder `node edit --dir` put the copy under
+
+      --stdin
+          Read the node's new content from stdin instead of the copy
+
+      --preimage <BLOB>
+          With `--stdin`: the graph blob the content was based on (as `node edit` printed it); else the record of your `node edit`
+
+      --request-id <ID>
+          A retry passes the same id and gets the original receipt (one is minted otherwise, and printed)
+
+      --json
+          Print JSON
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+  -r, --root <ROOT>
+          Run against this repository root (default: the current directory)
+
+      --as <ACTOR>
+          Act as this actor in coordination commands (default: $MDKG_ACTOR, then the worktree's folder name)
+
+      --allow-store-upgrade
+          Let a development build upgrade the coordinator store.
+
+          The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+```
+
 ### `mdkg config`
 
 ```text
@@ -911,6 +1030,9 @@ Arguments:
 Options:
       --checkpoint
           Also create a checkpoint node covering it
+
+      --residual <REASON>
+          Accept every gate failure a residual may record, for this reason, before finishing: a person's (outside turns), or a coordinator's on a node no live lease holds
 
       --json
           Print JSON
@@ -1374,6 +1496,73 @@ Examples:
   mdkg holds src/lib.rs
 ```
 
+### `mdkg lease`
+
+```text
+Ask about leases others hold: request
+
+Usage: mdkg lease [OPTIONS] <COMMAND>
+
+Commands:
+  request  Ask the actor holding a node or path to give it up: direct mail of kind `question` to the holder, copied to whoever you report to
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+  -r, --root <ROOT>
+          Run against this repository root (default: the current directory)
+
+      --as <ACTOR>
+          Act as this actor in coordination commands (default: $MDKG_ACTOR, then the worktree's folder name)
+
+      --allow-store-upgrade
+          Let a development build upgrade the coordinator store.
+
+          The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+```
+
+#### `mdkg lease request`
+
+```text
+Ask the actor holding a node or path to give it up: direct mail of kind `question` to the holder, copied to whoever you report to.
+
+The holder answers with a normal reply, and releasing stays its own act: nothing is released for it. The mail's context is `lease:<lease id>:<you>`, one conversation per lease and asker (asking again adds to it), and a data part names the path, you and the reason.
+
+Usage: mdkg lease request [OPTIONS] --reason <REASON> <TARGET>
+
+Arguments:
+  <TARGET>
+          The node id or path you need, as you'd claim it
+
+Options:
+      --reason <REASON>
+          Why you need it, for the holder
+
+      --json
+          Print JSON
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+  -r, --root <ROOT>
+          Run against this repository root (default: the current directory)
+
+      --as <ACTOR>
+          Act as this actor in coordination commands (default: $MDKG_ACTOR, then the worktree's folder name)
+
+      --allow-store-upgrade
+          Let a development build upgrade the coordinator store.
+
+          The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+Examples:
+  mdkg lease request src/parser.rs --reason "a security fix needs one commit here"
+```
+
 ### `mdkg renew`
 
 ```text
@@ -1409,7 +1598,7 @@ Examples:
 ```text
 Give up your lease without finishing; a lease that already ended is fine.
 
-`--all` releases every active lease you hold: run it once your head has merged and you've committed everything. Each lease is released on its own, so running it again finishes a run that stopped part way.
+`--all` releases every active lease you hold: run it once your head has merged and you've committed everything. Each lease is released on its own, so running it again finishes a run that stopped part way. `--clean` releases only the path leases `renew` lets lapse: nothing uncommitted in their paths, and not just claimed. The launcher runs it as each agent after every turn.
 
 Usage: mdkg release [OPTIONS] [TARGET]
 
@@ -1420,6 +1609,9 @@ Arguments:
 Options:
       --all
           Release every active lease you hold
+
+      --clean
+          Release your path leases whose paths have no uncommitted or staged changes in this worktree and that you didn't claim in the last 30 minutes: the leases `renew` lets lapse. Never a node, role or turn lease
 
       --json
           Print JSON
@@ -1443,6 +1635,7 @@ Examples:
   mdkg release <id>
   mdkg release src/lib.rs
   mdkg release --all
+  mdkg release --clean
 ```
 
 ### `mdkg status`
@@ -1450,13 +1643,16 @@ Examples:
 ```text
 Show leases, the settlement queue and your unacked mail.
 
-Leases are yours when the actor is named (--as or $MDKG_ACTOR), everyone's with --all; JSON always lists everyone's, marking yours.
+Every active lease, yours first; --mine lists only yours. Expired leases are yours, everyone's with --all. JSON always lists everyone's active leases, marking yours.
 
 Usage: mdkg status [OPTIONS]
 
 Options:
       --all
-          Show everyone's leases and expired leases
+          List everyone's expired leases too, not only yours
+
+      --mine
+          List only your own active leases (text; JSON lists everyone's)
 
       --json
           Print JSON
@@ -1478,6 +1674,7 @@ Global options:
 
 Examples:
   mdkg status
+  mdkg status --mine
   mdkg status --all
 ```
 
@@ -1581,6 +1778,2057 @@ Examples:
   mdkg mcp --as <agent>
 ```
 
+### `mdkg entry`
+
+```text
+The ledger: entries on a node (findings, questions, decisions, issues, reviews, requirements) and its gate
+
+Usage: mdkg entry [OPTIONS] <COMMAND>
+
+Commands:
+  list       List a node's entries
+  show       Show one entry and its history
+  gate       Check the node's gate: what `done` would refuse for (A29)
+  update     Apply op objects, one JSON object per line, from a file or `-`
+  add        Open a finding, an issue, a question or a decision
+  ask        Ask a question on a node
+  answer     Answer a question asked of you, or your own
+  decide     Record an accepted decision, or accept a proposed one (`<entry>`)
+  propose    Propose a decision
+  complete   Complete a review round you were asked for (`review.complete`)
+  fix        Mark a finding fixed at a SHA
+  verify     Verify a finding's fix at a reviewed SHA
+  reopen     Reopen a fixed finding (`--at` the reviewed SHA), or a disputed one
+  reject     Reject a finding, or a proposed decision, with a reason
+  dispute    Dispute a rejected finding
+  residual   Accept a failure as residual (a person or a coordinator)
+  duplicate  Mark a finding a duplicate of another (`--of`)
+  outdated   Mark a finding outdated
+  withdraw   Withdraw your own open question
+  close      Close an answered question you asked, or a rejected finding
+  resolve    Resolve an issue
+  move       Move an open question or issue to another node (`--to`)
+  req        Set a requirement's state: met, unmet or waived (`--state`)
+  help       Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+  -r, --root <ROOT>
+          Run against this repository root (default: the current directory)
+
+      --as <ACTOR>
+          Act as this actor in coordination commands (default: $MDKG_ACTOR, then the worktree's folder name)
+
+      --allow-store-upgrade
+          Let a development build upgrade the coordinator store.
+
+          The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+Examples:
+  mdkg entry list <node>
+  mdkg entry fix <node> F2 --sha <sha>
+  mdkg entry gate <node>
+```
+
+#### `mdkg entry list`
+
+```text
+List a node's entries
+
+Usage: mdkg entry list [OPTIONS] <NODE>
+
+Arguments:
+  <NODE>
+          The node: an id, a qid or a unique prefix
+
+Options:
+      --kind <KIND>
+
+
+      --state <STATE>
+
+
+      --severity <SEVERITY>
+
+
+      --asked-of <ASKED_OF>
+
+
+      --blocking <BLOCKING>
+          [possible values: true, false]
+
+      --json
+
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+  -r, --root <ROOT>
+          Run against this repository root (default: the current directory)
+
+      --as <ACTOR>
+          Act as this actor in coordination commands (default: $MDKG_ACTOR, then the worktree's folder name)
+
+      --allow-store-upgrade
+          Let a development build upgrade the coordinator store.
+
+          The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+```
+
+#### `mdkg entry show`
+
+```text
+Show one entry and its history
+
+Usage: mdkg entry show [OPTIONS] <NODE> <ENTRY>
+
+Arguments:
+  <NODE>
+
+
+  <ENTRY>
+          The entry: `F3`
+
+Options:
+      --json
+
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+  -r, --root <ROOT>
+          Run against this repository root (default: the current directory)
+
+      --as <ACTOR>
+          Act as this actor in coordination commands (default: $MDKG_ACTOR, then the worktree's folder name)
+
+      --allow-store-upgrade
+          Let a development build upgrade the coordinator store.
+
+          The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+```
+
+#### `mdkg entry gate`
+
+```text
+Check the node's gate: what `done` would refuse for (A29)
+
+Usage: mdkg entry gate [OPTIONS] <NODE>
+
+Arguments:
+  <NODE>
+
+
+Options:
+      --at <AT>
+          The head to check at (default: this checkout's HEAD)
+
+      --json
+
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+  -r, --root <ROOT>
+          Run against this repository root (default: the current directory)
+
+      --as <ACTOR>
+          Act as this actor in coordination commands (default: $MDKG_ACTOR, then the worktree's folder name)
+
+      --allow-store-upgrade
+          Let a development build upgrade the coordinator store.
+
+          The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+```
+
+#### `mdkg entry update`
+
+```text
+Apply op objects, one JSON object per line, from a file or `-`
+
+Usage: mdkg entry update [OPTIONS] --op-file <OP_FILE> <NODE>
+
+Arguments:
+  <NODE>
+          The node ops act on when they name none
+
+Options:
+      --op-file <OP_FILE>
+          Op objects, one per line; `-` reads stdin
+
+      --json
+
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+  -r, --root <ROOT>
+          Run against this repository root (default: the current directory)
+
+      --as <ACTOR>
+          Act as this actor in coordination commands (default: $MDKG_ACTOR, then the worktree's folder name)
+
+      --allow-store-upgrade
+          Let a development build upgrade the coordinator store.
+
+          The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+```
+
+#### `mdkg entry add`
+
+```text
+Open a finding, an issue, a question or a decision
+
+Usage: mdkg entry add [OPTIONS] <NODE> [ENTRY]
+
+Arguments:
+  <NODE>
+          The node: an id, a qid or a unique prefix
+
+  [ENTRY]
+          The entry the op acts on (`F3`; `R2` for `req`; `V1` for `complete`)
+
+Options:
+      --kind <KIND>
+
+
+      --title <TITLE>
+
+
+      --text <TEXT>
+          The text: a reason, an answer, a note
+
+      --severity <SEVERITY>
+
+
+      --anchor <ANCHOR>
+          `path` or `path:line`
+
+      --requirement <REQUIREMENT>
+
+
+      --asked-of <ASKED_OF>
+
+
+      --blocking
+
+
+      --slot <SLOT>
+
+
+      --ref <REFS>
+
+
+      --supersedes <SUPERSEDES>
+
+
+      --sha <SHA>
+
+
+      --commit <COMMITS>
+          For `fix`: another commit of the fix, besides `--sha` (repeat it)
+
+      --supersede
+          For `fix` on a reopened finding, by one of its fixers: these commits replace every one declared before (recorded as `supersede`)
+
+      --at <AT>
+
+
+      --of <OF>
+
+
+      --to <TO>
+
+
+      --state <STATE>
+          For `req`: met, unmet or waived
+
+      --range <RANGE>
+          For `complete`: `<base>..<sha>`
+
+      --verdict <VERDICT>
+          For `complete`: clean or findings
+
+      --json
+
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+  -r, --root <ROOT>
+          Run against this repository root (default: the current directory)
+
+      --as <ACTOR>
+          Act as this actor in coordination commands (default: $MDKG_ACTOR, then the worktree's folder name)
+
+      --allow-store-upgrade
+          Let a development build upgrade the coordinator store.
+
+          The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+```
+
+#### `mdkg entry ask`
+
+```text
+Ask a question on a node
+
+Usage: mdkg entry ask [OPTIONS] <NODE> [ENTRY]
+
+Arguments:
+  <NODE>
+          The node: an id, a qid or a unique prefix
+
+  [ENTRY]
+          The entry the op acts on (`F3`; `R2` for `req`; `V1` for `complete`)
+
+Options:
+      --kind <KIND>
+
+
+      --title <TITLE>
+
+
+      --text <TEXT>
+          The text: a reason, an answer, a note
+
+      --severity <SEVERITY>
+
+
+      --anchor <ANCHOR>
+          `path` or `path:line`
+
+      --requirement <REQUIREMENT>
+
+
+      --asked-of <ASKED_OF>
+
+
+      --blocking
+
+
+      --slot <SLOT>
+
+
+      --ref <REFS>
+
+
+      --supersedes <SUPERSEDES>
+
+
+      --sha <SHA>
+
+
+      --commit <COMMITS>
+          For `fix`: another commit of the fix, besides `--sha` (repeat it)
+
+      --supersede
+          For `fix` on a reopened finding, by one of its fixers: these commits replace every one declared before (recorded as `supersede`)
+
+      --at <AT>
+
+
+      --of <OF>
+
+
+      --to <TO>
+
+
+      --state <STATE>
+          For `req`: met, unmet or waived
+
+      --range <RANGE>
+          For `complete`: `<base>..<sha>`
+
+      --verdict <VERDICT>
+          For `complete`: clean or findings
+
+      --json
+
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+  -r, --root <ROOT>
+          Run against this repository root (default: the current directory)
+
+      --as <ACTOR>
+          Act as this actor in coordination commands (default: $MDKG_ACTOR, then the worktree's folder name)
+
+      --allow-store-upgrade
+          Let a development build upgrade the coordinator store.
+
+          The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+```
+
+#### `mdkg entry answer`
+
+```text
+Answer a question asked of you, or your own
+
+Usage: mdkg entry answer [OPTIONS] <NODE> [ENTRY]
+
+Arguments:
+  <NODE>
+          The node: an id, a qid or a unique prefix
+
+  [ENTRY]
+          The entry the op acts on (`F3`; `R2` for `req`; `V1` for `complete`)
+
+Options:
+      --kind <KIND>
+
+
+      --title <TITLE>
+
+
+      --text <TEXT>
+          The text: a reason, an answer, a note
+
+      --severity <SEVERITY>
+
+
+      --anchor <ANCHOR>
+          `path` or `path:line`
+
+      --requirement <REQUIREMENT>
+
+
+      --asked-of <ASKED_OF>
+
+
+      --blocking
+
+
+      --slot <SLOT>
+
+
+      --ref <REFS>
+
+
+      --supersedes <SUPERSEDES>
+
+
+      --sha <SHA>
+
+
+      --commit <COMMITS>
+          For `fix`: another commit of the fix, besides `--sha` (repeat it)
+
+      --supersede
+          For `fix` on a reopened finding, by one of its fixers: these commits replace every one declared before (recorded as `supersede`)
+
+      --at <AT>
+
+
+      --of <OF>
+
+
+      --to <TO>
+
+
+      --state <STATE>
+          For `req`: met, unmet or waived
+
+      --range <RANGE>
+          For `complete`: `<base>..<sha>`
+
+      --verdict <VERDICT>
+          For `complete`: clean or findings
+
+      --json
+
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+  -r, --root <ROOT>
+          Run against this repository root (default: the current directory)
+
+      --as <ACTOR>
+          Act as this actor in coordination commands (default: $MDKG_ACTOR, then the worktree's folder name)
+
+      --allow-store-upgrade
+          Let a development build upgrade the coordinator store.
+
+          The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+```
+
+#### `mdkg entry decide`
+
+```text
+Record an accepted decision, or accept a proposed one (`<entry>`)
+
+Usage: mdkg entry decide [OPTIONS] <NODE> [ENTRY]
+
+Arguments:
+  <NODE>
+          The node: an id, a qid or a unique prefix
+
+  [ENTRY]
+          The entry the op acts on (`F3`; `R2` for `req`; `V1` for `complete`)
+
+Options:
+      --kind <KIND>
+
+
+      --title <TITLE>
+
+
+      --text <TEXT>
+          The text: a reason, an answer, a note
+
+      --severity <SEVERITY>
+
+
+      --anchor <ANCHOR>
+          `path` or `path:line`
+
+      --requirement <REQUIREMENT>
+
+
+      --asked-of <ASKED_OF>
+
+
+      --blocking
+
+
+      --slot <SLOT>
+
+
+      --ref <REFS>
+
+
+      --supersedes <SUPERSEDES>
+
+
+      --sha <SHA>
+
+
+      --commit <COMMITS>
+          For `fix`: another commit of the fix, besides `--sha` (repeat it)
+
+      --supersede
+          For `fix` on a reopened finding, by one of its fixers: these commits replace every one declared before (recorded as `supersede`)
+
+      --at <AT>
+
+
+      --of <OF>
+
+
+      --to <TO>
+
+
+      --state <STATE>
+          For `req`: met, unmet or waived
+
+      --range <RANGE>
+          For `complete`: `<base>..<sha>`
+
+      --verdict <VERDICT>
+          For `complete`: clean or findings
+
+      --json
+
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+  -r, --root <ROOT>
+          Run against this repository root (default: the current directory)
+
+      --as <ACTOR>
+          Act as this actor in coordination commands (default: $MDKG_ACTOR, then the worktree's folder name)
+
+      --allow-store-upgrade
+          Let a development build upgrade the coordinator store.
+
+          The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+```
+
+#### `mdkg entry propose`
+
+```text
+Propose a decision
+
+Usage: mdkg entry propose [OPTIONS] <NODE> [ENTRY]
+
+Arguments:
+  <NODE>
+          The node: an id, a qid or a unique prefix
+
+  [ENTRY]
+          The entry the op acts on (`F3`; `R2` for `req`; `V1` for `complete`)
+
+Options:
+      --kind <KIND>
+
+
+      --title <TITLE>
+
+
+      --text <TEXT>
+          The text: a reason, an answer, a note
+
+      --severity <SEVERITY>
+
+
+      --anchor <ANCHOR>
+          `path` or `path:line`
+
+      --requirement <REQUIREMENT>
+
+
+      --asked-of <ASKED_OF>
+
+
+      --blocking
+
+
+      --slot <SLOT>
+
+
+      --ref <REFS>
+
+
+      --supersedes <SUPERSEDES>
+
+
+      --sha <SHA>
+
+
+      --commit <COMMITS>
+          For `fix`: another commit of the fix, besides `--sha` (repeat it)
+
+      --supersede
+          For `fix` on a reopened finding, by one of its fixers: these commits replace every one declared before (recorded as `supersede`)
+
+      --at <AT>
+
+
+      --of <OF>
+
+
+      --to <TO>
+
+
+      --state <STATE>
+          For `req`: met, unmet or waived
+
+      --range <RANGE>
+          For `complete`: `<base>..<sha>`
+
+      --verdict <VERDICT>
+          For `complete`: clean or findings
+
+      --json
+
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+  -r, --root <ROOT>
+          Run against this repository root (default: the current directory)
+
+      --as <ACTOR>
+          Act as this actor in coordination commands (default: $MDKG_ACTOR, then the worktree's folder name)
+
+      --allow-store-upgrade
+          Let a development build upgrade the coordinator store.
+
+          The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+```
+
+#### `mdkg entry complete`
+
+```text
+Complete a review round you were asked for (`review.complete`)
+
+Usage: mdkg entry complete [OPTIONS] <NODE> [ENTRY]
+
+Arguments:
+  <NODE>
+          The node: an id, a qid or a unique prefix
+
+  [ENTRY]
+          The entry the op acts on (`F3`; `R2` for `req`; `V1` for `complete`)
+
+Options:
+      --kind <KIND>
+
+
+      --title <TITLE>
+
+
+      --text <TEXT>
+          The text: a reason, an answer, a note
+
+      --severity <SEVERITY>
+
+
+      --anchor <ANCHOR>
+          `path` or `path:line`
+
+      --requirement <REQUIREMENT>
+
+
+      --asked-of <ASKED_OF>
+
+
+      --blocking
+
+
+      --slot <SLOT>
+
+
+      --ref <REFS>
+
+
+      --supersedes <SUPERSEDES>
+
+
+      --sha <SHA>
+
+
+      --commit <COMMITS>
+          For `fix`: another commit of the fix, besides `--sha` (repeat it)
+
+      --supersede
+          For `fix` on a reopened finding, by one of its fixers: these commits replace every one declared before (recorded as `supersede`)
+
+      --at <AT>
+
+
+      --of <OF>
+
+
+      --to <TO>
+
+
+      --state <STATE>
+          For `req`: met, unmet or waived
+
+      --range <RANGE>
+          For `complete`: `<base>..<sha>`
+
+      --verdict <VERDICT>
+          For `complete`: clean or findings
+
+      --json
+
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+  -r, --root <ROOT>
+          Run against this repository root (default: the current directory)
+
+      --as <ACTOR>
+          Act as this actor in coordination commands (default: $MDKG_ACTOR, then the worktree's folder name)
+
+      --allow-store-upgrade
+          Let a development build upgrade the coordinator store.
+
+          The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+```
+
+#### `mdkg entry fix`
+
+```text
+Mark a finding fixed at a SHA
+
+Usage: mdkg entry fix [OPTIONS] <NODE> [ENTRY]
+
+Arguments:
+  <NODE>
+          The node: an id, a qid or a unique prefix
+
+  [ENTRY]
+          The entry the op acts on (`F3`; `R2` for `req`; `V1` for `complete`)
+
+Options:
+      --kind <KIND>
+
+
+      --title <TITLE>
+
+
+      --text <TEXT>
+          The text: a reason, an answer, a note
+
+      --severity <SEVERITY>
+
+
+      --anchor <ANCHOR>
+          `path` or `path:line`
+
+      --requirement <REQUIREMENT>
+
+
+      --asked-of <ASKED_OF>
+
+
+      --blocking
+
+
+      --slot <SLOT>
+
+
+      --ref <REFS>
+
+
+      --supersedes <SUPERSEDES>
+
+
+      --sha <SHA>
+
+
+      --commit <COMMITS>
+          For `fix`: another commit of the fix, besides `--sha` (repeat it)
+
+      --supersede
+          For `fix` on a reopened finding, by one of its fixers: these commits replace every one declared before (recorded as `supersede`)
+
+      --at <AT>
+
+
+      --of <OF>
+
+
+      --to <TO>
+
+
+      --state <STATE>
+          For `req`: met, unmet or waived
+
+      --range <RANGE>
+          For `complete`: `<base>..<sha>`
+
+      --verdict <VERDICT>
+          For `complete`: clean or findings
+
+      --json
+
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+  -r, --root <ROOT>
+          Run against this repository root (default: the current directory)
+
+      --as <ACTOR>
+          Act as this actor in coordination commands (default: $MDKG_ACTOR, then the worktree's folder name)
+
+      --allow-store-upgrade
+          Let a development build upgrade the coordinator store.
+
+          The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+```
+
+#### `mdkg entry verify`
+
+```text
+Verify a finding's fix at a reviewed SHA
+
+Usage: mdkg entry verify [OPTIONS] <NODE> [ENTRY]
+
+Arguments:
+  <NODE>
+          The node: an id, a qid or a unique prefix
+
+  [ENTRY]
+          The entry the op acts on (`F3`; `R2` for `req`; `V1` for `complete`)
+
+Options:
+      --kind <KIND>
+
+
+      --title <TITLE>
+
+
+      --text <TEXT>
+          The text: a reason, an answer, a note
+
+      --severity <SEVERITY>
+
+
+      --anchor <ANCHOR>
+          `path` or `path:line`
+
+      --requirement <REQUIREMENT>
+
+
+      --asked-of <ASKED_OF>
+
+
+      --blocking
+
+
+      --slot <SLOT>
+
+
+      --ref <REFS>
+
+
+      --supersedes <SUPERSEDES>
+
+
+      --sha <SHA>
+
+
+      --commit <COMMITS>
+          For `fix`: another commit of the fix, besides `--sha` (repeat it)
+
+      --supersede
+          For `fix` on a reopened finding, by one of its fixers: these commits replace every one declared before (recorded as `supersede`)
+
+      --at <AT>
+
+
+      --of <OF>
+
+
+      --to <TO>
+
+
+      --state <STATE>
+          For `req`: met, unmet or waived
+
+      --range <RANGE>
+          For `complete`: `<base>..<sha>`
+
+      --verdict <VERDICT>
+          For `complete`: clean or findings
+
+      --json
+
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+  -r, --root <ROOT>
+          Run against this repository root (default: the current directory)
+
+      --as <ACTOR>
+          Act as this actor in coordination commands (default: $MDKG_ACTOR, then the worktree's folder name)
+
+      --allow-store-upgrade
+          Let a development build upgrade the coordinator store.
+
+          The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+```
+
+#### `mdkg entry reopen`
+
+```text
+Reopen a fixed finding (`--at` the reviewed SHA), or a disputed one
+
+Usage: mdkg entry reopen [OPTIONS] <NODE> [ENTRY]
+
+Arguments:
+  <NODE>
+          The node: an id, a qid or a unique prefix
+
+  [ENTRY]
+          The entry the op acts on (`F3`; `R2` for `req`; `V1` for `complete`)
+
+Options:
+      --kind <KIND>
+
+
+      --title <TITLE>
+
+
+      --text <TEXT>
+          The text: a reason, an answer, a note
+
+      --severity <SEVERITY>
+
+
+      --anchor <ANCHOR>
+          `path` or `path:line`
+
+      --requirement <REQUIREMENT>
+
+
+      --asked-of <ASKED_OF>
+
+
+      --blocking
+
+
+      --slot <SLOT>
+
+
+      --ref <REFS>
+
+
+      --supersedes <SUPERSEDES>
+
+
+      --sha <SHA>
+
+
+      --commit <COMMITS>
+          For `fix`: another commit of the fix, besides `--sha` (repeat it)
+
+      --supersede
+          For `fix` on a reopened finding, by one of its fixers: these commits replace every one declared before (recorded as `supersede`)
+
+      --at <AT>
+
+
+      --of <OF>
+
+
+      --to <TO>
+
+
+      --state <STATE>
+          For `req`: met, unmet or waived
+
+      --range <RANGE>
+          For `complete`: `<base>..<sha>`
+
+      --verdict <VERDICT>
+          For `complete`: clean or findings
+
+      --json
+
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+  -r, --root <ROOT>
+          Run against this repository root (default: the current directory)
+
+      --as <ACTOR>
+          Act as this actor in coordination commands (default: $MDKG_ACTOR, then the worktree's folder name)
+
+      --allow-store-upgrade
+          Let a development build upgrade the coordinator store.
+
+          The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+```
+
+#### `mdkg entry reject`
+
+```text
+Reject a finding, or a proposed decision, with a reason
+
+Usage: mdkg entry reject [OPTIONS] <NODE> [ENTRY]
+
+Arguments:
+  <NODE>
+          The node: an id, a qid or a unique prefix
+
+  [ENTRY]
+          The entry the op acts on (`F3`; `R2` for `req`; `V1` for `complete`)
+
+Options:
+      --kind <KIND>
+
+
+      --title <TITLE>
+
+
+      --text <TEXT>
+          The text: a reason, an answer, a note
+
+      --severity <SEVERITY>
+
+
+      --anchor <ANCHOR>
+          `path` or `path:line`
+
+      --requirement <REQUIREMENT>
+
+
+      --asked-of <ASKED_OF>
+
+
+      --blocking
+
+
+      --slot <SLOT>
+
+
+      --ref <REFS>
+
+
+      --supersedes <SUPERSEDES>
+
+
+      --sha <SHA>
+
+
+      --commit <COMMITS>
+          For `fix`: another commit of the fix, besides `--sha` (repeat it)
+
+      --supersede
+          For `fix` on a reopened finding, by one of its fixers: these commits replace every one declared before (recorded as `supersede`)
+
+      --at <AT>
+
+
+      --of <OF>
+
+
+      --to <TO>
+
+
+      --state <STATE>
+          For `req`: met, unmet or waived
+
+      --range <RANGE>
+          For `complete`: `<base>..<sha>`
+
+      --verdict <VERDICT>
+          For `complete`: clean or findings
+
+      --json
+
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+  -r, --root <ROOT>
+          Run against this repository root (default: the current directory)
+
+      --as <ACTOR>
+          Act as this actor in coordination commands (default: $MDKG_ACTOR, then the worktree's folder name)
+
+      --allow-store-upgrade
+          Let a development build upgrade the coordinator store.
+
+          The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+```
+
+#### `mdkg entry dispute`
+
+```text
+Dispute a rejected finding
+
+Usage: mdkg entry dispute [OPTIONS] <NODE> [ENTRY]
+
+Arguments:
+  <NODE>
+          The node: an id, a qid or a unique prefix
+
+  [ENTRY]
+          The entry the op acts on (`F3`; `R2` for `req`; `V1` for `complete`)
+
+Options:
+      --kind <KIND>
+
+
+      --title <TITLE>
+
+
+      --text <TEXT>
+          The text: a reason, an answer, a note
+
+      --severity <SEVERITY>
+
+
+      --anchor <ANCHOR>
+          `path` or `path:line`
+
+      --requirement <REQUIREMENT>
+
+
+      --asked-of <ASKED_OF>
+
+
+      --blocking
+
+
+      --slot <SLOT>
+
+
+      --ref <REFS>
+
+
+      --supersedes <SUPERSEDES>
+
+
+      --sha <SHA>
+
+
+      --commit <COMMITS>
+          For `fix`: another commit of the fix, besides `--sha` (repeat it)
+
+      --supersede
+          For `fix` on a reopened finding, by one of its fixers: these commits replace every one declared before (recorded as `supersede`)
+
+      --at <AT>
+
+
+      --of <OF>
+
+
+      --to <TO>
+
+
+      --state <STATE>
+          For `req`: met, unmet or waived
+
+      --range <RANGE>
+          For `complete`: `<base>..<sha>`
+
+      --verdict <VERDICT>
+          For `complete`: clean or findings
+
+      --json
+
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+  -r, --root <ROOT>
+          Run against this repository root (default: the current directory)
+
+      --as <ACTOR>
+          Act as this actor in coordination commands (default: $MDKG_ACTOR, then the worktree's folder name)
+
+      --allow-store-upgrade
+          Let a development build upgrade the coordinator store.
+
+          The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+```
+
+#### `mdkg entry residual`
+
+```text
+Accept a failure as residual (a person or a coordinator)
+
+Usage: mdkg entry residual [OPTIONS] <NODE> [ENTRY]
+
+Arguments:
+  <NODE>
+          The node: an id, a qid or a unique prefix
+
+  [ENTRY]
+          The entry the op acts on (`F3`; `R2` for `req`; `V1` for `complete`)
+
+Options:
+      --kind <KIND>
+
+
+      --title <TITLE>
+
+
+      --text <TEXT>
+          The text: a reason, an answer, a note
+
+      --severity <SEVERITY>
+
+
+      --anchor <ANCHOR>
+          `path` or `path:line`
+
+      --requirement <REQUIREMENT>
+
+
+      --asked-of <ASKED_OF>
+
+
+      --blocking
+
+
+      --slot <SLOT>
+
+
+      --ref <REFS>
+
+
+      --supersedes <SUPERSEDES>
+
+
+      --sha <SHA>
+
+
+      --commit <COMMITS>
+          For `fix`: another commit of the fix, besides `--sha` (repeat it)
+
+      --supersede
+          For `fix` on a reopened finding, by one of its fixers: these commits replace every one declared before (recorded as `supersede`)
+
+      --at <AT>
+
+
+      --of <OF>
+
+
+      --to <TO>
+
+
+      --state <STATE>
+          For `req`: met, unmet or waived
+
+      --range <RANGE>
+          For `complete`: `<base>..<sha>`
+
+      --verdict <VERDICT>
+          For `complete`: clean or findings
+
+      --json
+
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+  -r, --root <ROOT>
+          Run against this repository root (default: the current directory)
+
+      --as <ACTOR>
+          Act as this actor in coordination commands (default: $MDKG_ACTOR, then the worktree's folder name)
+
+      --allow-store-upgrade
+          Let a development build upgrade the coordinator store.
+
+          The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+```
+
+#### `mdkg entry duplicate`
+
+```text
+Mark a finding a duplicate of another (`--of`)
+
+Usage: mdkg entry duplicate [OPTIONS] <NODE> [ENTRY]
+
+Arguments:
+  <NODE>
+          The node: an id, a qid or a unique prefix
+
+  [ENTRY]
+          The entry the op acts on (`F3`; `R2` for `req`; `V1` for `complete`)
+
+Options:
+      --kind <KIND>
+
+
+      --title <TITLE>
+
+
+      --text <TEXT>
+          The text: a reason, an answer, a note
+
+      --severity <SEVERITY>
+
+
+      --anchor <ANCHOR>
+          `path` or `path:line`
+
+      --requirement <REQUIREMENT>
+
+
+      --asked-of <ASKED_OF>
+
+
+      --blocking
+
+
+      --slot <SLOT>
+
+
+      --ref <REFS>
+
+
+      --supersedes <SUPERSEDES>
+
+
+      --sha <SHA>
+
+
+      --commit <COMMITS>
+          For `fix`: another commit of the fix, besides `--sha` (repeat it)
+
+      --supersede
+          For `fix` on a reopened finding, by one of its fixers: these commits replace every one declared before (recorded as `supersede`)
+
+      --at <AT>
+
+
+      --of <OF>
+
+
+      --to <TO>
+
+
+      --state <STATE>
+          For `req`: met, unmet or waived
+
+      --range <RANGE>
+          For `complete`: `<base>..<sha>`
+
+      --verdict <VERDICT>
+          For `complete`: clean or findings
+
+      --json
+
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+  -r, --root <ROOT>
+          Run against this repository root (default: the current directory)
+
+      --as <ACTOR>
+          Act as this actor in coordination commands (default: $MDKG_ACTOR, then the worktree's folder name)
+
+      --allow-store-upgrade
+          Let a development build upgrade the coordinator store.
+
+          The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+```
+
+#### `mdkg entry outdated`
+
+```text
+Mark a finding outdated
+
+Usage: mdkg entry outdated [OPTIONS] <NODE> [ENTRY]
+
+Arguments:
+  <NODE>
+          The node: an id, a qid or a unique prefix
+
+  [ENTRY]
+          The entry the op acts on (`F3`; `R2` for `req`; `V1` for `complete`)
+
+Options:
+      --kind <KIND>
+
+
+      --title <TITLE>
+
+
+      --text <TEXT>
+          The text: a reason, an answer, a note
+
+      --severity <SEVERITY>
+
+
+      --anchor <ANCHOR>
+          `path` or `path:line`
+
+      --requirement <REQUIREMENT>
+
+
+      --asked-of <ASKED_OF>
+
+
+      --blocking
+
+
+      --slot <SLOT>
+
+
+      --ref <REFS>
+
+
+      --supersedes <SUPERSEDES>
+
+
+      --sha <SHA>
+
+
+      --commit <COMMITS>
+          For `fix`: another commit of the fix, besides `--sha` (repeat it)
+
+      --supersede
+          For `fix` on a reopened finding, by one of its fixers: these commits replace every one declared before (recorded as `supersede`)
+
+      --at <AT>
+
+
+      --of <OF>
+
+
+      --to <TO>
+
+
+      --state <STATE>
+          For `req`: met, unmet or waived
+
+      --range <RANGE>
+          For `complete`: `<base>..<sha>`
+
+      --verdict <VERDICT>
+          For `complete`: clean or findings
+
+      --json
+
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+  -r, --root <ROOT>
+          Run against this repository root (default: the current directory)
+
+      --as <ACTOR>
+          Act as this actor in coordination commands (default: $MDKG_ACTOR, then the worktree's folder name)
+
+      --allow-store-upgrade
+          Let a development build upgrade the coordinator store.
+
+          The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+```
+
+#### `mdkg entry withdraw`
+
+```text
+Withdraw your own open question
+
+Usage: mdkg entry withdraw [OPTIONS] <NODE> [ENTRY]
+
+Arguments:
+  <NODE>
+          The node: an id, a qid or a unique prefix
+
+  [ENTRY]
+          The entry the op acts on (`F3`; `R2` for `req`; `V1` for `complete`)
+
+Options:
+      --kind <KIND>
+
+
+      --title <TITLE>
+
+
+      --text <TEXT>
+          The text: a reason, an answer, a note
+
+      --severity <SEVERITY>
+
+
+      --anchor <ANCHOR>
+          `path` or `path:line`
+
+      --requirement <REQUIREMENT>
+
+
+      --asked-of <ASKED_OF>
+
+
+      --blocking
+
+
+      --slot <SLOT>
+
+
+      --ref <REFS>
+
+
+      --supersedes <SUPERSEDES>
+
+
+      --sha <SHA>
+
+
+      --commit <COMMITS>
+          For `fix`: another commit of the fix, besides `--sha` (repeat it)
+
+      --supersede
+          For `fix` on a reopened finding, by one of its fixers: these commits replace every one declared before (recorded as `supersede`)
+
+      --at <AT>
+
+
+      --of <OF>
+
+
+      --to <TO>
+
+
+      --state <STATE>
+          For `req`: met, unmet or waived
+
+      --range <RANGE>
+          For `complete`: `<base>..<sha>`
+
+      --verdict <VERDICT>
+          For `complete`: clean or findings
+
+      --json
+
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+  -r, --root <ROOT>
+          Run against this repository root (default: the current directory)
+
+      --as <ACTOR>
+          Act as this actor in coordination commands (default: $MDKG_ACTOR, then the worktree's folder name)
+
+      --allow-store-upgrade
+          Let a development build upgrade the coordinator store.
+
+          The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+```
+
+#### `mdkg entry close`
+
+```text
+Close an answered question you asked, or a rejected finding
+
+Usage: mdkg entry close [OPTIONS] <NODE> [ENTRY]
+
+Arguments:
+  <NODE>
+          The node: an id, a qid or a unique prefix
+
+  [ENTRY]
+          The entry the op acts on (`F3`; `R2` for `req`; `V1` for `complete`)
+
+Options:
+      --kind <KIND>
+
+
+      --title <TITLE>
+
+
+      --text <TEXT>
+          The text: a reason, an answer, a note
+
+      --severity <SEVERITY>
+
+
+      --anchor <ANCHOR>
+          `path` or `path:line`
+
+      --requirement <REQUIREMENT>
+
+
+      --asked-of <ASKED_OF>
+
+
+      --blocking
+
+
+      --slot <SLOT>
+
+
+      --ref <REFS>
+
+
+      --supersedes <SUPERSEDES>
+
+
+      --sha <SHA>
+
+
+      --commit <COMMITS>
+          For `fix`: another commit of the fix, besides `--sha` (repeat it)
+
+      --supersede
+          For `fix` on a reopened finding, by one of its fixers: these commits replace every one declared before (recorded as `supersede`)
+
+      --at <AT>
+
+
+      --of <OF>
+
+
+      --to <TO>
+
+
+      --state <STATE>
+          For `req`: met, unmet or waived
+
+      --range <RANGE>
+          For `complete`: `<base>..<sha>`
+
+      --verdict <VERDICT>
+          For `complete`: clean or findings
+
+      --json
+
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+  -r, --root <ROOT>
+          Run against this repository root (default: the current directory)
+
+      --as <ACTOR>
+          Act as this actor in coordination commands (default: $MDKG_ACTOR, then the worktree's folder name)
+
+      --allow-store-upgrade
+          Let a development build upgrade the coordinator store.
+
+          The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+```
+
+#### `mdkg entry resolve`
+
+```text
+Resolve an issue
+
+Usage: mdkg entry resolve [OPTIONS] <NODE> [ENTRY]
+
+Arguments:
+  <NODE>
+          The node: an id, a qid or a unique prefix
+
+  [ENTRY]
+          The entry the op acts on (`F3`; `R2` for `req`; `V1` for `complete`)
+
+Options:
+      --kind <KIND>
+
+
+      --title <TITLE>
+
+
+      --text <TEXT>
+          The text: a reason, an answer, a note
+
+      --severity <SEVERITY>
+
+
+      --anchor <ANCHOR>
+          `path` or `path:line`
+
+      --requirement <REQUIREMENT>
+
+
+      --asked-of <ASKED_OF>
+
+
+      --blocking
+
+
+      --slot <SLOT>
+
+
+      --ref <REFS>
+
+
+      --supersedes <SUPERSEDES>
+
+
+      --sha <SHA>
+
+
+      --commit <COMMITS>
+          For `fix`: another commit of the fix, besides `--sha` (repeat it)
+
+      --supersede
+          For `fix` on a reopened finding, by one of its fixers: these commits replace every one declared before (recorded as `supersede`)
+
+      --at <AT>
+
+
+      --of <OF>
+
+
+      --to <TO>
+
+
+      --state <STATE>
+          For `req`: met, unmet or waived
+
+      --range <RANGE>
+          For `complete`: `<base>..<sha>`
+
+      --verdict <VERDICT>
+          For `complete`: clean or findings
+
+      --json
+
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+  -r, --root <ROOT>
+          Run against this repository root (default: the current directory)
+
+      --as <ACTOR>
+          Act as this actor in coordination commands (default: $MDKG_ACTOR, then the worktree's folder name)
+
+      --allow-store-upgrade
+          Let a development build upgrade the coordinator store.
+
+          The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+```
+
+#### `mdkg entry move`
+
+```text
+Move an open question or issue to another node (`--to`)
+
+Usage: mdkg entry move [OPTIONS] <NODE> [ENTRY]
+
+Arguments:
+  <NODE>
+          The node: an id, a qid or a unique prefix
+
+  [ENTRY]
+          The entry the op acts on (`F3`; `R2` for `req`; `V1` for `complete`)
+
+Options:
+      --kind <KIND>
+
+
+      --title <TITLE>
+
+
+      --text <TEXT>
+          The text: a reason, an answer, a note
+
+      --severity <SEVERITY>
+
+
+      --anchor <ANCHOR>
+          `path` or `path:line`
+
+      --requirement <REQUIREMENT>
+
+
+      --asked-of <ASKED_OF>
+
+
+      --blocking
+
+
+      --slot <SLOT>
+
+
+      --ref <REFS>
+
+
+      --supersedes <SUPERSEDES>
+
+
+      --sha <SHA>
+
+
+      --commit <COMMITS>
+          For `fix`: another commit of the fix, besides `--sha` (repeat it)
+
+      --supersede
+          For `fix` on a reopened finding, by one of its fixers: these commits replace every one declared before (recorded as `supersede`)
+
+      --at <AT>
+
+
+      --of <OF>
+
+
+      --to <TO>
+
+
+      --state <STATE>
+          For `req`: met, unmet or waived
+
+      --range <RANGE>
+          For `complete`: `<base>..<sha>`
+
+      --verdict <VERDICT>
+          For `complete`: clean or findings
+
+      --json
+
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+  -r, --root <ROOT>
+          Run against this repository root (default: the current directory)
+
+      --as <ACTOR>
+          Act as this actor in coordination commands (default: $MDKG_ACTOR, then the worktree's folder name)
+
+      --allow-store-upgrade
+          Let a development build upgrade the coordinator store.
+
+          The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+```
+
+#### `mdkg entry req`
+
+```text
+Set a requirement's state: met, unmet or waived (`--state`)
+
+Usage: mdkg entry req [OPTIONS] <NODE> [ENTRY]
+
+Arguments:
+  <NODE>
+          The node: an id, a qid or a unique prefix
+
+  [ENTRY]
+          The entry the op acts on (`F3`; `R2` for `req`; `V1` for `complete`)
+
+Options:
+      --kind <KIND>
+
+
+      --title <TITLE>
+
+
+      --text <TEXT>
+          The text: a reason, an answer, a note
+
+      --severity <SEVERITY>
+
+
+      --anchor <ANCHOR>
+          `path` or `path:line`
+
+      --requirement <REQUIREMENT>
+
+
+      --asked-of <ASKED_OF>
+
+
+      --blocking
+
+
+      --slot <SLOT>
+
+
+      --ref <REFS>
+
+
+      --supersedes <SUPERSEDES>
+
+
+      --sha <SHA>
+
+
+      --commit <COMMITS>
+          For `fix`: another commit of the fix, besides `--sha` (repeat it)
+
+      --supersede
+          For `fix` on a reopened finding, by one of its fixers: these commits replace every one declared before (recorded as `supersede`)
+
+      --at <AT>
+
+
+      --of <OF>
+
+
+      --to <TO>
+
+
+      --state <STATE>
+          For `req`: met, unmet or waived
+
+      --range <RANGE>
+          For `complete`: `<base>..<sha>`
+
+      --verdict <VERDICT>
+          For `complete`: clean or findings
+
+      --json
+
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+  -r, --root <ROOT>
+          Run against this repository root (default: the current directory)
+
+      --as <ACTOR>
+          Act as this actor in coordination commands (default: $MDKG_ACTOR, then the worktree's folder name)
+
+      --allow-store-upgrade
+          Let a development build upgrade the coordinator store.
+
+          The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+```
+
+### `mdkg req`
+
+```text
+The requirements in a node's body, with their ledger states
+
+Usage: mdkg req [OPTIONS] <COMMAND>
+
+Commands:
+  list  List requirements in a node body, with their ledger states
+  help  Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+  -r, --root <ROOT>
+          Run against this repository root (default: the current directory)
+
+      --as <ACTOR>
+          Act as this actor in coordination commands (default: $MDKG_ACTOR, then the worktree's folder name)
+
+      --allow-store-upgrade
+          Let a development build upgrade the coordinator store.
+
+          The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+Examples:
+  mdkg req list <node> --json
+```
+
+#### `mdkg req list`
+
+```text
+List requirements in a node body, with their ledger states
+
+Usage: mdkg req list [OPTIONS] <NODE>
+
+Arguments:
+  <NODE>
+          A node id, qualified id, unique prefix, or title fragment
+
+Options:
+      --json
+          Print one JSON envelope
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+  -r, --root <ROOT>
+          Run against this repository root (default: the current directory)
+
+      --as <ACTOR>
+          Act as this actor in coordination commands (default: $MDKG_ACTOR, then the worktree's folder name)
+
+      --allow-store-upgrade
+          Let a development build upgrade the coordinator store.
+
+          The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+```
+
 ### `mdkg msg`
 
 ```text
@@ -1589,10 +3837,12 @@ Send and read messages: send, inbox, wait, ack, thread, import
 Usage: mdkg msg [OPTIONS] <COMMAND>
 
 Commands:
-  send       Send a message to a room or to mailboxes
+  watch      Follow the local coordinator event stream as one JSON event per line
+  send       Send a message to a channel or to mailboxes
   inbox      Show your unacked mail (your mailbox and the roles you hold)
   wait       Wait for mail; exits 6 if none arrives before the timeout
   ack        Ack messages delivered to you
+  forward    Re-send messages delivered to you, verbatim with their senders, as one new message; then ack them
   thread     Show a conversation's messages, oldest first
   import     Record a read-only sender's output (a file) as its message
   decisions  List send-time decision metadata without acknowledging mail. A row does not prove human approval or launcher promotion: the launcher revalidates against its own current configuration before using a decision
@@ -1616,19 +3866,65 @@ Global options:
 
 Examples:
   mdkg msg inbox
-  mdkg msg send --room dev --kind note --text "Tests pass on main"
+  mdkg msg send --channel dev --kind note --text "Tests pass on main"
+```
+
+#### `mdkg msg watch`
+
+```text
+Follow the local coordinator event stream as one JSON event per line
+
+Usage: mdkg msg watch [OPTIONS]
+
+Options:
+      --after <AFTER>
+          Resume just after this opaque event cursor (`start` replays history)
+
+      --from-start
+          Replay from the first record, then follow new events
+
+      --types <TYPES>
+          Event types, repeated or comma-separated; a trailing `*` matches a prefix
+
+      --channel <NAME>
+          Events of these channels, including messages posted to them (repeatable)
+
+      --mailbox <NAME>
+          Events for messages delivered to this mailbox
+
+      --json
+          Required: print one bare API event per line
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+  -r, --root <ROOT>
+          Run against this repository root (default: the current directory)
+
+      --as <ACTOR>
+          Act as this actor in coordination commands (default: $MDKG_ACTOR, then the worktree's folder name)
+
+      --allow-store-upgrade
+          Let a development build upgrade the coordinator store.
+
+          The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+Examples:
+  mdkg msg watch --json
+  mdkg msg watch --from-start --types 'mdkg.message.*' --json
 ```
 
 #### `mdkg msg send`
 
 ```text
-Send a message to a room or to mailboxes
+Send a message to a channel or to mailboxes
 
 Usage: mdkg msg send [OPTIONS] --kind <KIND>
 
 Options:
-      --room <ROOM>
-          Post to this room's members
+      --channel <NAME>
+          Post to this channel's members
 
       --to <TO>
           Send to these mailboxes (comma-separated or repeated)
@@ -1648,7 +3944,7 @@ Options:
       --context <CONTEXT>
           The conversation (default: the replied-to message's, else a new one).
 
-          A reply joins the replied-to message's context when it goes to the same place, room to room or direct to direct, and a direct reply's conversation holds no room post; otherwise a room post's context is `room:<name>`, and a direct message's its own id.
+          A reply joins the replied-to message's context when it goes to the same place, channel to channel or direct to direct, and a direct reply's conversation holds no channel post; otherwise a channel post's context is the channel's default context, and a direct message's its own id.
 
       --reply-to <REPLY_TO>
           The id of a message this replies to (repeatable)
@@ -1664,6 +3960,18 @@ Options:
 
       --url <URL>
           A URL part
+
+      --node <NODE>
+          A node this message is about (repeatable): an id, a qid or a unique prefix, bound by its UUID. A review_request names exactly one, and opens a review round on it with --range
+
+      --range <RANGE>
+          With --node on a review_request: the range under review, `<base>..<sha>`, which the review round records
+
+      --supersedes <SUPERSEDES>
+          A message of yours this one replaces (repeatable): its unacked deliveries to this message's recipients are acked by mdkg as superseded, so they leave inboxes and wake no one
+
+      --slot <SLOT>
+          Replaces your earlier unacked messages with this slot and the same first --node (or none), as --supersedes does: `[a-z0-9._:-]`, up to 200 characters, such as `brief.a-mail`
 
       --json
           Print JSON
@@ -1684,7 +3992,7 @@ Global options:
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
 
 Examples:
-  mdkg msg send --room dev --kind note --text "Tests pass on main"
+  mdkg msg send --channel dev --kind note --text "Tests pass on main"
   mdkg msg send --to role:reviewer --kind review_request --text "Please review cs-3"
 ```
 
@@ -1699,14 +4007,17 @@ Options:
       --mailbox <MAILBOX>
           Read this mailbox instead (yours, a role you hold, or `human:*`)
 
-      --room <ROOM>
-          Only mail posted to this room
+      --channel <NAME>
+          Only mail posted to this channel
 
       --kind <KIND>
-          Only these kinds: repeat the flag or separate them with commas (`--kind question,handoff`)
+          Only these kinds: repeat the flag or separate them with commas (`--kind question,handoff`). Receipts are left out unless this names `receipt`
 
-      --room-kind <ROOM_KIND>
-          Room mail only of these kinds, while direct mail of every kind still counts (`--room-kind question,handoff`): a wake hook's filter
+      --channel-kind <ROOM_KIND>
+          Channel mail only of these kinds, while direct mail of every kind still counts (`--channel-kind question,handoff`): a wake hook's filter
+
+      --from <FROM>
+          Only mail from these senders: repeat the flag or separate them with commas (`--from a-mail,orchestrator`)
 
       --after <AFTER>
           Only mail after this cursor (the `cursor` a previous call returned). A cursor covers the mailboxes it was issued for: after taking a role, read once without `--after` to see the role's backlog
@@ -1740,7 +4051,8 @@ Global options:
 
 Examples:
   mdkg msg inbox
-  mdkg msg inbox --room dev --json
+  mdkg msg inbox --channel dev --json
+  mdkg msg inbox --from orchestrator --kind question
 ```
 
 #### `mdkg msg wait`
@@ -1754,14 +4066,17 @@ Options:
       --mailbox <MAILBOX>
           Read this mailbox instead (yours, a role you hold, or `human:*`)
 
-      --room <ROOM>
-          Only mail posted to this room
+      --channel <NAME>
+          Only mail posted to this channel
 
       --kind <KIND>
-          Only these kinds: repeat the flag or separate them with commas (`--kind question,handoff`)
+          Only these kinds: repeat the flag or separate them with commas (`--kind question,handoff`). Receipts are left out unless this names `receipt`
 
-      --room-kind <ROOM_KIND>
-          Room mail only of these kinds, while direct mail of every kind still counts (`--room-kind question,handoff`): a wake hook's filter
+      --channel-kind <ROOM_KIND>
+          Channel mail only of these kinds, while direct mail of every kind still counts (`--channel-kind question,handoff`): a wake hook's filter
+
+      --from <FROM>
+          Only mail from these senders: repeat the flag or separate them with commas (`--from a-mail,orchestrator`)
 
       --after <AFTER>
           Only mail after this cursor (the `cursor` a previous call returned). A cursor covers the mailboxes it was issued for: after taking a role, read once without `--after` to see the role's backlog
@@ -1805,13 +4120,21 @@ Examples:
 ```text
 Ack messages delivered to you
 
-Usage: mdkg msg ack [OPTIONS] <IDS>...
+Usage: mdkg msg ack [OPTIONS] [IDS]...
 
 Arguments:
-  <IDS>...
+  [IDS]...
           Message ids, or the `#N` (or `N`) a listing shows
 
 Options:
+      --through <THROUGH>
+          Ack all your unacked mail numbered this or lower instead (`N` or `#N`: a listing's number, or the `cursor` it returned).
+
+          Findings and faults are skipped unless `--kind` names them, and so is mail never listed to you; the result names what it skipped and why.
+
+      --kind <KIND>
+          With --through: only these kinds (repeat the flag or separate them with commas). Name `findings` to ack findings
+
       --mailbox <MAILBOX>
           Ack only this mailbox's deliveries (yours or a role you hold)
 
@@ -1841,6 +4164,62 @@ Global options:
 Examples:
   mdkg msg ack <message-id>
   mdkg msg ack <message-id> --outcome merged
+  mdkg msg ack --through 4400 --kind note,handoff
+```
+
+#### `mdkg msg forward`
+
+```text
+Re-send messages delivered to you, verbatim with their senders, as one new message; then ack them.
+
+For a role that relays mail: an ack can purge a body, so forward it first. The send and the acks are one step: nothing is acked unless the forward is stored.
+
+Usage: mdkg msg forward [OPTIONS] <IDS>...
+
+Arguments:
+  <IDS>...
+          Message ids, or the `#N` (or `N`) a listing shows, in the order to forward them
+
+Options:
+      --channel <NAME>
+          Post to this channel's members
+
+      --to <TO>
+          Send to these mailboxes (comma-separated or repeated)
+
+      --kind <KIND>
+          The new message's kind (default: the forwarded messages' kind, when they all have one). Never `decision`
+
+      --text <TEXT>
+          A text part to put before the forwarded messages (repeatable)
+
+      --mailbox <MAILBOX>
+          Forward and ack only this mailbox's deliveries (yours or a role you hold)
+
+      --outcome <OUTCOME>
+          The outcome recorded with the acks (default: `forwarded as <id>`)
+
+      --json
+          Print JSON
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+  -r, --root <ROOT>
+          Run against this repository root (default: the current directory)
+
+      --as <ACTOR>
+          Act as this actor in coordination commands (default: $MDKG_ACTOR, then the worktree's folder name)
+
+      --allow-store-upgrade
+          Let a development build upgrade the coordinator store.
+
+          The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+Examples:
+  mdkg msg forward 4410 4411 --to a-mail --kind findings --text "Reviews of 1a2b3c4"
+  mdkg msg forward <message-id> --channel dev
 ```
 
 #### `mdkg msg thread`
@@ -1855,11 +4234,11 @@ Arguments:
           A message id (its conversation), the `#N` a listing shows, or a context id
 
 Options:
-      --room <ROOM>
-          Every message posted to this room instead, whatever its context
+      --channel <NAME>
+          Every message posted to this channel instead, whatever its context
 
       --after <AFTER>
-          Only messages after this cursor (the `cursor` a previous call on this thread or room returned), to page through a long one
+          Only messages after this cursor (the `cursor` a previous call on this thread or channel returned), to page through a long one
 
       --limit <LIMIT>
           At most this many messages (1 or more), the oldest first
@@ -1867,10 +4246,10 @@ Options:
       --tail <TAIL>
           The newest this many messages (1 or more), listed oldest first.
 
-          For catching up on a thread's or a room's recent messages. Not with --limit or --after.
+          For catching up on a thread's or a channel's recent messages. Not with --limit or --after.
 
       --member
-          With --room: read it only as a member (you or a role you hold), refused with room.not_member before anything is read
+          With --channel: read it only as a member (you or a role you hold), refused with channel.not_member before anything is read
 
       --no-mark
           List without counting as shown (see `inbox --no-mark`)
@@ -1895,7 +4274,7 @@ Global options:
 
 Examples:
   mdkg msg thread <message-id>
-  mdkg msg thread --room dev --tail 20
+  mdkg msg thread --channel dev --tail 20
 ```
 
 #### `mdkg msg import`
@@ -1910,8 +4289,8 @@ Arguments:
           The file: JSON becomes a data part, anything else a text part
 
 Options:
-      --room <ROOM>
-          Post to this room's members
+      --channel <NAME>
+          Post to this channel's members
 
       --to <TO>
           Send to these mailboxes (comma-separated or repeated)
@@ -1947,7 +4326,7 @@ Global options:
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
 
 Examples:
-  mdkg msg import --from codex:run-7 --room dev --kind findings review.json
+  mdkg msg import --from codex:run-7 --channel dev --kind findings review.json
 ```
 
 #### `mdkg msg decisions`
@@ -1986,18 +4365,18 @@ Global options:
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
 ```
 
-### `mdkg room`
+### `mdkg channel`
 
 ```text
-Manage rooms: create, join, leave, list
+Manage channels: create, join, leave, list
 
-Usage: mdkg room [OPTIONS] <COMMAND>
+Usage: mdkg channel [OPTIONS] <COMMAND>
 
 Commands:
-  create  Create a room, with you as a member
-  join    Add you (or the given mailboxes) to a room
-  leave   Remove you (or the given mailboxes) from a room
-  list    List every room, with its members and your unacked counts
+  create  Create a channel, with you as a member
+  join    Add you (or the given mailboxes) to a channel
+  leave   Remove you (or the given mailboxes) from a channel
+  list    List every channel, with its members and your unacked counts
   help    Print this message or the help of the given subcommand(s)
 
 Options:
@@ -2017,20 +4396,20 @@ Global options:
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
 
 Examples:
-  mdkg room list
-  mdkg room join dev
+  mdkg channel list
+  mdkg channel join dev
 ```
 
-#### `mdkg room create`
+#### `mdkg channel create`
 
 ```text
-Create a room, with you as a member
+Create a channel, with you as a member
 
-Usage: mdkg room create [OPTIONS] <NAME>
+Usage: mdkg channel create [OPTIONS] <NAME>
 
 Arguments:
   <NAME>
-          The room's name: lowercase letters, digits, `.`, `_` and `-`
+          The channel's name: lowercase letters, digits, `.`, `_` and `-`
 
 Options:
       --member <MEMBER>
@@ -2055,19 +4434,19 @@ Global options:
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
 
 Examples:
-  mdkg room create dev
+  mdkg channel create dev
 ```
 
-#### `mdkg room join`
+#### `mdkg channel join`
 
 ```text
-Add you (or the given mailboxes) to a room
+Add you (or the given mailboxes) to a channel
 
-Usage: mdkg room join [OPTIONS] <NAME>
+Usage: mdkg channel join [OPTIONS] <NAME>
 
 Arguments:
   <NAME>
-          The room's name: lowercase letters, digits, `.`, `_` and `-`
+          The channel's name: lowercase letters, digits, `.`, `_` and `-`
 
 Options:
       --member <MEMBER>
@@ -2092,19 +4471,19 @@ Global options:
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
 
 Examples:
-  mdkg room join dev
+  mdkg channel join dev
 ```
 
-#### `mdkg room leave`
+#### `mdkg channel leave`
 
 ```text
-Remove you (or the given mailboxes) from a room
+Remove you (or the given mailboxes) from a channel
 
-Usage: mdkg room leave [OPTIONS] <NAME>
+Usage: mdkg channel leave [OPTIONS] <NAME>
 
 Arguments:
   <NAME>
-          The room's name: lowercase letters, digits, `.`, `_` and `-`
+          The channel's name: lowercase letters, digits, `.`, `_` and `-`
 
 Options:
       --member <MEMBER>
@@ -2129,19 +4508,19 @@ Global options:
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
 
 Examples:
-  mdkg room leave dev
+  mdkg channel leave dev
 ```
 
-#### `mdkg room list`
+#### `mdkg channel list`
 
 ```text
-List every room, with its members and your unacked counts
+List every channel, with its members and your unacked counts
 
-Usage: mdkg room list [OPTIONS]
+Usage: mdkg channel list [OPTIONS]
 
 Options:
       --mine
-          Only rooms you're a member of
+          Only channels you're a member of
 
       --json
           Print JSON
@@ -2162,8 +4541,8 @@ Global options:
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
 
 Examples:
-  mdkg room list
-  mdkg room list --mine --json
+  mdkg channel list
+  mdkg channel list --mine --json
 ```
 
 ### `mdkg agents`
@@ -2174,13 +4553,16 @@ Manage definitions and run agents: add, edit, rm, up, status, resume
 Usage: mdkg agents [OPTIONS] <COMMAND>
 
 Commands:
-  add     Create a committed agent definition in .mdkg/agents/
-  edit    Update an agent definition; fields not given stay as they are
-  rm      Remove a committed definition, keeping local sessions and history
-  up      Wake agents on their mail and run their turns under their policies, until stopped
-  status  Show the agents, their policies, and the threads the loop guard paused
-  resume  Let a thread the loop guard paused run again, or all of an agent's
-  help    Print this message or the help of the given subcommand(s)
+  add      Create a committed agent definition in .mdkg/agents/
+  edit     Update an agent definition; fields not given stay as they are
+  rm       Remove a committed definition, keeping local sessions and history
+  up       Wake agents on their mail and run their turns under their policies, until stopped
+  stop     Stop agents gracefully: a turn in flight finishes, then each agent's supervisor admits no more of its turns. Nothing is killed. Inside an agent's turn it may stop only that agent
+  logs     Show a turn's output, normalized across harnesses, or follow an agent's turns as they run
+  status   Show the agents, their policies, and the threads the loop guard paused
+  use-key  Bill an agent's next turn, one, on your API key, after its subscription hit its usage limit. Nothing charges the key on its own; the agent's policy must allow this (`auth.api_key_fallback`). Refused inside an agent's turn, and for an agent's own actor: a person runs it from their own terminal
+  resume   Let a thread the loop guard paused run again, or all of an agent's
+  help     Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help
@@ -2246,7 +4628,7 @@ Options:
           Per-agent turn policy, as a JSON object
 
       --reports-to <REPORTS_TO>
-          The actor receiving turn receipts (default: orchestrator)
+          The actor receiving turn receipts and faults: turn errors and refused replies (default: orchestrator)
 
       --extends <EXTENDS>
           Reserved remote definition reference; this release does not run it
@@ -2263,7 +4645,7 @@ Options:
       --unset <UNSET>
           Remove an optional field; repeat for several fields
 
-          [possible values: extends, cwd, worktree, model, effort, base, instructions, policy, allow, protect, reports_to, mode, sandbox, approvals]
+          [possible values: extends, cwd, worktree, model, effort, base, instructions, policy, allow, protect, reports_to, mode, sandbox, approvals, follow]
 
       --json
 
@@ -2327,7 +4709,7 @@ Options:
           Per-agent turn policy, as a JSON object
 
       --reports-to <REPORTS_TO>
-          The actor receiving turn receipts (default: orchestrator)
+          The actor receiving turn receipts and faults: turn errors and refused replies (default: orchestrator)
 
       --extends <EXTENDS>
           Reserved remote definition reference; this release does not run it
@@ -2344,7 +4726,7 @@ Options:
       --unset <UNSET>
           Remove an optional field; repeat for several fields
 
-          [possible values: extends, cwd, worktree, model, effort, base, instructions, policy, allow, protect, reports_to, mode, sandbox, approvals]
+          [possible values: extends, cwd, worktree, model, effort, base, instructions, policy, allow, protect, reports_to, mode, sandbox, approvals, follow]
 
       --json
 
@@ -2470,6 +4852,98 @@ Examples:
   mdkg agents up worker-1 --max-turns 3
 ```
 
+#### `mdkg agents stop`
+
+```text
+Stop agents gracefully: a turn in flight finishes, then each agent's supervisor admits no more of its turns. Nothing is killed. Inside an agent's turn it may stop only that agent
+
+Usage: mdkg agents stop [OPTIONS] [AGENTS]...
+
+Arguments:
+  [AGENTS]...
+          The agents to stop
+
+Options:
+      --all
+          Every agent a running supervisor runs
+
+      --drain
+          Let a turn in flight finish, then admit no more (required: the only mode)
+
+      --wait <WAIT>
+          Wait up to this many seconds for each agent to stop; exits 6 if a turn is still running then
+
+      --json
+          Print JSON
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+  -r, --root <ROOT>
+          Run against this repository root (default: the current directory)
+
+      --as <ACTOR>
+          Act as this actor in coordination commands (default: $MDKG_ACTOR, then the worktree's folder name)
+
+      --allow-store-upgrade
+          Let a development build upgrade the coordinator store.
+
+          The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+Examples:
+  mdkg agents stop worker-1 --drain
+  mdkg agents stop --all --drain --wait 600
+```
+
+#### `mdkg agents logs`
+
+```text
+Show a turn's output, normalized across harnesses, or follow an agent's turns as they run
+
+Usage: mdkg agents logs [OPTIONS] <AGENT>
+
+Arguments:
+  <AGENT>
+          The agent's name
+
+Options:
+      --turn <TURN>
+          Only this turn (its turn id)
+
+      --follow
+          Keep following: a turn until it ends, or the agent's turns for good
+
+      --after <AFTER>
+          Start after this position: `<turn_id>:<seq>`, `<turn_id>:end` or `turn:<N>` (with --turn, a plain seq too)
+
+      --native
+          Also show native events no mapping covers
+
+      --json
+          Print NDJSON, one turn output event per line
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+  -r, --root <ROOT>
+          Run against this repository root (default: the current directory)
+
+      --as <ACTOR>
+          Act as this actor in coordination commands (default: $MDKG_ACTOR, then the worktree's folder name)
+
+      --allow-store-upgrade
+          Let a development build upgrade the coordinator store.
+
+          The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+Examples:
+  mdkg agents logs worker-1
+  mdkg agents logs worker-1 --follow --json
+  mdkg agents logs worker-1 --follow --after turn:1 --json
+```
+
 #### `mdkg agents status`
 
 ```text
@@ -2501,6 +4975,40 @@ Examples:
   mdkg agents status --json
 ```
 
+#### `mdkg agents use-key`
+
+```text
+Bill an agent's next turn, one, on your API key, after its subscription hit its usage limit. Nothing charges the key on its own; the agent's policy must allow this (`auth.api_key_fallback`). Refused inside an agent's turn, and for an agent's own actor: a person runs it from their own terminal
+
+Usage: mdkg agents use-key [OPTIONS] <AGENT>
+
+Arguments:
+  <AGENT>
+          The agent's name (its actor id)
+
+Options:
+      --json
+          Print JSON
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+  -r, --root <ROOT>
+          Run against this repository root (default: the current directory)
+
+      --as <ACTOR>
+          Act as this actor in coordination commands (default: $MDKG_ACTOR, then the worktree's folder name)
+
+      --allow-store-upgrade
+          Let a development build upgrade the coordinator store.
+
+          The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+Examples:
+  mdkg agents use-key worker-1
+```
+
 #### `mdkg agents resume`
 
 ```text
@@ -2515,6 +5023,12 @@ Arguments:
 Options:
       --thread <THREAD>
           Clear only this loop-guard thread. Without it, an interactive receiver also waits for a new primary prompt to select its route
+
+      --store <STORE>
+          Confirm the current physical store when retaining a foreign record
+
+      --archive-context
+          Preserve full recovery context in an immutable archive
 
       --json
           Print JSON
@@ -2601,24 +5115,92 @@ Examples:
   mdkg auth key anthropic
 ```
 
-### `mdkg hook`
+### `mdkg hooks`
 
 ```text
-What an agent harness's hook runs: mail at turn start, a reminder before stopping with unread mail, an idle wake, and the edit guard.
+What an agent harness's hooks run: one router (`hooks run`) for the mail notice, the stop reminders, the idle wake and the lease guards.
 
-Reads the harness's hook input on stdin and prints its output. Says nothing outside a graph; never shows a message's body.
+Reads the harness's hook input on stdin and prints its output. Says nothing outside a graph; never shows a message's body. `hook` is an alias, and `start|stop|wait|edit` are 0.7.0's commands, kept for one release.
 
-Usage: mdkg hook [OPTIONS] --harness <HARNESS> <EVENT>
+Usage: mdkg hooks [OPTIONS] <COMMAND>
+
+Commands:
+  run    The router each native hook entry calls: reads the harness's hook input on stdin, runs the rules for its event, prints the harness's output
+  start  Turn or session start, and each prompt (alias of `run`, for one release)
+  stop   Before the agent stops (alias of `run`, for one release)
+  wait   An idle session's wait for mail (alias of `run`, for one release)
+  edit   Before a tool call (alias of `run`, for one release)
+  help   Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+  -r, --root <ROOT>
+          Run against this repository root (default: the current directory)
+
+      --as <ACTOR>
+          Act as this actor in coordination commands (default: $MDKG_ACTOR, then the worktree's folder name)
+
+      --allow-store-upgrade
+          Let a development build upgrade the coordinator store.
+
+          The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+Examples:
+  mdkg hooks run --harness claude --native PreToolUse
+  mdkg hooks run --harness opencode --native context
+  mdkg hook start --harness claude
+```
+
+#### `mdkg hooks run`
+
+```text
+The router each native hook entry calls: reads the harness's hook input on stdin, runs the rules for its event, prints the harness's output
+
+Usage: mdkg hooks run [OPTIONS] --harness <HARNESS> --native <NATIVE> [-- <ARGS>...]
 
 Arguments:
-  <EVENT>
-          The event: start, stop, wait or edit
+  [ARGS]...
+          git only: the hook's own arguments (pre-push's remote and URL)
 
-          Possible values:
-          - start: Turn or session start, and each user prompt: the mail line
-          - stop:  Before the agent stops: block once on unread wake-worthy mail
-          - wait:  An idle session's wait: wake it when wake-worthy mail arrives
-          - edit:  Before a tool call: refuse an edit to a path the agent doesn't hold
+Options:
+      --harness <HARNESS>
+          The adapter calling: claude, codex, opencode, or git (its own `pre-commit` and `pre-push` hooks)
+
+          [possible values: claude, codex, opencode, git]
+
+      --native <NATIVE>
+          The harness's own name for the event: Claude's and Codex's `SessionStart`, `UserPromptSubmit`, `PreToolUse` and `Stop`, OpenCode's `context`, `tool.execute.before` and `session.execution.succeeded`, and `idle` for an idle session's wait
+
+      --timeout <TIMEOUT>
+          The idle wait only: how long to wait for mail, in seconds
+
+          [default: 3000]
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+  -r, --root <ROOT>
+          Run against this repository root (default: the current directory)
+
+      --as <ACTOR>
+          Act as this actor in coordination commands (default: $MDKG_ACTOR, then the worktree's folder name)
+
+      --allow-store-upgrade
+          Let a development build upgrade the coordinator store.
+
+          The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+```
+
+#### `mdkg hooks start`
+
+```text
+Turn or session start, and each prompt (alias of `run`, for one release)
+
+Usage: mdkg hooks start [OPTIONS] --harness <HARNESS>
 
 Options:
       --harness <HARNESS>
@@ -2645,10 +5227,108 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+```
 
-Examples:
-  mdkg hook start --harness claude
-  mdkg hook edit --harness opencode
+#### `mdkg hooks stop`
+
+```text
+Before the agent stops (alias of `run`, for one release)
+
+Usage: mdkg hooks stop [OPTIONS] --harness <HARNESS>
+
+Options:
+      --harness <HARNESS>
+          The harness calling: claude, codex or opencode
+
+          [possible values: claude, codex, opencode]
+
+      --timeout <TIMEOUT>
+          `wait` only: how long to wait for mail, in seconds
+
+          [default: 3000]
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+  -r, --root <ROOT>
+          Run against this repository root (default: the current directory)
+
+      --as <ACTOR>
+          Act as this actor in coordination commands (default: $MDKG_ACTOR, then the worktree's folder name)
+
+      --allow-store-upgrade
+          Let a development build upgrade the coordinator store.
+
+          The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+```
+
+#### `mdkg hooks wait`
+
+```text
+An idle session's wait for mail (alias of `run`, for one release)
+
+Usage: mdkg hooks wait [OPTIONS] --harness <HARNESS>
+
+Options:
+      --harness <HARNESS>
+          The harness calling: claude, codex or opencode
+
+          [possible values: claude, codex, opencode]
+
+      --timeout <TIMEOUT>
+          `wait` only: how long to wait for mail, in seconds
+
+          [default: 3000]
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+  -r, --root <ROOT>
+          Run against this repository root (default: the current directory)
+
+      --as <ACTOR>
+          Act as this actor in coordination commands (default: $MDKG_ACTOR, then the worktree's folder name)
+
+      --allow-store-upgrade
+          Let a development build upgrade the coordinator store.
+
+          The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+```
+
+#### `mdkg hooks edit`
+
+```text
+Before a tool call (alias of `run`, for one release)
+
+Usage: mdkg hooks edit [OPTIONS] --harness <HARNESS>
+
+Options:
+      --harness <HARNESS>
+          The harness calling: claude, codex or opencode
+
+          [possible values: claude, codex, opencode]
+
+      --timeout <TIMEOUT>
+          `wait` only: how long to wait for mail, in seconds
+
+          [default: 3000]
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+  -r, --root <ROOT>
+          Run against this repository root (default: the current directory)
+
+      --as <ACTOR>
+          Act as this actor in coordination commands (default: $MDKG_ACTOR, then the worktree's folder name)
+
+      --allow-store-upgrade
+          Let a development build upgrade the coordinator store.
+
+          The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
 ```
 
 ### `mdkg install`
@@ -2656,7 +5336,7 @@ Examples:
 ```text
 Set up Claude Code, Codex and OpenCode for this project.
 
-Writes exactly the projections .mdkg/config.json lists: MCP configs, the AGENTS.md block, skill mirrors and hooks. --enable and --disable change the list, then sync.
+Writes exactly the projections .mdkg/config.json lists: MCP configs, the AGENTS.md block, skill mirrors and, with --hooks, hooks. --enable and --disable change the list, then sync. --setup moves the clone to the graph ref (personal, professional or local); --checkout-mode moves it back.
 
 Usage: mdkg install [OPTIONS]
 
@@ -2675,6 +5355,29 @@ Options:
 
       --disable <LIST>
           Projections to take off the list, comma-separated; mdkg's part of their files is removed, the rest kept
+
+      --setup <SETUP>
+          Move this clone to the graph ref, or set its setup again: `personal` (the graph syncs with origin), `professional` (with --graph-remote, a private repository of your own, so the company remote is never touched) or `local` (no remote). Nothing is pushed until a person approves the remote
+
+          Possible values:
+          - personal:     `graph.remote = origin`: the graph syncs with the code's own remote
+          - professional: `graph.remote` is a private repository of your own, so the company remote is never touched
+          - local:        No remote
+
+      --graph-remote <REMOTE>
+          The professional setup's graph remote: an existing remote that shares no URL with another
+
+      --publish-design
+          Allow publishing design to the code base for a professional or local setup (personal allows it already)
+
+      --view
+          Create or refresh .worktrees/graph, a detached, read-only view of the graph ref
+
+      --hooks
+          Install the hook projections the config lists (hooks:git, hooks:claude, hooks:codex, hooks:opencode). Hooks are opt-in: without this, install skips any not already installed in this checkout, and `--enable hooks:<name>` asks for that one. The shared hook files install writes are ignored: in .git/info/exclude for the professional setup, in .gitignore otherwise. Claude's per-user .claude/settings.local.json goes in .git/info/exclude when install creates it
+
+      --checkout-mode
+          Go back to checkout mode (0.7.0's layout) in this build: unsets mdkg.graph.ref and keeps the graph ref
 
       --json
           Print JSON
@@ -2698,6 +5401,9 @@ Examples:
   mdkg install --enable agents-md,mcp:claude,skills:.claude/skills --dry-run
   mdkg install
   mdkg install --disable mcp:opencode
+  mdkg install --setup local --dry-run
+  mdkg install --setup professional --graph-remote mine
+  mdkg install --hooks
 ```
 
 ### `mdkg store`
@@ -2919,7 +5625,7 @@ Examples:
 ### `mdkg migrate`
 
 ```text
-Bring a 0.6.0 graph onto 0.7.0.
+Bring a 0.6 graph onto format 0.7.
 
 Plan with --dry-run, then --apply <hash>; --status shows how far it got, and --rollback reverts it.
 
@@ -2943,6 +5649,14 @@ Options:
 
       --force
           With --rollback: restore the store even though it changed since the migration (the changes since are lost)
+
+      --work-history <WHERE>
+          With --dry-run or --apply: where the work history goes. `git` keeps checkpoints, finished tests, event logs and progress sections in git; `store` moves them to the coordinator store's log, as 0.7.0 did. Default: `git` when the graph commits its work (its config's `work.location`, which is `git` for every 0.6 graph)
+
+          [possible values: git, store]
+
+      --restore-history
+          With --dry-run or --apply: on a graph already migrated, bring back into git, in one commit, the checkpoints, finished tests and event logs the migration moved to the store, read from the migration commit's parent
 
       --json
           Print JSON
@@ -3027,6 +5741,12 @@ Options:
       --dry-run
           Show what would change and write nothing
 
+      --in-checkout
+          In ref mode (`mdkg.graph.ref` set), write `.mdkg/` into this checkout as 0.7.0 did, instead of creating the graph ref
+
+      --new-graph
+          Start a new graph even though a fetched ref (any `refs/remotes/...` whose tip has a committed `.mdkg/config.json`) may hold this repository's graph, or git couldn't check. Without it, init refuses; for a graph it found, it names both ways to get it: merge the team's default branch (checkout mode) or `install` (ref mode)
+
       --json
           Print JSON
 
@@ -3055,11 +5775,14 @@ Examples:
 ```text
 Check this setup: build, PATH, git, config, graph, store, mirrors, MCP, agents, hooks.
 
-Changes nothing.
+Changes nothing, except --repair adds missing clone-local graph identity records.
 
 Usage: mdkg doctor [OPTIONS]
 
 Options:
+      --repair
+          Add missing clone-local graph identity records only; never sync projections
+
       --strict
           Fail on warnings too
 
@@ -3318,6 +6041,12 @@ Options:
 
           [default: HEAD]
 
+      --main <MAIN>
+          The main branch: paths the head has exactly as main had them where the two last met came from main, and aren't selected (default: `mdkg.mainRef`, else `main`; neither resolving skips nothing)
+
+      --targets
+          Require verified revisions and metadata before using the test-target plan
+
       --json
           Print JSON
 
@@ -3375,6 +6104,164 @@ Examples:
   mdkg schema next
 ```
 
+### `mdkg serve`
+
+```text
+Serve this graph's coordinator over its socket and, when asked, TLS; `serve status` tells whether it runs
+
+Usage: mdkg serve [OPTIONS]
+       mdkg serve <COMMAND>
+
+Commands:
+  status  Whether this repository's serve is running, from serve.json
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+      --listen <ADDR:PORT>
+          Also listen on loopback TCP, 127.0.0.1:<port> or [::1]:<port>, with a bearer token (overrides `serve.listen`)
+
+      --json
+          Print the start as one JSON envelope
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+  -r, --root <ROOT>
+          Run against this repository root (default: the current directory)
+
+      --as <ACTOR>
+          Act as this actor in coordination commands (default: $MDKG_ACTOR, then the worktree's folder name)
+
+      --allow-store-upgrade
+          Let a development build upgrade the coordinator store.
+
+          The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+```
+
+#### `mdkg serve status`
+
+```text
+Whether this repository's serve is running, from serve.json
+
+Usage: mdkg serve status [OPTIONS]
+
+Options:
+      --json
+          Print JSON
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+  -r, --root <ROOT>
+          Run against this repository root (default: the current directory)
+
+      --as <ACTOR>
+          Act as this actor in coordination commands (default: $MDKG_ACTOR, then the worktree's folder name)
+
+      --allow-store-upgrade
+          Let a development build upgrade the coordinator store.
+
+          The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+```
+
+### `mdkg git-serve`
+
+```text
+The receiving side of git between machines: the ssh forced command `authorized_keys` names for a machine's key, run by sshd as the repository owner
+
+Usage: mdkg git-serve [OPTIONS] <MACHINE_ID>
+
+Arguments:
+  <MACHINE_ID>
+          The machine whose key this is, as approved for the graph
+
+Options:
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+  -r, --root <ROOT>
+          Run against this repository root (default: the current directory)
+
+      --as <ACTOR>
+          Act as this actor in coordination commands (default: $MDKG_ACTOR, then the worktree's folder name)
+
+      --allow-store-upgrade
+          Let a development build upgrade the coordinator store.
+
+          The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+```
+
+## Anchor output
+
+mdkg anchor leads with the anchor path to commit, then counts distinct
+actors by kind (launcher, named and system). For example:
+
+~~~text
+anchored store <store> at seq 42 (<hash>) in .mdkg/anchors/<store>.json; commit it
+checkpoint 42: records 1 to 41; actors: launcher 35, named 2 (full list: --json)
+~~~
+
+mdkg anchor --json includes the complete sorted list in
+data.checkpoint.actors, including actors omitted from the bounded prose
+summary. Verified by anchor_text_counts_actors_and_json_keeps_the_complete_list
+in crates/mdkg-cli/tests/work.rs.
+
+## Doctor build warnings
+
+Doctor prints one builds row with the stale process count, current and
+observed builds, and PIDs grouped by build and process kind. For example:
+
+~~~text
+warn builds   mixed mdkg builds: 2 stale launcher/MCP process(es); current 0.7.1 at <new> (clean, built <date>); 0.7.0 at <old> (clean, built <date>): launcher pids [123, 456]
+hint: restart stale launcher and MCP processes after upgrading mdkg
+~~~
+
+JSON retains the builds check and its coded diagnostic. The same grouped
+warnings appear in agents status and frozen-checkout diagnostics, for
+Claude, Codex and OpenCode supervisors alike. Verified by
+mixed_live_builds_warn_in_doctor_and_status_text_and_json in
+crates/mdkg-cli/tests/process_builds.rs and
+warnings_group_pids_by_full_build_and_preserve_independent_problems in
+crates/mdkg-run/src/builds.rs.
+
+## Graph identity repair
+
+Plain doctor previews the exact clone-local Git identity records that
+are missing for an existing, validated graph checkout. For example:
+
+~~~text
+warn graph_identity identity repair would write: git config --local --add mdkg.graph.<graph-id>.worktree graph
+~~~
+
+Run mdkg doctor --repair to add those records. Repeating it is a no-op.
+It keeps conflicting records and refuses dirty graph checkouts, never
+advances the checkout or syncs Claude, Codex or OpenCode projections.
+This works from the primary, graph or ordinary sibling checkout.
+A subgraph source_path under a Git submodule belongs to that separate
+repository: parent install and repair skip its identity. Repair or install
+the submodule's own graph checkout from that repository instead. A workspace
+under a gitlink is still refused because workspaces belong to the parent.
+Correct it to a subgraph declaration on the configured main ref, then rerun
+install: its guarded fast-forward precedes identity validation. A preview
+checks the pinned target tree when that update can proceed. If install
+advances the checkout before refusing identity publication, its error names
+the updated commit. Doctor never advances the checkout. Repair uses the
+shared clone-local graph coordination lock, which may create its lock file.
+Verified by doctor_identity_repair_previews_only_identity_writes_and_is_idempotent,
+doctor_identity_repair_preserves_conflicts_and_dirty_checkouts,
+doctor_identity_repair_adds_only_missing_declared_ids_without_advancing_head,
+doctor_identity_repair_finds_moved_graph_from_an_ordinary_sibling,
+concurrent_doctor_identity_repairs_do_not_duplicate_records,
+doctor_identity_repair_explains_declared_submodule_workspace_boundary,
+install_skips_submodule_subgraphs_and_records_only_the_parent,
+install_heals_a_refused_gitlink_workspace_after_correction_on_main,
+subgraph_symlink_and_blob_parents_refuse_and_preserve_identity_records and
+install_identity_refusal_reports_an_already_completed_fast_forward in
+crates/mdkg-cli/tests/install_worktree.rs.
+
 ## Exit codes
 
 Every command exits with one of these. With `--json`, the envelope's
@@ -3385,7 +6272,7 @@ Every command exits with one of these. With `--json`, the envelope's
 | 0 | Success, warnings included |
 | 1 | Bad arguments: an unknown command or flag, a missing or bad value |
 | 2 | A check found errors: `validate`, `verify`, `doctor`, `skills validate` or `export`'s anchor check, or a write refused because the graph it would leave doesn't validate |
-| 3 | Something named doesn't exist (a node, workspace, file, lease, changeset, room, message or agent), or there's none to act on, such as no active goal |
+| 3 | Something named doesn't exist (a node, workspace, file, lease, changeset, channel, message or agent), or there's none to act on, such as no active goal |
 | 4 | The graph, store or Keychain can't be read or written, or another failure |
 | 5 | A coordination conflict, such as a lease someone else holds: sync or pick other work, then retry |
 | 6 | Waited and nothing happened: `msg wait` ran out of time |

@@ -1,6 +1,6 @@
 [package]
 name = "mdkg-index"
-version = "0.7.0"
+version = "0.7.1"
 description = "The derived plane: a rebuildable SQLite index with full-text search, handle resolution, graph queries and packs. Internal to mdkg, no stable API; depend on the mdkg binary"
 edition.workspace = true
 license.workspace = true
@@ -10,8 +10,8 @@ homepage.workspace = true
 readme = "README.md"
 
 [dependencies]
-mdkg-format = { path = "../mdkg-format", version = "0.7.0" }
-mdkg-graph = { path = "../mdkg-graph", version = "0.7.0" }
+mdkg-format = { path = "../mdkg-format", version = "0.7.1" }
+mdkg-graph = { path = "../mdkg-graph", version = "0.7.1" }
 rusqlite.workspace = true
 schemars.workspace = true
 serde.workspace = true

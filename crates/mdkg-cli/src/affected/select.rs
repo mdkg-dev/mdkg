@@ -4,8 +4,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::config::{Config, RuleSelect};
-use super::{GoSelection, MatchKind, ReasonCode, Selected};
+use super::config::{Config, RuleSelect, RustTarget};
+use super::{GoSelection, MatchKind, ReasonCode, RustTestSelection, Selected};
 
 /// One test target.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -16,6 +16,7 @@ pub enum Target {
         package: String,
     },
     Rust(String),
+    RustTest(RustTarget),
     Suite(String),
 }
 
@@ -25,6 +26,8 @@ impl Target {
         match self {
             Target::Go { package, .. } => format!("go:{package}"),
             Target::Rust(c) => format!("rust:{c}"),
+            // Keep the shipped path/package projection compatible.
+            Target::RustTest(t) => format!("rust:{}", t.package),
             Target::Suite(s) => format!("suite:{s}"),
         }
     }
@@ -58,6 +61,9 @@ pub trait Adapter {
     /// crate names). An unknown target is an `Err`, so a stale rule fails
     /// closed.
     fn resolve(&mut self, names: &[String]) -> Result<BTreeSet<Target>, String>;
+    fn resolve_tests(&mut self, _targets: &[RustTarget]) -> Result<BTreeSet<Target>, String> {
+        Err("this adapter cannot resolve Rust test targets".into())
+    }
 }
 
 /// The engine's verdict for one path.
@@ -67,6 +73,8 @@ pub struct PathVerdict {
     pub selects: BTreeSet<Target>,
     /// The reasons it forces a full run, with detail.
     pub reasons: BTreeMap<ReasonCode, String>,
+    /// Whole crates used because a path lacks a finer rule.
+    pub fallback_crates: BTreeSet<(String, String)>,
 }
 
 pub struct Engine<'a> {
@@ -99,7 +107,12 @@ impl Engine<'_> {
                     );
                 }
                 RuleSelect::None => {}
-                RuleSelect::Targets { go, rust, suites } => {
+                RuleSelect::Targets {
+                    go,
+                    rust,
+                    rust_targets,
+                    suites,
+                } => {
                     v.selects
                         .extend(suites.iter().map(|s| Target::Suite(s.clone())));
                     for (names, adapter, kind) in [
@@ -123,6 +136,21 @@ impl Engine<'_> {
                             }
                         }
                     }
+                    if !rust_targets.is_empty() {
+                        let resolved = match self.rust.as_deref_mut() {
+                            Some(a) => a.resolve_tests(rust_targets),
+                            None => Err("no rust adapter applies to this repository".into()),
+                        };
+                        match resolved {
+                            Ok(t) => v.selects.extend(t),
+                            Err(e) => {
+                                v.reasons.insert(
+                                    ReasonCode::ConfigInvalid,
+                                    format!("affected.rules[{i}].select.rust_targets: {e}"),
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -134,7 +162,21 @@ impl Engine<'_> {
                 Ok(Mapping::NotMine) => {}
                 Ok(Mapping::Selects(t)) => {
                     v.matched_by.insert(adapter.kind());
-                    v.selects.extend(t);
+                    for target in t {
+                        if let Target::Rust(package) = &target {
+                            let fine = v.selects.iter().any(|t| {
+                                matches!(t,
+                                Target::RustTest(t) if &t.package == package)
+                            });
+                            if fine {
+                                continue;
+                            }
+                            if !v.selects.contains(&target) {
+                                v.fallback_crates.insert((path.into(), package.clone()));
+                            }
+                        }
+                        v.selects.insert(target);
+                    }
                 }
                 Ok(Mapping::Removed(detail)) => {
                     v.matched_by.insert(adapter.kind());
@@ -168,6 +210,7 @@ impl Engine<'_> {
 pub fn selection(targets: &BTreeSet<Target>) -> Selected {
     let mut go: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
     let mut rust = BTreeSet::new();
+    let mut rust_targets = BTreeSet::new();
     let mut suites = BTreeSet::new();
     for t in targets {
         match t {
@@ -182,12 +225,40 @@ pub fn selection(targets: &BTreeSet<Target>) -> Selected {
             }
             Target::Rust(c) => {
                 rust.insert(c.clone());
+                rust_targets.insert(RustTestSelection::whole(c));
+            }
+            Target::RustTest(t) => {
+                rust.insert(t.package.clone());
+                if !targets.contains(&Target::Rust(t.package.clone())) {
+                    rust_targets.insert(RustTestSelection::scoped(t));
+                }
             }
             Target::Suite(s) => {
                 suites.insert(s.clone());
             }
         }
     }
+    // Cargo resolves features across selected packages before target filters.
+    // Keep that package set together. Target filters apply to every package,
+    // so their union may run another package's same-named target too.
+    let mut cargo_args = vec!["test".into()];
+    for package in &rust {
+        cargo_args.extend(["-p".into(), package.clone()]);
+    }
+    if !rust_targets.iter().any(|t| t.kind == "package") {
+        let filters: BTreeSet<Vec<String>> = rust_targets
+            .iter()
+            .map(|t| t.cargo_args[3..].to_vec())
+            .collect();
+        cargo_args.extend(filters.into_iter().flatten());
+    }
+    let rust_targets = rust_targets
+        .into_iter()
+        .map(|mut target| {
+            target.cargo_args = cargo_args.clone();
+            target
+        })
+        .collect();
     Selected {
         go: go
             .into_iter()
@@ -198,6 +269,7 @@ pub fn selection(targets: &BTreeSet<Target>) -> Selected {
             })
             .collect(),
         rust: rust.into_iter().collect(),
+        rust_targets,
         suites: suites.into_iter().collect(),
     }
 }

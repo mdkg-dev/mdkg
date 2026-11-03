@@ -14,6 +14,9 @@ use crate::orchestration::Names;
 
 const BRANCH: &str = "mdkg-graph";
 const IGNORE: &str = "/.worktrees/";
+/// The common `info/exclude` line that keeps `node edit`'s copies in
+/// `.mdkg-edit/` out of every commit (edd-01a18867, R45).
+pub const EDIT_IGNORE: &str = "/.mdkg-edit/";
 const CAP: u64 = 1 << 20;
 const MAX_DECLARATIONS: usize = 1024;
 const BATCH_CAP: u64 = 4 * CAP;
@@ -99,12 +102,49 @@ fn ignore_file(root: &Path, create: bool) -> Result<Option<File>, RunError> {
     Ok(Some(file))
 }
 
+/// The clone's primary checkout, validated: the first listed worktree
+/// whose git folder is the common one. `None` when there's none (a
+/// separate git folder recording no primary).
+pub fn primary_checkout(root: &Path) -> Result<Option<PathBuf>, RunError> {
+    known_primary(root)
+}
+
+/// The registered graph checkout, validated as install validates it (its
+/// records, admin folder, `gitdir` resolved from the admin folder, no
+/// links, the exact checkout), wherever it is. `None` with no records.
+pub fn registered_graph_checkout(root: &Path) -> Result<Option<PathBuf>, RunError> {
+    let records = identities(root)?;
+    if records.is_empty() {
+        return Ok(None);
+    }
+    registered_checkout(root, &records).map(Some)
+}
+
+/// The 0.7 graph ids committed at `reference`: the root graph's and each
+/// declared workspace's or subgraph's, as install records them.
+pub fn graph_ids_on(root: &Path, reference: &str) -> Result<Vec<String>, RunError> {
+    graph_ids_at(root, reference)
+}
+
 /// Add the worktree ignore rule when creating the first worktree, preserving
 /// the user's content. A dry run checks the file but creates nothing.
 pub fn ignore_worktrees(root: &Path, dry_run: bool) -> Result<(), RunError> {
+    ignore_line(root, IGNORE, &[".worktrees/"], dry_run).map(drop)
+}
+
+/// Adds `line` to the primary checkout's `.gitignore` unless it, or one of
+/// `same`, is there, preserving the user's content: whether it was added.
+/// A dry run checks the file but creates nothing.
+pub fn ignore_line(
+    root: &Path,
+    line: &str,
+    same: &[&str],
+    dry_run: bool,
+) -> Result<bool, RunError> {
     let root = primary(root)?;
+    // Only a dry run finds no file: it would add the line.
     let Some(mut file) = ignore_file(&root, !dry_run)? else {
-        return Ok(());
+        return Ok(true);
     };
     if !dry_run {
         file.lock()
@@ -118,21 +158,22 @@ pub fn ignore_worktrees(root: &Path, dry_run: bool) -> Result<(), RunError> {
     if text.len() as u64 > CAP {
         return Err(refused(".gitignore is over 1 MiB"));
     }
-    if dry_run
-        || text
-            .lines()
-            .any(|line| matches!(line.trim_end_matches('\r'), IGNORE | ".worktrees/"))
-    {
-        return Ok(());
+    let held = text.lines().any(|l| {
+        let l = l.trim_end_matches('\r');
+        l == line || same.contains(&l)
+    });
+    if dry_run || held {
+        return Ok(dry_run && !held);
     }
     let sep = if text.is_empty() || text.ends_with('\n') {
         ""
     } else {
         "\n"
     };
-    file.write_all(format!("{sep}{IGNORE}\n").as_bytes())
+    file.write_all(format!("{sep}{line}\n").as_bytes())
         .and_then(|()| file.sync_all())
-        .map_err(|e| RunError::io("can't update .gitignore", e))
+        .map_err(|e| RunError::io("can't update .gitignore", e))?;
+    Ok(true)
 }
 
 fn identity_error(why: impl std::fmt::Display) -> RunError {
@@ -356,7 +397,11 @@ fn config_tree(root: &Path, revision: &str, paths: &[PathBuf]) -> Result<ConfigT
     Ok(tree)
 }
 
-fn config_object<'a>(tree: &'a ConfigTree, path: &Path) -> Result<Option<&'a str>, RunError> {
+fn config_object<'a>(
+    tree: &'a ConfigTree,
+    path: &Path,
+    subgraph: bool,
+) -> Result<Option<&'a str>, RunError> {
     use std::os::unix::ffi::OsStrExt as _;
     for parent in path
         .ancestors()
@@ -366,6 +411,17 @@ fn config_object<'a>(tree: &'a ConfigTree, path: &Path) -> Result<Option<&'a str
         if let Some(entry) = tree.get(parent.as_os_str().as_bytes())
             && (entry.mode != "040000" || entry.kind != "tree")
         {
+            if entry.mode == "160000" || entry.kind == "commit" {
+                if subgraph {
+                    return Ok(None); // Another repository owns this graph's identity.
+                }
+                return Err(refused(format!(
+                    "graph checkout identity needs repair: declared workspace {} crosses Git submodule {}; workspaces must belong to this repository",
+                    path.display(), parent.display()
+                )).with_hint(format!(
+                    "Declare the submodule graph as a subgraph with source_path instead of a workspace, commit the correction to the configured main ref, then rerun {BIN} install from the primary checkout. Repair or install the submodule's own graph in its own repository. Keep the parent identity records; parent repair never traverses a gitlink."
+                )));
+            }
             return Err(identity_error(format!(
                 "committed {} must be a directory to serve declared {}",
                 parent.display(),
@@ -403,11 +459,12 @@ fn committed_configs(
     root: &Path,
     tree: &ConfigTree,
     paths: &[PathBuf],
+    subgraphs: &BTreeSet<PathBuf>,
     mut visit: impl FnMut(&Path, &serde_json::Value) -> Result<(), RunError>,
 ) -> Result<(), RunError> {
     let mut objects: BTreeMap<String, Vec<&Path>> = BTreeMap::new();
     for path in paths {
-        if let Some(object) = config_object(tree, path)? {
+        if let Some(object) = config_object(tree, path, subgraphs.contains(path))? {
             objects.entry(object.into()).or_default().push(path);
         }
     }
@@ -530,7 +587,9 @@ fn contained_declaration(value: &str) -> Option<PathBuf> {
     )
 }
 
-fn declared_configs(config: &serde_json::Value) -> Result<Vec<PathBuf>, RunError> {
+fn declared_configs(
+    config: &serde_json::Value,
+) -> Result<(Vec<PathBuf>, BTreeSet<PathBuf>), RunError> {
     let count = 1 + ["workspaces", "subgraphs"]
         .iter()
         .filter_map(|name| config.get(name).and_then(|v| v.as_object()))
@@ -569,6 +628,8 @@ fn declared_configs(config: &serde_json::Value) -> Result<Vec<PathBuf>, RunError
             paths.push(path.join(folder).join("config.json"));
         }
     }
+    let owned: BTreeSet<_> = paths.iter().cloned().collect();
+    let mut external = BTreeSet::new();
     if let Some(subgraphs) = config.get("subgraphs") {
         let subgraphs = subgraphs
             .as_object()
@@ -578,7 +639,11 @@ fn declared_configs(config: &serde_json::Value) -> Result<Vec<PathBuf>, RunError
                 None => (), // An external reference need not have a local source.
                 Some(serde_json::Value::String(value)) => {
                     if let Some(path) = contained_declaration(value) {
-                        paths.push(path.join(mdkg_graph::config::CONFIG_PATH));
+                        let path = path.join(mdkg_graph::config::CONFIG_PATH);
+                        if !owned.contains(&path) {
+                            external.insert(path.clone());
+                        }
+                        paths.push(path);
                     }
                 }
                 Some(_) => {
@@ -591,14 +656,21 @@ fn declared_configs(config: &serde_json::Value) -> Result<Vec<PathBuf>, RunError
     }
     paths.sort();
     paths.dedup();
-    Ok(paths)
+    Ok((paths, external))
 }
 
 /// The root and only its declared workspace/subgraph configs establish
 /// identity. Missing child configs are document workspaces or external graphs,
 /// not separate graphs served by this repository's checkout.
 fn graph_ids(root: &Path) -> Result<Vec<String>, RunError> {
-    let revision = output(root, &["rev-parse", "--verify", "HEAD^{tree}"])?;
+    graph_ids_at(root, "HEAD")
+}
+
+fn graph_ids_at(root: &Path, reference: &str) -> Result<Vec<String>, RunError> {
+    let revision = output(
+        root,
+        &["rev-parse", "--verify", &format!("{reference}^{{tree}}")],
+    )?;
     let revision = String::from_utf8(revision.stdout)
         .ok()
         .filter(|_| revision.status.success())
@@ -610,14 +682,20 @@ fn graph_ids(root: &Path) -> Result<Vec<String>, RunError> {
     let root_path = Path::new(mdkg_graph::config::CONFIG_PATH);
     let tree = config_tree(root, revision, &[root_path.to_owned()])?;
     let mut root_config = None;
-    committed_configs(root, &tree, &[root_path.to_owned()], |_, config| {
-        root_config = Some(config.clone());
-        Ok(())
-    })?;
+    committed_configs(
+        root,
+        &tree,
+        &[root_path.to_owned()],
+        &BTreeSet::new(),
+        |_, config| {
+            root_config = Some(config.clone());
+            Ok(())
+        },
+    )?;
     let root_config =
         root_config.ok_or_else(|| identity_error("the checkout has no committed root graph"))?;
     let mut ids = Vec::new();
-    let paths = declared_configs(&root_config)?;
+    let (paths, subgraphs) = declared_configs(&root_config)?;
     let tree = config_tree(root, revision, &paths)?;
     let mut visit = |path: &Path, config: &serde_json::Value| {
         let v07 = config.get("schema_version").and_then(|v| v.as_f64())
@@ -673,7 +751,7 @@ fn graph_ids(root: &Path) -> Result<Vec<String>, RunError> {
     };
     visit(root_path, &root_config)?;
     let children: Vec<_> = paths.into_iter().filter(|path| path != root_path).collect();
-    committed_configs(root, &tree, &children, visit)?;
+    committed_configs(root, &tree, &children, &subgraphs, visit)?;
     Ok(ids)
 }
 
@@ -755,7 +833,16 @@ fn check_identities(
     records: &[Identity],
     allow_missing: bool,
 ) -> Result<(), RunError> {
-    let ids = graph_ids(root)?;
+    check_identities_at(root, records, allow_missing, "HEAD")
+}
+
+fn check_identities_at(
+    root: &Path,
+    records: &[Identity],
+    allow_missing: bool,
+    reference: &str,
+) -> Result<(), RunError> {
+    let ids = graph_ids_at(root, reference)?;
     let checkout = git::check_worktree(root).map_err(|e| RunError::io("can't inspect graph", e))?;
     let admin = admin_name(&checkout)?;
     // Guidance must not make a valid identity depend on an available primary.
@@ -823,6 +910,120 @@ fn record_identities(root: &Path) -> Result<(), RunError> {
     Ok(())
 }
 
+/// Locate an existing graph only: durable registration wins; without one,
+/// use the standard slot or the unique checkout on mdkg-graph. Never create,
+/// advance or infer identity from an ordinary worker checkout.
+fn identity_repair_plan(root: &Path) -> Result<Option<(PathBuf, Vec<Identity>)>, RunError> {
+    let common = git::common_dir(root).map_err(|e| RunError::io("can't inspect repository", e))?;
+    let records = identities(root)?;
+    let graph = if records.is_empty() {
+        let standard = known_primary(root)?.map(|p| p.join(".worktrees/graph"));
+        if let Some(path) = standard.filter(|p| fs::symlink_metadata(p).is_ok()) {
+            path
+        } else {
+            let mut candidates = Vec::new();
+            for path in git::worktrees(root).map_err(|e| RunError::io("can't list worktrees", e))? {
+                let trust = git::WorktreeTrust {
+                    common: Some(common.clone()),
+                    worktree: Some(path.clone()),
+                };
+                if git::with_worktree_trust(&trust, || git::head(&path))
+                    .is_ok_and(|head| head.branch == BRANCH)
+                {
+                    candidates.push(path);
+                }
+            }
+            match candidates.len() {
+                0 => return Ok(None),
+                1 => candidates.remove(0),
+                _ => {
+                    return Err(identity_error(
+                        "several unregistered graph checkouts; verify their registrations manually",
+                    ));
+                }
+            }
+        }
+    } else {
+        registered_checkout(root, &records)?
+    };
+    for ancestor in graph.ancestors() {
+        plain_folder(ancestor)?;
+    }
+    let trust = git::WorktreeTrust {
+        common: Some(common.clone()),
+        worktree: Some(graph.clone()),
+    };
+    let missing = git::with_worktree_trust(&trust, || {
+        let checkout = git::check_worktree(&graph)
+            .map_err(|e| RunError::io("can't inspect graph checkout", e))?;
+        if !same_folder(&checkout.top, &graph)? {
+            return Err(identity_error(
+                "the graph must be the exact registered checkout",
+            ));
+        }
+        check_identities(&graph, &records, true)?;
+        if let Some(status) = repair_checkout(graph.clone(), &common)? {
+            return Err(status.error());
+        }
+        let admin = admin_name(&checkout)?;
+        Ok(graph_ids(&graph)?
+            .into_iter()
+            .filter(|id| !records.iter().any(|record| record.id == *id))
+            .map(|id| Identity {
+                id,
+                admin: admin.clone(),
+            })
+            .collect::<Vec<_>>())
+    })?;
+    Ok(Some((graph, missing)))
+}
+
+/// Preview or add missing clone-local identity records for an existing,
+/// validated graph checkout. This never opens the coordinator, refreshes
+/// HEAD, writes projections or replaces a conflicting record. Install and
+/// repair share the graph lock and the same identity validation/publication.
+pub fn repair_identities(root: &Path, apply: bool) -> Result<Vec<String>, RunError> {
+    let Some((_, missing)) = identity_repair_plan(root)? else {
+        return Ok(Vec::new());
+    };
+    if missing.is_empty() {
+        return Ok(Vec::new());
+    }
+    let commands = |records: &[Identity]| {
+        records
+            .iter()
+            .map(|record| {
+                format!(
+                    "git config --local --add {} {}",
+                    super::shell_word(&record.key()),
+                    super::shell_word(&record.admin)
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    if !apply {
+        return Ok(commands(&missing));
+    }
+    let common = git::common_dir(root).map_err(|e| RunError::io("can't inspect repository", e))?;
+    let _lock = graph_lock(&common)?;
+    // Replan under the same lock as install and sync. A concurrent repair
+    // either supplies the record first or leaves this one the sole writer.
+    let Some((graph, missing)) = identity_repair_plan(root)? else {
+        return Err(identity_error(
+            "graph checkout disappeared before identity repair",
+        ));
+    };
+    let writes = commands(&missing);
+    if !missing.is_empty() {
+        let trust = git::WorktreeTrust {
+            common: Some(common),
+            worktree: Some(graph.clone()),
+        };
+        git::with_worktree_trust(&trust, || record_identities(&graph))?;
+    }
+    Ok(writes)
+}
+
 /// A checked install plan. Only `create` changes the repository.
 #[derive(Debug)]
 pub struct GraphPlan {
@@ -831,6 +1032,9 @@ pub struct GraphPlan {
     common: PathBuf,
     main_ref: String,
     no_graph_commit: bool,
+    /// Checkout mode with no main branch to make the graph checkout
+    /// from: deferred, never refused (row 16: install needs no main).
+    missing_main: bool,
 }
 
 impl GraphPlan {
@@ -851,9 +1055,8 @@ impl GraphPlan {
             return Err(refused("mdkg-graph cannot also be the main branch"));
         }
         let unborn = !git::has_ref(&root, &format!("refs/heads/{main_ref}"));
-        if unborn && !git::no_commits(&root).map_err(|e| RunError::io("can't inspect HEAD", e))? {
-            return Err(refused(format!("main branch {main_ref} does not exist")));
-        }
+        let missing_main =
+            unborn && !git::no_commits(&root).map_err(|e| RunError::io("can't inspect HEAD", e))?;
         let no_graph_commit = unborn
             || !output(
                 &root,
@@ -885,7 +1088,9 @@ impl GraphPlan {
                     worktree: Some(path.clone()),
                 },
                 || {
-                    check_identities(&path, &records, true)?;
+                    // Install may advance past a committed declaration error.
+                    // Registration and checkout safety are checked before the update;
+                    // graph identities are checked afterwards, before publication.
                     if let Some(status) = repair_checkout(path.clone(), &common)? {
                         return Err(status.error());
                     }
@@ -902,7 +1107,55 @@ impl GraphPlan {
             common,
             main_ref: main_ref.into(),
             no_graph_commit,
+            missing_main,
         })
+    }
+
+    /// Whether create could fast-forward this checkout across a change to
+    /// an ignore file governing the supplied repository-relative hook targets.
+    /// Uses the install refresh preflight without changing repository state.
+    pub fn would_refresh_ignores(&self, targets: &[&str]) -> Result<bool, RunError> {
+        use std::os::unix::ffi::OsStrExt as _;
+        if self.missing_main || self.no_graph_commit || !self.path.exists() {
+            return Ok(false);
+        }
+        git::with_worktree_trust(
+            &git::WorktreeTrust {
+                common: Some(self.common.clone()),
+                worktree: Some(self.path.clone()),
+            },
+            || {
+                let old = git::commit_of(&self.path, "HEAD")
+                    .map_err(|e| RunError::io("can't read graph HEAD", e))?;
+                let target = git::commit_of(&self.path, &format!("refs/heads/{}", self.main_ref))
+                    .map_err(|e| RunError::io("can't read main", e))?;
+                if old == target || preflight(&self.path, &old, &target, false)?.is_some() {
+                    return Ok(false);
+                }
+                let mut paths = BTreeSet::from([PathBuf::from(".gitignore")]);
+                for target in targets {
+                    for parent in Path::new(target).ancestors().skip(1) {
+                        paths.insert(parent.join(".gitignore"));
+                    }
+                }
+                // info/exclude lives in the common Git directory, outside
+                // both committed trees: a checkout refresh cannot change it.
+                // Compare object IDs, including additions and removals,
+                // rather than worktree bytes or executable-mode changes.
+                let blobs = |revision| -> Result<BTreeMap<_, _>, RunError> {
+                    let tree = tree_entries(&self.path, revision, &paths)?;
+                    Ok(paths
+                        .iter()
+                        .filter_map(|path| {
+                            let key = path.as_os_str().as_bytes();
+                            tree.get(key)
+                                .map(|entry| (key.to_vec(), entry.object.clone()))
+                        })
+                        .collect())
+                };
+                Ok(blobs(&old)? != blobs(&target)?)
+            },
+        )
     }
 
     /// Create the graph checkout on its own branch. Undo never removes a
@@ -916,21 +1169,39 @@ impl GraphPlan {
         // Recheck after the lock: another installer may have made it, or
         // main may have received its first commit since planning.
         let plan = Self::inspect(&self.root, &self.main_ref)?;
+        if plan.missing_main {
+            // `MDKG_MAIN_REF` comes before the config: naming the branch
+            // there alone would change nothing.
+            let name_it = if std::env::var_os("MDKG_MAIN_REF").is_some() {
+                "`MDKG_MAIN_REF` names it in this environment: set it to an existing branch, \
+                 or unset it and name one with `git config mdkg.mainRef <branch>`"
+            } else {
+                "name one with `git config mdkg.mainRef <branch>`"
+            };
+            if plan.path.exists() {
+                // Not the move to the graph ref: it would start from this
+                // checkout, which may be behind main's last graph.
+                return Ok(format!(
+                    "graph worktree: {} (kept, and it may be behind: there's no main branch {} \
+                     to refresh it from; {name_it}, then run install again, before any move \
+                     to the graph ref)",
+                    plan.path.display(),
+                    self.main_ref
+                ));
+            }
+            // The move to the graph ref, which needs no main, is offered
+            // by install only when it keeps the graph (#14187).
+            return Ok(format!(
+                "graph worktree deferred: there's no main branch {} to make it from; {name_it}",
+                self.main_ref
+            ));
+        }
         if plan.no_graph_commit {
             return Ok(
                 "graph worktree deferred: commit the initial graph, then run install again".into(),
             );
         }
         if plan.path.exists() {
-            if !dry_run {
-                git::with_worktree_trust(
-                    &git::WorktreeTrust {
-                        common: Some(plan.common.clone()),
-                        worktree: Some(plan.path.clone()),
-                    },
-                    || record_identities(&plan.path),
-                )?;
-            }
             drop(_lock);
             return plan.with_refresh_note(
                 format!("graph worktree: {} (kept)", plan.path.display()),
@@ -945,13 +1216,6 @@ impl GraphPlan {
         }
         ignore_worktrees(&self.root, false)?;
         crate::turn::agent_worktree(&self.common, "graph", &self.main_ref, &names()?)?;
-        git::with_worktree_trust(
-            &git::WorktreeTrust {
-                common: Some(plan.common.clone()),
-                worktree: Some(plan.path.clone()),
-            },
-            || record_identities(&plan.path),
-        )?;
         drop(_lock);
         plan.with_refresh_note(
             format!(
@@ -965,29 +1229,47 @@ impl GraphPlan {
     }
 
     fn with_refresh_note(&self, mut note: String, dry_run: bool) -> Result<String, RunError> {
+        let _lock = if dry_run {
+            None
+        } else {
+            Some(graph_lock(&self.common)?)
+        };
+        let current = Self::inspect(&self.root, &self.main_ref)?;
+        if !same_folder(&current.path, &self.path)? {
+            return Err(identity_error(
+                "graph registration changed before install update",
+            ));
+        }
         let sync = git::with_worktree_trust(
             &git::WorktreeTrust {
                 common: Some(self.common.clone()),
                 worktree: Some(self.path.clone()),
             },
             || {
-                let sync = refresh_graph(&self.path, &self.main_ref, dry_run);
-                // Recheck before projections can be published. Only install
-                // may add the identity of a graph brought in by this sync.
-                let _lock = if dry_run {
-                    None
-                } else {
-                    Some(graph_lock(&self.common)?)
+                // Only install can recover a refused graph by advancing to a
+                // committed config correction. Ordinary sync keeps its strict
+                // identity gate. Hold the same lock over update and publication.
+                let sync = advance_checkout(&self.path, &self.main_ref, dry_run, false)?;
+                let finalize = || -> Result<(), RunError> {
+                    if let Some(status) = repair_checkout(self.path.clone(), &self.common)? {
+                        return Err(status.error());
+                    }
+                    if !dry_run {
+                        record_identities(&self.path)?;
+                        ensure_graph_writable(&self.path)?;
+                    }
+                    Ok(())
                 };
-                if let Some(status) = repair_checkout(self.path.clone(), &self.common)? {
-                    return Err(status.error());
-                }
-                if !dry_run {
-                    record_identities(&self.path)?;
-                    ensure_graph_writable(&self.path)?;
-                } else {
-                    check_identities(&self.path, &identities(&self.path)?, true)?;
-                }
+                finalize().map_err(|mut error| {
+                    if sync.updated
+                        && let Some(head) = &sync.head
+                    {
+                        error.message.push_str(&format!(
+                            "; graph checkout was already updated to {head} before this refusal"
+                        ));
+                    }
+                    error
+                })?;
                 Ok(sync)
             },
         )?;
@@ -1357,14 +1639,31 @@ pub fn sync_graph(root: &Path, main_ref: &str, dry_run: bool) -> Result<GraphSyn
     };
     // A second launcher or an operator may have changed it while we waited.
     ensure_graph_writable(&root)?;
-    let old =
-        git::commit_of(&root, "HEAD").map_err(|e| RunError::io("can't read graph HEAD", e))?;
+    advance_checkout(&root, main_ref, dry_run, true)
+}
+
+/// Caller holds the graph lock and has checked registration and checkout state.
+/// Install validates graph identities after this guarded update; ordinary sync
+/// also validates them before calling it.
+fn advance_checkout(
+    root: &Path,
+    main_ref: &str,
+    dry_run: bool,
+    identity: bool,
+) -> Result<GraphSync, RunError> {
+    let old = git::commit_of(root, "HEAD").map_err(|e| RunError::io("can't read graph HEAD", e))?;
     let main = format!(
         "refs/heads/{}",
         main_ref.strip_prefix("refs/heads/").unwrap_or(main_ref)
     );
-    let target = git::commit_of(&root, &main).map_err(|e| RunError::io("can't read main", e))?;
-    let reason = preflight(&root, &old, &target)?;
+    let target = git::commit_of(root, &main).map_err(|e| RunError::io("can't read main", e))?;
+    let reason = preflight(root, &old, &target, identity)?;
+    if dry_run && !identity {
+        // A preview validates the exact target tree only if the guarded
+        // update could proceed. A refused update still validates current HEAD.
+        let reference = if reason.is_none() { &target } else { &old };
+        check_identities_at(root, &identities(root)?, true, reference)?;
+    }
     let mut result = GraphSync {
         head: Some(old.clone()),
         ..GraphSync::default()
@@ -1374,7 +1673,11 @@ pub fn sync_graph(root: &Path, main_ref: &str, dry_run: bool) -> Result<GraphSyn
     } else if target != old {
         if dry_run {
             result.reason = Some(format!("graph would fast-forward from {old} to {target}"));
-        } else if let Some(reason) = advance_graph(&root, &old, &target, |_| ())? {
+        } else if let Some(reason) = if identity {
+            advance_graph(root, &old, &target, |_| ())?
+        } else {
+            advance_with_identity(root, &old, &target, |_| (), merge, false)?
+        } {
             result.reason = Some(format!("graph not synced: {reason} at {old}"));
         } else {
             result.head = Some(target);
@@ -1534,8 +1837,24 @@ fn expected_head(root: &Path, commit: &str) -> Result<bool, RunError> {
         && git::commit_of(root, "HEAD").is_ok_and(|head| head == commit))
 }
 
-fn preflight(root: &Path, old: &str, target: &str) -> Result<Option<String>, RunError> {
-    ensure_graph_writable(root)?;
+fn checkout_ready(root: &Path, identity: bool) -> Result<(), RunError> {
+    if identity {
+        return ensure_graph_writable(root);
+    }
+    let common = git::common_dir(root).map_err(|e| RunError::io("can't find git folder", e))?;
+    if let Some(status) = repair_checkout(root.to_owned(), &common)? {
+        return Err(status.error());
+    }
+    Ok(())
+}
+
+fn preflight(
+    root: &Path,
+    old: &str,
+    target: &str,
+    identity: bool,
+) -> Result<Option<String>, RunError> {
+    checkout_ready(root, identity)?;
     if !expected_head(root, old)? {
         return Ok(Some("branch or HEAD changed before fast-forward".into()));
     }
@@ -1608,24 +1927,33 @@ fn advance_with(
     root: &Path,
     old: &str,
     target: &str,
+    probe: impl FnMut(AdvancePhase),
+    merge: impl FnMut(&Path, &str) -> Result<bool, RunError>,
+) -> Result<Option<String>, RunError> {
+    advance_with_identity(root, old, target, probe, merge, true)
+}
+
+fn advance_with_identity(
+    root: &Path,
+    old: &str,
+    target: &str,
     mut probe: impl FnMut(AdvancePhase),
     mut merge: impl FnMut(&Path, &str) -> Result<bool, RunError>,
+    identity: bool,
 ) -> Result<Option<String>, RunError> {
-    if let Some(reason) = preflight(root, old, target)? {
+    if let Some(reason) = preflight(root, old, target, identity)? {
         return Ok(Some(reason));
     }
     probe(AdvancePhase::BeforeMerge);
     // Recheck at the mutation boundary. A branch switch in the remaining
     // window is a documented residual: Git may fast-forward that branch,
     // but loses no commits. The postflight reports it and writers freeze.
-    if let Some(reason) = preflight(root, old, target)? {
+    if let Some(reason) = preflight(root, old, target, identity)? {
         return Ok(Some(reason));
     }
     let merged = merge(root, target);
     probe(AdvancePhase::AfterMerge);
-    if let Some(status) = repair_status(root)? {
-        return Err(status.error());
-    }
+    checkout_ready(root, identity)?;
     let expected = if matches!(merged, Ok(true)) {
         target
     } else {
@@ -1665,8 +1993,20 @@ pub struct RepairStatus {
 
 impl RepairStatus {
     fn error(&self) -> RunError {
-        RunError::failure("io.write_failed", self.reason.clone())
-            .with_hint(self.guidance.join("\n"))
+        RunError::failure("io.write_failed", self.reason.clone()).with_hint(self.hint())
+    }
+
+    /// The guidance as one multi-line hint, the only way it's joined, for
+    /// every caller: a line each, any newline left inside a line (data a
+    /// line shows unquoted) escaped, so no path prints a line that reads
+    /// as a step. Quoted paths are `$'...'` already (e2e B8, orchestrator
+    /// #16197).
+    pub fn hint(&self) -> String {
+        self.guidance
+            .iter()
+            .map(|line| line.replace('\n', "\\u{a}"))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }
 
@@ -1915,6 +2255,47 @@ pub fn ensure_graph_writable(root: &Path) -> Result<(), RunError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A quoted path's newline stays inside `$'...'`, and the hint keeps
+    /// one line per step, any newline left inside a line escaped (e2e B8,
+    /// orchestrator #16197).
+    #[test]
+    fn repair_guidance_keeps_a_path_s_newline_off_its_own_line() {
+        let path = "/repo/a\nrun this forged step";
+        assert_eq!(
+            super::super::shell_word(path),
+            "$'/repo/a\\nrun this forged step'"
+        );
+        assert_eq!(super::super::shell_word("it's"), "'it'\\''s'");
+        // A backslash and ESC: `\\` and `\x1b` inside `$'...'`.
+        assert_eq!(super::super::shell_word("a\\b\u{1b}"), "$'a\\\\b\\x1b'");
+        let state = RepairStatus {
+            checkout: PathBuf::from("/repo"),
+            states: Vec::new(),
+            paths: Vec::new(),
+            guidance: vec![
+                status_command(Path::new("/repo")),
+                format!("remove {}", super::super::shell_word(path)),
+                format!("look at {path}"),
+            ],
+            reason: String::new(),
+        };
+        let hint = state.hint();
+        assert_eq!(hint.lines().count(), 3, "{hint}");
+        assert!(
+            !hint.lines().any(|l| l.starts_with("run this forged")),
+            "{hint}"
+        );
+        assert!(
+            hint.contains("remove $'/repo/a\\nrun this forged step'"),
+            "{hint}"
+        );
+        assert!(
+            hint.contains("look at /repo/a\\u{a}run this forged step"),
+            "{hint}"
+        );
+    }
+
     struct Scratch(PathBuf);
     impl Drop for Scratch {
         fn drop(&mut self) {
@@ -1969,6 +2350,101 @@ mod tests {
     }
 
     #[test]
+    fn refresh_probe_is_read_only_and_uses_the_install_preflight() {
+        git::with_worktree_trust(&Default::default(), || {
+            let (root, graph, old, _) = setup();
+            let plan = GraphPlan::inspect(&root.0, "main").expect("plan");
+            let targets = [".codex/hooks.json"];
+            assert!(
+                !plan
+                    .would_refresh_ignores(&targets)
+                    .expect("unrelated change")
+            );
+            fs::write(
+                root.0.join(".gitignore"),
+                "/.worktrees/\n!/.codex/hooks.json\n",
+            )
+            .expect("ignore change");
+            command(&root.0, &["add", ".gitignore"]);
+            command(&root.0, &["commit", "-qm", "change ignore rules"]);
+            let target = command(&root.0, &["rev-parse", "HEAD"]);
+            let config = fs::read(root.0.join(".git/config")).expect("config");
+            let index = fs::read(root.0.join(".git/worktrees/graph/index")).expect("index");
+            assert!(plan.would_refresh_ignores(&targets).expect("preview"));
+            assert!(
+                plan.would_refresh_ignores(&targets)
+                    .expect("repeat preview")
+            );
+            assert_eq!(command(&graph, &["rev-parse", "HEAD"]), old);
+            assert_eq!(
+                fs::read(root.0.join(".git/config")).expect("config"),
+                config
+            );
+            assert_eq!(
+                fs::read(root.0.join(".git/worktrees/graph/index")).expect("index"),
+                index
+            );
+            fs::write(graph.join("untracked"), "user content").expect("untracked");
+            assert!(!plan.would_refresh_ignores(&targets).expect("dirty preview"));
+            fs::remove_file(graph.join("untracked")).expect("remove fixture file");
+            plan.create(false).expect("separate refresh");
+            assert_eq!(command(&graph, &["rev-parse", "HEAD"]), target);
+            assert!(
+                !plan
+                    .would_refresh_ignores(&targets)
+                    .expect("already current")
+            );
+        });
+    }
+
+    #[test]
+    fn refresh_probe_compares_ignore_blobs_on_the_hook_path() {
+        git::with_worktree_trust(&Default::default(), || {
+            let (root, _, _, _) = setup();
+            let plan = GraphPlan::inspect(&root.0, "main").expect("plan");
+            let targets = [".opencode/plugins/mdkg/server.ts"];
+            // Common excludes are not in either tree and cannot change in
+            // a fast-forward. Existing rules are checked by the caller.
+            fs::write(
+                root.0.join(".git/info/exclude"),
+                "!/.opencode/plugins/mdkg/server.ts\n",
+            )
+            .expect("common exclude");
+            assert!(!plan.would_refresh_ignores(&targets).expect("same ignores"));
+            for path in [
+                ".opencode/.gitignore",
+                ".opencode/plugins/.gitignore",
+                ".opencode/plugins/mdkg/.gitignore",
+            ] {
+                let file = root.0.join(path);
+                fs::create_dir_all(file.parent().expect("parent")).expect("folder");
+                fs::write(&file, "# new rules\n").expect("ignore");
+                command(&root.0, &["add", path]);
+                command(&root.0, &["commit", "-qm", "add nested ignore"]);
+                assert!(plan.would_refresh_ignores(&targets).expect("addition"));
+                assert!(
+                    !plan
+                        .would_refresh_ignores(&[".codex/hooks.json"])
+                        .expect("unrelated nested ignore")
+                );
+                plan.create(false).expect("refresh addition");
+                command(&root.0, &["update-index", "--chmod=+x", path]);
+                command(&root.0, &["commit", "-qm", "change mode only"]);
+                assert!(!plan.would_refresh_ignores(&targets).expect("same blob"));
+                fs::write(&file, "!server.ts\n").expect("changed rule");
+                command(&root.0, &["add", path]);
+                command(&root.0, &["commit", "-qm", "modify ignore"]);
+                assert!(plan.would_refresh_ignores(&targets).expect("modification"));
+                plan.create(false).expect("refresh modification");
+                command(&root.0, &["rm", "-q", path]);
+                command(&root.0, &["commit", "-qm", "remove ignore"]);
+                assert!(plan.would_refresh_ignores(&targets).expect("removal"));
+                plan.create(false).expect("refresh removal");
+            }
+        });
+    }
+
+    #[test]
     fn selected_config_trees_exclude_unrelated_entries_and_keep_blockers() {
         git::with_worktree_trust(&Default::default(), || {
             let root = Scratch(
@@ -2000,24 +2476,30 @@ mod tests {
             assert!(tree.keys().all(|p| !p.starts_with(b"unrelated")));
             assert_eq!(tree.len(), 303); // packages + 100 triples + nested/link
             for path in &paths[..100] {
-                assert!(config_object(&tree, path).expect("config").is_some());
+                assert!(config_object(&tree, path, false).expect("config").is_some());
             }
             assert!(
-                config_object(&tree, &paths[100])
+                config_object(&tree, &paths[100], false)
                     .expect_err("link parent")
                     .message
                     .contains("directory")
             );
             assert!(
-                config_object(&tree, &paths[101])
+                config_object(&tree, &paths[101], false)
                     .expect("absent child")
                     .is_none()
+            );
+            assert!(
+                config_object(&tree, &paths[100], true)
+                    .expect_err("subgraph symlink parent")
+                    .message
+                    .contains("directory")
             );
             // A selected directory stays one entry and cannot expand its children.
             let directory =
                 config_tree(&root.0, &revision, &[PathBuf::from("unrelated")]).expect("directory");
             assert_eq!(directory.len(), 1);
-            assert!(config_object(&directory, Path::new("unrelated")).is_err());
+            assert!(config_object(&directory, Path::new("unrelated"), false).is_err());
         });
     }
 
@@ -2054,7 +2536,7 @@ mod tests {
             .map(|i| (format!("alias{i}"), serde_json::json!({"path":"same"})))
             .collect::<serde_json::Map<_, _>>();
         config["workspaces"] = workspaces.into();
-        assert_eq!(declared_configs(&config).expect("at limit").len(), 2);
+        assert_eq!(declared_configs(&config).expect("at limit").0.len(), 2);
         config["subgraphs"] = serde_json::json!({"external": {}});
         assert!(
             declared_configs(&config)
@@ -2172,7 +2654,10 @@ mod tests {
             let error = check_identities(&sibling, &records, false).expect_err("wrong caller");
             assert!(error.message.contains("names worktree admin graph"));
             let hint = error.hint.expect("hint");
-            assert!(hint.contains(graph.to_str().expect("graph path")));
+            // The hint names git's registration, which git records with
+            // symlinks resolved (a symlinked TMPDIR, macOS's /var).
+            let registered = fs::canonicalize(&graph).expect("graph path");
+            assert!(hint.contains(registered.to_str().expect("graph path")));
             assert!(hint.contains("Run from that checkout instead"));
             assert!(!hint.contains("unset"));
         });

@@ -568,11 +568,55 @@ fn init_new_validate_shared_work_commits_the_task_in_the_graph() {
     assert!(dir.join(path).is_file());
     let (code, v) = json(&dir, &["validate", "--json"]);
     assert_eq!(code, 0, "{v}");
+    // A new task's Requirements section holds only the template's fenced
+    // example, so the one warning is the lint asking for items (A28).
     assert_eq!(
         codes(&v),
-        Vec::<String>::new(),
-        "a fresh graph validates clean: {v}"
+        ["req.missing"],
+        "a fresh graph validates clean but for the empty requirements: {v}"
     );
+}
+
+#[test]
+fn new_nodes_from_local_and_bundled_templates_have_no_live_requirements() {
+    let kinds = ["task", "bug", "feat", "spike", "edd", "prd"];
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.mdkg/templates/default");
+    for local in [false, true] {
+        // The local case copies this repository's own templates; the
+        // public export's graph is a fresh `mdkg init` without them.
+        if local && !source.is_dir() {
+            eprintln!(
+                "skipped the local templates: this repository has no .mdkg/templates/default"
+            );
+            continue;
+        }
+        let dir = temp(if local { "req-local" } else { "req-bundled" }, true);
+        assert_eq!(json(&dir, &["init", "--work", "shared", "--json"]).0, 0);
+        if local {
+            let templates = dir.join(".mdkg/templates/default");
+            std::fs::create_dir_all(&templates).expect("template directory");
+            for kind in kinds {
+                std::fs::copy(
+                    source.join(format!("{kind}.md")),
+                    templates.join(format!("{kind}.md")),
+                )
+                .expect("local template");
+            }
+        }
+        commit_all(&dir);
+        for kind in kinds {
+            let title = format!("Example {kind}");
+            let (code, out) = json(&dir, &["new", kind, &title, "--json"]);
+            assert_eq!(code, 0, "{kind}, local={local}: {out}");
+            let path = out["data"]["node"]["path"].as_str().expect("node path");
+            let body = std::fs::read_to_string(dir.join(path)).expect("created node");
+            let parsed = mdkg_graph::requirements::parse(&body);
+            assert!(parsed.section_found, "{kind}, local={local}");
+            assert_eq!(parsed.items, 0, "{kind}, local={local}");
+            assert!(parsed.requirements.is_empty(), "{kind}, local={local}");
+        }
+        std::fs::remove_dir_all(dir).expect("remove fixture");
+    }
 }
 
 #[test]
@@ -659,25 +703,18 @@ fn start_hook(dir: &Path, harness: &str, input: &Value) -> Output {
 }
 
 /// Mail hooks work without an agent mapping; only receiver registration
-/// requires one. Uses read-only Git on handwritten unborn metadata.
+/// requires one. Identity reads only committed config, so the graph and its
+/// mapped definition are committed.
 #[test]
 fn codex_hook_fixture_registers_only_with_actor_identity_in_local_and_shared_work() {
     for work in ["local", "shared"] {
-        let dir = temp(&format!("hook-identity-{work}"), false);
-        for path in [".git/objects", ".git/refs"] {
-            std::fs::create_dir_all(dir.join(path)).expect("git metadata folder");
-        }
-        std::fs::write(dir.join(".git/HEAD"), "ref: refs/heads/main\n").expect("HEAD");
-        std::fs::write(
-            dir.join(".git/config"),
-            "[core]\nrepositoryformatversion = 0\nbare = false\n",
-        )
-        .expect("git config");
+        let dir = temp(&format!("hook-identity-{work}"), true);
         assert_eq!(
             json(&dir, &["init", "--work", work, "--no-gitignore", "--json"]).0,
             0
         );
         declare(&dir, &["hooks:codex"]);
+        commit_all(&dir);
         let input = serde_json::json!({"cwd":dir,
             "session_id":"0192f3a0-0000-7000-8000-000000000001",
             "hook_event_name":"SessionStart","source":"startup"});
@@ -721,6 +758,7 @@ fn codex_hook_fixture_registers_only_with_actor_identity_in_local_and_shared_wor
         );
 
         configure_codex_hook_actor(&dir);
+        commit_all(&dir);
         let after = start_hook(&dir, "codex", &input);
         assert_eq!(after.status.code(), Some(0), "{work}: {after:?}");
         assert!(after.stderr.is_empty(), "{work}: {after:?}");
@@ -856,7 +894,7 @@ fn fresh_init_installs_all_three_hook_defaults_and_projections() {
     for (canonical, target, expected) in [
         (
             ".mdkg/hooks/claude/settings.json",
-            ".claude/settings.json",
+            ".claude/settings.local.json",
             mdkg_run::hooks::claude_canonical(BIN),
         ),
         (
@@ -911,7 +949,7 @@ fn install_ships_hooks_and_preserves_the_users_files() {
                 "Notification": [{"hooks": [{"type": "command", "command": "./alert.sh"}]}]
             }
         });
-        let settings = dir.join(".claude/settings.json");
+        let settings = dir.join(".claude/settings.local.json");
         std::fs::create_dir_all(settings.parent().expect("parent")).expect("mkdir");
         std::fs::write(&settings, serde_json::to_string(&user).expect("json")).expect("write");
         let before = snapshot(&dir);
@@ -1063,6 +1101,253 @@ fn check_of<'a>(v: &'a Value, name: &str) -> &'a Value {
         .as_array()
         .and_then(|a| a.iter().find(|c| c["name"] == name))
         .unwrap_or(&Value::Null)
+}
+
+/// A graph with a nested workspace, optionally carrying private code
+/// beside that workspace's dedicated graph folder (#14632).
+fn nested_graph_shape(private_source: bool) -> PathBuf {
+    let dir = temp("nested-graph-shape", false);
+    git(&dir, &["init", "-q", "-b", "trunk"]);
+    let (code, v) = json(&dir, &["init", "--graph-only", "--json"]);
+    assert_eq!(code, 0, "{v}");
+    let mut cfg = config(&dir);
+    let mut nested = cfg.clone();
+    nested["graph_id"] = serde_json::json!(uuid::Uuid::now_v7().to_string());
+    std::fs::create_dir_all(dir.join("services/api/.mdkg")).expect("nested graph");
+    std::fs::write(
+        dir.join("services/api/.mdkg/config.json"),
+        nested.to_string(),
+    )
+    .expect("nested config");
+    cfg["workspaces"] = serde_json::json!({
+        "root": {"path": ".", "enabled": true, "mdkg_dir": ".mdkg", "visibility": "private"},
+        "api": {"path": "services/api", "enabled": true, "mdkg_dir": ".mdkg", "visibility": "private"}
+    });
+    std::fs::write(dir.join(".mdkg/config.json"), cfg.to_string()).expect("config");
+    if private_source {
+        std::fs::write(dir.join("services/api/private-source.rs"), "private code\n")
+            .expect("source");
+    }
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-q", "-m", "nested graph"]);
+    git(&dir, &["branch", "mdkg-graph"]);
+    git(&dir, &["config", "mdkg.graph.ref", "refs/heads/mdkg-graph"]);
+    let identity = format!(
+        "mdkg.graph.{}.ref",
+        cfg["graph_id"].as_str().expect("graph id")
+    );
+    git(&dir, &["config", &identity, "refs/heads/mdkg-graph"]);
+    // A fixture-only remote: install neither fetches nor pushes.
+    let remote = dir.join("private.git");
+    git(
+        &dir,
+        &["remote", "add", "mine", remote.to_str().expect("path")],
+    );
+    let (code, v) = json(&dir, &["install", "--setup", "local", "--json"]);
+    assert_eq!(code, 0, "{v}");
+    dir
+}
+
+#[test]
+fn professional_setup_refuses_source_beside_a_nested_graph() {
+    let dir = nested_graph_shape(true);
+    let config_before = std::fs::read(dir.join(".git/config")).expect("git config");
+    let (code, v) = json(
+        &dir,
+        &[
+            "install",
+            "--setup",
+            "professional",
+            "--graph-remote",
+            "mine",
+            "--json",
+        ],
+    );
+    assert_ne!(code, 0, "{v}");
+    assert_eq!(codes(&v), ["graph.shape"], "{v}");
+    assert_eq!(
+        std::fs::read(dir.join(".git/config")).expect("git config"),
+        config_before
+    );
+    // Doctor applies the same proof to an already-configured remote.
+    git(&dir, &["config", "mdkg.graph.remote", "mine"]);
+    let (_, v) = json(&dir, &["doctor", "--json"]);
+    assert_eq!(status_of(&v, "graph.shape"), "error", "{v}");
+}
+
+#[test]
+fn professional_setup_and_doctor_accept_a_pure_nested_graph() {
+    let dir = nested_graph_shape(false);
+    let (code, v) = json(
+        &dir,
+        &[
+            "install",
+            "--setup",
+            "professional",
+            "--graph-remote",
+            "mine",
+            "--json",
+        ],
+    );
+    assert_eq!(code, 0, "{v}");
+    let (_, v) = json(&dir, &["doctor", "--json"]);
+    assert_eq!(status_of(&v, "graph.shape"), "ok", "{v}");
+    assert_eq!(check_of(&v, "graph.shape")["summary"], "graph-only", "{v}");
+}
+
+fn shape_git_input(dir: &Path, args: &[&str], input: &[u8]) -> String {
+    let out = mdkg_git::command(dir)
+        .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
+        .args(args)
+        .run(Some(input))
+        .expect("git");
+    assert!(out.status.success(), "{out:?}");
+    String::from_utf8(out.stdout)
+        .expect("git output")
+        .trim()
+        .to_owned()
+}
+
+#[test]
+fn personal_doctor_checks_invalid_paths_after_an_outside_entry() {
+    for nested in [false, true] {
+        let dir = nested_graph_shape(false);
+        let graph = "refs/heads/mdkg-graph";
+        let blob = shape_git_input(&dir, &["rev-parse", "HEAD:.mdkg/README.md"], b"");
+        let mut entries = shape_git_input(&dir, &["ls-tree", "-z", graph], b"").into_bytes();
+        if nested {
+            let mut children = format!("100644 blob {blob}\tz").into_bytes();
+            children.extend_from_slice(b"\xff\0");
+            let tree = shape_git_input(&dir, &["mktree", "-z"], &children);
+            entries.extend_from_slice(format!("040000 tree {tree}\ta\0").as_bytes());
+        } else {
+            entries.extend_from_slice(format!("100644 blob {blob}\ta\0").as_bytes());
+            entries.extend_from_slice(format!("100644 blob {blob}\tz").as_bytes());
+            entries.extend_from_slice(b"\xff\0");
+        }
+        let tree = shape_git_input(&dir, &["mktree", "-z"], &entries);
+        let commit = shape_git_input(
+            &dir,
+            &["commit-tree", &tree, "-p", graph, "-m", "mixed full shape"],
+            b"",
+        );
+        git(&dir, &["update-ref", graph, &commit]);
+        let remote = dir.join("origin.git");
+        git(
+            &dir,
+            &["remote", "add", "origin", remote.to_str().expect("path")],
+        );
+        git(&dir, &["config", "mdkg.graph.remote", "origin"]);
+        let (_, v) = json(&dir, &["doctor", "--json"]);
+        assert_eq!(status_of(&v, "graph.shape"), "error", "{v}");
+    }
+    // Readable full shapes are still kept for a personal graph (G20).
+    let dir = nested_graph_shape(true);
+    let remote = dir.join("origin.git");
+    git(
+        &dir,
+        &["remote", "add", "origin", remote.to_str().expect("path")],
+    );
+    git(&dir, &["config", "mdkg.graph.remote", "origin"]);
+    let (_, v) = json(&dir, &["doctor", "--json"]);
+    assert_eq!(status_of(&v, "graph.shape"), "ok", "{v}");
+    assert_eq!(
+        check_of(&v, "graph.shape")["summary"],
+        "full shape (kept for a personal graph)",
+        "{v}"
+    );
+}
+
+#[test]
+fn outside_empty_trees_refuse_setup_and_fail_doctor() {
+    for name in [b"outside".as_slice(), b"outside-\xff".as_slice()] {
+        let dir = nested_graph_shape(false);
+        let graph = "refs/heads/mdkg-graph";
+        let empty = shape_git_input(&dir, &["mktree", "-z"], b"");
+        let mut entries = shape_git_input(&dir, &["ls-tree", "-z", graph], b"").into_bytes();
+        entries.extend_from_slice(format!("040000 tree {empty}\t").as_bytes());
+        entries.extend_from_slice(name);
+        entries.push(0);
+        let tree = shape_git_input(&dir, &["mktree", "-z"], &entries);
+        let commit = shape_git_input(
+            &dir,
+            &[
+                "commit-tree",
+                &tree,
+                "-p",
+                graph,
+                "-m",
+                "outside empty tree",
+            ],
+            b"",
+        );
+        git(&dir, &["update-ref", graph, &commit]);
+        let (code, v) = json(
+            &dir,
+            &[
+                "install",
+                "--setup",
+                "professional",
+                "--graph-remote",
+                "mine",
+                "--json",
+            ],
+        );
+        assert_ne!(code, 0, "{v}");
+        assert_eq!(codes(&v), ["graph.shape"], "{v}");
+        git(&dir, &["config", "mdkg.graph.remote", "mine"]);
+        let (_, v) = json(&dir, &["doctor", "--json"]);
+        assert_eq!(status_of(&v, "graph.shape"), "error", "{v}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn unclassifiable_nested_paths_refuse_setup_and_fail_doctor() {
+    use std::os::unix::ffi::OsStringExt as _;
+
+    let dir = nested_graph_shape(false);
+    // macOS can't create this filename on disk. Put it straight into the
+    // fixture index, reusing a blob, so the committed tree still tests it.
+    let out = Command::new("git")
+        .args(["rev-parse", "HEAD:.mdkg/README.md"])
+        .current_dir(&dir)
+        .output()
+        .expect("blob");
+    assert!(out.status.success(), "{out:?}");
+    let blob = String::from_utf8(out.stdout).expect("object id");
+    let name = std::ffi::OsString::from_vec(b"services/api/private-\xff.rs".to_vec());
+    let status = Command::new("git")
+        .args([
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            "100644",
+            blob.trim(),
+        ])
+        .arg(name)
+        .current_dir(&dir)
+        .status()
+        .expect("index");
+    assert!(status.success());
+    git(&dir, &["commit", "-q", "-m", "unclassifiable source path"]);
+    git(&dir, &["update-ref", "refs/heads/mdkg-graph", "HEAD"]);
+    let (code, v) = json(
+        &dir,
+        &[
+            "install",
+            "--setup",
+            "professional",
+            "--graph-remote",
+            "mine",
+            "--json",
+        ],
+    );
+    assert_ne!(code, 0, "{v}");
+    assert_eq!(codes(&v), ["graph.shape"], "{v}");
+    git(&dir, &["config", "mdkg.graph.remote", "mine"]);
+    let (_, v) = json(&dir, &["doctor", "--json"]);
+    assert_eq!(status_of(&v, "graph.shape"), "error", "{v}");
 }
 
 #[test]
@@ -1297,7 +1582,7 @@ fn doctor_checks_the_agents_instructions_are_this_builds() {
     assert_eq!(status_of(&v, "agents"), "ok", "{v}");
     assert!(v.to_string().contains("own changes"), "{v}");
     // Whitespace the frontmatter parser takes is the same version.
-    let spaced = shipped.replace("version: 0.7.0", "version :  0.7.0");
+    let spaced = shipped.replace("version: 0.7.1", "version :  0.7.1");
     assert_ne!(
         spaced, shipped,
         "the whitespace fixture must change the skill"
@@ -1306,7 +1591,7 @@ fn doctor_checks_the_agents_instructions_are_this_builds() {
     let (_, v) = json(&dir, &["doctor", "--json"]);
     assert_eq!(status_of(&v, "agents"), "ok", "{v}");
     // Another build's skill: bring in this build's.
-    let older = shipped.replace("version: 0.7.0", "version: 0.6.9");
+    let older = shipped.replace("version: 0.7.1", "version: 0.6.9");
     assert_ne!(older, shipped, "the version fixture must change the skill");
     std::fs::write(&skill, older).expect("write");
     let (_, v) = json(&dir, &["doctor", "--json"]);
@@ -1479,6 +1764,180 @@ fn doctor_warns_when_an_mcp_config_runs_a_missing_program() {
 }
 
 #[test]
+fn claudes_hooks_never_write_or_ignore_the_shared_settings() {
+    // dec-01a18ee0 item 11: Claude's hooks go in its per-user
+    // `.claude/settings.local.json`, ignored in the clone's own
+    // info/exclude when install creates it (orchestrator #13444), never in
+    // the shared .gitignore; the team's shared `.claude/settings.json`
+    // stays as it was, and stays committable. Codex's and OpenCode's files
+    // keep their .gitignore rule (G24).
+    let dir = temp("claude-hooks-local", true);
+    json(&dir, &["init", "--json"]);
+    let shared = dir.join(".claude/settings.json");
+    std::fs::create_dir_all(shared.parent().expect("parent")).expect("mkdir");
+    let team = "{\"permissions\": {\"allow\": [\"Bash(cargo test)\"]}}\n";
+    std::fs::write(&shared, team).expect("write");
+    let (code, v) = json(
+        &dir,
+        &[
+            "install",
+            "--hooks",
+            "--enable",
+            "hooks:claude,hooks:codex,hooks:opencode",
+            "--json",
+        ],
+    );
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(std::fs::read_to_string(&shared).expect("shared"), team);
+    let local: Value = serde_json::from_slice(
+        &std::fs::read(dir.join(".claude/settings.local.json")).expect("local"),
+    )
+    .expect("json");
+    assert!(local["hooks"]["SessionStart"].is_array(), "{local}");
+    let ignore = std::fs::read_to_string(dir.join(".gitignore")).unwrap_or_default();
+    assert!(!ignore.contains(".claude/"), "{ignore}");
+    for target in ["/.codex/hooks.json", "/.opencode/plugins/mdkg/server.ts"] {
+        assert!(ignore.lines().any(|l| l == target), "{target}: {ignore}");
+    }
+    let ignored = |path: &str| {
+        Command::new("git")
+            .args(["check-ignore", "-q", path])
+            .current_dir(&dir)
+            .status()
+            .expect("git check-ignore")
+            .success()
+    };
+    assert!(!ignored(".claude/settings.json"));
+    assert!(ignored(".claude/settings.local.json"));
+    let exclude = std::fs::read_to_string(dir.join(".git/info/exclude")).expect("exclude");
+    assert!(
+        exclude.lines().any(|l| l == "/.claude/settings.local.json"),
+        "{exclude}"
+    );
+    assert!(!v.to_string().contains("settings.json is ignored"), "{v}");
+    // Only the team's own file is there to commit under .claude/.
+    let staged = |dir: &Path| {
+        let out = Command::new("git")
+            .args(["add", "-A", "--dry-run", "--", ".claude"])
+            .current_dir(dir)
+            .output()
+            .expect("git add");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    assert_eq!(staged(&dir), "add '.claude/settings.json'\n");
+    // A sync again leaves both alone.
+    let (code, v) = json(&dir, &["install", "--json"]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(std::fs::read_to_string(&shared).expect("shared"), team);
+    // Undo takes its exclude line out with the file.
+    let (code, v) = json(&dir, &["install", "--undo", "--json"]);
+    assert_eq!(code, 0, "{v}");
+    assert!(!dir.join(".claude/settings.local.json").exists(), "{v}");
+    let exclude = std::fs::read_to_string(dir.join(".git/info/exclude")).expect("exclude");
+    assert!(
+        !exclude.lines().any(|l| l == "/.claude/settings.local.json"),
+        "{exclude}"
+    );
+    std::fs::remove_dir_all(&dir).expect("cleanup");
+
+    // A fresh install with no shared file: nothing under .claude/ to
+    // commit. One the user already had keeps its ignore state.
+    let dir = temp("claude-hooks-fresh", true);
+    json(&dir, &["init", "--json"]);
+    let (code, v) = json(
+        &dir,
+        &["install", "--hooks", "--enable", "hooks:claude", "--json"],
+    );
+    assert_eq!(code, 0, "{v}");
+    assert!(dir.join(".claude/settings.local.json").is_file(), "{v}");
+    assert_eq!(staged(&dir), "", "{v}");
+    std::fs::remove_dir_all(&dir).expect("cleanup");
+    let dir = temp("claude-hooks-theirs", true);
+    json(&dir, &["init", "--json"]);
+    std::fs::create_dir_all(dir.join(".claude")).expect("mkdir");
+    std::fs::write(
+        dir.join(".claude/settings.local.json"),
+        "{\"model\": \"opus\"}\n",
+    )
+    .expect("write");
+    let (code, v) = json(
+        &dir,
+        &["install", "--hooks", "--enable", "hooks:claude", "--json"],
+    );
+    assert_eq!(code, 0, "{v}");
+    let exclude = std::fs::read_to_string(dir.join(".git/info/exclude")).unwrap_or_default();
+    assert!(!exclude.contains("settings.local.json"), "{exclude}");
+    std::fs::remove_dir_all(&dir).expect("cleanup");
+}
+
+/// #13893: the per-user hook file's exclusion follows install's record,
+/// so a retry repairs one a failed install never wrote; and install says
+/// when git still doesn't ignore the file (a .gitignore negation, or a
+/// linked folder) instead of calling it ignored.
+#[test]
+fn claudes_per_user_exclusion_is_repaired_and_checked_against_git() {
+    let exclude_holds = |dir: &Path| {
+        std::fs::read_to_string(dir.join(".git/info/exclude"))
+            .unwrap_or_default()
+            .lines()
+            .any(|l| l == "/.claude/settings.local.json")
+    };
+    let dir = temp("claude-hooks-retry", true);
+    json(&dir, &["init", "--json"]);
+    let (code, v) = json(
+        &dir,
+        &["install", "--hooks", "--enable", "hooks:claude", "--json"],
+    );
+    assert_eq!(code, 0, "{v}");
+    assert!(exclude_holds(&dir), "{v}");
+    // As if the exclude write had failed after the file was written.
+    let file = dir.join(".git/info/exclude");
+    let text = std::fs::read_to_string(&file).expect("exclude");
+    std::fs::write(&file, text.replace("/.claude/settings.local.json\n", "")).expect("w");
+    let (code, v) = json(&dir, &["install", "--json"]);
+    assert_eq!(code, 0, "{v}");
+    assert!(exclude_holds(&dir), "a retry repairs it: {v}");
+    std::fs::remove_dir_all(&dir).expect("cleanup");
+
+    let dir = temp("claude-hooks-negated", true);
+    json(&dir, &["init", "--json"]);
+    std::fs::write(dir.join(".gitignore"), "!/.claude/settings.local.json\n").expect("w");
+    let (code, v) = json(
+        &dir,
+        &["install", "--hooks", "--enable", "hooks:claude", "--json"],
+    );
+    // A new hook file git wouldn't ignore is refused before it's made,
+    // naming the rule (#14381 E).
+    assert_ne!(code, 0, "{v}");
+    assert!(v.to_string().contains("git wouldn't ignore it"), "{v}");
+    assert!(v.to_string().contains(".gitignore:1:"), "{v}");
+    assert!(!dir.join(".claude/settings.local.json").exists(), "{v}");
+    std::fs::remove_dir_all(&dir).expect("cleanup");
+
+    #[cfg(unix)]
+    {
+        let dir = temp("claude-hooks-linked-folder", true);
+        json(&dir, &["init", "--json"]);
+        std::fs::create_dir_all(dir.join("config")).expect("mkdir");
+        std::os::unix::fs::symlink("config", dir.join(".claude")).expect("ln");
+        let (code, v) = json(
+            &dir,
+            &["install", "--hooks", "--enable", "hooks:claude", "--json"],
+        );
+        // Git never ignores a path under a link: a new hook file there is
+        // refused too (#14381 E), and with no rule to name, says so
+        // (#14492).
+        assert_ne!(code, 0, "{v}");
+        assert!(
+            v.to_string().contains("git can't say it would ignore it"),
+            "{v}"
+        );
+        assert!(!dir.join("config/settings.local.json").exists(), "{v}");
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+}
+
+#[test]
 fn doctor_checks_each_enabled_hook_projection() {
     let dir = temp("doctor-hooks", true);
     json(&dir, &["init", "--json"]);
@@ -1488,7 +1947,7 @@ fn doctor_checks_each_enabled_hook_projection() {
     let (_, v) = json(&dir, &["doctor", "--json"]);
     assert_eq!(status_of(&v, "hooks"), "ok", "{v}");
     for (path, drift) in [
-        (".claude/settings.json", "{\"hooks\": {}}\n"),
+        (".claude/settings.local.json", "{\"hooks\": {}}\n"),
         (".opencode/plugins/mdkg/server.ts", "// drift\n"),
     ] {
         std::fs::write(dir.join(path), drift).expect("write");

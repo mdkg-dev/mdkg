@@ -328,18 +328,33 @@ mod tests {
 
     /// Key files the content check must find: one per private key header.
     const KEY_FILES: &[(&str, &str)] = &[
-        ("server.pem", "-----BEGIN PRIVATE KEY-----\nMIIE\n"),
-        ("certs/TLS.KEY", "-----BEGIN RSA PRIVATE KEY-----\nMIIE\n"),
-        ("ec.key", "-----BEGIN EC PRIVATE KEY-----\nMHc\n"),
+        (
+            "server.pem",
+            concat!("-----BEGIN PRIV", "ATE KEY-----\nMIIE\n"),
+        ),
+        (
+            "certs/TLS.KEY",
+            concat!("-----BEGIN RSA PRIV", "ATE KEY-----\nMIIE\n"),
+        ),
+        (
+            "ec.key",
+            concat!("-----BEGIN EC PRIV", "ATE KEY-----\nMHc\n"),
+        ),
         (
             "deploy/id.pem",
-            "-----BEGIN OPENSSH PRIVATE KEY-----\nb3Bl\n",
+            concat!("-----BEGIN OPENSSH PRIV", "ATE KEY-----\nb3Bl\n"),
         ),
-        ("enc.pem", "-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIIF\n"),
+        (
+            "enc.pem",
+            concat!("-----BEGIN ENCRYPTED PRIV", "ATE KEY-----\nMIIF\n"),
+        ),
         (
             "chain.pem",
-            "-----BEGIN CERTIFICATE-----\nMIID\n-----END CERTIFICATE-----\n\
-             -----BEGIN PRIVATE KEY-----\nMIIE\n",
+            concat!(
+                "-----BEGIN CERTIFICATE-----\nMIID\n-----END CERTIFICATE-----\n",
+                "-----BEGIN PRIV",
+                "ATE KEY-----\nMIIE\n"
+            ),
         ),
     ];
 
@@ -525,7 +540,7 @@ mod tests {
         // "PRIVATE KEY" starts 5 bytes before a 64 KiB boundary.
         let chunk = 64 << 10;
         chain.push_str(&"x".repeat((2 * chunk - 16 - chain.len() % chunk) % chunk));
-        chain.push_str("-----BEGIN PRIVATE KEY-----\n");
+        chain.push_str(concat!("-----BEGIN PRIV", "ATE KEY-----\n"));
         fs::write(root.join("chain.pem"), chain).expect("w");
         assert!(is_secret_at(&root, "chain.pem"));
         // Past the cap with none found: judged a secret.

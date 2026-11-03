@@ -20,6 +20,13 @@ use rusqlite::{
 
 use crate::git;
 
+/// "4" since the flow tables (edd-01a1878e: message links to nodes,
+/// supersession and expiry, the ledger's entries): a binary that predates
+/// them would send, ack and finish work around the flow rules (a `done`
+/// skipping its node's gate), so it must refuse the store. Opening a "3"
+/// store upgrades it in place, copying it first and adding the tables;
+/// nothing it held changes, and its chain goes on.
+///
 /// "3" since every write appends a record to the `log` chain:
 /// a binary that predates the log would change the state without a
 /// record, so it must refuse the store. Opening a "1" or "2" store
@@ -31,10 +38,10 @@ use crate::git;
 /// behind the journal's back. A lease or claim without a mode reads as
 /// exclusive. There is no way back: an older binary refuses an upgraded
 /// store.
-const SCHEMA_VERSION: &str = "3";
+const SCHEMA_VERSION: &str = "4";
 
 /// Versions this binary upgrades in place on open.
-const UPGRADES_FROM: &[&str] = &["1", "2"];
+const UPGRADES_FROM: &[&str] = &["1", "2", "3"];
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -89,6 +96,13 @@ pub enum StoreError {
         from: String,
         to: String,
     },
+    /// A reader found an upgradeable store and leaves it for a writer.
+    ReadUpgradeRequired {
+        from: String,
+        to: String,
+    },
+    /// A read-only handle cannot roll back a hot SQLite journal.
+    ReadRecoveryRequired(rusqlite::Error),
     /// The record chain can't be written or doesn't verify.
     Log(String),
 }
@@ -96,7 +110,18 @@ pub enum StoreError {
 impl fmt::Display for StoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            StoreError::Sqlite(e) => write!(f, "coordinator store: {e}"),
+            StoreError::Sqlite(e) => {
+                write!(f, "coordinator store: {e}")?;
+                if matches!(e, rusqlite::Error::SqliteFailure(code, _)
+                    if matches!(code.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked))
+                {
+                    write!(
+                        f,
+                        " (bounded lock wait; SQLite does not report the lock holder)"
+                    )?;
+                }
+                Ok(())
+            }
             StoreError::Io(e) => write!(f, "coordinator store: {e}"),
             StoreError::Json(e) => write!(f, "coordinator store: {e}"),
             StoreError::Schema(v) => write!(f, "coordinator store has unsupported schema {v}"),
@@ -125,6 +150,15 @@ impl fmt::Display for StoreError {
                 "this build runs from a Cargo build folder (or its location can't be checked), \
                  so it won't upgrade the existing coordinator store from {from} to {to}; only an \
                  installed build upgrades a store"
+            ),
+            StoreError::ReadUpgradeRequired { from, to } => write!(
+                f,
+                "the coordinator store needs an upgrade from {from} to {to}; this read left it unchanged"
+            ),
+            StoreError::ReadRecoveryRequired(error) => write!(
+                f,
+                "coordinator store needs SQLite journal recovery before this read: {error}; run a writing command such as `{} msg inbox`, then retry the read",
+                mdkg_format::program::BIN
             ),
             StoreError::Log(why) => write!(f, "coordinator log: {why}"),
         }
@@ -163,7 +197,8 @@ impl From<serde_json::Error> for StoreError {
 pub enum Upgrade {
     /// Upgrade an older store, copying it first.
     Allow,
-    /// Refuse with [`StoreError::UpgradeRefused`], changing nothing.
+    /// Refuse upgrades with [`StoreError::UpgradeRefused`]. Native SQLite
+    /// rollback recovery and WAL-index cache maintenance may still occur.
     Refuse,
 }
 
@@ -260,19 +295,32 @@ pub fn has_cargo_markers(exe: &Path) -> bool {
 pub struct Chained {
     pub first: Outcome,
     pub second: Option<Outcome>,
-    /// Both were recorded; false when the second was refused, which left
+    /// Both were recorded; false when the second was refused, or the
+    /// check before commit refused ([`Chained::checked`]), which left
     /// nothing recorded.
     pub recorded: bool,
+    /// False when the check run before the transaction commits (a
+    /// [`BeforeCommit`], such as a node's settle) refused it.
+    pub checked: bool,
 }
 
 /// What [`Store::execute_chain`] did: every outcome, in order.
 #[derive(Debug)]
 pub struct ChainOutcomes {
     pub outcomes: Vec<Outcome>,
-    /// All were recorded; false when a later one was refused, which left
-    /// nothing recorded.
+    /// All were recorded; false when a later one was refused, or the
+    /// check before commit refused, which left nothing recorded.
     pub recorded: bool,
+    /// False when the check before commit refused.
+    pub checked: bool,
 }
+
+/// A check run inside a write transaction once every command in it has
+/// applied, before it commits, over the same connection: `done`'s settle
+/// (A29 step 4), which evaluates the gate and appends `ledger.settle`
+/// there. `Ok(false)` refuses: the transaction rolls back and nothing is
+/// recorded; an error rolls it back too.
+pub type BeforeCommit<'h> = &'h mut dyn FnMut(&Connection) -> Result<bool, StoreError>;
 
 #[derive(Debug)]
 pub struct Store {
@@ -280,9 +328,14 @@ pub struct Store {
     /// Device/inode checked around SQLite's open. No independent descriptor:
     /// closing one could release this process's SQLite POSIX locks.
     file: Option<(u64, u64)>,
-    ttl: Ms,
+    pub(crate) ttl: Ms,
     /// The copy this open took before upgrading the store, if it did.
     backup: Option<PathBuf>,
+    /// Whether that copy settled for a plain fsync ([`PLAIN_FSYNC_ENV`]).
+    backup_weak: bool,
+    /// How long an acked `purge_on_ack` body is kept
+    /// ([`Store::set_ack_grace_days`]); 0 purges it at the ack.
+    pub(crate) ack_grace_ms: u64,
 }
 
 fn journal_seq(tx: &Connection) -> Result<i64, StoreError> {
@@ -354,6 +407,130 @@ fn meta(conn: &Connection, key: &str) -> Result<Option<String>, StoreError> {
         .optional()?)
 }
 
+type TableColumns = std::collections::BTreeMap<String, (String, bool, i64)>;
+
+fn table_columns(conn: &Connection, table: &str) -> Result<TableColumns, StoreError> {
+    Ok(conn
+        .prepare("SELECT name, upper(type), \"notnull\", pk FROM pragma_table_info(?1)")?
+        .query_map([table], |row| {
+            Ok((row.get(0)?, (row.get(1)?, row.get(2)?, row.get(3)?)))
+        })?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
+/// Require the recorded version's structure, and validate later known objects
+/// if present: the upgrade will reuse them instead of replacing their shape.
+fn check_coordinator_structure(conn: &Connection, schema: &str) -> Result<(), StoreError> {
+    let mail = meta(conn, "msg_schema")?;
+    let mail = match mail.as_deref() {
+        None => 0,
+        Some(version)
+            if version == crate::mail::MAIL_SCHEMA_VERSION
+                || crate::mail::UPGRADES_FROM.contains(&version) =>
+        {
+            version.parse::<u8>().map_err(|_| {
+                schema_error("msg_schema", version, crate::mail::MAIL_SCHEMA_VERSION)
+            })?
+        }
+        Some(version) => {
+            return Err(schema_error(
+                "msg_schema",
+                version,
+                crate::mail::MAIL_SCHEMA_VERSION,
+            ));
+        }
+    };
+    // Build the reference in memory: validation never runs schema DDL on
+    // the candidate database. These are the definitions used by creation.
+    let reference = Connection::open_in_memory()?;
+    reference.execute_batch(SCHEMA)?;
+    reference.execute_batch(crate::mail::MAIL_SCHEMA)?;
+    reference.execute_batch(crate::ledger::LEDGER_SCHEMA)?;
+    let mut tables = vec![
+        ("meta", true),
+        ("journal", true),
+        ("state", true),
+        ("events", true),
+    ];
+    tables.push(("log", matches!(schema, "3" | "4")));
+    tables.extend(
+        [
+            "msg_links",
+            "msg_meta",
+            "msg_deferred",
+            "entries",
+            "entry_events",
+        ]
+        .map(|table| (table, schema == "4")),
+    );
+    tables.extend(
+        [
+            "msg_rooms",
+            "msg_members",
+            "msg_messages",
+            "msg_bodies",
+            "msg_deliveries",
+        ]
+        .map(|table| (table, mail > 0)),
+    );
+    tables.push(("msg_decisions", mail >= 5));
+    for (table, required_table) in tables {
+        let kind: Option<String> = conn
+            .query_row(
+                "SELECT type FROM sqlite_master WHERE name=?1",
+                [table],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if kind.is_none() && !required_table {
+            continue;
+        }
+        if kind.as_deref() != Some("table") {
+            return Err(StoreError::BadMeta(format!(
+                "schema {schema}: missing table {table}"
+            )));
+        }
+        let required = table_columns(&reference, table)?;
+        let actual = table_columns(conn, table)?;
+        for (column, shape) in required {
+            let required_column = match (table, column.as_str()) {
+                ("msg_messages", "request_digest") => mail >= 2,
+                ("msg_deliveries", "acked_via") => mail >= 3,
+                ("msg_deliveries", "shown_ms") => mail >= 4,
+                _ => true,
+            };
+            if !actual.contains_key(&column) && !required_column {
+                continue;
+            }
+            if actual.get(&column) != Some(&shape) {
+                return Err(StoreError::BadMeta(format!(
+                    "schema {schema}: incompatible column {table}.{column}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Only an empty database may acquire a coordinator schema. Existing objects
+/// must already name a supported coordinator version before any DDL or journal
+/// mode change, and again inside the initialization/upgrade write transaction.
+fn check_initializable(conn: &Connection) -> Result<(), StoreError> {
+    if let Some(schema) = meta(conn, "schema")? {
+        return if schema == SCHEMA_VERSION || UPGRADES_FROM.contains(&schema.as_str()) {
+            check_coordinator_structure(conn, &schema)
+        } else {
+            Err(schema_error("schema", &schema, SCHEMA_VERSION))
+        };
+    }
+    if conn.prepare("SELECT 1 FROM sqlite_master")?.exists([])? {
+        return Err(StoreError::BadMeta(
+            "schema (missing in a nonempty database)".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// The upgrade opening this store makes, as `(from, to)` labels: none for a
 /// new store, one at this build's versions, or one no build here reads.
 fn upgrade_of(conn: &Connection) -> Result<Option<(String, String)>, StoreError> {
@@ -381,11 +558,8 @@ fn upgrade_of(conn: &Connection) -> Result<Option<(String, String)>, StoreError>
 /// checkpoint a WAL a crashed writer left when it closes. A store that
 /// doesn't exist yet needs none.
 fn probe_upgrade(path: &Path) -> Result<Option<(String, String)>, StoreError> {
-    match std::fs::metadata(path) {
-        Ok(m) if m.len() > 0 => {}
-        Ok(_) => return Ok(None),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e.into()),
+    if !store_file_present(path)? {
+        return Ok(None);
     }
     let probe = |flags: OpenFlags| -> Result<Option<(String, String)>, StoreError> {
         let probe = open_durable(path, flags | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
@@ -393,6 +567,7 @@ fn probe_upgrade(path: &Path) -> Result<Option<(String, String)>, StoreError> {
             rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
             true,
         )?;
+        check_initializable(&probe)?;
         upgrade_of(&probe)
     };
     match probe(OpenFlags::SQLITE_OPEN_READ_ONLY) {
@@ -406,6 +581,28 @@ fn probe_upgrade(path: &Path) -> Result<Option<(String, String)>, StoreError> {
         }
         other => other,
     }
+}
+
+/// The versions the store at `path` holds, as a label (`3+msg5`), to
+/// compare with [`build_label`]; `None` for a store that doesn't exist yet
+/// or has no schema. Read only, as [`probe_upgrade`] reads, but never
+/// through a writer: a hot rollback journal is an error here.
+pub fn stored_label(path: &Path) -> Result<Option<String>, StoreError> {
+    if !store_file_present(path)? {
+        return Ok(None);
+    }
+    let probe = open_durable(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    probe.set_db_config(
+        rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+        true,
+    )?;
+    let Some(schema) = meta(&probe, "schema")? else {
+        return Ok(None);
+    };
+    Ok(Some(label(&schema, meta(&probe, "msg_schema")?.as_deref())))
 }
 
 /// Where the copies of the store at `path` go: beside it, as
@@ -438,20 +635,98 @@ fn backup_path(path: &Path, from: &str, to: &str) -> PathBuf {
 /// cache. The coordinator writes rarely, so the cost is a few ms a
 /// command. Set on every connection, read-only ones included, so no path
 /// opens one with weaker settings.
-fn open_durable(path: &Path, flags: OpenFlags) -> rusqlite::Result<Connection> {
+pub(crate) fn open_durable(path: &Path, flags: OpenFlags) -> rusqlite::Result<Connection> {
+    open_durable_wait(path, flags, BUSY_WAIT)
+}
+
+/// A missing/zero regular file is absent; an unreachable store link needs
+/// repair, not initialization. Never let SQLite inspect a zero-page artifact:
+/// its read-only pager may otherwise delete an existing WAL.
+pub(crate) fn store_file_present(path: &Path) -> std::io::Result<bool> {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            for ancestor in path.ancestors() {
+                match std::fs::symlink_metadata(ancestor) {
+                    Ok(metadata) if metadata.is_symlink() => {
+                        if let Err(error) = std::fs::metadata(ancestor) {
+                            return Err(std::io::Error::new(
+                                error.kind(),
+                                format!(
+                                    "coordinator store has an unreachable link at {}; restore its target before retrying",
+                                    ancestor.display()
+                                ),
+                            ));
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            return Ok(false);
+        }
+        Err(error) => return Err(error),
+    };
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "coordinator store is not a regular file",
+        ));
+    }
+    Ok(metadata.len() > 0)
+}
+
+fn open_durable_wait(
+    path: &Path,
+    flags: OpenFlags,
+    wait: Duration,
+) -> rusqlite::Result<Connection> {
+    if flags.contains(OpenFlags::SQLITE_OPEN_READ_ONLY) {
+        match store_file_present(path) {
+            Ok(true) => {}
+            Ok(false) => return Err(rusqlite::Error::InvalidPath(path.to_path_buf())),
+            Err(error) => {
+                return Err(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN),
+                    Some(error.to_string()),
+                ));
+            }
+        }
+    }
     let conn = Connection::open_with_flags(path, flags)?;
     // Before anything else touches the file: every statement after this
     // waits for a busy store instead of failing at once. Callers that must
     // not wait (restore) set their own afterwards.
-    conn.busy_timeout(BUSY_WAIT)?;
+    conn.busy_timeout(wait)?;
+    durable_settings(&conn)?;
+    Ok(conn)
+}
+
+fn durable_settings(conn: &Connection) -> rusqlite::Result<()> {
     conn.pragma_update(None, "synchronous", "FULL")?;
     conn.pragma_update(None, "fullfsync", true)?;
     conn.pragma_update(None, "checkpoint_fullfsync", true)?;
-    Ok(conn)
+    Ok(())
 }
 
 /// How long a store connection waits for another process's lock.
 const BUSY_WAIT: Duration = Duration::from_secs(30);
+
+/// Polling status must fail promptly even when an exclusive locker prevents reads.
+const READ_BUSY_WAIT: Duration = Duration::from_secs(5);
+
+fn read_only_error(error: StoreError) -> StoreError {
+    match error {
+        StoreError::Sqlite(error)
+            if matches!(&error, rusqlite::Error::SqliteFailure(code, _)
+                if matches!(code.extended_code, rusqlite::ffi::SQLITE_READONLY_RECOVERY | rusqlite::ffi::SQLITE_READONLY_ROLLBACK)) =>
+        {
+            StoreError::ReadRecoveryRequired(error)
+        }
+        other => other,
+    }
+}
 
 /// Moves the store to WAL mode, if it isn't there already. SQLite never
 /// waits on its busy handler for a journal-mode change, so a plain
@@ -479,22 +754,59 @@ fn to_wal(conn: &Connection) -> Result<(), StoreError> {
     }
 }
 
-/// Syncs a file to the disk. A filesystem that can't (some network and FUSE
-/// mounts reject macOS's F_FULLFSYNC as unsupported) is left unsynced
-/// rather than failing the upgrade; I/O errors still fail it.
-fn sync(file: &File) -> std::io::Result<()> {
-    match file.sync_all() {
-        Err(e)
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::Unsupported | std::io::ErrorKind::InvalidInput
-            ) || (cfg!(target_vendor = "apple") && e.raw_os_error() == Some(45)) =>
-        {
-            // ENOTSUP (45 on Apple, where std doesn't call it unsupported):
-            // what SMB mounts answer to F_FULLFSYNC.
-            Ok(())
+/// The documented override for file systems with no full sync barrier:
+/// `MDKG_STORE_PLAIN_FSYNC=1` lets a backup copy settle for a plain
+/// `fsync` where `F_FULLFSYNC` (or `fsync` itself) is refused as
+/// unsupported. A plain macOS `fsync` can leave data in the drive's cache,
+/// so this is a weaker guarantee, and an upgrade that relied on it records
+/// it in the upgraded store (`meta.upgrade_barrier = "fsync"`) and says so.
+pub const PLAIN_FSYNC_ENV: &str = "MDKG_STORE_PLAIN_FSYNC";
+
+#[cfg(not(test))]
+fn plain_fsync_allowed() -> bool {
+    std::env::var_os(PLAIN_FSYNC_ENV).is_some_and(|v| v == "1")
+}
+
+#[cfg(test)]
+thread_local! {
+    static PLAIN_FSYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn plain_fsync_allowed() -> bool {
+    PLAIN_FSYNC.with(std::cell::Cell::get)
+}
+
+/// Syncs a backup copy, or its folder, with the full barrier, refusing
+/// every failure: a copy an upgrade relies on is durable or the upgrade
+/// doesn't start (edd-01a1878e, Storage; Terra's reviews of
+/// e821ea6e..a1412008, finding 3, and of 070dc919..0bf4a12a, finding 6).
+/// Where the full barrier isn't offered (`F_FULLFSYNC` on an SMB mount
+/// answers ENOTSUP; some file systems answer EINVAL) it refuses, unless
+/// [`PLAIN_FSYNC_ENV`] accepts a plain `fsync`. Returns whether it settled
+/// for the plain one.
+fn sync(file: &File, step: &'static str) -> std::io::Result<bool> {
+    let unsupported = |e: &std::io::Error| {
+        matches!(
+            e.kind(),
+            std::io::ErrorKind::Unsupported | std::io::ErrorKind::InvalidInput
+        ) || (cfg!(target_vendor = "apple") && e.raw_os_error() == Some(45))
+    };
+    match injected_io(step).and_then(|()| file.sync_all()) {
+        Ok(()) => Ok(false),
+        Err(e) if unsupported(&e) && plain_fsync_allowed() => {
+            rustix::fs::fsync(file).map_err(std::io::Error::from)?;
+            Ok(true)
         }
-        other => other,
+        Err(e) if unsupported(&e) => Err(std::io::Error::new(
+            e.kind(),
+            format!(
+                "this file system offers no full sync barrier ({e}), so the copy can't be made \
+                 durable; {PLAIN_FSYNC_ENV}=1 accepts a plain fsync, a weaker guarantee the \
+                 store records"
+            ),
+        )),
+        Err(e) => Err(e),
     }
 }
 
@@ -549,6 +861,91 @@ fn restore_image(source: &Connection, current: u64) -> Result<Connection, StoreE
     Ok(image)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// A step at which this thread's next store open fails, for the
+    /// upgrade's fault-injection tests.
+    static FAIL_AT: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+    static PAUSE_CREATION: std::cell::RefCell<Option<(&'static str, PathBuf)>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn injected(step: &'static str) -> Result<(), StoreError> {
+    PAUSE_CREATION.with(|hook| {
+        if let Some((phase, ready)) = hook.borrow().as_ref()
+            && *phase == step
+        {
+            std::fs::write(ready, b"ready").expect("creation checkpoint");
+            loop {
+                std::thread::park();
+            }
+        }
+    });
+    if FAIL_AT.with(|f| f.get()) == Some(step) {
+        return Err(StoreError::Io(std::io::Error::other(format!(
+            "injected failure at {step}"
+        ))));
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn injected(_step: &'static str) -> Result<(), StoreError> {
+    Ok(())
+}
+
+/// Makes the store's entry in its folder, and the folder's entry in its
+/// parent (the folder may be new: `open_between` creates it, Terra #16445),
+/// durable.
+fn sync_store_entries(dir: &Path) -> Result<(), StoreError> {
+    sync_entry(dir, "store_folder_sync")?;
+    if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+        sync_entry(parent, "store_parent_sync")?;
+    }
+    Ok(())
+}
+
+/// Syncs one folder; a test's injected failure replaces the sync's own
+/// result, so a caller that dropped the result would be caught.
+fn sync_entry(dir: &Path, step: &'static str) -> Result<(), StoreError> {
+    let result = File::open(dir).and_then(|folder| folder.sync_all());
+    #[cfg(test)]
+    let result = if FAIL_AT.with(|f| f.get()) == Some(step) {
+        Err(std::io::Error::other(format!("injected failure at {step}")))
+    } else {
+        result
+    };
+    #[cfg(not(test))]
+    let _ = step;
+    Ok(result?)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Every sync on this thread fails as unsupported (no full barrier
+    /// anywhere), so a test can also inject a failure at another step.
+    static NO_BARRIER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// [`injected`] for a sync: the step fails as a file system that offers
+/// no full barrier would, with an unsupported error, so a test shows it
+/// is refused, or, with the override, settled for a plain fsync.
+#[cfg(test)]
+fn injected_io(step: &'static str) -> std::io::Result<()> {
+    if FAIL_AT.with(|f| f.get()) == Some(step) || NO_BARRIER.with(std::cell::Cell::get) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!("injected unsupported sync at {step}"),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn injected_io(_step: &'static str) -> std::io::Result<()> {
+    Ok(())
+}
+
 /// Copies the store `conn` has open (at `path`, with no transaction of its
 /// own open) with SQLite's backup API, syncs the copy and its folder, and
 /// marks it with the store it came from. Written under a temporary name
@@ -556,6 +953,144 @@ fn restore_image(source: &Connection, current: u64) -> Result<Connection, StoreE
 /// exists is complete, and two copies taken at once (snapshots hold no
 /// lock) each land whole under their own names.
 fn back_up(conn: &Connection, path: &Path, from: &str, to: &str) -> Result<PathBuf, StoreError> {
+    back_up_noting(conn, path, from, to).map(|(copy, _)| copy)
+}
+
+/// Syncs a copy's folder ([`sync`]), saying whether it settled for a plain
+/// `fsync`.
+fn sync_folder(dir: &Path, step: &'static str) -> Result<bool, StoreError> {
+    File::open(dir)
+        .and_then(|d| sync(&d, step))
+        .map_err(|e| StoreError::Backup(format!("can't sync the copy's folder: {e}")))
+}
+
+/// The proof beside a copy (`<copy>.synced`) that its final folder
+/// barrier held: the copy's own generation (a random id written into its
+/// `meta.backup_generation` before it was published), with its
+/// inode, length and modification time, so a proof never vouches for
+/// another file under the same name, a replacement on a file system that
+/// reuses inodes included (Terra's code review #8466, with the
+/// orchestrator's call). Device numbers change across reboots/remounts and
+/// are not durable identity. A proof goes whenever its copy does
+/// ([`remove_copy`]).
+fn proof_path(copy: &Path) -> PathBuf {
+    let mut name = copy.as_os_str().to_owned();
+    name.push(".synced");
+    PathBuf::from(name)
+}
+
+/// Removes a copy and, in the same step, its proof.
+fn remove_copy(copy: &Path) {
+    std::fs::remove_file(copy).ok();
+    std::fs::remove_file(proof_path(copy)).ok();
+}
+
+fn proof_of(copy: &Path, generation: &str) -> std::io::Result<String> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::symlink_metadata(copy)?;
+    if !m.is_file() {
+        return Err(std::io::Error::other("a copy is a file"));
+    }
+    Ok(format!(
+        "mdkg-copy-synced gen={generation} ino={} len={} mtime={}.{}\n",
+        m.ino(),
+        m.len(),
+        m.mtime(),
+        m.mtime_nsec()
+    ))
+}
+
+fn proof_matches(found: &str, expected: &str) -> bool {
+    if found == expected {
+        return true;
+    }
+    // Old proofs persisted the device as well. Ignore only that decimal
+    // field; every stable field, including generation and inode, must match.
+    let Some((prefix, rest)) = found.split_once(" dev=") else {
+        return false;
+    };
+    let Some((device, suffix)) = rest.split_once(' ') else {
+        return false;
+    };
+    !device.is_empty()
+        && device.bytes().all(|b| b.is_ascii_digit())
+        && device.parse::<u64>().is_ok()
+        && format!("{prefix} {suffix}") == expected
+}
+
+/// Writes `copy`'s proof, new (never through a link or over another
+/// file), synced, with its folder.
+fn write_proof(copy: &Path, generation: &str) -> Result<(), StoreError> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let text = proof_of(copy, generation)?;
+    let proof = proof_path(copy);
+    // A proof left by an earlier copy of this name can't vouch for this
+    // one (another generation): it goes, so this copy isn't left weak
+    // (Opus's code review #8408).
+    if std::fs::symlink_metadata(&proof).is_ok() {
+        std::fs::remove_file(&proof)?;
+    }
+    let written = (|| -> Result<(), StoreError> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
+            .open(&proof)?;
+        file.write_all(text.as_bytes())?;
+        if sync(&file, "proof_sync")? {
+            return Err(StoreError::Backup(
+                "the proof settled for a plain fsync".into(),
+            ));
+        }
+        let dir = proof.parent().unwrap_or(Path::new("."));
+        if sync_folder(dir, "proof_folder")? {
+            return Err(StoreError::Backup(
+                "the proof settled for a plain fsync".into(),
+            ));
+        }
+        Ok(())
+    })();
+    if written.is_err() {
+        std::fs::remove_file(&proof).ok();
+    }
+    written
+}
+
+/// A copy's barrier as its readers take it: its own `backup_barrier`
+/// mark, lifted only by a proof that matches the copy and its generation
+/// ([`write_proof`]). A copy from before proofs, with no mark, reads as
+/// it always did.
+fn copy_barrier(copy: &Path, marked: Option<String>, generation: Option<&str>) -> Option<String> {
+    let proven = || {
+        let Some(generation) = generation.filter(|g| !g.is_empty()) else {
+            return false;
+        };
+        let Ok(meta) = std::fs::symlink_metadata(proof_path(copy)) else {
+            return false;
+        };
+        meta.is_file()
+            && meta.len() < 512
+            && std::fs::read_to_string(proof_path(copy))
+                .ok()
+                .zip(proof_of(copy, generation).ok())
+                .is_some_and(|(found, want)| proof_matches(&found, &want))
+    };
+    match marked {
+        Some(m) if m == "fsync" && proven() => None,
+        m => m,
+    }
+}
+
+/// [`back_up`], saying whether a sync settled for a plain `fsync`
+/// ([`PLAIN_FSYNC_ENV`]).
+fn back_up_noting(
+    conn: &Connection,
+    path: &Path,
+    from: &str,
+    to: &str,
+) -> Result<(PathBuf, bool), StoreError> {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let fail = |e: &dyn fmt::Display| StoreError::Backup(e.to_string());
     let of = std::fs::canonicalize(path).map_err(|e| fail(&e))?;
@@ -568,6 +1103,13 @@ fn back_up(conn: &Connection, path: &Path, from: &str, to: &str) -> Result<PathB
         std::process::id(),
         NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
     ));
+    let mut weak = false;
+    // This copy's own generation, which its proof must name.
+    let generation = mdkg_format::Digest::of_bytes(
+        format!("{}-{}", mdkg_format::Uuid7::now(), partial.display()).as_bytes(),
+    )
+    .hex()[..32]
+        .to_string();
     let result = (|| -> Result<PathBuf, StoreError> {
         let mut copy = open_durable(
             &partial,
@@ -581,10 +1123,34 @@ fn back_up(conn: &Connection, path: &Path, from: &str, to: &str) -> Result<PathB
             "INSERT OR REPLACE INTO meta (key, value) VALUES ('backup_of', ?1)",
             [of.to_string_lossy()],
         )?;
+        // Born marked weak, and the copy itself never loses the mark: the
+        // marker is this copy's own (never one the source inherited from
+        // a weak restore; Opus's code review #6264, finding 1), and a copy
+        // reads as fully synced only beside the proof written once the
+        // final folder barrier held ([`copy_barrier`]). So a lost write, a
+        // reader listing it before that barrier, or a removal that a crash
+        // undoes, leaves a copy marked weak, never strong (Terra's code
+        // reviews #6874, finding 3, and #7598, finding 1, with the
+        // orchestrator's call).
+        copy.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('backup_barrier', 'fsync')",
+            [],
+        )?;
+        copy.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('backup_generation', ?1)",
+            [&generation],
+        )?;
         copy.close().map_err(|(_, e)| e)?;
-        sync(&File::open(&partial)?)?;
+        weak |= sync(&File::open(&partial)?, "copy_sync")?;
+        // The folder's barrier, tried before the publish (which also makes
+        // the partial's own name durable; Terra's code review #6273,
+        // finding 1).
+        let dir = partial.parent().unwrap_or(Path::new("."));
+        weak |= sync_folder(dir, "copy_folder_barrier")?;
         // Published under the first free name: a link fails rather than
-        // replace a copy another process published there first.
+        // replace a copy another process published there first. Nothing is
+        // written to the copy after this (Terra's code review #6874,
+        // findings 1 and 4).
         let target = loop {
             let target = backup_path(path, from, to);
             match std::fs::hard_link(&partial, &target) {
@@ -594,18 +1160,31 @@ fn back_up(conn: &Connection, path: &Path, from: &str, to: &str) -> Result<PathB
             }
         };
         std::fs::remove_file(&partial).ok();
-        // As SQLite does: a folder that can't be synced doesn't fail it.
-        if let Some(dir) = target.parent()
-            && let Ok(dir) = File::open(dir)
-        {
-            sync(&dir).ok();
+        // The copy's name, and the partial's removal, are durable only once
+        // the folder is synced. A copy whose folder can't be synced isn't
+        // one to rely on: its name is removed again, and should a crash
+        // undo that removal, the copy is still marked weak (Terra's code
+        // reviews #6874, findings 1 and 2, and #7598, finding 1).
+        let synced =
+            injected("copy_folder_sync").and_then(|()| sync_folder(dir, "copy_folder_published"));
+        match synced {
+            Ok(later_weak) => weak |= later_weak,
+            Err(e) => {
+                remove_copy(&target);
+                return Err(e);
+            }
+        }
+        // Every barrier held: the proof beside it lifts the mark. A proof
+        // that can't be written leaves the copy weak, never failed.
+        if !weak && write_proof(&target, &generation).is_err() {
+            weak = true;
         }
         Ok(target)
     })();
     if result.is_err() {
         std::fs::remove_file(&partial).ok();
     }
-    result.map_err(|e| fail(&e))
+    result.map(|copy| (copy, weak)).map_err(|e| fail(&e))
 }
 
 /// Copies the store at `path` beside it, as an upgrade does, named
@@ -642,6 +1221,9 @@ pub struct BackupInfo {
     pub backup_of: Option<String>,
     /// The store's own id, as the copy carries it.
     pub store_id: Option<String>,
+    /// `fsync` when the copy was synced with a plain fsync only, under
+    /// [`PLAIN_FSYNC_ENV`]: a weaker guarantee than the full barrier.
+    pub barrier: Option<String>,
     pub bytes: u64,
     pub modified_ms: u64,
 }
@@ -702,6 +1284,11 @@ pub fn backups(path: &Path) -> Result<Vec<BackupInfo>, StoreError> {
             msg_schema: value("msg_schema"),
             backup_of: value("backup_of"),
             store_id: value("store_id"),
+            barrier: copy_barrier(
+                &entry.path(),
+                value("backup_barrier"),
+                value("backup_generation").as_deref(),
+            ),
             bytes: meta_fs.len(),
             modified_ms: meta_fs
                 .modified()
@@ -726,6 +1313,10 @@ pub struct Restored {
     /// A copy of the store as it was just before, so a restore can be
     /// undone the same way.
     pub previous: PathBuf,
+    /// Whether that copy settled for a plain fsync ([`PLAIN_FSYNC_ENV`]).
+    pub previous_weak: bool,
+    /// `fsync` when the restored copy itself was synced that way.
+    pub from_barrier: Option<String>,
 }
 
 /// Restores the store at `path` from `copy`, one of its own copies:
@@ -769,6 +1360,11 @@ fn restore_checked(
         return Err(refuse(format!("{} is damaged: {ok}", copy.display())));
     }
     let theirs = meta(&source, "store_id")?;
+    let from_barrier = copy_barrier(
+        copy,
+        meta(&source, "backup_barrier")?,
+        meta(&source, "backup_generation")?.as_deref(),
+    );
     match meta(&source, "backup_of")? {
         Some(b) if copy_of(path, copy, Some(&b), theirs.as_deref()) => {}
         Some(b) => {
@@ -869,7 +1465,7 @@ fn restore_checked(
     // store as it was but in rollback mode: each one puts the store's own
     // journal mode back, and says so if it can't (the store is valid
     // either way).
-    let prepared = (|| -> Result<(String, PathBuf), StoreError> {
+    let prepared = (|| -> Result<(String, PathBuf, bool), StoreError> {
         // Held until this connection closes: nothing opens it in between.
         store
             .execute_batch("PRAGMA locking_mode = EXCLUSIVE; BEGIN EXCLUSIVE; COMMIT;")
@@ -886,21 +1482,30 @@ fn restore_checked(
             meta(&store, "msg_schema")?.as_deref(),
         );
         let incoming = restore_image(&source, restore_generation(&store)?)?;
-        let previous = back_up(&store, path, &replaced, "restore")
+        let (previous, previous_weak) = back_up_noting(&store, path, &replaced, "restore")
             .map_err(|e| refuse(format!("the store couldn't be copied first: {e}")))?;
-        if let Err(e) = copy_all(&incoming, &mut store) {
+        if let Err(e) = injected("restore_write").and_then(|()| copy_all(&incoming, &mut store)) {
             // One transaction, but a failure while SQLite finishes it (a
             // failed sync after the journal is cleared) can leave the copy
-            // landed: so the store as it was stays, and the error says so.
+            // landed: so the store as it was stays, and the error says so,
+            // and how far that copy can be trusted (Terra's code review
+            // #6273, finding 2).
+            let weak = if previous_weak {
+                " (synced with a plain fsync only: a power loss can lose it, so take a \
+                 snapshot of whichever store you keep, without MDKG_STORE_PLAIN_FSYNC, once \
+                 this is settled)"
+            } else {
+                ""
+            };
             return Err(refuse(format!(
                 "the copy failed ({e}), and may have landed in part or whole; the store as it \
-                 was is at {}, which `store restore` puts back",
+                 was is at {}{weak}, which `store restore` puts back",
                 previous.display()
             )));
         }
-        Ok((replaced, previous))
+        Ok((replaced, previous, previous_weak))
     })();
-    let (replaced, previous) = match prepared {
+    let (replaced, previous, previous_weak) = match prepared {
         Ok(done) => done,
         Err(e) => {
             // Through a fresh connection: in exclusive locking mode SQLite
@@ -934,7 +1539,10 @@ fn restore_checked(
     };
     // Landed: what follows is tidying, which can't make it fail.
     let tidied = store
-        .execute("DELETE FROM meta WHERE key = 'backup_of'", [])
+        .execute(
+            "DELETE FROM meta WHERE key IN ('backup_of', 'backup_barrier', 'backup_generation')",
+            [],
+        )
         .is_ok();
     // Exclusive locking mode keeps the rollback journal (zeroed, so not
     // hot), with page images of the store as it was: removed while the
@@ -956,6 +1564,8 @@ fn restore_checked(
         replaced,
         restored: label(&schema, mail.as_deref()),
         previous,
+        previous_weak,
+        from_barrier,
     })
 }
 
@@ -973,7 +1583,13 @@ fn schema_error(key: &str, version: &str, ours: &str) -> StoreError {
     }
 }
 
-fn load(conn: &Connection, ttl: Ms) -> Result<(i64, Coordinator), StoreError> {
+/// The coordinator state as `conn`'s transaction reads it: the lease
+/// state an entry op's class is judged on (A27 rule 4).
+pub(crate) fn coordinator_in(conn: &Connection) -> Result<Coordinator, StoreError> {
+    Ok(load(conn, 0)?.1)
+}
+
+pub(crate) fn load(conn: &Connection, ttl: Ms) -> Result<(i64, Coordinator), StoreError> {
     check_schema(conn)?;
     let row: Option<(i64, String)> = conn
         .query_row("SELECT seq, coordinator FROM state WHERE id = 1", [], |r| {
@@ -996,6 +1612,193 @@ fn load(conn: &Connection, ttl: Ms) -> Result<(i64, Coordinator), StoreError> {
 }
 
 impl Store {
+    /// Records an already-read observation on a fresh, zero-wait connection.
+    /// Never creates/upgrades/repairs a store, expires leases, or runs Git.
+    /// `Some(reason)` means the observation was deferred without a write.
+    pub fn try_record_observation(
+        path: &Path,
+        observation: &Observation,
+    ) -> Result<Option<&'static str>, StoreError> {
+        let attempt = || -> Result<Option<&'static str>, StoreError> {
+            let mut conn = Connection::open_with_flags(
+                path,
+                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )?;
+            conn.busy_timeout(Duration::ZERO)?;
+            conn.set_db_config(
+                rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+                true,
+            )?;
+            durable_settings(&conn)?;
+            conn.pragma_update(None, "wal_autocheckpoint", 0)?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            check_mail_schema(&tx)?;
+            let ttl: String =
+                tx.query_row("SELECT value FROM meta WHERE key = 'ttl'", [], |r| r.get(0))?;
+            let ttl = ttl.parse().map_err(|_| StoreError::BadMeta("ttl".into()))?;
+            let (seq, mut state) = load(&tx, ttl)?;
+            if state.generation() != observation.read_generation {
+                return Ok(Some("coordinator changed"));
+            }
+            let before = state.clone();
+            let command = Command::ObserveMain {
+                observation: observation.clone(),
+            };
+            let outcome = state.apply(&command);
+            if matches!(outcome, Outcome::Refused { .. }) {
+                return Ok(Some("coordinator changed"));
+            }
+            if state == before {
+                return Ok(None);
+            }
+            Self::save(&tx, seq + 1, &command, &outcome, &mut state)?;
+            tx.commit()?;
+            Ok(None)
+        };
+        match attempt() {
+            Err(StoreError::Sqlite(rusqlite::Error::SqliteFailure(code, _)))
+                if matches!(
+                    code.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                ) =>
+            {
+                Ok(Some("store busy"))
+            }
+            Err(StoreError::Schema(_) | StoreError::BadMeta(_)) => Ok(Some("schema not current")),
+            other => other,
+        }
+    }
+
+    /// Opens an existing coordinator for queries only. Never creates,
+    /// upgrades, repairs, changes journal mode or checkpoints the store.
+    /// A missing or zero-object store reads as absent. Hot journals require a
+    /// writer and return `ReadRecoveryRequired`. Each lock wait is at most 5 s.
+    /// SQLite may maintain its WAL-index cache files during a read.
+    pub fn open_read_only(path: &Path) -> Result<Option<Self>, StoreError> {
+        Self::read_only_inner(path).map_err(read_only_error)
+    }
+
+    /// A guarded read handle without version validation, for diagnostics and
+    /// migrations inspecting older schemas. Missing/uninitialized stores are
+    /// absent; SQLite may maintain WAL-index caches, never logical contents.
+    pub fn open_raw_read_only(path: &Path) -> Result<Option<Connection>, StoreError> {
+        let read = || -> Result<Option<Connection>, StoreError> {
+            if !store_file_present(path)? {
+                return Ok(None);
+            }
+            let conn = open_durable_wait(
+                path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                READ_BUSY_WAIT,
+            )?;
+            conn.set_db_config(
+                rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+                true,
+            )?;
+            if !conn.prepare("SELECT 1 FROM sqlite_master")?.exists([])? {
+                return Ok(None);
+            }
+            Ok(Some(conn))
+        };
+        read().map_err(read_only_error)
+    }
+
+    /// Event readers share the same absence, schema and journal validation.
+    pub(crate) fn open_read_only_connection(path: &Path) -> Result<Option<Connection>, StoreError> {
+        Ok(Self::open_read_only(path)?.map(|store| store.conn))
+    }
+
+    fn read_only_inner(path: &Path) -> Result<Option<Self>, StoreError> {
+        let before = crate::activity::identity_at(path)?;
+        let Some(conn) = Self::open_raw_read_only(path)? else {
+            return Ok(None);
+        };
+        let file = crate::activity::identity_at(path)?;
+        if before != file {
+            return Err(crate::activity::replaced());
+        }
+        let tx = conn.unchecked_transaction()?;
+        if let Some((from, to)) = upgrade_of(&tx)? {
+            return Err(StoreError::ReadUpgradeRequired { from, to });
+        }
+        check_mail_schema(&tx)?;
+        let ttl: String =
+            tx.query_row("SELECT value FROM meta WHERE key = 'ttl'", [], |r| r.get(0))?;
+        let ttl = ttl
+            .parse()
+            .map_err(|_| StoreError::BadMeta(format!("ttl {ttl}")))?;
+        tx.finish()?;
+        Ok(Some(Self {
+            conn,
+            file,
+            ttl,
+            backup: None,
+            backup_weak: false,
+            ack_grace_ms: 0,
+        }))
+    }
+
+    /// Keep the public name absent until all initial schema and metadata are
+    /// committed in one private rollback-mode database. Concurrent creators
+    /// publish without replacing each other's stores; unpublished crash debris
+    /// is private and is never opened as the coordinator.
+    fn create_if_missing(path: &Path, ttl: Ms) -> Result<(), StoreError> {
+        let dir = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        if path.try_exists()? {
+            // A store found published may follow a creation whose entry
+            // syncs failed: they are made durable again before any write is
+            // acknowledged (Terra #16575). Idempotent.
+            return sync_store_entries(dir);
+        }
+        let staging = dir.join(format!(".mdkg-store-{}", mdkg_format::Uuid7::now()));
+        let mut folder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+            folder.mode(0o700);
+        }
+        folder.create(&staging)?;
+        let temporary = staging.join("coord.sqlite");
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options
+                .mode(0o600)
+                .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32);
+        }
+        let result = (|| -> Result<(), StoreError> {
+            drop(options.open(&temporary)?);
+            injected("creation_file")?;
+            let mut conn = open_durable(&temporary, OpenFlags::default())?;
+            conn.pragma_update(None, "journal_mode", "DELETE")?;
+            injected("creation_opened")?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let mut committing = false;
+            Self::finish_open(tx, path, ttl, false, &mut committing)?;
+            conn.close().map_err(|(_, error)| error)?;
+            File::open(&temporary)?.sync_all()?;
+            match rustix::fs::renameat_with(
+                rustix::fs::CWD,
+                &temporary,
+                rustix::fs::CWD,
+                path,
+                rustix::fs::RenameFlags::NOREPLACE,
+            ) {
+                Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+                Err(error) => return Err(std::io::Error::from(error).into()),
+            }
+            injected("creation_published")?;
+            sync_store_entries(dir)
+        })();
+        let _ = std::fs::remove_dir_all(&staging);
+        result
+    }
+
     /// Opens the store at `path`, creating it if needed. `ttl` (the lease
     /// length) is fixed when the store is created; an existing store keeps
     /// its own. An older store is upgraded only as
@@ -1018,19 +1821,37 @@ impl Store {
         upgrade: Upgrade,
         between: impl FnOnce(),
     ) -> Result<Self, StoreError> {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
+        if let Some(dir) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+            // Folders made here are the owner's only, as the store files
+            // are (e2e N4); an existing folder keeps its mode.
+            let mut folder = std::fs::DirBuilder::new();
+            folder.recursive(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt as _;
+                folder.mode(0o700);
+            }
+            folder.create(dir)?;
         }
+        Self::create_if_missing(path, ttl)?;
         let refuse = upgrade == Upgrade::Refuse;
         // Refused before anything is written, and before this handle
         // touches the store: its close could checkpoint a WAL another
         // process left. Checked again under the write lock, since a
         // restore can swap an older store in until then.
-        if refuse && let Some((from, to)) = probe_upgrade(path)? {
+        let pending = probe_upgrade(path)?;
+        if refuse && let Some((from, to)) = pending {
             return Err(StoreError::UpgradeRefused { from, to });
         }
         let before = crate::activity::identity_at(path)?;
         let mut conn = open_durable(path, OpenFlags::default())?;
+        // Test-only: foreign keys on, so a deferred violation can make the
+        // upgrade's own COMMIT fail (`deferred_fk`, below). Outside any
+        // transaction, where the pragma takes effect.
+        #[cfg(test)]
+        if FAIL_AT.with(|f| f.get()) == Some("deferred_fk") {
+            conn.pragma_update(None, "foreign_keys", true)?;
+        }
         let file = crate::activity::identity_at(path)?;
         if before.is_some() && before != file {
             return Err(crate::activity::replaced());
@@ -1042,6 +1863,7 @@ impl Store {
         // below: the journal mode isn't the store's content, no table, row
         // or meta key changes, and every later opener does the same.
         to_wal(&conn)?;
+        injected("creation_wal")?;
         // A store from before ids gets one first, so the copy an upgrade
         // takes carries it. A refusing process never upgrades, so it mints
         // one under the write lock below instead, once allowed to go on.
@@ -1079,42 +1901,71 @@ impl Store {
         }
         // An upgrade first copies the store as it is, inside this same
         // write lock, and goes no further if the copy fails.
+        let upgrading = pending.clone();
         let backup = match pending {
             Some((from, to)) => {
                 // Read through a second connection: this one's write lock
                 // keeps every other writer out, and it has written nothing.
                 let reader = open_durable(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
                     .map_err(|e| StoreError::Backup(e.to_string()))?;
-                Some(back_up(&reader, path, &from, &to)?)
+                Some(back_up_noting(&reader, path, &from, &to)?)
             }
             None => None,
         };
-        match Self::finish_open(tx, path, ttl) {
+        let weak = backup.as_ref().is_some_and(|(_, weak)| *weak);
+        let backup = backup.map(|(copy, _)| copy);
+        let mut committing = false;
+        match Self::finish_open(tx, path, ttl, weak, &mut committing) {
             Ok(ttl) => Ok(Self {
                 conn,
                 file,
                 ttl,
                 backup,
+                backup_weak: weak,
+                ack_grace_ms: 0,
             }),
             Err(e) => {
-                // Nothing changed: the copy would only pile up on retries.
-                if let Some(copy) = &backup {
-                    std::fs::remove_file(copy).ok();
+                // The copy goes only when the upgrade failed before its
+                // COMMIT was issued: then nothing changed, and the copy
+                // would only pile up on retries. An error from COMMIT or
+                // after it leaves the outcome unknown, whatever a readback
+                // shows (after a failed WAL sync a commit frame can be on
+                // disk while the live index still reads schema 3), so the
+                // copy stays (edd-01a1878e, Storage; Terra's fourth
+                // review, finding 9).
+                if let Some(copy) = &backup
+                    && upgrading.is_some()
+                    && !committing
+                {
+                    remove_copy(copy);
                 }
                 Err(e)
             }
         }
     }
 
-    /// Creates or upgrades the tables inside `tx`, and commits.
-    fn finish_open(tx: Transaction<'_>, path: &Path, ttl: Ms) -> Result<Ms, StoreError> {
+    /// Creates or upgrades the tables inside `tx`, and commits. `committing`
+    /// is set just before COMMIT is issued, so a caller can tell a failure
+    /// before it (nothing changed) from one whose outcome is unknown.
+    fn finish_open(
+        tx: Transaction<'_>,
+        path: &Path,
+        ttl: Ms,
+        weak_copy: bool,
+        committing: &mut bool,
+    ) -> Result<Ms, StoreError> {
+        check_initializable(&tx)?;
         tx.execute_batch(SCHEMA)?;
+        injected("creation_schema")?;
         tx.execute_batch(crate::mail::MAIL_SCHEMA)?;
         tx.execute(
             "INSERT OR IGNORE INTO meta (key, value) VALUES ('msg_schema', ?1)",
             params![crate::mail::MAIL_SCHEMA_VERSION],
         )?;
         crate::mail::upgrade(&tx)?;
+        // Schema 4's flow tables, for a new store and for one this open
+        // upgrades (after its copy).
+        crate::ledger::create(&tx)?;
         let mail: String =
             tx.query_row("SELECT value FROM meta WHERE key = 'msg_schema'", [], |r| {
                 r.get(0)
@@ -1149,7 +2000,8 @@ impl Store {
             Some(other) => return Err(schema_error("schema", other, SCHEMA_VERSION)),
         }
         // A new or upgraded store opens its chain, after the journal it
-        // already has.
+        // already has; a chain a "3" store already has goes on (genesis
+        // writes nothing over a head).
         if version.as_deref() != Some(SCHEMA_VERSION) {
             let store_id = meta(&tx, "store_id")?
                 .ok_or_else(|| StoreError::BadMeta("store_id (missing)".into()))?;
@@ -1160,13 +2012,49 @@ impl Store {
         let ttl = ttl
             .parse()
             .map_err(|_| StoreError::BadMeta(format!("ttl {ttl}")))?;
+        if weak_copy {
+            // The copy this upgrade relies on settled for a plain fsync
+            // (PLAIN_FSYNC_ENV): the store says so for as long as it lives.
+            tx.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('upgrade_barrier', 'fsync')",
+                [],
+            )?;
+        }
+        injected("before_commit")?;
+        *committing = true;
+        // COMMIT itself failing, with nothing written (the store reads
+        // back as it was, yet the outcome counts as unknown).
+        injected("commit_failed")?;
+        // Test-only: a real COMMIT error, from a deferred foreign key that
+        // fails at COMMIT, with SQLite rolling the upgrade back. It does
+        // not simulate a failed WAL sync after a commit frame (Terra's
+        // code review #5973, r2 #8); `after_commit` stands in for that.
+        #[cfg(test)]
+        if FAIL_AT.with(|f| f.get()) == Some("deferred_fk") {
+            tx.execute_batch(
+                "CREATE TABLE fk_parent (id INTEGER PRIMARY KEY);
+                 CREATE TABLE fk_child (p INTEGER REFERENCES fk_parent (id)
+                     DEFERRABLE INITIALLY DEFERRED);
+                 INSERT INTO fk_child (p) VALUES (1);",
+            )?;
+        }
         tx.commit()?;
+        // A commit that wrote its frame and then failed (a WAL sync)
+        // reports an error although the upgrade may stand.
+        injected("after_commit")?;
         Ok(ttl)
     }
 
     /// The copy this open took before upgrading the store, if it did.
     pub fn backup(&self) -> Option<&Path> {
         self.backup.as_deref()
+    }
+
+    /// Whether [`Store::backup`]'s copy was synced with a plain fsync only
+    /// ([`PLAIN_FSYNC_ENV`]; the upgraded store records it as
+    /// `meta.upgrade_barrier`).
+    pub fn backup_weak(&self) -> bool {
+        self.backup_weak
     }
 
     /// Opens the store a repository's worktrees share.
@@ -1278,15 +2166,49 @@ impl Store {
         first: &Command,
         then: impl FnOnce(&Coordinator, &Outcome) -> Option<Command>,
     ) -> Result<Chained, StoreError> {
+        self.execute_then_checked(first, then, None)
+    }
+
+    /// [`Store::execute_then`], running `check` before the transaction
+    /// commits when both commands were recorded (and only then).
+    pub fn execute_then_checked(
+        &mut self,
+        first: &Command,
+        then: impl FnOnce(&Coordinator, &Outcome) -> Option<Command>,
+        check: Option<BeforeCommit<'_>>,
+    ) -> Result<Chained, StoreError> {
         let mut then = Some(then);
-        let mut outcomes = self.execute_chain(first, |c, o| then.take().and_then(|f| f(c, o)))?;
+        let mut outcomes = self.execute_chain_completed(
+            first,
+            |c, o| then.take().and_then(|f| f(c, o)),
+            None,
+            check,
+        )?;
         let recorded = outcomes.recorded;
         let first = outcomes.outcomes.remove(0);
         Ok(Chained {
             first,
             second: outcomes.outcomes.pop(),
             recorded,
+            checked: outcomes.checked,
         })
+    }
+
+    /// Runs `check` (a node's settle) alone in its own write transaction,
+    /// applying no command: commits what it wrote when it passes, and rolls
+    /// it back when it refuses (`Ok(false)`) or fails. For `done`'s rerun
+    /// on a node whose done file main already holds, which needs no mark
+    /// and no work state, only the settle (Terra's code review #10631,
+    /// finding 1).
+    pub fn check_alone(&mut self, check: BeforeCommit<'_>) -> Result<bool, StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !check(&tx)? {
+            return Ok(false);
+        }
+        tx.commit()?;
+        Ok(true)
     }
 
     /// Records one local done revision and clears its temporary status in
@@ -1299,6 +2221,20 @@ impl Store {
         actor: &str,
         revision: &str,
         now: Ms,
+    ) -> Result<Chained, StoreError> {
+        self.complete_local_checked(leaf, node, actor, revision, now, None)
+    }
+
+    /// [`Store::complete_local`], running `check` (the node's settle)
+    /// before the transaction commits, once the completion is recorded.
+    pub fn complete_local_checked(
+        &mut self,
+        leaf: &Scope,
+        node: &str,
+        actor: &str,
+        revision: &str,
+        now: Ms,
+        check: Option<BeforeCommit<'_>>,
     ) -> Result<Chained, StoreError> {
         let first = Command::SetWork {
             leaf: leaf.clone(),
@@ -1324,11 +2260,13 @@ impl Store {
                 }
             },
             Some((node, revision)),
+            check,
         )?;
         Ok(Chained {
             first: batch.outcomes.remove(0),
             second: batch.outcomes.pop(),
             recorded: batch.recorded,
+            checked: batch.checked,
         })
     }
 
@@ -1341,7 +2279,7 @@ impl Store {
         first: &Command,
         next: impl FnMut(&Coordinator, &Outcome) -> Option<Command>,
     ) -> Result<ChainOutcomes, StoreError> {
-        self.execute_chain_completed(first, next, None)
+        self.execute_chain_completed(first, next, None, None)
     }
 
     fn execute_chain_completed(
@@ -1349,6 +2287,7 @@ impl Store {
         first: &Command,
         mut next: impl FnMut(&Coordinator, &Outcome) -> Option<Command>,
         completion: Option<(&str, &str)>,
+        check: Option<BeforeCommit<'_>>,
     ) -> Result<ChainOutcomes, StoreError> {
         let ttl = self.ttl;
         let tx = self
@@ -1368,21 +2307,36 @@ impl Store {
                 return Ok(ChainOutcomes {
                     outcomes,
                     recorded: false,
+                    checked: true,
                 });
             }
             seq += 1;
             Self::save(&tx, seq, &command, &outcome, &mut coordinator)?;
         }
-        if outcomes.iter().all(|o| o.error().is_none())
+        let all = outcomes.iter().all(|o| o.error().is_none());
+        if all
             && let Some((node, revision)) = completion
             && let Command::SetWork { leaf, .. } = first
         {
             crate::activity::record_completion(&tx, first_seq, leaf.as_str(), node, revision)?;
         }
+        // The check sees everything this transaction wrote; a refusal
+        // drops the transaction, which rolls every command back.
+        if all
+            && let Some(check) = check
+            && !check(&tx)?
+        {
+            return Ok(ChainOutcomes {
+                outcomes,
+                recorded: false,
+                checked: false,
+            });
+        }
         tx.commit()?;
         Ok(ChainOutcomes {
             outcomes,
             recorded: true,
+            checked: true,
         })
     }
 
@@ -1434,6 +2388,17 @@ impl Store {
         let (_, coordinator) = load(&tx, self.ttl)?;
         tx.finish()?;
         Ok(coordinator)
+    }
+
+    /// Coordinator state and API event-stream head from one read transaction.
+    /// This read has no expiry, observation, purge or journal effects.
+    pub fn coordinator_with_cursor(&self) -> Result<(Coordinator, String), StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        check_schema(&tx)?;
+        let (_, coordinator) = load(&tx, self.ttl)?;
+        let cursor = crate::events::head_in(&tx)?.encode();
+        tx.finish()?;
+        Ok((coordinator, cursor))
     }
 
     /// Receipt baseline before a turn, bound to this store and log history.
@@ -1790,6 +2755,718 @@ fn replay_on(conn: &Connection, ttl: Ms) -> Result<Coordinator, StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dangling_store_links_refuse_initialization_advice_on_every_read() {
+        use std::os::unix::fs::symlink;
+        for parent in [false, true] {
+            let dir = std::env::temp_dir()
+                .join(format!("mdkg-dangling-read-{}", mdkg_format::Uuid7::now()));
+            let folder = dir.join("mdkg");
+            let path = folder.join("coord.sqlite");
+            drop(Store::open_with(&path, 100, Upgrade::Allow).unwrap());
+            let graph = "01a185ac-560e-76e0-91af-2c49dfc29b81";
+            let mut reader = crate::events::Reader::open(&path, graph, None).unwrap();
+            let missing = dir.join("missing-target");
+            let link = if parent { &folder } else { &path };
+            if parent {
+                std::fs::remove_dir_all(&folder).unwrap();
+            } else {
+                std::fs::remove_file(&path).unwrap();
+            }
+            symlink(&missing, link).unwrap();
+            for error in [
+                Store::open_read_only(&path).unwrap_err(),
+                crate::events::head(&path).unwrap_err(),
+            ] {
+                assert!(error.to_string().contains("restore"), "{error}");
+                assert!(!error.to_string().contains("initialize"), "{error}");
+            }
+            for error in [
+                crate::events::Reader::open(&path, graph, None).unwrap_err(),
+                reader.poll(1).unwrap_err(),
+            ] {
+                let crate::events::ReadError::Store(error) = error else {
+                    panic!("{error:?}");
+                };
+                assert!(error.to_string().contains("restore"), "{error}");
+            }
+            assert!(std::fs::symlink_metadata(link).unwrap().is_symlink());
+            assert!(!missing.exists());
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn malformed_current_tables_are_refused_before_schema_ddl() {
+        for sql in [
+            "DROP TABLE journal; CREATE VIEW journal AS SELECT 0 AS seq, '' AS command, '' AS outcome;",
+            "DROP TABLE journal; CREATE TABLE journal(seq INTEGER PRIMARY KEY, command INTEGER, outcome TEXT NOT NULL);",
+        ] {
+            let dir =
+                std::env::temp_dir().join(format!("mdkg-structure-{}", mdkg_format::Uuid7::now()));
+            let path = dir.join("coord.sqlite");
+            drop(Store::open_with(&path, 100, Upgrade::Allow).unwrap());
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(sql).unwrap();
+            drop(conn);
+            let before = std::fs::read(&path).unwrap();
+            for upgrade in [Upgrade::Allow, Upgrade::Refuse] {
+                assert!(matches!(
+                    Store::open_with(&path, 100, upgrade),
+                    Err(StoreError::BadMeta(_))
+                ));
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn version_specific_structure_keeps_supported_upgrade_paths() {
+        for version in ["1", "2", "3"] {
+            let dir = std::env::temp_dir().join(format!(
+                "mdkg-legacy-structure-{}",
+                mdkg_format::Uuid7::now()
+            ));
+            std::fs::create_dir(&dir).unwrap();
+            let path = dir.join("coord.sqlite");
+            schema_3_at(&path);
+            let conn = Connection::open(&path).unwrap();
+            conn.execute("UPDATE meta SET value=?1 WHERE key='schema'", [version])
+                .unwrap();
+            if version != "3" {
+                conn.execute_batch(
+                    "DROP TABLE log; DELETE FROM meta WHERE key IN ('store_id','log_head');",
+                )
+                .unwrap();
+            }
+            drop(conn);
+            let store = Store::open_with(&path, 999, Upgrade::Allow).unwrap();
+            assert_eq!(store.ttl(), 1000);
+            assert!(store.backup().is_some());
+            drop(store);
+            assert!(Store::open_read_only(&path).unwrap().is_some());
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+        for version in ["1", "2", "3", "4"] {
+            let dir = std::env::temp_dir().join(format!(
+                "mdkg-legacy-mail-shape-{}",
+                mdkg_format::Uuid7::now()
+            ));
+            let path = dir.join("coord.sqlite");
+            drop(Store::open_with(&path, 100, Upgrade::Allow).unwrap());
+            let conn = Connection::open(&path).unwrap();
+            conn.execute("UPDATE meta SET value=?1 WHERE key='msg_schema'", [version])
+                .unwrap();
+            conn.execute_batch("DROP TABLE msg_decisions;").unwrap();
+            if version == "1" {
+                conn.execute_batch("ALTER TABLE msg_messages DROP COLUMN request_digest;")
+                    .unwrap();
+            }
+            if matches!(version, "1" | "2") {
+                conn.execute_batch("ALTER TABLE msg_deliveries DROP COLUMN acked_via;")
+                    .unwrap();
+            }
+            if version != "4" {
+                conn.execute_batch("ALTER TABLE msg_deliveries DROP COLUMN shown_ms;")
+                    .unwrap();
+            }
+            drop(conn);
+            let store = Store::open_with(&path, 999, Upgrade::Allow).unwrap();
+            assert_eq!(store.ttl(), 100);
+            assert!(store.backup().is_some());
+            drop(store);
+            assert!(Store::open_read_only(&path).unwrap().is_some());
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn upgrades_refuse_incompatible_future_objects_before_changing_versions() {
+        for version in ["1", "4"] {
+            let dir = std::env::temp_dir()
+                .join(format!("mdkg-future-shape-{}", mdkg_format::Uuid7::now()));
+            let path = dir.join("coord.sqlite");
+            drop(Store::open_with(&path, 100, Upgrade::Allow).unwrap());
+            let conn = Connection::open(&path).unwrap();
+            conn.execute("UPDATE meta SET value=?1 WHERE key='msg_schema'", [version])
+                .unwrap();
+            if version == "1" {
+                let schema: String = conn
+                    .query_row(
+                        "SELECT sql FROM sqlite_master WHERE name='msg_messages'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                conn.execute_batch("DROP TABLE msg_messages;").unwrap();
+                conn.execute_batch(
+                    &schema.replace("request_digest TEXT NOT NULL", "request_digest INTEGER"),
+                )
+                .unwrap();
+            } else {
+                conn.execute_batch("DROP TABLE msg_decisions; CREATE TABLE msg_decisions(seq INTEGER PRIMARY KEY, provenance INTEGER);").unwrap();
+            }
+            drop(conn);
+            assert!(matches!(
+                Store::open_with(&path, 100, Upgrade::Allow),
+                Err(StoreError::BadMeta(_))
+            ));
+            let conn = Connection::open(&path).unwrap();
+            assert_eq!(meta(&conn, "msg_schema").unwrap().as_deref(), Some(version));
+            drop(conn);
+            assert!(matches!(
+                Store::open_with(&path, 100, Upgrade::Allow),
+                Err(StoreError::BadMeta(_))
+            ));
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn foreign_refusals_preserve_committed_data_through_native_recovery() {
+        fn logical(conn: &Connection) -> (Vec<(String, String)>, Vec<String>) {
+            let schema = conn.prepare("SELECT name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY name")
+                .unwrap().query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>().unwrap();
+            let rows = conn
+                .prepare("SELECT value FROM foreign_data ORDER BY value")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            (schema, rows)
+        }
+        for mode in ["hot", "wal"] {
+            for upgrade in [Upgrade::Allow, Upgrade::Refuse] {
+                let dir = std::env::temp_dir().join(format!(
+                    "mdkg-foreign-journal-{}",
+                    mdkg_format::Uuid7::now()
+                ));
+                std::fs::create_dir(&dir).unwrap();
+                let source = dir.join("source.sqlite");
+                let path = dir.join("coord.sqlite");
+                let writer = Connection::open(&source).unwrap();
+                if mode == "wal" {
+                    writer.pragma_update(None, "journal_mode", "WAL").unwrap();
+                }
+                writer.execute_batch("CREATE TABLE foreign_data(value TEXT); INSERT INTO foreign_data VALUES ('preserve'); CREATE UNIQUE INDEX entries_request ON foreign_data(value); CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT NOT NULL); INSERT INTO meta VALUES('schema','4'),('msg_schema','5'),('ttl','100');").unwrap();
+                let expected = logical(&writer);
+                if mode == "hot" {
+                    writer
+                        .execute_batch("PRAGMA cache_size=1; BEGIN IMMEDIATE;")
+                        .unwrap();
+                    for seq in 0..200 {
+                        writer
+                            .execute(
+                                "INSERT INTO foreign_data VALUES(?1)",
+                                [format!("uncommitted{seq}{}", "x".repeat(4000))],
+                            )
+                            .unwrap();
+                    }
+                    std::fs::copy(&source, &path).unwrap();
+                    std::fs::copy(
+                        dir.join("source.sqlite-journal"),
+                        dir.join("coord.sqlite-journal"),
+                    )
+                    .unwrap();
+                    writer.execute_batch("ROLLBACK;").unwrap();
+                } else {
+                    std::fs::copy(&source, &path).unwrap();
+                    std::fs::copy(dir.join("source.sqlite-wal"), dir.join("coord.sqlite-wal"))
+                        .unwrap();
+                    std::fs::write(dir.join("coord.sqlite-shm"), vec![0; 32768]).unwrap();
+                }
+                drop(writer);
+                assert!(
+                    matches!(
+                        Store::open_with(&path, 100, upgrade),
+                        Err(StoreError::BadMeta(_))
+                    ),
+                    "{mode}"
+                );
+                let reader =
+                    Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+                assert_eq!(logical(&reader), expected, "{mode}");
+                drop(reader);
+                std::fs::remove_dir_all(dir).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn read_only_store_refuses_directories_and_zero_length_special_files() {
+        let dir =
+            std::env::temp_dir().join(format!("mdkg-special-store-{}", mdkg_format::Uuid7::now()));
+        std::fs::create_dir(&dir).unwrap();
+        let fifo = dir.join("coord.sqlite");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(std::fs::metadata(&fifo).unwrap().len(), 0);
+        assert!(Store::open_read_only(&fifo).is_err());
+        assert!(Store::open_read_only(&dir).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn creating_through_a_link_does_not_narrow_the_target_folder() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let dir =
+            std::env::temp_dir().join(format!("mdkg-linked-parent-{}", mdkg_format::Uuid7::now()));
+        let target = dir.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let link = dir.join("mdkg");
+        symlink(&target, &link).unwrap();
+        drop(Store::open_with(&link.join("coord.sqlite"), 100, Upgrade::Refuse).unwrap());
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_bare_store_filename_does_not_narrow_its_working_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        const CHILD: &str = "MDKG_TEST_BARE_STORE_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            drop(Store::open_with(Path::new("coord.sqlite"), 100, Upgrade::Refuse).unwrap());
+            assert!(
+                Store::open_read_only(Path::new("coord.sqlite"))
+                    .unwrap()
+                    .is_some()
+            );
+            return;
+        }
+        let dir =
+            std::env::temp_dir().join(format!("mdkg-bare-store-{}", mdkg_format::Uuid7::now()));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .current_dir(&dir)
+            .env(CHILD, "1")
+            .args([
+                "--exact",
+                "store::tests::a_bare_store_filename_does_not_narrow_its_working_directory",
+                "--test-threads=1",
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// e2e N4: the folders an open creates for the store (`.git/mdkg`)
+    /// are 0700; an existing one keeps its mode.
+    #[cfg(unix)]
+    #[test]
+    fn a_created_store_folder_is_the_owners_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir =
+            std::env::temp_dir().join(format!("mdkg-store-folder-{}", mdkg_format::Uuid7::now()));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = dir.join("mdkg/coord.sqlite");
+        drop(Store::open_with(&path, 100, Upgrade::Allow).unwrap());
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir.join("mdkg")), 0o700);
+        assert_eq!(mode(&dir), 0o755);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn read_only_zero_byte_store_preserves_every_sidecar() {
+        let dir =
+            std::env::temp_dir().join(format!("mdkg-empty-sidecars-{}", mdkg_format::Uuid7::now()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("coord.sqlite");
+        std::fs::write(&path, b"").unwrap();
+        for suffix in ["-wal", "-shm", "-journal"] {
+            std::fs::write(dir.join(format!("coord.sqlite{suffix}")), suffix).unwrap();
+        }
+        let snapshot = || {
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    (entry.file_name(), std::fs::read(entry.path()).unwrap())
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let before = snapshot();
+        assert!(Store::open_read_only(&path).unwrap().is_none());
+        assert!(Store::open_raw_read_only(&path).unwrap().is_none());
+        assert!(stored_label(&path).unwrap().is_none());
+        assert!(open_durable(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).is_err());
+        assert!(
+            crate::mail::read_decisions(&path, 0, 10, &[])
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(snapshot(), before);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn read_only_empty_creation_artifacts_are_absent_without_writes() {
+        let dir =
+            std::env::temp_dir().join(format!("mdkg-empty-create-{}", mdkg_format::Uuid7::now()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("coord.sqlite");
+        for header in [false, true] {
+            drop(Connection::open(&path).unwrap());
+            if header {
+                let conn = Connection::open(&path).unwrap();
+                conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+                drop(conn);
+            }
+            let bytes = std::fs::read(&path).unwrap();
+            assert!(Store::open_read_only(&path).unwrap().is_none());
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            drop(Store::open_with(&path, 100, Upgrade::Refuse).unwrap());
+            assert!(Store::open_read_only(&path).unwrap().is_some());
+            std::fs::remove_file(&path).unwrap();
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn first_creation_survives_sigkill_and_keeps_private_modes() {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::Command as ProcessCommand;
+        use std::time::Instant;
+
+        const CHILD: &str = "MDKG_TEST_STORE_CREATION_CHILD";
+        const PHASE: &str = "MDKG_TEST_STORE_CREATION_PHASE";
+        const PHASES: [(&str, bool); 8] = [
+            ("creation_file", false),
+            ("creation_opened", false),
+            ("creation_schema", false),
+            ("before_commit", false),
+            ("after_commit", false),
+            ("creation_published", true),
+            ("creation_wal", true),
+            ("creation_complete", true),
+        ];
+        if let Some(dir) = std::env::var_os(CHILD) {
+            let dir = PathBuf::from(dir);
+            let phase = std::env::var(PHASE).unwrap();
+            let phase = PHASES.iter().find(|(name, _)| *name == phase).unwrap().0;
+            PAUSE_CREATION.with(|hook| *hook.borrow_mut() = Some((phase, dir.join("ready"))));
+            let _store =
+                Store::open_with(&dir.join(".git/mdkg/coord.sqlite"), 100, Upgrade::Refuse)
+                    .unwrap();
+            injected("creation_complete").unwrap();
+            panic!("creation checkpoint was not reached");
+        }
+
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        for (phase, published) in PHASES {
+            let dir = std::env::temp_dir()
+                .join(format!("mdkg-create-kill-{}", mdkg_format::Uuid7::now()));
+            std::fs::create_dir(&dir).unwrap();
+            let path = dir.join(".git/mdkg/coord.sqlite");
+            let ready = dir.join("ready");
+            let mut child = Child(
+                ProcessCommand::new("/bin/sh")
+                    .args(["-c", "umask 022; exec \"$@\"", "store-create-test"])
+                    .arg(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "store::tests::first_creation_survives_sigkill_and_keeps_private_modes",
+                        "--test-threads=1",
+                    ])
+                    .env(CHILD, &dir)
+                    .env(PHASE, phase)
+                    .spawn()
+                    .unwrap(),
+            );
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while !ready.exists() {
+                assert!(
+                    child.0.try_wait().unwrap().is_none(),
+                    "child exited before {phase}"
+                );
+                assert!(Instant::now() < deadline, "creation did not reach {phase}");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            for entry in std::fs::read_dir(path.parent().unwrap()).unwrap() {
+                let entry = entry.unwrap();
+                let metadata = entry.metadata().unwrap();
+                if metadata.is_dir() {
+                    assert_eq!(metadata.mode() & 0o777, 0o700, "{phase}");
+                    for child in std::fs::read_dir(entry.path()).unwrap() {
+                        assert_eq!(
+                            child.unwrap().metadata().unwrap().mode() & 0o777,
+                            0o600,
+                            "{phase}"
+                        );
+                    }
+                } else {
+                    assert_eq!(metadata.mode() & 0o777, 0o600, "{phase}");
+                }
+            }
+            child.0.kill().unwrap();
+            assert_eq!(child.0.wait().unwrap().signal(), Some(9));
+            assert_eq!(path.exists(), published, "{phase}");
+            let before = std::fs::read(&path).ok();
+            assert_eq!(
+                Store::open_read_only(&path).unwrap().is_some(),
+                published,
+                "{phase}"
+            );
+            assert_eq!(std::fs::read(&path).ok(), before, "read modified {phase}");
+            let mut store = Store::open_with(&path, 100, Upgrade::Refuse).unwrap();
+            store
+                .execute(&Command::Register {
+                    leaf: Scope::new("work/a"),
+                    content: "work/a@0".into(),
+                })
+                .unwrap();
+            let identity = store.store_id().unwrap();
+            drop(store);
+            let contents = content(&path);
+            let store = Store::open_with(&path, 999, Upgrade::Refuse).unwrap();
+            assert_eq!(store.ttl(), 100);
+            assert_eq!(store.store_id().unwrap(), identity);
+            drop(store);
+            assert_eq!(content(&path), contents);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn concurrent_first_creators_publish_one_identity_and_keep_existing_data() {
+        let dir =
+            std::env::temp_dir().join(format!("mdkg-create-race-{}", mdkg_format::Uuid7::now()));
+        let path = dir.join("coord.sqlite");
+        let barrier = std::sync::Barrier::new(2);
+        let identities = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        let mut store = Store::open_with(&path, 100, Upgrade::Refuse).unwrap();
+                        store
+                            .execute(&Command::Register {
+                                leaf: Scope::new("work/a"),
+                                content: "work/a@0".into(),
+                            })
+                            .unwrap();
+                        store.store_id().unwrap()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(identities[0], identities[1]);
+        let before = content(&path);
+        assert!(Store::open_read_only(&path).unwrap().is_some());
+        drop(Store::open_with(&path, 100, Upgrade::Refuse).unwrap());
+        assert_eq!(content(&path), before);
+        assert!(std::fs::read_dir(&dir).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".mdkg-store-")
+        }));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn read_only_nonempty_unknown_schemas_are_not_hidden_as_absent() {
+        let dir =
+            std::env::temp_dir().join(format!("mdkg-unknown-create-{}", mdkg_format::Uuid7::now()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("coord.sqlite");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE foreign_data(value TEXT); INSERT INTO foreign_data VALUES ('preserve');",
+        )
+        .unwrap();
+        drop(conn);
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(Store::open_read_only(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn writers_refuse_unknown_nonempty_schemas_without_changing_any_files() {
+        for upgrade in [Upgrade::Allow, Upgrade::Refuse] {
+            for marker in ["no_meta", "missing", "1", "2", "3", "4"] {
+                let dir = std::env::temp_dir()
+                    .join(format!("mdkg-foreign-writer-{}", mdkg_format::Uuid7::now()));
+                std::fs::create_dir(&dir).unwrap();
+                let path = dir.join("coord.sqlite");
+                let conn = Connection::open(&path).unwrap();
+                conn.execute_batch(
+                    "CREATE TABLE foreign_data(value TEXT); \
+                     INSERT INTO foreign_data VALUES ('preserve'); \
+                     CREATE UNIQUE INDEX entries_request ON foreign_data(value);",
+                )
+                .unwrap();
+                if marker != "no_meta" {
+                    conn.execute_batch(
+                        "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+                    )
+                    .unwrap();
+                    if marker != "missing" {
+                        conn.execute("INSERT INTO meta VALUES('schema',?1)", [marker])
+                            .unwrap();
+                        conn.execute_batch(
+                            "INSERT INTO meta VALUES('msg_schema','5'),('ttl','100');",
+                        )
+                        .unwrap();
+                    }
+                }
+                drop(conn);
+                let before = std::fs::read(&path).unwrap();
+                let error = Store::open_with(&path, 100, upgrade).unwrap_err();
+                assert!(matches!(error, StoreError::BadMeta(_)), "{error}");
+                assert_eq!(std::fs::read(&path).unwrap(), before);
+                assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+                let conn =
+                    Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+                assert!(
+                    conn.prepare("SELECT 1 FROM sqlite_master WHERE name='entries_request'")
+                        .unwrap()
+                        .exists([])
+                        .unwrap()
+                );
+                assert_eq!(
+                    conn.query_row("SELECT value FROM foreign_data", [], |r| r
+                        .get::<_, String>(0))
+                        .unwrap(),
+                    "preserve"
+                );
+                drop(conn);
+                std::fs::remove_dir_all(dir).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn read_only_hot_rollback_preserves_data_and_explains_writer_recovery() {
+        let dir =
+            std::env::temp_dir().join(format!("mdkg-read-recovery-{}", mdkg_format::Uuid7::now()));
+        std::fs::create_dir(&dir).unwrap();
+        let source = dir.join("source.sqlite");
+        let crashed = dir.join("crashed.sqlite");
+        let mut store = Store::open_with(&source, 100, Upgrade::Refuse).unwrap();
+        store
+            .execute(&Command::Register {
+                leaf: Scope::new("work/a"),
+                content: "work/a@0".into(),
+            })
+            .unwrap();
+        drop(store);
+        let committed = content(&source);
+        std::fs::copy(&source, &crashed).unwrap();
+        let mut events =
+            crate::events::Reader::open(&crashed, "01a185ac-560e-76e0-91af-2c49dfc29b81", None)
+                .unwrap();
+        let writer = Connection::open(&source).unwrap();
+        writer
+            .pragma_update(None, "journal_mode", "DELETE")
+            .unwrap();
+        writer
+            .execute_batch("PRAGMA cache_size=1; BEGIN IMMEDIATE;")
+            .unwrap();
+        for seq in 0..200 {
+            writer
+                .execute(
+                    "INSERT INTO events(seq,event) VALUES (?1,?2)",
+                    params![seq, "x".repeat(4000)],
+                )
+                .unwrap();
+        }
+        std::fs::copy(&source, &crashed).unwrap();
+        let journal = dir.join("crashed.sqlite-journal");
+        std::fs::copy(dir.join("source.sqlite-journal"), &journal).unwrap();
+        writer.execute_batch("ROLLBACK;").unwrap();
+        drop(writer);
+        let before = std::fs::read(&crashed).unwrap();
+        let rollback = std::fs::read(&journal).unwrap();
+        let error = Store::open_read_only(&crashed).unwrap_err();
+        assert!(
+            matches!(error, StoreError::ReadRecoveryRequired(_)),
+            "{error}"
+        );
+        assert!(error.to_string().contains("msg inbox"));
+        assert!(matches!(
+            crate::events::head(&crashed).unwrap_err(),
+            StoreError::ReadRecoveryRequired(_)
+        ));
+        for error in [
+            crate::events::Reader::open(&crashed, "01a185ac-560e-76e0-91af-2c49dfc29b81", None)
+                .unwrap_err(),
+            events.poll(1).unwrap_err(),
+        ] {
+            assert!(matches!(
+                error,
+                crate::events::ReadError::Store(StoreError::ReadRecoveryRequired(_))
+            ));
+        }
+        assert_eq!(std::fs::read(&crashed).unwrap(), before);
+        assert_eq!(std::fs::read(&journal).unwrap(), rollback);
+        drop(Store::open_with(&crashed, 100, Upgrade::Refuse).unwrap());
+        assert_eq!(content(&crashed), committed);
+        assert!(Store::open_read_only(&crashed).unwrap().is_some());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn stored_label_reads_a_store_without_writing_it() {
+        let dir = std::env::temp_dir().join(format!(
+            "mdkg-stored-label-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("coord.sqlite");
+        assert_eq!(stored_label(&path).unwrap(), None);
+        assert!(!path.exists(), "a missing store stays missing");
+        drop(Store::open_with(&path, 1_000, Upgrade::Allow).unwrap());
+        assert_eq!(stored_label(&path).unwrap(), Some(build_label()));
+        // A newer build's versions read as they are, for a supervisor to see
+        // that the store moved under it.
+        let conn = Connection::open(&path).unwrap();
+        conn.execute("UPDATE meta SET value = '99' WHERE key = 'schema'", [])
+            .unwrap();
+        drop(conn);
+        let before = std::fs::read(&path).unwrap();
+        assert_eq!(
+            stored_label(&path).unwrap(),
+            Some(format!("99+msg{}", crate::mail::MAIL_SCHEMA_VERSION))
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn activity_snapshot_keeps_one_view_while_a_wal_writer_commits() {
@@ -2204,6 +3881,498 @@ mod tests {
                 "{flags:?}"
             );
         }
+        let reader = Store::open_read_only(&path).unwrap().unwrap();
+        assert_eq!(wait(&reader.conn), 5_000);
+        drop(reader);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_held_read_only_snapshot_allows_a_writer_to_commit() {
+        let dir = std::env::temp_dir().join(format!(
+            "mdkg-status-wal-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("coord.sqlite");
+        let mut writer = Store::open_with(&path, 100, Upgrade::Allow).unwrap();
+        let reader = Store::open_read_only(&path).unwrap().unwrap();
+        let tx = reader.conn.unchecked_transaction().unwrap();
+        let (seq, before) = load(&tx, reader.ttl).unwrap();
+        writer.conn.busy_timeout(Duration::ZERO).unwrap();
+        writer
+            .execute(&Command::Register {
+                leaf: Scope::new("new"),
+                content: "new".into(),
+            })
+            .unwrap();
+        assert_eq!(
+            load(&tx, reader.ttl).unwrap(),
+            (seq, before.clone()),
+            "one snapshot while the writer commits"
+        );
+        tx.finish().unwrap();
+        assert_ne!(reader.coordinator().unwrap(), before);
+        drop(reader);
+        drop(writer);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A schema 3 store, as a 0.7.0 build left it, at `path`.
+    fn schema_3_at(path: &Path) {
+        drop(Store::open_with(path, 1_000, Upgrade::Allow).expect("new store"));
+        let conn = Connection::open(path).expect("conn");
+        conn.execute("UPDATE meta SET value = '3' WHERE key = 'schema'", [])
+            .expect("schema 3");
+        // Without the tables schema 4 adds, so a test sees a failed
+        // upgrade leave none behind (Terra's code review #6273, finding 4).
+        conn.execute_batch(&schema_4_tables().iter().fold(String::new(), |mut sql, t| {
+            sql.push_str(&format!("DROP TABLE {t};"));
+            sql
+        }))
+        .expect("schema 4 tables dropped");
+    }
+
+    /// The tables schema 4 adds to a schema 3 store.
+    fn schema_4_tables() -> [&'static str; 5] {
+        [
+            "msg_links",
+            "msg_meta",
+            "msg_deferred",
+            "entries",
+            "entry_events",
+        ]
+    }
+
+    fn tables_present(path: &Path, names: &[&str]) -> Vec<String> {
+        let conn = Connection::open(path).expect("conn");
+        names
+            .iter()
+            .filter(|n| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    [n],
+                    |r| r.get::<_, i64>(0),
+                )
+                .expect("count")
+                    > 0
+            })
+            .map(|n| n.to_string())
+            .collect()
+    }
+
+    fn copies_beside(path: &Path) -> Vec<PathBuf> {
+        let dir = path.parent().expect("dir");
+        let mut out: Vec<PathBuf> = std::fs::read_dir(dir)
+            .expect("dir")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.to_string_lossy().contains(".pre-3+msg5-to-4+msg5"))
+            .filter(|p| !p.to_string_lossy().ends_with(".synced"))
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn schema_at(path: &Path) -> String {
+        let conn = Connection::open(path).expect("conn");
+        meta(&conn, "schema").expect("meta").unwrap_or_default()
+    }
+
+    #[test]
+    fn a_new_store_reports_a_failed_sync_of_its_folder_entry() {
+        let dir = std::env::temp_dir().join(format!(
+            "mdkg-store-parent-sync-{}",
+            mdkg_format::Uuid7::now()
+        ));
+        std::fs::create_dir(&dir).expect("dir");
+        let path = dir.join(".git/mdkg/coord.sqlite");
+        FAIL_AT.with(|f| f.set(Some("store_parent_sync")));
+        let failed = Store::open_with(&path, 1_000, Upgrade::Refuse);
+        let Err(error) = failed else {
+            panic!("an unsynced folder entry is an error")
+        };
+        assert!(error.to_string().contains("store_parent_sync"), "{error}");
+        // Terra #16575: the store is published now; a retry syncs the
+        // entries again before acknowledging anything, so it fails the same
+        // way while the sync does.
+        assert!(path.exists(), "published before the failed sync");
+        for step in ["store_parent_sync", "store_folder_sync"] {
+            FAIL_AT.with(|f| f.set(Some(step)));
+            let retry = Store::open_with(&path, 1_000, Upgrade::Refuse);
+            let Err(error) = retry else {
+                panic!("a retry syncs the entries again ({step})")
+            };
+            assert!(error.to_string().contains(step), "{error}");
+        }
+        FAIL_AT.with(|f| f.set(None));
+        drop(Store::open_with(&path, 1_000, Upgrade::Refuse).expect("published store opens"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_upgrade_stops_when_its_copy_or_its_folder_cant_be_made_durable() {
+        let dir = std::env::temp_dir().join(format!("mdkg-store-copy-sync-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("coord.sqlite");
+        schema_3_at(&path);
+        FAIL_AT.with(|f| f.set(Some("copy_folder_sync")));
+        let failed = Store::open_with(&path, 1_000, Upgrade::Allow);
+        FAIL_AT.with(|f| f.set(None));
+        assert!(failed.is_err());
+        assert_eq!(schema_at(&path), "3", "nothing upgraded");
+        drop(Store::open_with(&path, 1_000, Upgrade::Allow).expect("retry"));
+        assert_eq!(schema_at(&path), "4");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_sync_the_file_system_doesnt_offer_stops_the_upgrade() {
+        // The copy's sync and its folder's, each refused as unsupported (no
+        // full barrier): without the override, neither settles for a plain
+        // fsync, and the upgrade doesn't start.
+        for step in ["copy_sync", "copy_folder_barrier", "copy_folder_published"] {
+            let dir = std::env::temp_dir().join(format!(
+                "mdkg-store-unsupported-{step}-{}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).expect("dir");
+            let path = dir.join("coord.sqlite");
+            schema_3_at(&path);
+            FAIL_AT.with(|f| f.set(Some(step)));
+            let failed = Store::open_with(&path, 1_000, Upgrade::Allow);
+            FAIL_AT.with(|f| f.set(None));
+            assert!(failed.is_err(), "{step}");
+            assert_eq!(schema_at(&path), "3", "{step}: nothing upgraded");
+            // No copy is left at any step, published or partial (Opus's
+            // #6817, minor 2; Terra's #6874, finding 2).
+            assert!(copies_beside(&path).is_empty(), "{step}: no copy left");
+            drop(Store::open_with(&path, 1_000, Upgrade::Allow).expect("retry"));
+            assert_eq!(schema_at(&path), "4");
+            let conn = Connection::open(&path).expect("conn");
+            assert_eq!(meta(&conn, "upgrade_barrier").expect("meta"), None);
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    #[test]
+    fn the_plain_fsync_override_upgrades_and_records_the_weaker_guarantee() {
+        let dir = std::env::temp_dir().join(format!("mdkg-store-plain-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("coord.sqlite");
+        schema_3_at(&path);
+        FAIL_AT.with(|f| f.set(Some("copy_sync")));
+        PLAIN_FSYNC.with(|f| f.set(true));
+        let opened = Store::open_with(&path, 1_000, Upgrade::Allow);
+        PLAIN_FSYNC.with(|f| f.set(false));
+        FAIL_AT.with(|f| f.set(None));
+        let opened = opened.expect("upgraded with the override");
+        // The open says so, for the CLI's upgrade notice.
+        assert!(opened.backup_weak());
+        drop(opened);
+        assert_eq!(schema_at(&path), "4");
+        let conn = Connection::open(&path).expect("conn");
+        assert_eq!(
+            meta(&conn, "upgrade_barrier").expect("meta").as_deref(),
+            Some("fsync")
+        );
+        drop(conn);
+        assert_eq!(copies_beside(&path).len(), 1);
+        // So does the copy itself, as `store snapshots` lists it.
+        let listed = backups(&path).expect("backups");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].barrier.as_deref(), Some("fsync"));
+        // A snapshot under the override is marked; one with the full
+        // barrier isn't. Restoring the weak copy says both the copy it
+        // read and the one it took first.
+        FAIL_AT.with(|f| f.set(Some("copy_sync")));
+        PLAIN_FSYNC.with(|f| f.set(true));
+        let weak = snapshot(&path, "weak").expect("weak snapshot");
+        PLAIN_FSYNC.with(|f| f.set(false));
+        FAIL_AT.with(|f| f.set(None));
+        let full = snapshot(&path, "full").expect("full snapshot");
+        let by_path = |p: &Path| {
+            backups(&path)
+                .expect("backups")
+                .into_iter()
+                .find(|b| b.path == p)
+                .expect("listed")
+                .barrier
+        };
+        assert_eq!(by_path(&weak).as_deref(), Some("fsync"));
+        assert_eq!(by_path(&full), None);
+        // The full copy is still marked in itself: only its proof, written
+        // once the final folder barrier held, lifts the mark, and a proof
+        // of another file doesn't (Terra's #7598, finding 1).
+        let marked = Connection::open(&full).expect("conn");
+        assert_eq!(
+            meta(&marked, "backup_barrier").expect("meta").as_deref(),
+            Some("fsync")
+        );
+        drop(marked);
+        let proof = std::fs::read_to_string(proof_path(&full)).expect("proof");
+        std::fs::write(proof_path(&full), proof.replace("len=", "len=1")).expect("tamper");
+        assert_eq!(by_path(&full).as_deref(), Some("fsync"));
+        std::fs::write(proof_path(&full), &proof).expect("restore proof");
+        assert_eq!(by_path(&full), None);
+        let restored = restore(&path, &weak).expect("restore");
+        assert_eq!(restored.from_barrier.as_deref(), Some("fsync"));
+        assert!(
+            !restored.previous_weak,
+            "the copy first took the full barrier"
+        );
+        // The weak copy's marker doesn't stay in the live store, and a
+        // full-barrier copy taken after it isn't labelled weak (Opus's code
+        // review #6264, finding 1; Terra's #6273, finding 3).
+        let conn = Connection::open(&path).expect("conn");
+        assert_eq!(meta(&conn, "backup_barrier").expect("meta"), None);
+        drop(conn);
+        let after = snapshot(&path, "after").expect("full snapshot");
+        assert_eq!(by_path(&after), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Terra's code review #6273, finding 1: a copy whose folder only a
+    /// plain fsync could sync, before its publish or after, is marked.
+    #[test]
+    fn a_folder_that_settles_for_a_plain_fsync_marks_the_copy() {
+        for step in ["copy_folder_barrier", "copy_folder_published"] {
+            let dir = std::env::temp_dir().join(format!(
+                "mdkg-store-weak-folder-{step}-{}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).expect("dir");
+            let path = dir.join("coord.sqlite");
+            drop(Store::open_with(&path, 1_000, Upgrade::Allow).expect("store"));
+            FAIL_AT.with(|f| f.set(Some(step)));
+            PLAIN_FSYNC.with(|f| f.set(true));
+            let copy = snapshot(&path, "weak");
+            PLAIN_FSYNC.with(|f| f.set(false));
+            FAIL_AT.with(|f| f.set(None));
+            // Weak before the publish or after it: the copy keeps its own
+            // mark, with no proof beside it (Terra's #7598, finding 1,
+            // with the orchestrator's call).
+            let copy = copy.expect("snapshot");
+            let listed = backups(&path).expect("backups");
+            let found = listed.iter().find(|b| b.path == copy).expect("listed");
+            assert_eq!(found.barrier.as_deref(), Some("fsync"), "{step}");
+            assert!(!proof_path(&copy).exists(), "{step}");
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// Terra's code review #6273, finding 2: a restore whose write fails
+    /// after a weak first copy says that copy is weak.
+    #[test]
+    fn a_failed_restore_says_its_first_copy_is_weak() {
+        let dir =
+            std::env::temp_dir().join(format!("mdkg-store-weak-restore-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("coord.sqlite");
+        drop(Store::open_with(&path, 1_000, Upgrade::Allow).expect("store"));
+        let copy = snapshot(&path, "full").expect("snapshot");
+        NO_BARRIER.with(|f| f.set(true));
+        PLAIN_FSYNC.with(|f| f.set(true));
+        FAIL_AT.with(|f| f.set(Some("restore_write")));
+        let failed = restore(&path, &copy);
+        FAIL_AT.with(|f| f.set(None));
+        PLAIN_FSYNC.with(|f| f.set(false));
+        NO_BARRIER.with(|f| f.set(false));
+        match failed {
+            Err(StoreError::Restore(m)) => {
+                assert!(m.contains("the copy failed"), "{m}");
+                assert!(m.contains("plain fsync only"), "{m}");
+            }
+            other => panic!("{other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_ambiguous_commit_keeps_the_copy_and_a_clean_failure_removes_it() {
+        let dir = std::env::temp_dir().join(format!("mdkg-store-ambiguous-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("coord.sqlite");
+        schema_3_at(&path);
+        // Before the commit: the store is as it was, so the copy goes.
+        FAIL_AT.with(|f| f.set(Some("before_commit")));
+        assert!(Store::open_with(&path, 1_000, Upgrade::Allow).is_err());
+        FAIL_AT.with(|f| f.set(None));
+        assert_eq!(schema_at(&path), "3");
+        assert!(copies_beside(&path).is_empty());
+        // Its proof went with it, and the retry's copy, under the same
+        // name, reads fully synced (Opus's #8408; Terra's #8466).
+        let names = |p: &Path| -> Vec<String> {
+            std::fs::read_dir(p.parent().expect("dir"))
+                .expect("dir")
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.ends_with(".synced"))
+                .collect()
+        };
+        assert!(names(&path).is_empty(), "no orphan proof");
+        let retried = Store::open_with(&path, 1_000, Upgrade::Allow).expect("retry");
+        assert!(!retried.backup_weak());
+        drop(retried);
+        let listed = backups(&path).expect("backups");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].barrier, None, "fully synced");
+        // A proof of another generation never vouches for a copy.
+        let copy = listed[0].path.clone();
+        let proof = std::fs::read_to_string(proof_path(&copy)).expect("proof");
+        let generation = proof
+            .split(' ')
+            .find_map(|w| w.strip_prefix("gen="))
+            .expect("gen")
+            .to_string();
+        std::fs::write(
+            proof_path(&copy),
+            proof.replace(&generation, "0123456789abcdef"),
+        )
+        .expect("other generation");
+        assert_eq!(
+            backups(&path).expect("backups")[0].barrier.as_deref(),
+            Some("fsync")
+        );
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).expect("dir");
+        schema_3_at(&path);
+        // After the commit frame: the store may read back upgraded, so the
+        // copy stays.
+        FAIL_AT.with(|f| f.set(Some("after_commit")));
+        assert!(Store::open_with(&path, 1_000, Upgrade::Allow).is_err());
+        FAIL_AT.with(|f| f.set(None));
+        assert_eq!(schema_at(&path), "4");
+        assert_eq!(copies_beside(&path).len(), 1, "the recovery copy stays");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn backup_proofs_survive_device_changes_without_trusting_other_copy_metadata() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "mdkg-store-proof-reboot-{}",
+            mdkg_format::Uuid7::now()
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("coord.sqlite");
+        drop(Store::open(&path, 1_000).expect("store"));
+        let copy = snapshot(&path, "reboot").expect("snapshot");
+        let conn = Connection::open(&copy).expect("copy");
+        let generation = meta(&conn, "backup_generation").unwrap().unwrap();
+        drop(conn);
+        let file = std::fs::metadata(&copy).unwrap();
+        let legacy = format!(
+            "mdkg-copy-synced gen={generation} dev={} ino={} len={} mtime={}.{}\n",
+            file.dev() ^ 1,
+            file.ino(),
+            file.len(),
+            file.mtime(),
+            file.mtime_nsec()
+        );
+        std::fs::write(proof_path(&copy), &legacy).unwrap();
+        let barrier = || {
+            backups(&path)
+                .unwrap()
+                .into_iter()
+                .find(|b| b.path == copy)
+                .unwrap()
+                .barrier
+        };
+        assert_eq!(
+            barrier(),
+            None,
+            "reboot must not weaken a fully synced copy"
+        );
+        assert_eq!(
+            std::fs::read_to_string(proof_path(&copy)).unwrap(),
+            legacy,
+            "read-only listing must not rewrite legacy proofs"
+        );
+        let stable = proof_of(&copy, &generation).unwrap();
+        assert!(
+            !stable.contains(" dev="),
+            "new proofs must not persist device numbers"
+        );
+        for proof in [&legacy, &stable] {
+            for altered in [
+                proof.replace(&generation, "other-generation"),
+                proof.replace(
+                    &format!("ino={}", file.ino()),
+                    &format!("ino={}", file.ino() ^ 1),
+                ),
+                proof.replace(
+                    &format!("len={}", file.len()),
+                    &format!("len={}", file.len() + 1),
+                ),
+                proof.replace("mtime=", "mtime=1"),
+            ] {
+                std::fs::write(proof_path(&copy), altered).unwrap();
+                assert_eq!(barrier().as_deref(), Some("fsync"));
+            }
+            std::fs::write(proof_path(&copy), proof).unwrap();
+            assert_eq!(barrier(), None);
+        }
+        std::fs::write(proof_path(&copy), legacy).unwrap();
+        assert_eq!(
+            restore(&path, &copy).unwrap().from_barrier,
+            None,
+            "restore must recognize the old proof after a device change"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_failed_commit_keeps_the_copy_even_when_the_store_reads_back_unchanged() {
+        let dir =
+            std::env::temp_dir().join(format!("mdkg-store-commit-failed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("coord.sqlite");
+        schema_3_at(&path);
+        FAIL_AT.with(|f| f.set(Some("commit_failed")));
+        assert!(Store::open_with(&path, 1_000, Upgrade::Allow).is_err());
+        FAIL_AT.with(|f| f.set(None));
+        assert_eq!(schema_at(&path), "3", "the readback shows schema 3");
+        assert_eq!(copies_beside(&path).len(), 1, "yet the copy stays");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_commit_sqlite_itself_refuses_rolls_back_and_keeps_the_copy() {
+        let dir = std::env::temp_dir().join(format!("mdkg-store-fk-commit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("coord.sqlite");
+        schema_3_at(&path);
+        // A deferred foreign key fails at COMMIT: SQLite's own error, not
+        // an injected one before the call.
+        FAIL_AT.with(|f| f.set(Some("deferred_fk")));
+        let e = Store::open_with(&path, 1_000, Upgrade::Allow).expect_err("COMMIT fails");
+        FAIL_AT.with(|f| f.set(None));
+        assert!(e.to_string().contains("FOREIGN KEY"), "{e}");
+        // Rolled back whole: schema 3, and nothing the transaction wrote.
+        assert_eq!(schema_at(&path), "3");
+        let conn = Connection::open(&path).expect("open");
+        let tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name IN ('fk_parent', 'fk_child')",
+                [],
+                |r| r.get(0),
+            )
+            .expect("tables");
+        assert_eq!(tables, 0);
+        drop(conn);
+        // Nor any table schema 4 adds (the fixture has none of them).
+        assert_eq!(
+            tables_present(&path, &schema_4_tables()),
+            Vec::<String>::new()
+        );
+        // An error from COMMIT counts as unknown: the copy stays.
+        assert_eq!(copies_beside(&path).len(), 1, "the copy stays");
+        // And the next open upgrades as usual.
+        Store::open_with(&path, 1_000, Upgrade::Allow).expect("upgrades");
+        assert_eq!(schema_at(&path), SCHEMA_VERSION);
+        assert_eq!(tables_present(&path, &schema_4_tables()).len(), 5);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

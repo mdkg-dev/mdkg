@@ -1,0 +1,17 @@
+[package]
+name = "mdkg-git"
+version = "0.7.1"
+description = "Hardened Git commands and trusted worktree primitives. Internal to mdkg, no stable API; depend on the mdkg binary"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+readme = "README.md"
+
+[dependencies]
+# Safe NOFOLLOW/NONBLOCK flags for bounded ref-storage config snapshots.
+rustix.workspace = true
+
+[lints]
+workspace = true

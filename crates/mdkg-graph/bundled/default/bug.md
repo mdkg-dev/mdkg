@@ -28,6 +28,14 @@ updated: {{updated}}
 
 What is broken? What’s the impact?
 
+# Requirements
+
+Replace this example with the behavior to deliver.
+
+```text
+- R1: The component shall perform the specified behavior. (verify: name the check)
+```
+
 # Reproduction Steps
 
 1. step 1

@@ -6,11 +6,20 @@
 //! hide breakage. A decision, selective or full, is a success (exit 0);
 //! only bad arguments or an unreadable repository fail.
 //!
-//! It reads the two commits, never the checkout: uncommitted edits, a
-//! different branch checked out, filters or sparse entries can't change
-//! the answer. `--head` defaults to `HEAD`.
+//! Code paths and adapter metadata come from the two commits; selection
+//! rules come from one committed graph authority. Uncommitted checkout edits,
+//! filters and sparse entries cannot change either input. `--head` defaults
+//! to `HEAD`. In 0.7.1 the authority is the repository-top graph, even when
+//! the caller selects a nested root.
+//!
+//! A path whose content at the head is what main had where the head last
+//! met it (their merge base) came from main unchanged: main's own runs
+//! tested it, so the selection skips it and lists it in `from_main`. Main
+//! is `--main`, else `mdkg.mainRef`, else `main`; when none resolves,
+//! nothing is skipped. Under `--targets` only an explicit `--main` naming
+//! a branch counts.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use mdkg_format::Code;
@@ -38,8 +47,55 @@ pub struct AffectedData {
     pub reasons: Vec<Reason>,
     /// What a selective run needs; empty when the run is full.
     pub selected: Selected,
-    /// Every changed path and what it maps to, sorted by path.
+    /// Every changed path the selection judged and what it maps to,
+    /// sorted by path. Paths in `from_main` aren't here.
     pub paths: Vec<PathOut>,
+    /// The main branch `from_main` compares against; absent when no main
+    /// ref resolved and none was given.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub main: Option<MainOut>,
+    /// Changed paths whose content at the head equals main's at their merge
+    /// base: they came from main unchanged, so the selection skips them.
+    /// Sorted by path. Always present in this build's output; optional in
+    /// the schema, for older output.
+    #[schemars(skip_serializing_if = "Vec::is_empty")]
+    pub from_main: Vec<FromMain>,
+    /// Paths using whole-crate fallback because no finer Rust rule covers them.
+    #[schemars(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<SelectionWarning>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, JsonSchema)]
+pub struct SelectionWarning {
+    pub path: String,
+    pub packages: Vec<String>,
+    pub detail: String,
+}
+
+/// The main ref, and why nothing was skipped when that's so.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct MainOut {
+    /// The ref as given (`--main`) or found (`mdkg.mainRef`, `main`).
+    pub rev: String,
+    /// The commit it names; absent when it names none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha: Option<String>,
+    /// The head's merge bases with it, sorted; empty when none was used.
+    pub merge_bases: Vec<String>,
+    /// Why no path was compared (for example, the head is on main).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// A changed path that came from main unchanged.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct FromMain {
+    pub path: String,
+    /// git's status letter between the base and the head.
+    pub status: String,
+    /// For a rename or copy, the path at the base; it matches main too.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_path: Option<String>,
 }
 
 /// A revision as given, and the commit it names.
@@ -109,8 +165,50 @@ pub struct Selected {
     pub go: Vec<GoSelection>,
     /// Rust workspace crates.
     pub rust: Vec<String>,
+    /// Complete Rust execution plan. Prefer this over `rust` when present.
+    #[schemars(skip_serializing_if = "Vec::is_empty")]
+    pub rust_targets: Vec<RustTestSelection>,
     /// Suites named by config rules; the consumer decides what they run.
     pub suites: Vec<String>,
+}
+
+/// One selected target and the combined Cargo invocation covering it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, JsonSchema)]
+pub struct RustTestSelection {
+    pub package: String,
+    /// `package`, `lib`, `bin` or `test`.
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Entries share grouped invocations: deduplicate before executing the plan.
+    pub cargo_args: Vec<String>,
+}
+
+impl RustTestSelection {
+    fn whole(package: &str) -> Self {
+        Self {
+            package: package.into(),
+            kind: "package".into(),
+            name: None,
+            cargo_args: vec!["test".into(), "-p".into(), package.into()],
+        }
+    }
+
+    fn scoped(target: &config::RustTarget) -> Self {
+        let mut selection = Self::whole(&target.package);
+        let (kind, name) = match &target.kind {
+            config::RustTargetKind::Lib => ("lib", None),
+            config::RustTargetKind::Test(name) => ("test", Some(name)),
+            config::RustTargetKind::Bin(name) => ("bin", Some(name)),
+        };
+        selection.kind = kind.into();
+        selection.name = name.cloned();
+        selection.cargo_args.push(format!("--{kind}"));
+        if let Some(name) = name {
+            selection.cargo_args.push(name.clone());
+        }
+        selection
+    }
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -154,8 +252,20 @@ pub struct PathOut {
 }
 
 /// Runs `affected` and prints its report.
-pub fn run(root: &Path, base: &str, head: &str, json: bool) -> u8 {
-    let report = match decide(root, base, head) {
+pub fn run(
+    root: &Path,
+    base: &str,
+    head: &str,
+    main: Option<&str>,
+    targets: bool,
+    json: bool,
+) -> u8 {
+    let result = decide(root, base, head, main, targets).map_err(|error| {
+        if targets && error.diagnostic.hint.is_none() {
+            error.with_hint("Fetch complete base/head commits locally, fix the committed config or offline metadata, and retry --targets.")
+        } else { error }
+    });
+    let report = match result {
         Ok(data) => Report::ok(data),
         Err(e) => Report::failed(e),
     };
@@ -166,12 +276,28 @@ fn git_error(e: std::io::Error) -> GraphError {
     GraphError::failure(Code::IoGitFailed, e.to_string())
 }
 
+fn target_rules_error(detail: &str) -> GraphError {
+    GraphError::failure(Code::ConfigInvalid,
+        format!("cannot verify affected Rust test-target rules: {detail}"))
+        .with_hint("Make the committed snapshot and offline cargo metadata available, or remove the rust_targets rules; no test selection was verified.")
+}
+
 /// The decision, without printing it.
-pub fn decide(root: &Path, base: &str, head: &str) -> Result<AffectedData, GraphError> {
+pub fn decide(
+    root: &Path,
+    base: &str,
+    head: &str,
+    main: Option<&str>,
+    strict: bool,
+) -> Result<AffectedData, GraphError> {
     let repo = git::Repo::open(root).map_err(git_error)?;
     if repo.is_partial_clone().map_err(git_error)? {
         // Even resolving a revision could fetch missing objects over the
         // network in a partial clone, so decide before reading anything.
+        if strict {
+            return Err(GraphError::failure(Code::IoGitFailed, "cannot verify a target-aware selection in a partial clone")
+                .with_hint("Use a complete local clone without --filter before requesting --targets; affected never fetches objects."));
+        }
         return Ok(finish(AffectedData {
             base: Rev {
                 rev: base.to_string(),
@@ -189,6 +315,9 @@ pub fn decide(root: &Path, base: &str, head: &str) -> Result<AffectedData, Graph
             }],
             selected: Selected::default(),
             paths: Vec::new(),
+            main: None,
+            from_main: Vec::new(),
+            warnings: Vec::new(),
         }));
     }
     let base_sha = repo.resolve_commit(base).map_err(git_error)?;
@@ -206,8 +335,15 @@ pub fn decide(root: &Path, base: &str, head: &str) -> Result<AffectedData, Graph
         reasons: Vec::new(),
         selected: Selected::default(),
         paths: Vec::new(),
+        main: None,
+        from_main: Vec::new(),
+        warnings: Vec::new(),
     };
     let (Some(base_sha), Some(head_sha)) = (base_sha, head_sha) else {
+        if strict {
+            return Err(GraphError::failure(Code::IoGitFailed, "cannot verify affected base/head: a revision names no local commit")
+                .with_hint("Fetch the required base and head locally or choose existing commits, then retry with --targets."));
+        }
         if data.base.sha.is_none() {
             data.reasons.push(Reason {
                 code: ReasonCode::BaseMissing,
@@ -227,6 +363,15 @@ pub fn decide(root: &Path, base: &str, head: &str) -> Result<AffectedData, Graph
 
     let ancestry = repo.is_ancestor(&base_sha, &head_sha);
     if !matches!(ancestry, Ok(true)) {
+        if strict {
+            return Err(GraphError::failure(
+                Code::IoGitFailed,
+                "cannot verify affected ancestry for --targets",
+            )
+            .with_hint(
+                "Fetch complete local history and choose a base that is an ancestor of the head.",
+            ));
+        }
         // In a shallow clone a missing link in the history reads as "not an
         // ancestor", so say what to do about it.
         let shallow = repo.is_shallow().unwrap_or(true);
@@ -249,25 +394,13 @@ pub fn decide(root: &Path, base: &str, head: &str) -> Result<AffectedData, Graph
         });
     }
 
-    // Everything below reads the head commit, never the checkout.
+    // Code and adapter metadata come from the selected head, while the rules
+    // are pinned independently to the graph authority for this operation.
     let entries = repo.tree(&head_sha).map_err(git_error)?;
-    let config = match tree::read(&repo, &entries, mdkg_graph::config::CONFIG_PATH)
-        .and_then(|bytes| bytes.ok_or_else(|| "the head has no .mdkg/config.json".to_string()))
-        .and_then(|bytes| {
-            String::from_utf8(bytes).map_err(|_| ".mdkg/config.json isn't UTF-8".to_string())
-        })
-        .and_then(|text| {
-            // Use the same format/version guard as graph commands, but only
-            // on the committed config. No checkout or coordinator is read.
-            let entry = entries
-                .iter()
-                .find(|e| e.path == mdkg_graph::config::CONFIG_PATH.as_bytes())
-                .ok_or("the head has no .mdkg/config.json")?;
-            let snapshot = tree::write(&repo, std::slice::from_ref(entry))?;
-            mdkg_graph::config::check_version(&snapshot.root)
-                .map_err(|e| snapshot.scrub(&e.to_string()))?;
-            config::parse(&text)
-        }) {
+    let config = match mdkg_run::orchestration::authority(&repo.top)
+        .map_err(|e| format!("{}: {}", e.code, e.message))
+        .and_then(|authority| config::parse(&authority.config.to_string()))
+    {
         Ok(c) => c,
         Err(e) => {
             data.reasons.push(Reason {
@@ -278,6 +411,14 @@ pub fn decide(root: &Path, base: &str, head: &str) -> Result<AffectedData, Graph
             config::Config::defaults()
         }
     };
+    if strict
+        && let Some(reason) = data
+            .reasons
+            .iter()
+            .find(|r| r.code == ReasonCode::ConfigInvalid)
+    {
+        return Err(target_rules_error(&reason.detail));
+    }
     let tracked = tree::paths(&entries);
     let wants_tree = tracked
         .iter()
@@ -305,12 +446,55 @@ pub fn decide(root: &Path, base: &str, head: &str) -> Result<AffectedData, Graph
         ),
         None => (None, None),
     };
+    let rule_targets: Vec<_> = config
+        .rules
+        .iter()
+        .flat_map(|rule| match &rule.select {
+            config::RuleSelect::Targets { rust_targets, .. } => rust_targets.clone(),
+            _ => Vec::new(),
+        })
+        .collect();
+    if strict && wants_tree && written.is_none() {
+        return Err(target_rules_error(
+            "the committed snapshot could not be created",
+        ));
+    }
+    if !rule_targets.is_empty() || strict {
+        if let Some(rust) = &mut rust {
+            match rust.unsupported_rule_target(&rule_targets) {
+                Ok(Some((target, reason))) => return Err(GraphError::failure(Code::ConfigInvalid,
+                    format!("affected rule selects unsupported opt-in Rust target {} {:?} ({reason})", target.package, target.kind))
+                    .with_hint("In 0.7.1, affected rules require Cargo default test targets. Remove this rust_targets entry or make the target a default Cargo test (test = true and no required-features); run opt-in targets explicitly outside affected.")),
+                Ok(None) => {},
+                Err(detail) => {
+                    let detail = written.as_ref().map_or(detail.clone(), |t| t.scrub(&detail));
+                    if strict { return Err(target_rules_error(&detail)); }
+                    data.reasons.push(Reason { code: ReasonCode::AdapterFailed, path: None, detail });
+                }
+            }
+        } else if !rule_targets.is_empty() {
+            if strict {
+                return Err(target_rules_error(
+                    "the committed head has no usable Rust adapter",
+                ));
+            }
+            data.reasons.push(Reason {
+                code: ReasonCode::AdapterFailed,
+                path: None,
+                detail: "no Rust adapter is available for the configured target rules".into(),
+            });
+        }
+    }
     let mut engine = select::Engine {
         config: &config,
         go: go.as_mut().map(|a| a as &mut dyn select::Adapter),
         rust: rust.as_mut().map(|a| a as &mut dyn select::Adapter),
     };
-    let changes = repo.changes(&base_sha, &head_sha).map_err(git_error)?;
+    let mut changes = repo.changes(&base_sha, &head_sha).map_err(git_error)?;
+    let (main_out, from_main) =
+        split_from_main(&repo, &head_sha, &entries, main, strict, &mut changes);
+    data.main = main_out;
+    data.from_main = from_main;
     // Submodule contents aren't in the written tree. Both endpoints matter:
     // a deleted gitlink, rename or type change may exist only at the base.
     let base_entries = repo.tree(&base_sha).map_err(git_error)?;
@@ -331,6 +515,15 @@ pub fn decide(root: &Path, base: &str, head: &str) -> Result<AffectedData, Graph
             });
         }
         targets.extend(verdict.selects);
+        for (path, package) in verdict.fallback_crates {
+            data.warnings.push(SelectionWarning {
+                path,
+                packages: vec![package],
+                detail:
+                    "no test-target rule covers this path for the package; using whole-crate tests for the combined Rust selection"
+                        .into(),
+            });
+        }
         data.paths.push(out);
     }
     data.selected = select::selection(&targets);
@@ -339,7 +532,159 @@ pub fn decide(root: &Path, base: &str, head: &str) -> Result<AffectedData, Graph
             r.detail = t.scrub(&r.detail);
         }
     }
+    if strict
+        && let Some(reason) = data.reasons.iter().find(|r| {
+            matches!(
+                r.code,
+                ReasonCode::AdapterFailed | ReasonCode::ConfigInvalid
+            )
+        })
+    {
+        return Err(target_rules_error(&reason.detail));
+    }
     Ok(finish(data))
+}
+
+/// The main ref, its commit, and why it can't be used when that's so.
+/// Without `--targets`: `--main` as given, else the branch
+/// `mdkg.mainRef` names (the repository's own config file only), else the
+/// branch `main`; `None` when nothing was given and neither names a
+/// commit. Under `--targets`, the verified gate, only an explicit `--main`
+/// naming a branch or remote-tracking ref counts, so no ambient setting
+/// can shrink a verified selection (orchestrator, #12089).
+fn main_ref(
+    repo: &git::Repo,
+    given: Option<&str>,
+    strict: bool,
+) -> Option<(String, Option<String>, Option<String>)> {
+    if let Some(rev) = given {
+        if !strict {
+            return Some((
+                rev.to_string(),
+                repo.resolve_commit(rev).ok().flatten(),
+                None,
+            ));
+        }
+        let full = repo.full_ref_name(rev).ok().flatten();
+        let branch = full
+            .as_ref()
+            .filter(|f| f.starts_with("refs/heads/") || f.starts_with("refs/remotes/"));
+        return Some(match branch {
+            Some(f) => (rev.to_string(), repo.resolve_commit(f).ok().flatten(), None),
+            None => (
+                rev.to_string(),
+                repo.resolve_commit(rev).ok().flatten(),
+                Some(format!(
+                    "under --targets, --main must name a branch or remote-tracking ref, and {rev} names {}",
+                    full.as_deref().unwrap_or("no ref")
+                )),
+            ),
+        });
+    }
+    if strict {
+        return None;
+    }
+    let mut names: Vec<String> = repo.configured_main().into_iter().collect();
+    if names.first().map(String::as_str) != Some("main") {
+        names.push("main".into());
+    }
+    names.into_iter().find_map(|name| {
+        // A branch, not a tag or file that happens to share its name.
+        let full = if name.starts_with("refs/") {
+            name.clone()
+        } else {
+            format!("refs/heads/{name}")
+        };
+        let sha = repo.resolve_commit(&full).ok().flatten()?;
+        Some((name, Some(sha), None))
+    })
+}
+
+/// Moves the changes that came from main unchanged out of `changes`. A
+/// change came from main when, at one of the head's merge bases with main,
+/// each of its paths (both, for a rename or copy) has the same mode and
+/// blob as at the head, or is absent at both. Any doubt (no main, a git
+/// error, a shallow clone, the head on main itself) moves nothing.
+fn split_from_main(
+    repo: &git::Repo,
+    head: &str,
+    head_entries: &[git::TreeEntry],
+    given: Option<&str>,
+    strict: bool,
+    changes: &mut Vec<git::Change>,
+) -> (Option<MainOut>, Vec<FromMain>) {
+    let Some((rev, sha, refused)) = main_ref(repo, given, strict) else {
+        return (None, Vec::new());
+    };
+    let mut out = MainOut {
+        rev,
+        sha,
+        merge_bases: Vec::new(),
+        detail: None,
+    };
+    let skip = |mut out: MainOut, why: String| {
+        out.detail = Some(format!("{why}; no path is skipped"));
+        (Some(out), Vec::new())
+    };
+    if let Some(why) = refused {
+        return skip(out, why);
+    }
+    let Some(main_sha) = out.sha.clone() else {
+        let why = format!("{} names no commit", out.rev);
+        return skip(out, why);
+    };
+    // A cut history can hide the real merge base behind an older one.
+    if repo.is_shallow().unwrap_or(true) {
+        return skip(out, "this is a shallow clone".into());
+    }
+    let bases = match repo.merge_bases(head, &main_sha) {
+        Ok(b) if b.is_empty() => return skip(out, "the head shares no history with main".into()),
+        Ok(b) => b,
+        Err(e) => return skip(out, format!("git can't find the merge base: {e}")),
+    };
+    // Main's runs tested a merge base only when it isn't the head itself.
+    if bases.iter().any(|b| b == head) {
+        return skip(out, "the head is on main".into());
+    }
+    let index = |entries: &[git::TreeEntry]| -> BTreeMap<Vec<u8>, (String, String)> {
+        entries
+            .iter()
+            .map(|e| (e.path.clone(), (e.mode.clone(), e.oid.clone())))
+            .collect()
+    };
+    let at_head = index(head_entries);
+    let mut at_bases = Vec::new();
+    for b in &bases {
+        match repo.tree(b) {
+            Ok(entries) => at_bases.push(index(&entries)),
+            Err(e) => return skip(out, format!("git can't read merge base {b}: {e}")),
+        }
+    }
+    out.merge_bases = bases;
+    let mut kept = Vec::new();
+    let mut from_main = Vec::new();
+    for change in changes.drain(..) {
+        let known = matches!(change.status, 'A' | 'C' | 'D' | 'M' | 'R' | 'T');
+        let paths: Vec<&Vec<u8>> = std::iter::once(&change.path)
+            .chain(change.old_path.as_ref())
+            .collect();
+        let matches_main = known
+            && at_bases
+                .iter()
+                .any(|base| paths.iter().all(|p| base.get(*p) == at_head.get(*p)));
+        let path = String::from_utf8(change.path.clone());
+        let old_path = change.old_path.clone().map(String::from_utf8).transpose();
+        match (matches_main, path, old_path) {
+            (true, Ok(path), Ok(old_path)) => from_main.push(FromMain {
+                path,
+                status: change.status.to_string(),
+                old_path,
+            }),
+            _ => kept.push(change),
+        }
+    }
+    *changes = kept;
+    (Some(out), from_main)
 }
 
 /// What one changed path maps to. A rename or copy judges its old path
@@ -396,6 +741,7 @@ fn explain(
         let before = engine.judge(old, change.status == 'R');
         verdict.matched_by.extend(before.matched_by);
         verdict.selects.extend(before.selects);
+        verdict.fallback_crates.extend(before.fallback_crates);
         let what = if change.status == 'R' {
             "rename"
         } else {
@@ -413,7 +759,17 @@ fn explain(
         status: change.status.to_string(),
         old_path,
         matched_by: verdict.matched_by.iter().cloned().collect(),
-        selects: verdict.selects.iter().map(select::Target::label).collect(),
+        selects: verdict
+            .selects
+            .iter()
+            .map(|target| match target {
+                select::Target::RustTest(target) => select::Target::Rust(target.package.clone()),
+                target => target.clone(),
+            })
+            .collect::<BTreeSet<_>>()
+            .iter()
+            .map(select::Target::label)
+            .collect(),
         reason: verdict.reasons.keys().next().copied(),
     };
     (out, verdict)
@@ -425,11 +781,16 @@ fn finish(mut data: AffectedData) -> AffectedData {
         .sort_by(|a, b| a.path.cmp(&b.path).then(a.old_path.cmp(&b.old_path)));
     data.reasons.sort();
     data.reasons.dedup();
+    data.warnings.sort();
+    data.warnings.dedup();
+    data.from_main
+        .sort_by(|a, b| a.path.cmp(&b.path).then(a.old_path.cmp(&b.old_path)));
     if data.reasons.is_empty() {
         data.mode = Mode::Selective;
     } else {
         data.mode = Mode::Full;
         data.selected = Selected::default();
+        data.warnings.clear();
     }
     data
 }
@@ -440,6 +801,19 @@ fn print_text(data: &AffectedData) {
         Mode::Full => "full",
     };
     println!("mode: {mode}");
+    for warning in &data.warnings {
+        println!(
+            "warning: {}: {} ({})",
+            output::shown_path(&warning.path),
+            warning.detail,
+            warning
+                .packages
+                .iter()
+                .map(|p| output::shown_path(p))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     for r in &data.reasons {
         let detail = output::shown_path(&r.detail);
         match &r.path {
@@ -459,8 +833,31 @@ fn print_text(data: &AffectedData) {
     for c in &data.selected.rust {
         println!("rust: {}", output::shown_path(c));
     }
+    // The plan, which a target rule can make narrower than its packages:
+    // `rust: mdkg` alone reads as the whole package.
+    let plans: BTreeSet<&Vec<String>> = data
+        .selected
+        .rust_targets
+        .iter()
+        .map(|t| &t.cargo_args)
+        .collect();
+    for args in plans {
+        println!("cargo: {}", output::shown_path(&args.join(" ")));
+    }
     for s in &data.selected.suites {
         println!("suite: {}", output::shown_path(s));
+    }
+    if let Some(main) = &data.main {
+        let detail = main
+            .detail
+            .as_ref()
+            .map(|d| format!(" ({})", output::shown_path(d)))
+            .unwrap_or_default();
+        println!(
+            "main: {}: {} path(s) came from main unchanged{detail}",
+            output::shown_path(&main.rev),
+            data.from_main.len()
+        );
     }
 }
 

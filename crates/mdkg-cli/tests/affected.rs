@@ -26,9 +26,15 @@ fn scratch() -> Scratch {
 }
 
 fn isolated(cmd: &mut Command) -> &mut Command {
-    common::without_launcher_env(cmd)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+    common::without_launcher_env(cmd);
+    for (name, _) in std::env::vars_os() {
+        if name.to_string_lossy().starts_with("GIT_") {
+            cmd.env_remove(name);
+        }
+    }
+    cmd.env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_ATTR_NOSYSTEM", "1")
         .env("GIT_AUTHOR_NAME", "Test")
         .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
         .env("GIT_COMMITTER_NAME", "Test")
@@ -36,15 +42,54 @@ fn isolated(cmd: &mut Command) -> &mut Command {
 }
 
 fn git(dir: &Path, args: &[&str]) -> String {
-    let out = isolated(Command::new("git").arg("-C").arg(dir).args(args))
-        .output()
-        .expect("git runs");
+    let out = isolated(
+        Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "core.hooksPath=/dev/null", "-c", "init.templateDir="])
+            .args(args),
+    )
+    .output()
+    .expect("git runs");
     assert!(
         out.status.success(),
         "git {args:?}: {}",
         String::from_utf8_lossy(&out.stderr)
     );
     String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+#[test]
+fn fixture_git_ignores_inherited_repository_and_index_overrides() {
+    const CHILD: &str = "MDKG_AFFECTED_FIXTURE_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let (s, _) = repo();
+        write(&s.0, "change.txt", "fixture\n");
+        commit(&s.0, "fixture change");
+        return;
+    }
+    let s = scratch();
+    let index = s.0.join("external-index");
+    fs::write(&index, b"untouched").unwrap();
+    let result = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "fixture_git_ignores_inherited_repository_and_index_overrides",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .env("GIT_DIR", s.0.join("other-git"))
+        .env("GIT_WORK_TREE", s.0.join("other-worktree"))
+        .env("GIT_INDEX_FILE", &index)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(fs::read(index).unwrap(), b"untouched");
 }
 
 fn write(dir: &Path, path: &str, text: &str) {
@@ -97,6 +142,12 @@ fn affected(dir: &Path, args: &[&str]) -> (i32, Value) {
     });
     common::conforms("affected", &v);
     (out.status.code().unwrap_or(-1), v)
+}
+
+fn affected_targets(dir: &Path, args: &[&str]) -> (i32, Value) {
+    let mut args = args.to_vec();
+    args.push("--targets");
+    affected(dir, &args)
 }
 
 fn codes(v: &Value) -> Vec<String> {
@@ -345,7 +396,10 @@ fn grafts_and_repository_replace_settings_dont_hide_a_change() {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_mdkg"));
         isolated(cmd.current_dir(&s.0));
         match how {
-            "graft file" => fs::write(s.0.join(".git/info/grafts"), &graft).expect("graft"),
+            "graft file" => {
+                fs::create_dir_all(s.0.join(".git/info")).expect("git info");
+                fs::write(s.0.join(".git/info/grafts"), &graft).expect("graft");
+            }
             "graft env" => {
                 let file = s.0.join("grafts");
                 fs::write(&file, &graft).expect("graft");
@@ -511,6 +565,17 @@ fn a_partial_clone_is_full_without_reading_anything() {
     assert!(
         v["data"]["base"].get("sha").is_none(),
         "nothing was resolved"
+    );
+    let (exit, strict) = affected_targets(&c, &["--base", &base]);
+    assert_ne!(exit, 0, "{strict}");
+    assert_eq!(strict["ok"], false);
+    assert!(strict.get("data").is_none());
+    assert_eq!(strict["diagnostics"][0]["code"], "io.git_failed");
+    assert!(
+        strict["diagnostics"][0]["hint"]
+            .as_str()
+            .expect("hint")
+            .contains("without --filter")
     );
 }
 
@@ -1343,6 +1408,12 @@ fn go_leaves_nothing_behind_in_the_temporary_folder() {
         .expect("read")
         .map(|e| e.expect("entry").file_name())
         .collect();
+    // Apple's tool shims can create this cache in TMPDIR in a sandbox.
+    // It belongs to xcrun, not mdkg's snapshot or Go's telemetry process.
+    let left: Vec<_> = left
+        .into_iter()
+        .filter(|name| !(cfg!(target_os = "macos") && name == "xcrun_db"))
+        .collect();
     assert!(left.is_empty(), "left behind: {left:?}");
 }
 
@@ -1470,8 +1541,92 @@ fn unmapped_v07_graph_document_is_full() {
     assert_eq!(codes(&v), ["unmatched_path"]);
     assert_eq!(
         v["data"]["selected"],
-        serde_json::json!({"go": [], "rust": [], "suites": []})
+        serde_json::json!({"go": [], "rust": [], "rust_targets": [], "suites": []})
     );
+}
+
+#[test]
+fn graph_ref_rules_apply_to_code_without_a_graph_checkout() {
+    let (s, _) = repo();
+    let path = s.0.join(".mdkg/config.json");
+    let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    config["affected"] = serde_json::json!({"rules": [
+        {"paths": ["app/**"], "select": {"suites": ["graph-checks"]}}
+    ]});
+    write(&s.0, ".mdkg/config.json", &config.to_string());
+    let graph = commit(&s.0, "graph rules");
+    git(&s.0, &["update-ref", "refs/heads/mdkg-graph", &graph]);
+    git(&s.0, &["rm", "-q", "-r", ".mdkg"]);
+    let base = commit(&s.0, "code without graph");
+    write(&s.0, "app/change.txt", "code\n");
+    let head = commit(&s.0, "code change");
+    git(&s.0, &["config", "mdkg.graph.ref", "refs/heads/mdkg-graph"]);
+    git(
+        &s.0,
+        &[
+            "config",
+            "mdkg.graph.01900000-0000-7000-8000-000000000001.ref",
+            "refs/heads/mdkg-graph",
+        ],
+    );
+    assert!(!s.0.join(".mdkg").exists());
+
+    // Invoke from a subdirectory: it is not itself the graph root.
+    let (exit, selected) = affected(&s.0.join("app"), &["--base", &base, "--head", &head]);
+    assert_eq!(exit, 0, "{selected}");
+    assert_eq!(selected["data"]["mode"], "selective", "{selected}");
+    assert_eq!(selected["data"]["head"]["sha"], head);
+    assert_eq!(selected["data"]["paths"][0]["path"], "app/change.txt");
+    assert_eq!(
+        selected["data"]["selected"]["suites"],
+        serde_json::json!(["graph-checks"])
+    );
+
+    // Neither a checkout edit nor a missing authority may change the source
+    // to that edit. The latter must conservatively request the full suite.
+    write(&s.0, ".mdkg/config.json", "not JSON");
+    assert_eq!(
+        affected(&s.0, &["--base", &base, "--head", &head]).1,
+        selected
+    );
+    git(&s.0, &["update-ref", "-d", "refs/heads/mdkg-graph"]);
+    let (_, missing) = affected(&s.0, &["--base", &base, "--head", &head]);
+    assert_eq!(missing["data"]["mode"], "full", "{missing}");
+    assert!(codes(&missing).contains(&"config_invalid".to_string()));
+}
+
+#[test]
+fn inherited_git_overrides_cannot_redirect_affected_to_another_repository() {
+    let (s, base) = repo();
+    let other = scratch();
+    git(&other.0, &["init", "-q", "-b", "main"]);
+    git(&s.0, &["update-ref", "refs/heads/mdkg-graph", &base]);
+    git(&s.0, &["config", "mdkg.graph.ref", "refs/heads/mdkg-graph"]);
+    git(
+        &s.0,
+        &[
+            "config",
+            "mdkg.graph.01900000-0000-7000-8000-000000000001.ref",
+            "refs/heads/mdkg-graph",
+        ],
+    );
+    let expected = affected(&s.0, &["--base", &base]);
+    assert_eq!(expected.1["data"]["mode"], "selective");
+    let out = isolated(Command::new(env!("CARGO_BIN_EXE_mdkg")).current_dir(&s.0))
+        .env("GIT_DIR", other.0.join(".git"))
+        .env("GIT_WORK_TREE", &other.0)
+        .env("GIT_COMMON_DIR", other.0.join(".git"))
+        .env("GIT_INDEX_FILE", other.0.join("other-index"))
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "core.worktree")
+        .env("GIT_CONFIG_VALUE_0", &other.0)
+        .args(["affected", "--base", &base, "--json"])
+        .output()
+        .unwrap();
+    let actual: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(out.status.code(), Some(expected.0), "{actual}");
+    assert_eq!(actual, expected.1);
+    assert!(!other.0.join("other-index").exists());
 }
 
 #[test]
@@ -1507,7 +1662,7 @@ fn invalid_committed_graph_configs_fail_closed() {
         assert_eq!(codes(&v), ["config_invalid"], "{v}");
         assert_eq!(
             v["data"]["selected"],
-            serde_json::json!({"go": [], "rust": [], "suites": []})
+            serde_json::json!({"go": [], "rust": [], "rust_targets": [], "suites": []})
         );
     }
     fs::remove_file(s.0.join(".mdkg/config.json")).unwrap();
@@ -1954,7 +2109,7 @@ fn root_manifest_case_variants_override_none_rules_before_cargo() {
         );
         assert_eq!(
             v["data"]["selected"],
-            serde_json::json!({"go":[],"rust":[],"suites":[]})
+            serde_json::json!({"go":[],"rust":[],"rust_targets":[],"suites":[]})
         );
     }
 }
@@ -2108,4 +2263,1190 @@ fn round3_text_output_escapes_changed_path_controls() {
         text.contains("unknown\\u{1b}[2J\\u{a}forged.txt"),
         "{text:?}"
     );
+}
+
+/// A shared crate and two dependent crates, each with a precise test scope.
+fn rust_target_repo() -> (Scratch, String) {
+    let (s, _) = rust_repo();
+    write(&s.0, "crates/core/src/extra.rs", "// another module\n");
+    write(
+        &s.0,
+        "crates/core/tests/behavior.rs",
+        "#[test] fn works() {}\n",
+    );
+    write(&s.0, "crates/cli/tests/smoke.rs", "#[test] fn works() {}\n");
+    let mut cfg: Value = serde_json::from_str(
+        &fs::read_to_string(s.0.join(".mdkg/config.json")).expect("target fixture"),
+    )
+    .expect("target fixture");
+    cfg["affected"] = serde_json::json!({"version": 1, "rules": [
+        {"paths": ["crates/core/src/lib.rs"], "select": {"rust_targets": [
+            {"package": "core-fx", "test": "behavior"},
+            {"package": "cli-fx", "test": "smoke"},
+            {"package": "checks-fx", "lib": true}
+        ]}},
+        {"paths": ["docs/**"], "select": {"rust_targets": [{"package": "cli-fx", "lib": true}]}}
+    ]});
+    write(&s.0, ".mdkg/config.json", &cfg.to_string());
+    let base = commit(&s.0, "target rules");
+    (s, base)
+}
+
+#[test]
+fn rust_target_rules_narrow_all_covered_dependents_and_keep_legacy_fields() {
+    if !have("cargo") {
+        eprintln!("skipped: cargo isn't on PATH");
+        return;
+    }
+    let (s, base) = rust_target_repo();
+    write(&s.0, "crates/core/src/lib.rs", "pub fn f() -> u8 { 2 }\n");
+    commit(&s.0, "core fix");
+    let (_, v) = affected_targets(&s.0, &["--base", &base]);
+    assert_eq!(v["data"]["mode"], "selective", "{v}");
+    assert_eq!(
+        v["data"]["selected"]["rust"],
+        serde_json::json!(["checks-fx", "cli-fx", "core-fx"])
+    );
+    assert_eq!(
+        v["data"]["paths"][0]["selects"],
+        serde_json::json!(["rust:checks-fx", "rust:cli-fx", "rust:core-fx"])
+    );
+    assert_eq!(v["data"]["warnings"], serde_json::json!([]));
+    let targets = v["data"]["selected"]["rust_targets"]
+        .as_array()
+        .expect("target fixture");
+    assert_eq!(targets.len(), 3);
+    let mut legacy = v.clone();
+    legacy["data"]
+        .as_object_mut()
+        .expect("target fixture")
+        .remove("warnings");
+    legacy["data"]["selected"]
+        .as_object_mut()
+        .expect("target fixture")
+        .remove("rust_targets");
+    common::conforms("affected", &legacy);
+    let args = serde_json::json!([
+        "test",
+        "-p",
+        "checks-fx",
+        "-p",
+        "cli-fx",
+        "-p",
+        "core-fx",
+        "--lib",
+        "--test",
+        "behavior",
+        "--test",
+        "smoke"
+    ]);
+    assert!(targets.iter().all(|t| t["cargo_args"] == args));
+    assert_eq!(targets[0]["kind"], "lib");
+    assert_eq!(targets[1]["name"], "smoke");
+    assert_eq!(targets[2]["name"], "behavior");
+}
+
+#[test]
+fn rust_target_rules_do_not_drop_uncovered_dependents() {
+    if !have("cargo") {
+        eprintln!("skipped: cargo isn't on PATH");
+        return;
+    }
+    let (s, _) = rust_target_repo();
+    let path = s.0.join(".mdkg/config.json");
+    let mut cfg: Value = serde_json::from_str(&fs::read_to_string(&path).expect("target fixture"))
+        .expect("target fixture");
+    cfg["affected"]["rules"][0]["select"]["rust_targets"] = serde_json::json!([
+        {"package": "core-fx", "test": "behavior"}
+    ]);
+    fs::write(path, cfg.to_string()).expect("target fixture");
+    let base = commit(&s.0, "only core mapped");
+    write(&s.0, "crates/core/src/lib.rs", "pub fn f() -> u8 { 2 }\n");
+    commit(&s.0, "core fix");
+    let (_, v) = affected_targets(&s.0, &["--base", &base]);
+    let targets = v["data"]["selected"]["rust_targets"]
+        .as_array()
+        .expect("target fixture");
+    assert_eq!(targets.len(), 3, "{v}");
+    let whole = serde_json::json!(["test", "-p", "checks-fx", "-p", "cli-fx", "-p", "core-fx"]);
+    assert!(targets.iter().all(|t| t["cargo_args"] == whole));
+    assert_eq!(targets[2]["kind"], "test");
+    let warnings = v["data"]["warnings"].as_array().expect("target fixture");
+    assert_eq!(warnings.len(), 2);
+    assert!(
+        warnings
+            .iter()
+            .all(|w| w["path"] == "crates/core/src/lib.rs")
+    );
+}
+
+#[test]
+fn rust_target_whole_crate_fallback_dominates_default_scopes_across_paths() {
+    if !have("cargo") {
+        eprintln!("skipped: cargo isn't on PATH");
+        return;
+    }
+    let (s, base) = rust_target_repo();
+    write(&s.0, "crates/core/src/lib.rs", "pub fn f() -> u8 { 2 }\n");
+    write(&s.0, "crates/core/src/extra.rs", "// unmapped change\n");
+    commit(&s.0, "mapped and unmapped fix");
+    let (_, v) = affected_targets(&s.0, &["--base", &base]);
+    let targets = v["data"]["selected"]["rust_targets"]
+        .as_array()
+        .expect("target fixture");
+    assert_eq!(targets.len(), 3, "{v}");
+    assert!(targets.iter().all(|t| t["kind"] == "package"));
+    assert!(
+        v["data"]["warnings"]
+            .as_array()
+            .expect("target fixture")
+            .iter()
+            .all(|w| w["path"] == "crates/core/src/extra.rs")
+    );
+}
+
+#[test]
+fn rust_target_stale_names_and_missing_libraries_fail_closed() {
+    if !have("cargo") {
+        eprintln!("skipped: cargo isn't on PATH");
+        return;
+    }
+    for target in [
+        serde_json::json!({"package":"core-fx", "test":"missing"}),
+        serde_json::json!({"package":"missing", "lib":true}),
+        serde_json::json!({"package":"core-fx", "lib":true}),
+    ] {
+        let (s, _) = rust_target_repo();
+        // The final case has a binary, but no library.
+        if target.get("lib").is_some() && target["package"] == "core-fx" {
+            git(
+                &s.0,
+                &["mv", "crates/core/src/lib.rs", "crates/core/src/main.rs"],
+            );
+            write(&s.0, "crates/core/src/main.rs", "fn main() {}\n");
+        }
+        let path = s.0.join(".mdkg/config.json");
+        let mut cfg: Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("target fixture"))
+                .expect("target fixture");
+        cfg["affected"]["rules"][1]["select"]["rust_targets"] = serde_json::json!([target]);
+        fs::write(path, cfg.to_string()).expect("target fixture");
+        let base = commit(&s.0, "stale target rule");
+        write(&s.0, "docs/new.md", "docs\n");
+        commit(&s.0, "docs change");
+        let (exit, v) = affected_targets(&s.0, &["--base", &base]);
+        assert_ne!(exit, 0, "{v}");
+        assert_eq!(v["ok"], false, "{v}");
+        assert!(v.get("data").is_none(), "{v}");
+        assert_eq!(v["diagnostics"][0]["code"], "config.invalid");
+    }
+}
+
+#[test]
+fn rust_target_malformed_config_is_rejected() {
+    for target in [
+        serde_json::json!({"package":"x", "lib":false}),
+        serde_json::json!({"package":"x", "lib":true, "test":"a"}),
+        serde_json::json!({"package":"x", "test":"a", "extra":1}),
+        serde_json::json!({"package":"x"}),
+    ] {
+        let (s, _) = repo();
+        let mut cfg: Value = serde_json::from_str(
+            &fs::read_to_string(s.0.join(".mdkg/config.json")).expect("target fixture"),
+        )
+        .expect("target fixture");
+        cfg["affected"] =
+            serde_json::json!({"rules":[{"paths":["docs/**"],"select":{"rust_targets":[target]}}]});
+        write(&s.0, ".mdkg/config.json", &cfg.to_string());
+        let base = commit(&s.0, "bad rule");
+        write(&s.0, "docs/new.md", "docs\n");
+        commit(&s.0, "docs change");
+        let (_, v) = affected_targets(&s.0, &["--base", &base]);
+        assert_eq!(v["ok"], false, "{v}");
+        assert_eq!(v["diagnostics"][0]["code"], "config.invalid");
+    }
+}
+
+#[test]
+fn rust_target_binary_unit_tests_are_available_for_cli_crates() {
+    if !have("cargo") {
+        eprintln!("skipped: cargo isn't on PATH");
+        return;
+    }
+    let (s, _) = rust_target_repo();
+    write(&s.0, "crates/lone/src/main.rs", "fn main() {}\n");
+    let path = s.0.join(".mdkg/config.json");
+    let mut cfg: Value = serde_json::from_str(&fs::read_to_string(&path).expect("target fixture"))
+        .expect("target fixture");
+    cfg["affected"]["rules"][1]["select"]["rust_targets"] = serde_json::json!([
+        {"package":"lone-fx", "bin":"lone-fx"}
+    ]);
+    fs::write(path, cfg.to_string()).expect("target fixture");
+    let base = commit(&s.0, "binary target rule");
+    write(&s.0, "docs/new.md", "docs\n");
+    commit(&s.0, "docs change");
+    let (_, v) = affected_targets(&s.0, &["--base", &base]);
+    assert_eq!(v["data"]["mode"], "selective", "{v}");
+    assert_eq!(
+        v["data"]["selected"]["rust_targets"][0]["cargo_args"],
+        serde_json::json!(["test", "-p", "lone-fx", "--bin", "lone-fx"])
+    );
+}
+
+#[test]
+fn rust_target_empty_lists_with_suites_fail_closed() {
+    let (s, _) = repo();
+    let mut cfg: Value =
+        serde_json::from_str(&fs::read_to_string(s.0.join(".mdkg/config.json")).expect("config"))
+            .expect("config JSON");
+    cfg["affected"] = serde_json::json!({"rules":[{"paths":["docs/**"],"select":{
+        "rust_targets":[],"suites":["docs"]
+    }}]});
+    write(&s.0, ".mdkg/config.json", &cfg.to_string());
+    let base = commit(&s.0, "empty target list");
+    write(&s.0, "docs/new.md", "docs\n");
+    commit(&s.0, "docs change");
+    let (_, v) = affected_targets(&s.0, &["--base", &base]);
+    assert_eq!(v["ok"], false, "{v}");
+    assert_eq!(v["diagnostics"][0]["code"], "config.invalid");
+}
+
+#[test]
+fn rust_target_full_run_drops_selective_fallback_warnings() {
+    if !have("cargo") {
+        eprintln!("skipped: cargo isn't on PATH");
+        return;
+    }
+    let (s, base) = rust_repo();
+    write(&s.0, "crates/core/src/lib.rs", "pub fn f() -> u8 { 2 }\n");
+    write(&s.0, "Cargo.lock", "# global\n");
+    commit(&s.0, "source and global change");
+    let (_, v) = affected_targets(&s.0, &["--base", &base]);
+    assert_eq!(v["data"]["mode"], "full", "{v}");
+    assert_eq!(v["data"]["warnings"], serde_json::json!([]));
+}
+
+#[test]
+fn rust_target_addition_preserves_go_path_selection_order() {
+    if !have("go") {
+        eprintln!("skipped: go isn't on PATH");
+        return;
+    }
+    let (s, _) = repo();
+    write(&s.0, "go.mod", "module example.com/a\n\ngo 1.21\n");
+    write(&s.0, "z/root.go", "package root\n");
+    write(&s.0, "nested/go.mod", "module example.com/a/a\n\ngo 1.21\n");
+    write(&s.0, "nested/a.go", "package a\n");
+    let mut cfg: Value =
+        serde_json::from_str(&fs::read_to_string(s.0.join(".mdkg/config.json")).expect("config"))
+            .expect("config JSON");
+    cfg["affected"] =
+        serde_json::json!({"rules":[{"paths":["docs/**"],"select":{"go":["./..."]}}]});
+    write(&s.0, ".mdkg/config.json", &cfg.to_string());
+    let base = commit(&s.0, "two modules and rule");
+    write(&s.0, "docs/new.md", "docs\n");
+    commit(&s.0, "docs change");
+    let (_, v) = affected_targets(&s.0, &["--base", &base]);
+    assert_eq!(v["data"]["mode"], "selective", "{v}");
+    assert_eq!(
+        v["data"]["paths"][0]["selects"],
+        serde_json::json!(["go:example.com/a/z", "go:example.com/a/a"])
+    );
+}
+
+#[test]
+fn rust_target_grouped_invocation_preserves_feature_unified_tests() {
+    if !have("cargo") {
+        eprintln!("skipped: cargo isn't on PATH");
+        return;
+    }
+    let (s, _) = rust_target_repo();
+    let core = s.0.join("crates/core/Cargo.toml");
+    fs::write(
+        &core,
+        fs::read_to_string(&core).expect("manifest") + "\n[features]\nshared = []\n",
+    )
+    .expect("features");
+    let cli = s.0.join("crates/cli/Cargo.toml");
+    fs::write(
+        &cli,
+        fs::read_to_string(&cli).expect("manifest").replace(
+            "path = \"../core\"",
+            "path = \"../core\", features = [\"shared\"]",
+        ),
+    )
+    .expect("dependency features");
+    write(
+        &s.0,
+        "crates/core/src/lib.rs",
+        "pub fn f() -> u8 { 1 }\n#[cfg(feature=\"shared\")] #[test] fn feature_unified_test_runs() {}\n",
+    );
+    let path = s.0.join(".mdkg/config.json");
+    let mut cfg: Value =
+        serde_json::from_str(&fs::read_to_string(&path).expect("config")).expect("JSON");
+    cfg["affected"]["rules"][1]["select"]["rust_targets"] = serde_json::json!([
+        {"package":"core-fx","lib":true}, {"package":"cli-fx","test":"smoke"}
+    ]);
+    fs::write(path, cfg.to_string()).expect("config");
+    let base = commit(&s.0, "feature-unified fixture");
+    write(&s.0, "docs/new.md", "docs\n");
+    commit(&s.0, "docs change");
+    let (_, v) = affected_targets(&s.0, &["--base", &base]);
+    assert_eq!(v["data"]["mode"], "selective", "{v}");
+    let targets = v["data"]["selected"]["rust_targets"]
+        .as_array()
+        .expect("targets");
+    assert_eq!(targets.len(), 2);
+    assert_eq!(targets[0]["cargo_args"], targets[1]["cargo_args"]);
+    let args: Vec<_> = targets[0]["cargo_args"]
+        .as_array()
+        .expect("argv")
+        .iter()
+        .map(|s| s.as_str().expect("arg"))
+        .collect();
+    let out = isolated(Command::new("cargo").current_dir(&s.0))
+        .args(args)
+        .arg("--offline")
+        .args(["--", "--test-threads=4"])
+        .env("CARGO_BUILD_JOBS", "4")
+        .output()
+        .expect("Cargo plan runs");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("feature_unified_test_runs ... ok"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+fn assert_opt_in_rule_refused(dir: &Path, base: &str) {
+    let (exit, v) = affected_targets(dir, &["--base", base]);
+    assert_ne!(exit, 0, "{v}");
+    assert_eq!(v["ok"], false, "{v}");
+    assert!(
+        v.get("data").is_none(),
+        "legacy consumers must not receive a runnable selection: {v}"
+    );
+    let diagnostic = &v["diagnostics"][0];
+    assert_eq!(diagnostic["code"], "config.invalid", "{v}");
+    assert!(
+        diagnostic["message"]
+            .as_str()
+            .expect("message")
+            .contains("unsupported opt-in Rust target")
+    );
+    assert!(
+        diagnostic["hint"]
+            .as_str()
+            .expect("hint")
+            .contains("Remove this rust_targets entry")
+    );
+}
+
+#[test]
+fn rust_target_opt_in_rules_are_refused_before_selective_full_and_no_change_decisions() {
+    if !have("cargo") {
+        eprintln!("skipped: cargo isn't on PATH");
+        return;
+    }
+    let (s, _) = rust_target_repo();
+    let manifest = s.0.join("crates/core/Cargo.toml");
+    fs::write(
+        &manifest,
+        fs::read_to_string(&manifest).expect("manifest")
+            + "\n[[test]]\nname=\"behavior\"\npath=\"tests/behavior.rs\"\ntest=false\n",
+    )
+    .expect("manifest target");
+    let base = commit(&s.0, "unsupported opt-in rule");
+    // The invalid rule is refused even with no changes or no matching path.
+    assert_opt_in_rule_refused(&s.0, &base);
+    write(&s.0, "docs/new.md", "docs\n");
+    commit(&s.0, "unrelated selective path");
+    assert_opt_in_rule_refused(&s.0, &base);
+    write(&s.0, "crates/core/src/lib.rs", "pub fn f() -> u8 { 2 }\n");
+    commit(&s.0, "matching source path");
+    assert_opt_in_rule_refused(&s.0, &base);
+    write(&s.0, "Cargo.lock", "# full-run path\n");
+    commit(&s.0, "global full-run path");
+    assert_opt_in_rule_refused(&s.0, &base);
+}
+
+#[test]
+fn rust_target_opt_in_library_and_binary_rules_are_refused() {
+    if !have("cargo") {
+        eprintln!("skipped: cargo isn't on PATH");
+        return;
+    }
+    for (package, section, target) in [
+        (
+            "core",
+            "\n[lib]\ntest=false\n",
+            serde_json::json!({"package":"core-fx","lib":true}),
+        ),
+        (
+            "lone",
+            "\n[[bin]]\nname=\"lone-fx\"\npath=\"src/main.rs\"\ntest=false\n",
+            serde_json::json!({"package":"lone-fx","bin":"lone-fx"}),
+        ),
+    ] {
+        let (s, _) = rust_target_repo();
+        write(&s.0, "crates/lone/src/main.rs", "fn main() {}\n");
+        let manifest = s.0.join(format!("crates/{package}/Cargo.toml"));
+        fs::write(
+            &manifest,
+            fs::read_to_string(&manifest).expect("manifest") + section,
+        )
+        .expect("manifest target");
+        let config_path = s.0.join(".mdkg/config.json");
+        let mut config: Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).expect("config")).expect("JSON");
+        config["affected"]["rules"][1]["select"]["rust_targets"] = serde_json::json!([target]);
+        fs::write(config_path, config.to_string()).expect("config");
+        let base = commit(&s.0, "unsupported unit target");
+        write(&s.0, "docs/new.md", "docs\n");
+        commit(&s.0, "docs change");
+        assert_opt_in_rule_refused(&s.0, &base);
+    }
+}
+
+#[test]
+fn rust_target_feature_gated_rules_are_refused_even_with_default_features() {
+    if !have("cargo") {
+        eprintln!("skipped: cargo isn't on PATH");
+        return;
+    }
+    for defaults in ["", "default=[\"gate\"]\n"] {
+        let (s, _) = rust_target_repo();
+        let manifest = s.0.join("crates/core/Cargo.toml");
+        fs::write(&manifest, fs::read_to_string(&manifest).expect("manifest") +
+            &format!("\n[features]\n{defaults}gate=[]\n[[test]]\nname=\"behavior\"\npath=\"tests/behavior.rs\"\nrequired-features=[\"gate\"]\n")).expect("feature-gated target");
+        let base = commit(&s.0, "feature-gated target rule");
+        assert_opt_in_rule_refused(&s.0, &base);
+        write(&s.0, "Cargo.lock", "# full run\n");
+        commit(&s.0, "global change");
+        assert_opt_in_rule_refused(&s.0, &base);
+    }
+}
+
+#[test]
+fn rust_target_rules_fail_without_an_adapter_or_a_safe_snapshot() {
+    for unsafe_snapshot in [false, true] {
+        let (s, _) = rust_target_repo();
+        if unsafe_snapshot {
+            #[cfg(unix)]
+            std::os::unix::fs::symlink("README.md", s.0.join("snapshot-link")).expect("link");
+            #[cfg(not(unix))]
+            continue;
+        } else {
+            git(&s.0, &["rm", "-rf", "crates", "Cargo.toml"]);
+        }
+        let base = commit(&s.0, "target rules cannot be verified");
+        write(&s.0, "docs/new.md", "docs\n");
+        commit(&s.0, "docs change");
+        let (exit, v) = affected_targets(&s.0, &["--base", &base]);
+        assert_ne!(exit, 0, "{v}");
+        assert_eq!(v["ok"], false, "{v}");
+        assert!(v.get("data").is_none(), "{v}");
+        assert_eq!(v["diagnostics"][0]["code"], "config.invalid");
+        assert!(
+            v["diagnostics"][0]["hint"]
+                .as_str()
+                .expect("hint")
+                .contains("offline cargo metadata")
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn rust_target_rules_fail_when_offline_metadata_cannot_run() {
+    use std::os::unix::fs::PermissionsExt;
+    let (s, base) = rust_target_repo();
+    let tools = scratch();
+    let fake = tools.0.join("cargo");
+    fs::write(
+        &fake,
+        "#!/bin/sh\nprintf 'metadata unavailable\\n' >&2\nexit 2\n",
+    )
+    .expect("stub");
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).expect("executable");
+    let path = std::env::join_paths(
+        std::iter::once(tools.0.clone()).chain(std::env::split_paths(
+            &std::env::var_os("PATH").expect("PATH"),
+        )),
+    )
+    .expect("PATH");
+    let out = isolated(Command::new(env!("CARGO_BIN_EXE_mdkg")).current_dir(&s.0))
+        .env("PATH", path)
+        .args(["affected", "--targets", "--base", &base, "--json"])
+        .output()
+        .expect("affected");
+    let v: Value = serde_json::from_slice(&out.stdout).expect("JSON");
+    common::conforms("affected", &v);
+    assert!(!out.status.success(), "{v}");
+    assert_eq!(v["ok"], false, "{v}");
+    assert!(v.get("data").is_none(), "{v}");
+    assert_eq!(v["diagnostics"][0]["code"], "config.invalid");
+    assert!(
+        v["diagnostics"][0]["message"]
+            .as_str()
+            .expect("message")
+            .contains("metadata unavailable")
+    );
+}
+
+#[test]
+fn rust_target_mode_requires_local_revisions_even_without_rules() {
+    for has_rules in [false, true] {
+        let (s, base) = if has_rules {
+            rust_target_repo()
+        } else {
+            repo()
+        };
+        for args in [
+            vec!["--base", "missing-revision"],
+            vec!["--base", base.as_str(), "--head", "missing-revision"],
+        ] {
+            let (legacy_exit, legacy) = affected(&s.0, &args);
+            assert_eq!(legacy_exit, 0, "{legacy}");
+            assert_eq!(legacy["data"]["mode"], "full");
+            let (exit, strict) = affected_targets(&s.0, &args);
+            assert_ne!(exit, 0, "{strict}");
+            assert_eq!(strict["ok"], false);
+            assert!(strict.get("data").is_none());
+            assert_eq!(strict["diagnostics"][0]["code"], "io.git_failed");
+            assert!(
+                strict["diagnostics"][0]["hint"]
+                    .as_str()
+                    .expect("hint")
+                    .contains("Fetch")
+            );
+        }
+    }
+}
+
+#[test]
+fn repository_local_templates_create_valid_nodes() {
+    use std::os::unix::fs::PermissionsExt;
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .unwrap();
+    let settings: Value = match fs::read(source.join(".mdkg/config.json")) {
+        Ok(bytes) => serde_json::from_slice(&bytes).expect("repository config"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(error) => panic!("repository config: {error}"),
+    };
+    let root_path = settings["templates"]["root_path"]
+        .as_str()
+        .unwrap_or(".mdkg/templates");
+    let set = settings["templates"]["default_set"]
+        .as_str()
+        .unwrap_or("default");
+    let relative = Path::new(root_path).join(set);
+    assert!(
+        !relative.as_os_str().is_empty()
+            && relative.components().all(|part| matches!(
+                part,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )),
+        "template fixture requires a relative repository template set"
+    );
+    let templates = source.join(&relative);
+    if fs::symlink_metadata(&templates)
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    {
+        std::io::Write::write_all(
+            &mut std::io::stderr(),
+            b"skipped: repository_local_templates_create_valid_nodes: active local template set absent\n",
+        ).expect("skip reason");
+        return;
+    }
+    assert!(
+        templates
+            .canonicalize()
+            .expect("active templates")
+            .starts_with(&source),
+        "template fixture must stay inside the repository"
+    );
+    fn copy_templates(from: &Path, to: &Path) {
+        let kind = fs::symlink_metadata(from)
+            .expect("template metadata")
+            .file_type();
+        assert!(
+            !kind.is_symlink(),
+            "local template link: {}",
+            from.display()
+        );
+        if kind.is_dir() {
+            fs::create_dir_all(to).expect("template directory");
+            for entry in fs::read_dir(from).expect("templates") {
+                let entry = entry.expect("template entry");
+                copy_templates(&entry.path(), &to.join(entry.file_name()));
+            }
+        } else {
+            assert!(kind.is_file(), "special local template: {}", from.display());
+            let mut bytes = fs::read(from).expect("template");
+            bytes.extend_from_slice(b"\nLOCAL_TEMPLATE_FIXTURE_OVERRIDE\n");
+            fs::write(to, bytes).expect("fixture template");
+        }
+    }
+    let (s, _) = repo();
+    let home = scratch();
+    // Protect private content even after a crash or MDKG_KEEP_SCRATCH.
+    for dir in [&s.0, &home.0] {
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).expect("private fixture root");
+    }
+    let fixture_templates = s.0.join(".mdkg/templates").join(set);
+    copy_templates(&templates, &fixture_templates);
+    write(
+        &s.0,
+        ".mdkg/config.json",
+        &serde_json::json!({
+            "schema_version": 3, "format_version": "0.7",
+            "graph_id": "01900000-0000-7000-8000-000000000001",
+            "work": {"location": "git"},
+            "templates": {"root_path": ".mdkg/templates", "default_set": set}
+        })
+        .to_string(),
+    );
+    // The loop template names an optional skill; supply only that fixture
+    // dependency, without loading any user or repository skill instructions.
+    write(
+        &s.0,
+        ".mdkg/skills/pursue-mdkg-loop/SKILL.md",
+        "# Fixture skill\nOnly a reference target for template validation.\n",
+    );
+    commit(&s.0, "actual local templates");
+    let run = |args: &[&str]| {
+        isolated(Command::new(env!("CARGO_BIN_EXE_mdkg")).current_dir(&s.0))
+            .env("HOME", &home.0)
+            .env("XDG_CONFIG_HOME", home.0.join("config"))
+            .env("XDG_DATA_HOME", home.0.join("data"))
+            .env("CODEX_HOME", home.0.join("codex"))
+            .args(["--as", "template-check"])
+            .args(args)
+            .arg("--json")
+            .output()
+            .expect("fixture CLI")
+    };
+    for kind in [
+        "task",
+        "bug",
+        "feat",
+        "spike",
+        "test",
+        "epic",
+        "goal",
+        "loop",
+        "checkpoint",
+        "edd",
+        "dec",
+        "prd",
+        "prop",
+        "rule",
+    ] {
+        let output = run(&["new", kind, &format!("Local {kind} template")]);
+        assert!(
+            output.status.success(),
+            "{kind}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let report: Value = serde_json::from_slice(&output.stdout).expect("new report");
+        let file = if kind == "checkpoint" { "chk" } else { kind };
+        if !templates.join(format!("{file}.md")).is_file() {
+            continue; // A partial override legitimately uses bundled defaults.
+        }
+        assert!(
+            report["data"]["node"]["body"]
+                .as_str()
+                .is_some_and(|body| body.contains("LOCAL_TEMPLATE_FIXTURE_OVERRIDE")),
+            "bundled template substituted for {kind}: {report}"
+        );
+    }
+    let output = run(&["validate"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    if templates.join("task.md").is_file() {
+        let blocker = run(&["new", "task", "Unfinished blocker"]);
+        assert!(
+            blocker.status.success(),
+            "{}",
+            String::from_utf8_lossy(&blocker.stdout)
+        );
+        let blocker: Value = serde_json::from_slice(&blocker.stdout).unwrap();
+        let id = blocker["data"]["node"]["id"].as_str().expect("blocker id");
+        let dependent = run(&["new", "task", "Blocked task", "--blocked-by", id]);
+        assert!(
+            dependent.status.success(),
+            "{}",
+            String::from_utf8_lossy(&dependent.stdout)
+        );
+        let dependent: Value = serde_json::from_slice(&dependent.stdout).unwrap();
+        assert!(
+            dependent["data"]["node"]["edges"]["blocked_by"]
+                .as_array()
+                .is_some_and(|values| values.iter().any(|v| v == id)),
+            "active template silently dropped blocked_by: {dependent}"
+        );
+
+        // Negative control: the positive assertion must detect an omitted
+        // optional field, even though such a node can still validate.
+        let task = fixture_templates.join("task.md");
+        let original = fs::read_to_string(&task).expect("task override");
+        let missing_field = original
+            .lines()
+            .filter(|line| !line.starts_with("blocked_by:"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_ne!(original, missing_field, "missing blocked_by control");
+        fs::write(&task, missing_field).unwrap();
+        let negative = run(&["new", "task", "Missing optional field", "--blocked-by", id]);
+        let negative: Value = serde_json::from_slice(&negative.stdout).unwrap();
+        assert!(
+            !negative["data"]["node"]["edges"]["blocked_by"]
+                .as_array()
+                .is_some_and(|values| values.iter().any(|v| v == id)),
+            "negative control preserved the deliberately removed field: {negative}"
+        );
+
+        fs::write(&task, "---\ntype: [broken\n---\n").unwrap();
+        let malformed = run(&["new", "task", "Invalid template"]);
+        assert!(!malformed.status.success());
+        let malformed: Value = serde_json::from_slice(&malformed.stdout).unwrap();
+        assert_eq!(
+            malformed["diagnostics"][0]["code"], "frontmatter.bad_list",
+            "{malformed}"
+        );
+        assert_eq!(
+            malformed["diagnostics"][0]["path"], "<template>",
+            "{malformed}"
+        );
+    }
+}
+
+/// Paths of one list in the decision, such as `paths` or `from_main`.
+fn listed(v: &Value, field: &str) -> Vec<String> {
+    v["data"][field]
+        .as_array()
+        .unwrap_or_else(|| panic!("{field}: {v}"))
+        .iter()
+        .map(|p| p["path"].as_str().expect("path").to_string())
+        .collect()
+}
+
+fn selected_rust(v: &Value) -> Vec<String> {
+    v["data"]["selected"]["rust"]
+        .as_array()
+        .expect("rust")
+        .iter()
+        .map(|c| c.as_str().expect("crate").to_string())
+        .collect()
+}
+
+/// A lane branch with a handoff, while main changes a global file, a
+/// manifest, a crate, renames one file and deletes another; then the lane
+/// changes its own crate and merges main. Returns the repository, the
+/// handoff commit and main's tip.
+fn lane_merging_main() -> (Scratch, String, String) {
+    let (s, _) = rust_repo();
+    write(&s.0, ".tool-versions", "rust 1.0\n");
+    write(&s.0, "notes/old.txt", "moved by main\n");
+    write(&s.0, "notes/gone.txt", "deleted by main\n");
+    commit(&s.0, "more files");
+    git(&s.0, &["checkout", "-q", "-b", "lane"]);
+    write(
+        &s.0,
+        "crates/cli/src/lib.rs",
+        "pub fn g() -> u8 { core_fx::f() + 1 }\n",
+    );
+    let handoff = commit(&s.0, "lane: first handoff");
+    git(&s.0, &["checkout", "-q", "main"]);
+    write(&s.0, ".tool-versions", "rust 2.0\n");
+    write(
+        &s.0,
+        "crates/lone/Cargo.toml",
+        "[package]\nname = \"lone-fx\"\nversion = \"0.0.1\"\nedition = \"2021\"\n",
+    );
+    write(&s.0, "crates/core/src/lib.rs", "pub fn f() -> u8 { 2 }\n");
+    git(&s.0, &["mv", "notes/old.txt", "notes/new.txt"]);
+    git(&s.0, &["rm", "-q", "notes/gone.txt"]);
+    let main = commit(&s.0, "main moves on");
+    git(&s.0, &["checkout", "-q", "lane"]);
+    write(&s.0, "crates/checks/src/lib.rs", "// lane\n");
+    commit(&s.0, "lane: second change");
+    git(&s.0, &["merge", "-q", "--no-edit", "main"]);
+    (s, handoff, main)
+}
+
+#[test]
+fn a_lane_merging_main_stays_selective_for_its_own_change() {
+    if !have("cargo") {
+        eprintln!("skipped: cargo isn't on PATH");
+        return;
+    }
+    let (s, handoff, main) = lane_merging_main();
+    let (exit, v) = affected(&s.0, &["--base", &handoff]);
+    assert_eq!(exit, 0);
+    assert_eq!(v["data"]["mode"], "selective", "{v}");
+    assert_eq!(listed(&v, "paths"), ["crates/checks/src/lib.rs"], "{v}");
+    assert_eq!(
+        listed(&v, "from_main"),
+        [
+            ".tool-versions",
+            "crates/core/src/lib.rs",
+            "crates/lone/Cargo.toml",
+            "notes/gone.txt",
+            "notes/new.txt"
+        ],
+        "{v}"
+    );
+    let rename = &v["data"]["from_main"][4];
+    assert_eq!(rename["status"], "R", "{v}");
+    assert_eq!(rename["old_path"], "notes/old.txt", "{v}");
+    assert_eq!(v["data"]["from_main"][3]["status"], "D", "{v}");
+    assert_eq!(selected_rust(&v), ["checks-fx"]);
+    assert_eq!(v["data"]["main"]["rev"], "main");
+    assert_eq!(v["data"]["main"]["sha"], main.as_str());
+    assert_eq!(v["data"]["main"]["merge_bases"], serde_json::json!([main]));
+    assert!(v["data"]["main"].get("detail").is_none(), "{v}");
+}
+
+#[test]
+fn a_lane_change_to_a_global_file_main_also_changed_is_still_full() {
+    if !have("cargo") {
+        eprintln!("skipped: cargo isn't on PATH");
+        return;
+    }
+    let (s, handoff, _) = lane_merging_main();
+    write(&s.0, ".tool-versions", "rust 3.0\n");
+    commit(&s.0, "lane: its own toolchain");
+    let (_, v) = affected(&s.0, &["--base", &handoff]);
+    assert_eq!(v["data"]["mode"], "full", "{v}");
+    assert_eq!(codes(&v), ["global_file"], "{v}");
+    assert!(listed(&v, "paths").contains(&".tool-versions".to_string()));
+    assert!(!listed(&v, "from_main").contains(&".tool-versions".to_string()));
+    // A mode change is the lane's too, even with main's blob.
+    let (s, handoff, _) = lane_merging_main();
+    git(
+        &s.0,
+        &["update-index", "--chmod=+x", "crates/core/src/lib.rs"],
+    );
+    git(&s.0, &["commit", "-q", "-m", "lane: mode only"]);
+    let (_, v) = affected(&s.0, &["--base", &handoff]);
+    assert!(
+        listed(&v, "paths").contains(&"crates/core/src/lib.rs".to_string()),
+        "{v}"
+    );
+    assert_eq!(v["data"]["mode"], "selective", "{v}");
+}
+
+#[test]
+fn a_conflict_resolution_is_the_lanes_unless_it_takes_mains_blob() {
+    if !have("cargo") {
+        eprintln!("skipped: cargo isn't on PATH");
+        return;
+    }
+    for (resolution, lanes) in [("rust 9.0\n", true), ("rust 2.0\n", false)] {
+        let (s, _) = rust_repo();
+        write(&s.0, ".tool-versions", "rust 1.0\n");
+        commit(&s.0, "toolchain");
+        git(&s.0, &["checkout", "-q", "-b", "lane"]);
+        write(&s.0, "crates/cli/src/lib.rs", "pub fn g() -> u8 { 0 }\n");
+        let handoff = commit(&s.0, "lane: handoff");
+        write(&s.0, ".tool-versions", "rust 1.5\n");
+        commit(&s.0, "lane: toolchain");
+        git(&s.0, &["checkout", "-q", "main"]);
+        write(&s.0, ".tool-versions", "rust 2.0\n");
+        commit(&s.0, "main: toolchain");
+        git(&s.0, &["checkout", "-q", "lane"]);
+        let merged = isolated(Command::new("git").arg("-C").arg(&s.0).args([
+            "-c",
+            "core.hooksPath=/dev/null",
+            "merge",
+            "-q",
+            "--no-edit",
+            "main",
+        ]))
+        .output()
+        .expect("git runs");
+        assert!(!merged.status.success(), "the merge conflicts");
+        write(&s.0, ".tool-versions", resolution);
+        git(&s.0, &["add", ".tool-versions"]);
+        git(&s.0, &["commit", "-q", "--no-edit"]);
+        let (_, v) = affected(&s.0, &["--base", &handoff]);
+        let path = ".tool-versions".to_string();
+        if lanes {
+            assert_eq!(v["data"]["mode"], "full", "{v}");
+            assert!(listed(&v, "paths").contains(&path), "{v}");
+        } else {
+            assert_eq!(v["data"]["mode"], "selective", "{v}");
+            assert_eq!(listed(&v, "from_main"), [path], "{v}");
+        }
+    }
+}
+
+#[test]
+fn with_no_main_ref_nothing_is_skipped() {
+    if !have("cargo") {
+        eprintln!("skipped: cargo isn't on PATH");
+        return;
+    }
+    let (s, handoff, main) = lane_merging_main();
+    git(&s.0, &["branch", "-q", "-m", "main", "trunk"]);
+    let (_, v) = affected(&s.0, &["--base", &handoff]);
+    assert_eq!(v["data"]["mode"], "full", "{v}");
+    assert!(v["data"].get("main").is_none(), "{v}");
+    assert_eq!(v["data"]["from_main"], serde_json::json!([]));
+    assert_eq!(listed(&v, "paths").len(), 6, "{v}");
+    assert!(codes(&v).contains(&"global_file".to_string()));
+
+    // A configured mainRef that names nothing falls back to `main`, which
+    // is gone too.
+    git(&s.0, &["config", "mdkg.mainRef", "nosuch"]);
+    let (_, unresolved) = affected(&s.0, &["--base", &handoff]);
+    assert_eq!(unresolved["data"], v["data"]);
+
+    // An explicit ref that names nothing is reported, and skips nothing.
+    let (exit, given) = affected(&s.0, &["--base", &handoff, "--main", "nosuch"]);
+    assert_eq!(exit, 0);
+    assert_eq!(given["data"]["mode"], "full", "{given}");
+    assert_eq!(given["data"]["main"]["rev"], "nosuch");
+    assert!(given["data"]["main"].get("sha").is_none(), "{given}");
+    assert!(
+        given["data"]["main"]["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("names no commit")),
+        "{given}"
+    );
+
+    // mdkg.mainRef, or --main, naming the renamed branch restores it.
+    git(&s.0, &["config", "mdkg.mainRef", "trunk"]);
+    let (_, configured) = affected(&s.0, &["--base", &handoff]);
+    assert_eq!(configured["data"]["mode"], "selective", "{configured}");
+    assert_eq!(configured["data"]["main"]["rev"], "trunk");
+    git(&s.0, &["config", "--unset", "mdkg.mainRef"]);
+    let (_, flag) = affected(&s.0, &["--base", &handoff, "--main", &main]);
+    assert_eq!(flag["data"]["mode"], "selective", "{flag}");
+    assert_eq!(listed(&flag, "from_main").len(), 5, "{flag}");
+}
+
+#[test]
+fn a_head_on_main_skips_nothing() {
+    if !have("cargo") {
+        eprintln!("skipped: cargo isn't on PATH");
+        return;
+    }
+    let (s, handoff, main) = lane_merging_main();
+    // Main's own range: every path is main's, and main must still test it.
+    let (_, v) = affected(&s.0, &["--base", &format!("{main}~1"), "--head", &main]);
+    assert_eq!(v["data"]["mode"], "full", "{v}");
+    assert_eq!(v["data"]["from_main"], serde_json::json!([]));
+    assert!(
+        v["data"]["main"]["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("the head is on main")),
+        "{v}"
+    );
+    // Once main has merged the lane, the lane's head is on main too.
+    git(&s.0, &["checkout", "-q", "main"]);
+    git(&s.0, &["merge", "-q", "--no-edit", "lane"]);
+    git(&s.0, &["checkout", "-q", "lane"]);
+    let (_, v) = affected(&s.0, &["--base", &handoff]);
+    assert_eq!(v["data"]["mode"], "full", "{v}");
+    assert_eq!(v["data"]["from_main"], serde_json::json!([]));
+}
+
+/// A prose edit a target rule covers selects one test target of its
+/// package, not the package; `rust:` keeps naming the package for older
+/// consumers, so text output prints the plan beside it (#11719).
+#[test]
+fn text_output_prints_the_target_plan_beside_the_package() {
+    if !have("cargo") {
+        eprintln!("skipped: cargo isn't on PATH");
+        return;
+    }
+    let (s, base) = rust_target_repo();
+    write(&s.0, "docs/design.md", "prose only\n");
+    commit(&s.0, "prose");
+    let (_, v) = affected(&s.0, &["--base", &base]);
+    assert_eq!(v["data"]["mode"], "selective", "{v}");
+    assert_eq!(selected_rust(&v), ["cli-fx"]);
+    let out = isolated(Command::new(env!("CARGO_BIN_EXE_mdkg")).current_dir(&s.0))
+        .args(["affected", "--base", &base])
+        .output()
+        .expect("text affected");
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("rust: cli-fx\n"), "{text}");
+    assert!(text.contains("cargo: test -p cli-fx --lib\n"), "{text}");
+    assert_eq!(text.matches("cargo: ").count(), 1, "{text}");
+}
+
+/// The verified gate (`--targets`) skips main's paths only for an explicit
+/// `--main` naming a branch or remote-tracking ref: no ambient setting can
+/// shrink it (orchestrator, #12089).
+#[test]
+fn under_targets_only_an_explicit_branch_main_skips() {
+    if !have("cargo") {
+        eprintln!("skipped: cargo isn't on PATH");
+        return;
+    }
+    let (s, handoff, main) = lane_merging_main();
+    let (_, v) = affected_targets(&s.0, &["--base", &handoff]);
+    assert_eq!(v["data"]["mode"], "full", "{v}");
+    assert!(v["data"].get("main").is_none(), "{v}");
+    assert_eq!(v["data"]["from_main"], serde_json::json!([]));
+
+    // A branch at the lane's own earlier commit, named by the shared config.
+    git(&s.0, &["branch", "tmp", &handoff]);
+    git(&s.0, &["config", "mdkg.mainRef", "tmp"]);
+    let (_, v) = affected_targets(&s.0, &["--base", &format!("{handoff}~1")]);
+    assert_eq!(v["data"]["from_main"], serde_json::json!([]), "{v}");
+    git(&s.0, &["config", "--unset", "mdkg.mainRef"]);
+
+    for (given, skips) in [
+        ("main", true),
+        ("refs/heads/main", true),
+        (main.as_str(), false),
+        ("nosuch", false),
+    ] {
+        let (_, v) = affected_targets(&s.0, &["--base", &handoff, "--main", given]);
+        assert_eq!(v["data"]["main"]["rev"], given, "{v}");
+        if skips {
+            assert_eq!(v["data"]["mode"], "selective", "{given}: {v}");
+            assert_eq!(listed(&v, "from_main").len(), 5, "{given}: {v}");
+        } else {
+            assert_eq!(v["data"]["mode"], "full", "{given}: {v}");
+            assert_eq!(v["data"]["from_main"], serde_json::json!([]), "{given}");
+            assert!(v["data"]["main"]["detail"].is_string(), "{given}: {v}");
+        }
+    }
+    git(&s.0, &["update-ref", "refs/remotes/origin/main", &main]);
+    let (_, v) = affected_targets(&s.0, &["--base", &handoff, "--main", "origin/main"]);
+    assert_eq!(v["data"]["mode"], "selective", "{v}");
+}
+
+/// The default main ref comes from `mdkg.mainRef` in the repository's own
+/// config only, never `$MDKG_MAIN_REF` (as R33 settled for the protected
+/// list).
+#[test]
+fn the_environment_never_names_main() {
+    if !have("cargo") {
+        eprintln!("skipped: cargo isn't on PATH");
+        return;
+    }
+    let (s, handoff, _) = lane_merging_main();
+    git(&s.0, &["branch", "-q", "-m", "main", "trunk"]);
+    let out = isolated(Command::new(env!("CARGO_BIN_EXE_mdkg")).current_dir(&s.0))
+        .env("MDKG_MAIN_REF", "trunk")
+        .args(["affected", "--base", &handoff, "--json"])
+        .output()
+        .expect("run mdkg");
+    let v: Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert!(v["data"].get("main").is_none(), "{v}");
+    assert_eq!(v["data"]["from_main"], serde_json::json!([]));
+    git(&s.0, &["config", "mdkg.mainRef", "refs/heads/trunk"]);
+    let (_, v) = affected(&s.0, &["--base", &handoff]);
+    assert_eq!(v["data"]["main"]["rev"], "refs/heads/trunk", "{v}");
+    assert_eq!(v["data"]["mode"], "selective", "{v}");
+}
+
+/// Every tracked source file under `crates/*/src` has rules naming a test
+/// target in its crate and in each crate that depends on it, so no change
+/// to it falls back to whole-crate tests (orchestrator, 2026-10-31: a new
+/// file with no rule sent lanes to whole-package runs). Runs this
+/// repository's own `affected` rules on a copy of its workspace, with every
+/// such file changed.
+#[test]
+fn every_workspace_source_file_has_test_target_rules() {
+    if !have("cargo") {
+        eprintln!("skipped: cargo isn't on PATH");
+        return;
+    }
+    let top = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .unwrap();
+    if !top.join(".git").exists() || !top.join(".mdkg/config.json").is_file() {
+        eprintln!("skipped: not run from the mdkg repository");
+        return;
+    }
+    let config: Value =
+        serde_json::from_slice(&fs::read(top.join(".mdkg/config.json")).unwrap()).unwrap();
+    // The public export's graph is a fresh `mdkg init`, with no rules of
+    // its own to check.
+    if config.get("affected").is_none() {
+        eprintln!("skipped: this repository's .mdkg/config.json has no `affected` rules");
+        return;
+    }
+    let tracked = git(
+        &top,
+        &[
+            "ls-files",
+            "-z",
+            "--",
+            "Cargo.toml",
+            "Cargo.lock",
+            "rust-toolchain.toml",
+            "crates",
+        ],
+    );
+    let (s, _) = repo();
+    let mut sources = Vec::new();
+    for path in tracked.split('\0').filter(|p| !p.is_empty()) {
+        let from = top.join(path);
+        // A file deleted in the checkout but not yet in the index.
+        if !from.is_file() {
+            continue;
+        }
+        let to = s.0.join(path);
+        fs::create_dir_all(to.parent().unwrap()).unwrap();
+        fs::copy(&from, &to).unwrap();
+        let parts: Vec<&str> = path.split('/').collect();
+        if parts.len() > 3 && parts[0] == "crates" && parts[2] == "src" && path.ends_with(".rs") {
+            sources.push(path.to_string());
+        }
+    }
+    assert!(!sources.is_empty(), "no source files under crates/*/src");
+    let fixture = s.0.join(".mdkg/config.json");
+    let mut cfg: Value = serde_json::from_slice(&fs::read(&fixture).unwrap()).unwrap();
+    cfg["affected"] = config["affected"].clone();
+    fs::write(&fixture, cfg.to_string()).unwrap();
+    let base = commit(&s.0, "the workspace and its rules");
+    for path in &sources {
+        let mut text = fs::read(s.0.join(path)).unwrap();
+        text.extend_from_slice(b"\n// changed\n");
+        fs::write(s.0.join(path), text).unwrap();
+    }
+    commit(&s.0, "every source file changed");
+    let (_, v) = affected_targets(&s.0, &["--base", &base]);
+    assert_eq!(v["ok"], true, "{v}");
+    let mut problems: Vec<String> = v["data"]["warnings"]
+        .as_array()
+        .expect("warnings")
+        .iter()
+        .map(|w| format!("{}: whole-crate tests for {}", w["path"], w["packages"]))
+        .collect();
+    problems.extend(
+        v["data"]["reasons"]
+            .as_array()
+            .expect("reasons")
+            .iter()
+            .map(|r| format!("{}: {} ({})", r["path"], r["code"], r["detail"])),
+    );
+    assert!(
+        problems.is_empty(),
+        "{} source files lack test-target rules; add rules to .mdkg/config.json's \
+         `affected` section naming a test target in each listed package:\n{}",
+        problems.len(),
+        problems.join("\n")
+    );
+    assert_eq!(v["data"]["mode"], "selective", "{v}");
 }

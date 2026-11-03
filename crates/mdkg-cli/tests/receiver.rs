@@ -150,17 +150,63 @@ impl Fixture {
         .expect("receiver fixture succeeds");
         fs::write(cwd.join(".git"), format!("gitdir: {}\n", admin.display()))
             .expect("receiver fixture succeeds");
-        let mut config: Value =
-            serde_json::from_str(include_str!("../../../conformance/base/.mdkg/config.json"))
-                .expect("fixture config");
-        config["projections"] = json!(["hooks:codex"]);
-        let config = config.to_string();
-        fs::write(root.join(".mdkg/config.json"), &config).expect("receiver fixture succeeds");
-        fs::write(cwd.join(".mdkg/config.json"), config).expect("receiver fixture succeeds");
         let program = root.join("fake-codex");
         let f = Self { root, cwd, program };
         f.fake("exit 0");
+        // Public setup owns the current graph format and identity. The linked
+        // checkout shares that identity; initializing it again would mint a
+        // different graph. Leave projection installation to the tests below.
+        f.data("setup", &["init", "--graph-only", "--work", "shared"]);
+        let mut config: Value = serde_json::from_slice(
+            &fs::read(f.root.join(".mdkg/config.json")).expect("read initialized config"),
+        )
+        .expect("initialized fixture config");
+        config["projections"] = json!(["hooks:codex"]);
+        let config = config.to_string();
+        fs::write(f.root.join(".mdkg/config.json"), &config).expect("receiver fixture succeeds");
+        fs::write(f.cwd.join(".mdkg/config.json"), config).expect("receiver fixture succeeds");
+        // Identity reads committed graph objects, including in checkout mode.
+        // Both fixture checkouts start at the same committed graph snapshot.
+        f.git(&["add", ".mdkg/config.json"]);
+        f.git(&["commit", "-q", "-m", "fixture authority"]);
+        f.git(&["update-ref", "refs/heads/agent/alice", "HEAD"]);
         f
+    }
+    fn git(&self, args: &[&str]) {
+        let output = Command::new("git")
+            .current_dir(&self.root)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", &self.root)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_ATTR_NOSYSTEM", "1")
+            .args([
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "init.templateDir=",
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+            ])
+            .args(args)
+            .output()
+            .expect("fixture git");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    fn committed_config(&self, config: &Value) {
+        let bytes = config.to_string();
+        fs::write(self.root.join(".mdkg/config.json"), &bytes).expect("write graph config");
+        fs::write(self.cwd.join(".mdkg/config.json"), bytes).expect("write checkout config");
+        self.git(&["add", ".mdkg/config.json"]);
+        self.git(&["commit", "-q", "--allow-empty", "-m", "fixture graph"]);
+        self.git(&["update-ref", "refs/heads/agent/alice", "HEAD"]);
     }
     fn fake(&self, tail: &str) {
         fs::write(&self.program, format!("#!/bin/sh\nif [ \"$1\" = --fixture-ready ]; then printf READY; exit 0; fi\nprintf '%s\\n' \"$@\" >> \"$RECEIVER_ARGV\"\nprintf 'BEGIN\\n' >> \"$RECEIVER_CALLS\"\n{tail}\n")).expect("receiver fixture succeeds");
@@ -366,6 +412,48 @@ fn missing_registration_waits_without_creating_a_headless_spec() {
 }
 
 #[test]
+fn manual_once_does_not_dispatch_new_mail_after_completion_before_finish() {
+    let f = Fixture::new();
+    f.ready();
+    f.post("question");
+    assert_eq!(f.up()["wake"]["status"], "queued");
+    let path = f.root.join(".git/mdkg/run/progress/alice.json");
+    let mut record: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(record["progress"]["ran"], 1);
+    assert_eq!(record["finished"], true);
+    let watch = record["watch_id"].clone();
+    let reminded = hooks::try_reminded_through(&f.root.join(".git"), "alice", SESSION).unwrap();
+    // This is the durable snapshot immediately before finish: completion has
+    // charged this manual pass, but a crash or failed finish left it unfinished.
+    record["finished"] = json!(false);
+    fs::write(&path, record.to_string()).unwrap();
+    f.post("question");
+    // Intentionally no --max-turns: explicit --once itself limits this pass.
+    let out = f.call("launcher", &["agents", "up", "alice", "--once"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(
+        f.calls(),
+        1,
+        "a recovered manual pass must not dispatch newer mail"
+    );
+    let after: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(after["watch_id"], watch);
+    assert_eq!(after["progress"]["ran"], 1);
+    assert_eq!(after["finished"], true);
+    assert_eq!(
+        hooks::try_reminded_through(&f.root.join(".git"), "alice", SESSION).unwrap(),
+        reminded
+    );
+    // Once finalization has succeeded, a later manual invocation is new work.
+    assert_eq!(f.up()["wake"]["status"], "queued");
+    assert_eq!(f.calls(), 2);
+}
+
+#[test]
 fn slow_pre_spawn_renewal_still_queues_exactly_once() {
     let f = Fixture::new();
     f.ready();
@@ -488,26 +576,46 @@ fn supervisor_retries_pre_spawn_timeout_on_its_next_cycle() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let began = Instant::now();
-    while child.try_wait().unwrap().is_none() {
-        if began.elapsed() >= STARTUP_ALLOWANCE {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("supervisor did not retry the unsent reminder");
+    // One allowance per cycle, from the one before it, never one for the
+    // whole run: under load each cycle's process startups take seconds
+    // (a flake at load 37). The first cycle also waits out the renewal
+    // the shim holds until the launcher's 30 s deadline.
+    let mut stderr = child.stderr.take().unwrap();
+    let err = std::thread::spawn(move || {
+        let mut err = String::new();
+        let _ = stderr.read_to_string(&mut err);
+        err
+    });
+    let stdout = child.stdout.take().unwrap();
+    let (send, lines) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::BufRead as _;
+        for line in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if send.send(line).is_err() {
+                break;
+            }
         }
-        std::thread::sleep(Duration::from_millis(10));
+    });
+    let mut events: Vec<Value> = Vec::new();
+    for (cycle, allowance) in [
+        ("the unsent reminder", STARTUP_ALLOWANCE * 3),
+        ("its retry", STARTUP_ALLOWANCE),
+    ] {
+        match lines.recv_timeout(allowance) {
+            Ok(line) => events.push(serde_json::from_str(&line).unwrap()),
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("supervisor didn't report {cycle} in {allowance:?}: {events:?}");
+            }
+        }
     }
-    let out = child.wait_with_output().unwrap();
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let events: Vec<Value> = String::from_utf8(out.stdout)
-        .unwrap()
-        .lines()
-        .map(|s| serde_json::from_str(s).unwrap())
-        .collect();
+    let status = wait_for_exit(&mut child, "supervisor exit after its retry");
+    assert!(status.success(), "{}", err.join().unwrap());
+    events.extend(lines.iter().map(|l| serde_json::from_str(&l).unwrap()));
     let statuses: Vec<_> = events
         .iter()
         .map(|e| e["data"]["wake"]["status"].as_str())
@@ -720,9 +828,36 @@ fn loop_guard_stays_paused_until_explicit_thread_resume() {
             .expect("receiver fixture succeeds"),
         0
     );
+    // A live paused supervisor owns its durable progress lock between turns.
+    // Full recovery must refuse clearly, while thread-only guard recovery must
+    // leave the watch's accounting and route intact.
+    let path = dir.join("progress/alice.json");
+    let record: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let mut watch = mdkg_run::supervise::progress::Locked::open(
+        &dir,
+        record["graph_id"].as_str().unwrap().parse().unwrap(),
+        "alice",
+    )
+    .unwrap();
+    watch
+        .start(record["invocation"].as_str().unwrap(), None)
+        .unwrap();
+    let before = fs::read(&path).unwrap();
+    let result = f.call("launcher", &["agents", "resume", "alice"]);
+    assert!(!result.status.success());
+    let error: Value = serde_json::from_slice(&result.stdout).unwrap();
+    let hint = error["diagnostics"][0]["hint"]
+        .as_str()
+        .expect("live watch recovery hint");
+    assert!(
+        hint.contains("stop") && hint.contains("agents resume alice --thread"),
+        "{error}"
+    );
     let reset = f.data("launcher", &["agents", "resume", "alice", "--thread", &key]);
     assert_eq!(reset["waiting_for_prompt"], false);
     assert_eq!(f.route().session.as_deref(), Some(SESSION));
+    assert_eq!(fs::read(path).unwrap(), before);
+    drop(watch);
     assert_eq!(f.up()["wake"]["status"], "queued");
 }
 
@@ -799,11 +934,29 @@ fn reset_cannot_change_the_route_during_an_admitted_queue_process() {
         (f.calls() > 0).then_some(())
     });
     let result = f.call("launcher", &["agents", "resume", "alice"]);
-    assert!(!result.status.success());
-    assert!(String::from_utf8_lossy(&result.stdout).contains("coord.lease_held"));
-    assert_eq!(f.route().session.as_deref(), Some(SESSION));
+    let session = f.route().session;
+    let supervisor = child.id();
+    // Release and reap the admitted child even if a refusal assertion fails.
     fs::write(release, "go").expect("release admitted queue");
-    assert!(child.wait().expect("receiver fixture succeeds").success());
+    let status = wait_for_exit(&mut child, "admitted queue did not finish");
+    assert!(!result.status.success());
+    let error: Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(
+        error["diagnostics"][0]["code"], "run.progress_invalid",
+        "{error}"
+    );
+    // The refusal names the live supervisor, so it can be found and stopped.
+    assert!(
+        error["diagnostics"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains(&format!(
+                "progress is busy: the last recorded holder is process {supervisor}"
+            )),
+        "{error}"
+    );
+    assert_eq!(session.as_deref(), Some(SESSION));
+    assert!(status.success());
     assert_eq!(
         f.data("launcher", &["agents", "resume", "alice"])["waiting_for_prompt"],
         true
@@ -819,7 +972,7 @@ fn interactive_receivers_refuse_a_model_turn_concurrency_cap() {
         serde_json::from_slice(&fs::read(&file).expect("receiver fixture succeeds"))
             .expect("receiver fixture succeeds");
     cfg["agents"] = json!({"defaults":{"concurrency":1}});
-    fs::write(file, cfg.to_string()).expect("receiver fixture succeeds");
+    f.committed_config(&cfg);
     let result = f.call("launcher", &["agents", "up", "alice", "--once"]);
     assert!(!result.status.success());
     assert!(String::from_utf8_lossy(&result.stdout).contains("concurrency cap"));
@@ -837,7 +990,8 @@ fn install_and_undo_exclude_interactive_dispatch_after_installation_check() {
             .output()
             .unwrap()
     };
-    assert!(install(&["install"]).status.success());
+    // Hooks are opt-in (G24): this test needs hooks:codex installed.
+    assert!(install(&["install", "--hooks"]).status.success());
     f.ready();
     f.post("question");
     assert!(!f.root.join(".git/mdkg/run/alice.json").exists());
@@ -936,7 +1090,7 @@ fn install_and_undo_exclude_interactive_dispatch_after_installation_check() {
 #[test]
 fn install_and_undo_include_active_turns_without_saved_state_or_registration() {
     let f = Fixture::new();
-    f.data("installer", &["install"]);
+    f.data("installer", &["install", "--hooks"]);
     f.data("holder", &["claim", "run:alice"]);
     for args in [&["install"][..], &["install", "--undo"][..]] {
         let out = f.call("installer", args);
@@ -973,7 +1127,7 @@ fn install_holds_idle_interactive_registration_before_writing() {
     let mut child = f
         .command("installer")
         .current_dir(&f.cwd)
-        .args(["install", "--json"])
+        .args(["install", "--hooks", "--json"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -1005,21 +1159,26 @@ fn install_holds_idle_interactive_registration_before_writing() {
 #[test]
 fn headless_setup_rechecks_intent_before_saving_a_spec() {
     let f = Fixture::new();
+    // Headless preparation must get past the launcher-on-main refusal to
+    // exercise the actor-mode recheck at lease acquisition.
+    f.git(&["update-ref", "refs/heads/fixture", "refs/heads/main"]);
+    fs::write(f.root.join(".git/HEAD"), "ref: refs/heads/fixture\n").unwrap();
     let config = f.root.join(".mdkg/config.json");
-    let clean = f.root.join("clean-config");
-    fs::copy(&config, &clean).expect("fixture config");
+    let clean_sha = fs::read_to_string(f.root.join(".git/refs/heads/fixture")).unwrap();
     let mut cfg: Value = serde_json::from_slice(&fs::read(&config).expect("config")).expect("json");
     cfg["agents"] = json!({"alice":{"cwd":f.cwd,"harness":"codex","role":"reviewer"}});
     fs::write(&config, cfg.to_string()).expect("configured actor");
+    f.git(&["add", ".mdkg/config.json"]);
+    f.git(&["commit", "-q", "-m", "fixture headless actor"]);
     let shim = f.root.join("mail-shim");
-    fs::write(&shim,"#!/bin/sh\nfor arg in \"$@\"; do\nif [ \"$arg\" = claim ]; then /bin/cp \"$CLEAN_CONFIG\" \"$TEST_CONFIG\"; fi\ndone\nexec \"$REAL_MDKG\" \"$@\"\n").expect("shim");
+    fs::write(&shim,"#!/bin/sh\nfor arg in \"$@\"; do\nif [ \"$arg\" = claim ]; then /usr/bin/env -i PATH=\"$PATH\" HOME=\"$TEST_ROOT\" GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_ATTR_NOSYSTEM=1 git -C \"$TEST_ROOT\" update-ref refs/heads/fixture \"$CLEAN_SHA\" || exit 1; fi\ndone\nexec \"$REAL_MDKG\" \"$@\"\n").expect("shim");
     fs::set_permissions(&shim, fs::Permissions::from_mode(0o700)).expect("mode");
     let result = f
         .command("launcher")
         .env("MDKG_RUN_MDKG", &shim)
         .env("REAL_MDKG", env!("CARGO_BIN_EXE_mdkg"))
-        .env("CLEAN_CONFIG", &clean)
-        .env("TEST_CONFIG", &config)
+        .env("TEST_ROOT", &f.root)
+        .env("CLEAN_SHA", clean_sha.trim())
         .args(["agents", "up", "alice", "--once", "--json"])
         .output()
         .expect("up");
@@ -1074,20 +1233,53 @@ fn large_body_batches_are_small_header_pages_and_stay_unshown() {
 #[test]
 fn supervisor_interruption_stops_a_delayed_queue_and_keeps_reservation() {
     use std::os::unix::process::CommandExt;
-    for signal in ["-INT", "-KILL"] {
+    // A shell without job control starts background commands with SIGINT
+    // ignored, so a terminal's Ctrl-C can't reach them, and the supervisor,
+    // which installs no SIGINT handler, keeps that ignore across exec. Under
+    // such a runner INT did nothing: the queue ran to its 30-second deadline,
+    // then `--once` reported delivery_unknown and exited 0. So neither case
+    // depends on the runner's disposition:
+    // - INT: this process catches SIGINT with the default action, and exec
+    //   resets a caught signal to its default, so the supervisor starts with
+    //   INT at its default even under a runner that ignores it.
+    // - TERM and KILL: the supervisor starts with INT ignored, as under such
+    //   a runner. The test does assume the runner doesn't ignore TERM.
+    signal_hook::flag::register_conditional_default(
+        signal_hook::consts::SIGINT,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+    )
+    .expect("catch SIGINT with its default action");
+    for signal in ["-INT", "-TERM", "-KILL"] {
         let f = Fixture::new();
         f.ready();
         f.post("question");
         f.fake("printf '%s' \"$$\" > \"$QUEUE_PID\"; while [ ! -e \"$RECEIVER_RELEASE\" ]; do /bin/sleep 0.01; done; printf 'LATE\\n' >> \"$RECEIVER_ARGV\"");
         let release = f.root.join("release-canary");
         let queue_pid = f.root.join("queue-pid");
-        let mut child = f
-            .command("launcher")
+        let supervisor = f.command("launcher");
+        let mut command = if signal == "-INT" {
+            Command::new(supervisor.get_program())
+        } else {
+            let mut sh = Command::new("/bin/sh");
+            sh.args(["-c", "trap '' INT; exec \"$0\" \"$@\""])
+                .arg(supervisor.get_program());
+            sh
+        };
+        command
+            .args(supervisor.get_args())
+            .current_dir(f.root.as_path());
+        for (key, value) in supervisor.get_envs() {
+            match value {
+                Some(value) => command.env(key, value),
+                None => command.env_remove(key),
+            };
+        }
+        let mut child = command
             .args(["agents", "up", "alice", "--once", "--json"])
             .env("RECEIVER_RELEASE", &release)
             .env("QUEUE_PID", &queue_pid)
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdout(fs::File::create(f.root.join("supervisor.out")).expect("stdout"))
             .stderr(Stdio::null())
             .process_group(0)
             .spawn()
@@ -1100,7 +1292,15 @@ fn supervisor_interruption_stops_a_delayed_queue_and_keeps_reservation() {
             .status()
             .expect("signal supervisor group");
         assert!(killed.success());
-        assert!(!child.wait().expect("reap supervisor").success());
+        let signalled = Instant::now();
+        let status = child.wait().expect("reap supervisor");
+        assert!(
+            !status.success(),
+            "{signal}: supervisor exited 0 after {:?} (near 30 s means the signal was ignored, \
+             likely inherited from the runner): {}",
+            signalled.elapsed(),
+            fs::read_to_string(f.root.join("supervisor.out")).unwrap_or_default()
+        );
         // Verify death before releasing the canary, rather than assuming a
         // surviving process would be scheduled during a fixed sleep window.
         wait_pid_gone(queue, STARTUP_ALLOWANCE);
@@ -1415,22 +1615,23 @@ fn hooks_projection_is_required_for_registration_and_dispatch() {
     let f = Fixture::new();
     let path = f.cwd.join(".mdkg/config.json");
     let enabled = fs::read(&path).expect("config");
-    let mut config: Value = serde_json::from_slice(&enabled).expect("json");
+    let enabled: Value = serde_json::from_slice(&enabled).expect("json");
+    let mut config = enabled.clone();
     config
         .as_object_mut()
         .expect("config object")
         .remove("projections");
-    fs::write(&path, config.to_string()).expect("legacy defaults");
+    f.committed_config(&config);
     f.hook_start(SESSION, None);
     assert!(
         route::read(&f.root.join(".git"), "alice")
             .expect("route read")
             .is_none()
     );
-    fs::write(&path, enabled).expect("enable");
+    f.committed_config(&enabled);
     f.ready();
     config["projections"] = json!([]);
-    fs::write(&path, config.to_string()).expect("disable");
+    f.committed_config(&config);
     f.post("question");
     assert_eq!(f.up()["wake"]["status"], "waiting");
     assert_eq!(f.calls(), 0);

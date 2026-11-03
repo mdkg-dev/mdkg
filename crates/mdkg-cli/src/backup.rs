@@ -73,6 +73,10 @@ pub struct SnapshotRecord {
     /// Whether `store restore` would take it: a copy of this repository's
     /// store.
     pub restorable: bool,
+    /// `fsync` when the copy was synced with a plain fsync only (the
+    /// `MDKG_STORE_PLAIN_FSYNC` override): a weaker guarantee.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub barrier: Option<String>,
     pub bytes: u64,
     /// When it was written, RFC 3339 UTC.
     pub written: String,
@@ -122,6 +126,7 @@ pub fn snapshots(root: &Path, json: bool) -> u8 {
                 ),
                 schema: b.schema,
                 msg_schema: b.msg_schema,
+                barrier: b.barrier,
                 bytes: b.bytes,
                 written: rfc3339(b.modified_ms),
             })
@@ -138,11 +143,16 @@ pub fn snapshots(root: &Path, json: bool) -> u8 {
         }
         for s in &d.snapshots {
             println!(
-                "{} (schema {}, mail {}, {}{})",
+                "{} (schema {}, mail {}, {}{}{})",
                 s.path,
                 s.schema.as_deref().unwrap_or("?"),
                 s.msg_schema.as_deref().unwrap_or("none"),
                 s.written,
+                if s.barrier.is_some() {
+                    ", plain fsync only"
+                } else {
+                    ""
+                },
                 if s.restorable {
                     ""
                 } else {
@@ -192,6 +202,12 @@ pub fn restore(root: &Path, copy: &str, json: bool) -> u8 {
             )
             .with_hint("reinstall the older build before running anything else here")
         });
+        let weak = weak_copies(
+            restored.from_barrier.is_some(),
+            &restored.from,
+            restored.previous_weak,
+            &restored.previous,
+        );
         Ok(Report::ok(RestoreData {
             store: store.display().to_string(),
             restored_from: restored.from.display().to_string(),
@@ -199,7 +215,8 @@ pub fn restore(root: &Path, copy: &str, json: bool) -> u8 {
             restored: restored.restored,
             previous: restored.previous.display().to_string(),
         })
-        .with(older))
+        .with(older)
+        .with(weak))
     })()
     .unwrap_or_else(Report::failed);
     output::emit("store.restore", json, report, |d| {
@@ -207,5 +224,36 @@ pub fn restore(root: &Path, copy: &str, json: bool) -> u8 {
             "restored {} from {} ({} -> {}); the store as it was is at {}",
             d.store, d.restored_from, d.replaced, d.restored, d.previous
         );
+    })
+}
+
+/// A warning naming the copies a restore read or wrote that were synced
+/// with a plain fsync only (the `MDKG_STORE_PLAIN_FSYNC` override), a
+/// weaker guarantee than the full barrier (Terra's code review #5973,
+/// finding 5).
+fn weak_copies(
+    from_weak: bool,
+    from: &Path,
+    previous_weak: bool,
+    previous: &Path,
+) -> Option<Diagnostic> {
+    let named: Vec<String> = [(from_weak, from), (previous_weak, previous)]
+        .into_iter()
+        .filter(|(weak, _)| *weak)
+        .map(|(_, p)| p.display().to_string())
+        .collect();
+    (!named.is_empty()).then(|| {
+        Diagnostic::warning(
+            Code::CoordStoreRestored,
+            format!(
+                "synced with a plain fsync only, a weaker guarantee than the full barrier: {}",
+                named.join(", ")
+            ),
+        )
+        .with_hint(
+            "a power loss can lose such a copy, and the store as it is now may be the only \
+             good state: copy it now, without MDKG_STORE_PLAIN_FSYNC, to a file system with a \
+             full barrier",
+        )
     })
 }

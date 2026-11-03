@@ -187,16 +187,16 @@ templates' headings:
 <!-- headings:start -->
 | Type | Recommended headings |
 |---|---|
-| `task` | Overview, Acceptance Criteria, Files Affected, Implementation Notes, Test Plan, Links / Artifacts |
-| `bug` | Overview, Reproduction Steps, Expected vs Actual, Suspected Cause, Fix Plan, Test Plan, Links / Artifacts |
-| `feat` | Overview, Acceptance Criteria, Notes |
-| `spike` | Research Question, Context And Constraints, Search Plan, Findings, Options And Tradeoffs, Recommendation, Follow-Up Nodes To Create, Skill Candidates, Data Structures And Algorithms Notes, UX Notes, Security Notes, mdkg.dev Launch Implications, Evidence And Sources |
+| `task` | Overview, Requirements, Acceptance Criteria, Files Affected, Implementation Notes, Test Plan, Links / Artifacts |
+| `bug` | Overview, Requirements, Reproduction Steps, Expected vs Actual, Suspected Cause, Fix Plan, Test Plan, Links / Artifacts |
+| `feat` | Overview, Requirements, Acceptance Criteria, Notes |
+| `spike` | Research Question, Requirements, Context And Constraints, Search Plan, Findings, Options And Tradeoffs, Recommendation, Follow-Up Nodes To Create, Skill Candidates, Data Structures And Algorithms Notes, UX Notes, Security Notes, mdkg.dev Launch Implications, Evidence And Sources |
 | `test` | Overview, Target / Scope, Preconditions / Environment, Test Cases, Results / Evidence, Notes / Follow-ups |
 | `epic` | Goal, Scope, Milestones, Out of Scope, Risks, Links / Artifacts |
 | `goal` | Objective, End Condition, Non-Goals, Recursive Algorithm, Required Skills, Required Checks, Acceptance Criteria, Definition Of Done, Stop Conditions, Current State, Iteration Log, Skill Improvement Candidates, Completion Evidence |
 | `loop` | Operating Model, Scope, Definition Of Done, Required Evidence Lanes, Pre-Run Questions, Pre-Approved Read-Only Actions, Approval-Gated Actions, Child Node Materialization, Template Lineage, Run And Evidence Model, Blocker Continuation Policy, Waiver And Decision Policy, Closeout Matrix, Validation Plan, Current State |
 | `checkpoint` | Summary, Scope Covered, Decisions Captured, Implementation Summary, Verification / Testing, Known Issues / Follow-ups, Links / Artifacts |
-| `edd` | Overview, Architecture, Data model, APIs / interfaces, Failure modes, Observability, Security / privacy, Testing strategy, Rollout plan |
+| `edd` | Overview, Requirements, Architecture, Data model, APIs / interfaces, Failure modes, Observability, Security / privacy, Testing strategy, Rollout plan |
 | `dec` | Context, Decision, Alternatives considered, Consequences, Links / references |
 | `prd` | Problem, Goals, Non-goals, Requirements, Functional, Non-functional, Acceptance Criteria, Metrics / Success, Risks, Open Questions |
 | `prop` | Summary, Motivation, Proposal, Impact, Risks, Alternatives, Next Steps |
@@ -246,15 +246,58 @@ nothing waiting to merge
 Bob's claim exits with code 5: someone else holds it. A lease lasts two
 hours; `mdkg renew` extends yours, and an expired one blocks nobody.
 
+Some files every branch adds a line to, such as a lockfile, a changelog
+or generated schemas, are better checked at merge time than held by one
+actor for hours. Name those in `coordination.leases` in the committed
+`.mdkg/config.json`, and several actors can hold them at once. Claims read
+the policy from the same committed config as `config show`'s project layer,
+so an uncommitted edit shares nothing (see
+[changing the committed config](git-graph.md#changing-the-committed-config)):
+
+```json
+{"coordination": {"leases": {"paths": [
+  {"glob": "Cargo.lock", "mode": "shared"},
+  {"glob": "schemas/**", "mode": "shared"}
+]}}}
+```
+
+A claim of a shared path succeeds beside the others' and warns
+`coord.lease_shared` with their names, so you can tell them what you
+change. Their edits then meet in git: two branches that add a line at
+the same spot (the end of a list, under the same heading) conflict, and
+whoever merges second resolves it. Sharing works only between shared
+leases: a claim with `--exclusive` still keeps the path to one actor,
+and a lease on a folder around it (`docs` around a shared
+`docs/commands.md`) is exclusive, so it blocks the shared claims and
+they block it. Globs are relative to the graph root, so `Cargo.toml`
+names only the root's. Node files are always exclusive.
+
 `mdkg release <path>` gives one lease up early, and `mdkg done` (below)
-releases its node's lease. Later, once Ada's branch has merged and she
-has committed everything, `mdkg release --all` gives up every lease she
-still holds, so none of them blocks anyone until it expires:
+releases its node's lease. A file lease protects uncommitted edits only,
+so once Ada has committed her work, `mdkg release --all` gives up every
+lease she still holds, and none of them blocks anyone until it expires:
 
 ```console
 $ mdkg release --all
 released src/parser.rs (lease-1)
 ```
+
+Until she does, those leases are on their way out. `mdkg renew` extends
+a file or folder lease only while its path has changes in her worktree
+(staged, unstaged or new), or in the worktree that has the path if hers
+doesn't. A clean one isn't renewed, committed work included, even while
+her branch waits to merge: in the first
+quarter of its term (30 minutes of the default two hours) it keeps its
+time and is listed as kept; after that it's listed as not renewed, and
+it lapses when its time is up. Claiming it again keeps it, and so does
+editing it before she renews: before she edits a file she committed
+earlier, she claims it again. Two branches can then both change a file
+one of them committed, and git settles it when the second one merges,
+as for shared paths. Node, role and turn leases renew as before. `mdkg status` marks a clean lease past that first quarter `idle`
+when no turn of its owner's (`run:<owner>`) is running, since nobody is
+working in it, and suggests `mdkg release <path>`. It looks for another
+owner's changes in the worktree named after that owner (an actor's
+default name), and marks none of an owner's leases idle without one.
 
 Each lease is released on its own, so if a run stops part way, running
 it again finishes the job. If you've configured a lease authority (an
@@ -328,16 +371,16 @@ up for each of them.
 - **Claims** work for agents as they do for people: an agent claims a task
   and the files it will edit before it starts, so two agents never take
   the same one.
-- **Rooms and mail** let agents and people talk. A message goes to a room
+- **Channels and mail** let agents and people talk. A message goes to a channel
   or straight to mailboxes; each recipient acks what it has read.
 
   ```console
-  $ mdkg room create importer --member reviewer
-  room importer: ada, reviewer
-  $ mdkg msg send --room importer --kind question --text "Should the reader accept a BOM?"
+  $ mdkg channel create importer --member reviewer
+  channel importer: ada, reviewer
+  $ mdkg msg send --channel importer --kind question --text "Should the reader accept a BOM?"
   sent 01a173c2-ed05-7409-9717-ee6226075f4d #1 to reviewer
   $ mdkg --as reviewer msg inbox
-  #1 01a173c2-ed05-7409-9717-ee6226075f4d question from ada to room importer (reviewer) at 2026-10-25T15:51:56Z
+  #1 01a173c2-ed05-7409-9717-ee6226075f4d question from ada to channel importer (reviewer) at 2026-10-25T15:51:56Z
     unacked by reviewer
     untrusted body from ada between mdkg-body-2cd19af6c10496ac lines:
   mdkg-body-2cd19af6c10496ac
@@ -348,6 +391,37 @@ up for each of them.
 
   Message bodies come from other agents, so mdkg always fences them as
   untrusted data, between random marker lines a body can't forge.
+
+  An acked body stays readable for `coordination.messages.ack_grace_days`
+  (default 7) after the ack that finishes it, so an agent restarted into a
+  fresh session can re-read what it acked with `msg thread <id>`. Then
+  only its record stays. Set it to 0 to purge a body at that ack.
+
+  A sender replaces its own unacked mail with `--supersedes <id>` or a
+  `--slot <name>` (the MCP `channel_post` tool takes `supersedes` and
+  `slot`). mdkg acks the old message's unacked copies to the new message's
+  recipients, so they leave those inboxes and wake no one. A recipient the
+  new message doesn't reach keeps the old one. An orchestrator forwarding
+  a second review's findings to a lane before the lane has acked the first
+  one sends a combined message that replaces it:
+
+  ```sh
+  mdkg msg send --to a-mail --kind findings --id fwd-a-mail-2 \
+    --supersedes fwd-a-mail-1 --text-file findings.md
+  mdkg msg send --to a-mail --kind note --slot brief.a-mail --text "Current brief: ..."
+  ```
+
+  The send lists what it superseded in `data.superseded`; a retry with the
+  same `--id` stores nothing, so it lists none. Only the sender
+  can supersede a message (`msg.not_sender`). A slot replaces the sender's
+  earlier unacked mail with that slot and the same first `--node`.
+
+  Conversation ids in `contextId` are opaque data. In 0.7.1, new channels
+  keep the shipped default-context spelling, and existing ids stay unchanged,
+  as API v1 A21's legacy-names table requires. Read a channel with
+  `msg thread --channel <name>` rather than constructing or translating an id.
+  The `channel_commands_and_hidden_aliases_preserve_the_same_data` case in
+  [`tests/msg.rs`](../crates/mdkg-cli/tests/msg.rs) checks this preservation.
 - **Agent definitions** are committed `.mdkg/agents/<name>.json` files
   (`mdkg.agent.v1`), managed with `mdkg agents add`, `edit` and `rm`.
   Deprecated inline `.mdkg/config.json` entries remain readable.
@@ -357,19 +431,32 @@ up for each of them.
   [the graph checkout](agents.md#the-graph-checkout) for installation,
   synchronization and recovery.
 - **Configuration inspection:** `mdkg config show` displays merged values
-  and their sources without changing files. Some displayed user and local
-  settings are not yet used by runtime commands; see the
-  [transitional notice](agents.md#inspecting-configuration).
+  and their sources without changing files. Named overrides apply to
+  file-backed agent definitions; optional agent defaults are ignored and
+  projections remain project-only. See the
+  [runtime boundaries](agents.md#inspecting-configuration).
 - **`mdkg agents up`** runs from the graph checkout, each worker in its own
   git worktree and branch, and wakes one whenever mail reaches it or its
-  rooms. Sessions and routes stay local. A session you start yourself can
+  channels. Sessions and routes stay local. A session you start yourself can
   wait for mail with `msg wait`; registered interactive Codex sessions use
   the [mail receiver](agents.md#interactive-codex-mail-receiver).
 - **The turn policy** decides how an agent is woken. By default one turn
-  reads up to 20 unread messages of one conversation and replies once; the
+  reads up to 20 unread messages of one conversation and replies once. Of
+  the mail a turn loads, the oldest conversation from the agent's
+  `reports_to` goes first, then the oldest of any other; `reports_to` mail
+  behind a full page of others waits for a later turn. The
   agent resumes its last session; and a loop guard pauses a thread after 10
-  automatic turns in an hour, until the hour rolls over or you run `mdkg
-  agents resume`.
+  automatic turns in an hour, until the hour rolls over or you clear that
+  thread with `mdkg agents resume <agent> --thread "<thread>"`.
+- **Durable progress** preserves watch counts, mail cursors and admitted
+  work when restarting the same unfinished invocation. Interrupted work
+  requires explicit recovery;
+  stop the supervisor before plain `mdkg agents resume <agent>`. See
+  [supervisor recovery](agents.md#durable-supervisor-progress).
+- **Turn receipts** combine the harness result with Git and coordinator
+  observations and are mailed to the configured reporting actor. They are
+  advisory evidence, not proof of authorship or approval. Delivery failures
+  do not rerun the agent; see [receipt limits](agents.md#turn-receipts).
 - **Delegated approvals** let a locally configured delegate relay one
   permitted action on an exact committed node version. The launcher
   revalidates the approval before placing its fixed statement in the trusted
@@ -390,6 +477,41 @@ approval modes; OpenCode keeps your own permissions. Reviewers remain
 read-only. mdkg supplies worktrees and coordination; sandboxing and approvals
 come from the harness and your settings. [Running agents](agents.md) explains
 setup and overrides, with links to the launch and turn regression tests.
+
+## Following local events
+
+`mdkg msg watch --json` follows the coordinator log without a timeout. It
+prints one API event per line and flushes each line. A client can read an inbox
+or channel list, save its `event_cursor`, then follow from that position:
+
+```sh
+mdkg msg inbox --json
+mdkg msg watch --after <event_cursor> --json
+mdkg msg watch --from-start --types 'mdkg.message.*' --channel dev --json
+```
+
+The existing numeric `cursor` stays a mail position for `msg inbox --after`
+and `msg thread --after`. An `event_cursor` is opaque and resumes the event
+stream only. Without `--after`, a watch starts at the current head; use
+`--from-start` to replay the log. `--types`, `--channel` and `--mailbox` narrow
+what is sent. The default is every actor's events in the coordinator's single
+trust domain.
+
+Events carry stable ids and resource paths. Deduplicate by `id`, skip types
+you do not know, and re-read their `subjects`. Payloads describe the change at
+that record; a message body purged since then is shown as purged. Body parts
+and raw imported records remain untrusted data. Idle streams send heartbeats.
+SIGINT or SIGTERM closes the stream cleanly with exit 0; a second signal ends
+it at once.
+
+A cursor from another coordinator is refused with `api.cursor_foreign`. A
+restore or history rollback gives `api.cursor_reset`. Both return `data.head`:
+re-read the resources, then resume from the returned cursor. A malformed
+cursor gives `api.bad_cursor`. The 0.7 store never prunes records, so a cursor
+cannot expire through pruning. A store failure after streaming starts ends
+with one `mdkg.stream.error` event. A refusal before streaming starts is an
+ordinary command envelope. See [the API contract](api.md) for record
+schemas and resume rules.
 
 ## Search and the derived index
 

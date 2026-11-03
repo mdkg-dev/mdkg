@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "mdkg.api.check.v1",
+  "description": "Draft (mdkg API v1; see docs/api.md). May change until the release that first emits it. The JSON document the configured `api.check` command reads on stdin before a write (A16). It answers with one envelope on stdout.",
+  "x-mdkg-status": "draft",
+  "type": "object",
+  "properties": {
+    "schema": {
+      "const": "mdkg.api.check.v1"
+    },
+    "operation": {
+      "type": "string",
+      "description": "The write, such as `lease.claim` or `message.send`."
+    },
+    "uri": {
+      "type": "string",
+      "description": "The resource's path at its coordinator, beginning `/v1/`."
+    },
+    "actor": {
+      "type": "string"
+    },
+    "machine": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "The enrolled machine, null for local requests."
+    },
+    "idempotency_key": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "request": {
+      "type": "object"
+    }
+  },
+  "required": [
+    "schema",
+    "operation",
+    "uri",
+    "actor",
+    "machine",
+    "idempotency_key",
+    "request"
+  ]
+}

@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use mdkg_coord::{Changes, Command, Outcome, Scope, Settlement};
-use mdkg_coord_sqlite::{Store, StoreError, git};
+use mdkg_coord_sqlite::{Store, StoreError};
 use mdkg_format::NodeId;
 use mdkg_format::frontmatter::{self, Frontmatter, Value as FmValue};
 use mdkg_format::node::{FormatVersion, WORK_TYPES};
@@ -23,6 +23,7 @@ use schemars::JsonSchema;
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::coord::graph_git::git;
 use crate::coord::{
     self, LeaseRecord, Repo, View, git_error, lease_record, now_ms, refusal, store_error,
 };
@@ -615,6 +616,20 @@ fn create_v07(
         &stem,
         &content,
     )?;
+    // Ref mode: a node the graph commits is created on the graph ref (local
+    // work stays beside the store, above).
+    if let (Some(mode), false) = (repo.mode.clone(), in_store) {
+        return create_ref(
+            repo,
+            &mode,
+            store,
+            actor,
+            &id.to_string(),
+            folder,
+            &stem,
+            &content,
+        );
+    }
     let dir = match &store_dir {
         Some(d) => d.clone(),
         None => repo.root.join(".mdkg").join(folder),
@@ -681,6 +696,153 @@ fn create_v07(
         });
     }
     Ok((id.to_string(), rel))
+}
+
+/// `new` in ref mode: the node's file is written in a write session under
+/// the first name free at the graph tip, and published on the graph ref.
+/// The name is chosen inside the session, after it has caught up under the
+/// exclusive lock, so a node another writer published meanwhile is never
+/// replaced (a cache read before the lock can be behind the tip). No lease
+/// holds a new file, so the journaled intent is its commit point. A rerun
+/// with the same request id returns the node that run made (R41): no
+/// second node is minted.
+#[allow(clippy::too_many_arguments)]
+fn create_ref(
+    repo: &Repo,
+    mode: &crate::coord::graph_git::RefMode,
+    store: &mut Store,
+    actor: &str,
+    id: &str,
+    folder: &str,
+    stem: &str,
+    content: &str,
+) -> Result<(String, String), GraphError> {
+    use crate::coord::graph_git::{Publish, Wrote, next_request_id, prepare_record_publish};
+    let wrote = prepare_record_publish(
+        mode,
+        store,
+        (&next_request_id(), "new", actor),
+        |w, store| {
+            let taken = names_at(mode, w.base(), folder)?;
+            let rel = free_name(folder, stem, |candidate| {
+                taken.contains(&candidate.to_ascii_lowercase())
+                    || mode.root().join(candidate).exists()
+            })?;
+            check_new_file_lease(repo, store, actor, &rel)?;
+            let leaf = repo.scope_for(&rel);
+            w.write(leaf.as_str(), content.as_bytes())?;
+            fault("staged")?;
+            Ok((
+                Publish {
+                    message: format!("new {id}"),
+                    leases: Vec::new(),
+                    allowed: vec![leaf],
+                    trailers: Vec::new(),
+                },
+                rel,
+            ))
+        },
+        // A new file holds no lease, so there's no changeset to record.
+        |_, _| Ok(()),
+    )?;
+    match wrote {
+        Wrote::Done(rel, _) => Ok((id.to_owned(), rel)),
+        Wrote::Already(w) => {
+            let (id, rel) = published_new(mode, &w.receipt.commit)?;
+            output::notice(Diagnostic::new(
+                Code::GraphIntents,
+                mdkg_format::Severity::Info,
+                format!("recovered: this request already made {id}"),
+            ));
+            Ok((id, rel))
+        }
+    }
+}
+
+/// The first of `.mdkg/<folder>/<stem>.md`, `<stem>-2.md`, ... that isn't
+/// `taken`.
+fn free_name(folder: &str, stem: &str, taken: impl Fn(&str) -> bool) -> Result<String, GraphError> {
+    (1..=10_000u32)
+        .map(|n| match n {
+            1 => format!(".mdkg/{folder}/{stem}.md"),
+            n => format!(".mdkg/{folder}/{stem}-{n}.md"),
+        })
+        .find(|candidate| !taken(candidate))
+        .ok_or_else(|| {
+            GraphError::failure(
+                Code::NodeExists,
+                format!("every name for .mdkg/{folder}/{stem}.md is taken"),
+            )
+        })
+}
+
+/// The paths under `.mdkg/<folder>` in `commit`'s tree, ASCII-lowercased
+/// (paths match as scopes do, ignoring ASCII case).
+fn names_at(
+    mode: &crate::coord::graph_git::RefMode,
+    commit: &str,
+    folder: &str,
+) -> Result<std::collections::BTreeSet<String>, GraphError> {
+    let out = git::command(&mode.checkout)
+        .args(["ls-tree", "-r", "-z", "--name-only", commit, "--"])
+        .arg(format!(":(literal).mdkg/{folder}/"))
+        .run(None)
+        .map_err(git_error)?;
+    if !out.status.success() {
+        return Err(git_error(std::io::Error::other(format!(
+            "git ls-tree: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))));
+    }
+    Ok(out
+        .stdout
+        .split(|b| *b == 0)
+        .filter(|r| !r.is_empty())
+        .map(|r| String::from_utf8_lossy(r).to_ascii_lowercase())
+        .collect())
+}
+
+/// The node an earlier `new` published in `commit`: its id from the
+/// subject (`mdkg: new <id> [...]`) and its file from the commit's change.
+fn published_new(
+    mode: &crate::coord::graph_git::RefMode,
+    commit: &str,
+) -> Result<(String, String), GraphError> {
+    let git = |args: &[&str]| -> Result<String, GraphError> {
+        let out = git::command(&mode.checkout)
+            .args(args)
+            .run(None)
+            .map_err(git_error)?;
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+    };
+    let subject = git(&["log", "-1", "--format=%s", commit])?;
+    let id = subject
+        .strip_prefix("mdkg: new ")
+        .and_then(|r| r.split_whitespace().next())
+        .ok_or_else(|| {
+            GraphError::failure(
+                Code::NodeExists,
+                "this request id was used by another kind of write",
+            )
+            .with_hint("pass a new --request-id")
+        })?
+        .to_owned();
+    let names = git(&[
+        "diff-tree",
+        "--no-commit-id",
+        "--name-only",
+        "-r",
+        "--root",
+        commit,
+    ])?;
+    let rel = names
+        .lines()
+        .find(|l| l.ends_with(".md"))
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            GraphError::failure(Code::NodeExists, "the earlier new published no node")
+        })?;
+    Ok((id, rel))
 }
 
 /// Writes a new file and syncs it; an existing one is never replaced.
@@ -1108,8 +1270,30 @@ pub(crate) fn record_edits(
         now,
         &|_| Ok(()),
         None,
+        None,
     )
 }
+
+/// The settling transaction's check (A29 step 4).
+pub(crate) trait SettleCheck {
+    /// Before the transaction opens, at the commit just made: reads what
+    /// [`SettleCheck::check`] will, so the check, which runs holding the
+    /// coordinator's write lock, spawns no git for it (Terra's code review
+    /// #10357, minor 2). Its answer is dropped; only the check decides.
+    fn warm(&mut self, store: &Store, at: &str);
+
+    /// Run in the mark's transaction before it commits: the commit made
+    /// (`at`) and the changeset the mark settles. `Ok(false)` refuses,
+    /// rolling the changeset and the mark back.
+    fn check(
+        &mut self,
+        tx: &rusqlite::Connection,
+        at: &str,
+        changeset: Option<&str>,
+    ) -> Result<bool, StoreError>;
+}
+
+pub(crate) type SettleHook<'h> = &'h mut dyn SettleCheck;
 
 /// [`record_edits`] for one edit whose changeset `mark` records something
 /// about (`done`'s done mark): the mark goes in the same coordinator
@@ -1125,6 +1309,7 @@ pub(crate) fn record_edits_marked(
     message: &str,
     now: u64,
     mark: &dyn Fn(mdkg_coord::ChangesetId) -> Command,
+    settle: Option<SettleHook<'_>>,
 ) -> Result<Recorded, GraphError> {
     record_edits_checked(
         repo,
@@ -1136,6 +1321,7 @@ pub(crate) fn record_edits_marked(
         now,
         &|_| Ok(()),
         Some(mark),
+        settle,
     )
 }
 
@@ -1153,7 +1339,15 @@ pub(crate) fn record_edits_checked(
     now: u64,
     check: &dyn Fn(&mut Store) -> Result<(), GraphError>,
     mark: Option<&dyn Fn(mdkg_coord::ChangesetId) -> Command>,
+    settle: Option<SettleHook<'_>>,
 ) -> Result<Recorded, GraphError> {
+    // Ref mode: the graph is the graph ref; its files change only inside a
+    // write session, and reach it by prepare, record, publish.
+    if let Some(mode) = repo.mode.clone() {
+        return record_edits_ref(
+            repo, &mode, store, actor, edits, created, message, now, check, mark, settle,
+        );
+    }
     crate::graph_repair::require_writable(&repo.root)?;
     let mut taken: Vec<String> = Vec::new();
     // A failure before the git commit puts the edited files back (from
@@ -1255,6 +1449,7 @@ pub(crate) fn record_edits_checked(
             message,
             now,
             mark,
+            settle,
         ) {
             Ok(r) => r,
             Err((e, committed)) => {
@@ -1270,6 +1465,293 @@ pub(crate) fn record_edits_checked(
     recorded.store_leases = store_leases.into_iter().map(|(id, _)| id).collect();
     recorded.taken = taken;
     Ok(recorded)
+}
+
+/// [`record_edits_checked`] in ref mode (edd-01a18867, "Worktree-free
+/// writes"): the leases and `check` as in checkout mode; then one write
+/// session in which the edits are written to the cache; the commit
+/// prepared on the graph tip; every changeset of the request recorded with
+/// source `{commit: P, branch: graph.ref}` (`done`'s mark and settle in the
+/// first lease's transaction, as a-flow's settling transaction has them);
+/// then the publish. Local work (profile C) is written in place, as
+/// before, and never reaches the graph ref. `created` paths are already on
+/// the graph ref (ref mode's `create` publishes its file).
+#[allow(clippy::too_many_arguments)]
+fn record_edits_ref(
+    repo: &Repo,
+    mode: &crate::coord::graph_git::RefMode,
+    store: &mut Store,
+    actor: &str,
+    edits: &[Edit],
+    created: &[String],
+    message: &str,
+    now: u64,
+    check: &dyn Fn(&mut Store) -> Result<(), GraphError>,
+    mark: Option<&dyn Fn(mdkg_coord::ChangesetId) -> Command>,
+    settle: Option<SettleHook<'_>>,
+) -> Result<Recorded, GraphError> {
+    use crate::coord::graph_git::{Publish, Wrote, next_request_id, prepare_record_publish};
+    let mut taken: Vec<String> = Vec::new();
+    let release = |store: &mut Store, taken: &[String]| {
+        for id in taken {
+            store
+                .execute(&Command::Release {
+                    owner: actor.to_string(),
+                    lease: mdkg_coord::LeaseId(id.clone()),
+                    now,
+                })
+                .ok();
+        }
+    };
+    let leases = match take_leases(repo, store, actor, edits, now, &mut taken) {
+        Ok(l) => l,
+        Err(e) => {
+            release(store, &taken);
+            return Err(e);
+        }
+    };
+    if let Err(e) = check(store).and_then(|()| fault("leased")) {
+        release(store, &taken);
+        return Err(e);
+    }
+    let (store_leases, graph_leases): (Vec<_>, Vec<_>) = leases
+        .into_iter()
+        .partition(|(_, s)| coord::is_store_scope(s));
+    let (store_edits, graph_edits): (Vec<&Edit>, Vec<&Edit>) = edits
+        .iter()
+        .partition(|e| repo.store_scope(&e.node.path).is_some());
+    // Local work: in place, as in checkout mode.
+    if !store_edits.is_empty() {
+        let owned: Vec<Edit> = store_edits
+            .iter()
+            .map(|e| Edit {
+                node: e.node.clone(),
+                fields: e.fields.clone(),
+                content: e.content.clone(),
+            })
+            .collect();
+        if let Err(e) = write_fields(repo, &owned).and_then(|()| fault("written")) {
+            release(store, &taken);
+            return Err(e);
+        }
+    }
+    let mut recorded = Recorded {
+        commit: String::new(),
+        changesets: Vec::new(),
+        store_leases: store_leases.into_iter().map(|(id, _)| id).collect(),
+        taken: Vec::new(),
+    };
+    if graph_edits.is_empty() {
+        recorded.taken = taken;
+        return Ok(recorded);
+    }
+    let lex = match config::load(&repo.root) {
+        Ok(c) => lexical(&c),
+        Err(e) => {
+            release(store, &taken);
+            return Err(e);
+        }
+    };
+    let graph = mode.graph.name.clone();
+    let lease_ids: Vec<String> = graph_leases.iter().map(|(id, _)| id.clone()).collect();
+    let mut allowed: Vec<Scope> = graph_leases.iter().map(|(_, s)| s.clone()).collect();
+    allowed.extend(created.iter().map(|p| repo.scope_for(p)));
+    let subject = message.strip_prefix("mdkg: ").unwrap_or(message).to_owned();
+    let wrote = prepare_record_publish(
+        mode,
+        store,
+        (&next_request_id(), "edit", actor),
+        |w, _| {
+            for edit in &graph_edits {
+                let content = edited_content(repo, lex, edit)?;
+                let rel = repo.scope_for(&edit.node.path).to_string();
+                w.write(&rel, content.as_bytes())?;
+            }
+            fault("written")?;
+            Ok((
+                Publish {
+                    message: subject.clone(),
+                    leases: lease_ids.clone(),
+                    allowed: allowed.clone(),
+                    trailers: Vec::new(),
+                },
+                (),
+            ))
+        },
+        |store, prepared| {
+            let source = mdkg_coord::Source {
+                commit: prepared.commit.clone(),
+                branch: graph.clone(),
+            };
+            let ids = record_changesets(
+                repo,
+                store,
+                actor,
+                &graph_leases,
+                created,
+                &source,
+                now,
+                mark,
+                settle,
+            )?;
+            recorded.changesets = ids;
+            Ok(())
+        },
+    );
+    match wrote {
+        Ok(Wrote::Done((), written)) => {
+            recorded.commit = written.map(|w| w.receipt.commit).unwrap_or_default();
+            recorded.taken = taken;
+            Ok(recorded)
+        }
+        Ok(Wrote::Already(written)) => {
+            recorded.commit = written.receipt.commit;
+            recorded.taken = taken;
+            Ok(recorded)
+        }
+        Err(e) => {
+            release(store, &taken);
+            Err(e)
+        }
+    }
+}
+
+/// Records a ref-mode request's changesets, one per lease, at `source`
+/// (the prepared commit). With a `mark` (`done`), the one lease's
+/// changeset, the mark and the settle check share one transaction, as
+/// a-flow's settling transaction requires; otherwise every changeset of
+/// the request is recorded in one transaction (R11).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_changesets(
+    repo: &Repo,
+    store: &mut Store,
+    actor: &str,
+    leases: &[(String, Scope)],
+    created: &[String],
+    source: &mdkg_coord::Source,
+    now: u64,
+    mark: Option<&dyn Fn(mdkg_coord::ChangesetId) -> Command>,
+    mut settle: Option<SettleHook<'_>>,
+) -> Result<Vec<String>, GraphError> {
+    let seam = repo.graph_git();
+    let state = store.coordinator().map_err(store_error)?;
+    let current = state.leaves();
+    let created_leaves: Vec<String> = created
+        .iter()
+        .map(|p| repo.scope_for(p).to_string())
+        .collect();
+    let mut commands = Vec::new();
+    for (i, (lease, scope)) in leases.iter().enumerate() {
+        let mut files: BTreeMap<Scope, String> = BTreeMap::new();
+        for f in seam.files_under(scope.as_str()).map_err(git_error)? {
+            coord::check_scope_text(&Scope::new(f.as_str())).map_err(|e| e.at(f.clone(), None))?;
+            files.entry(Scope::new(f.as_str())).or_insert(f);
+        }
+        let mut extra: Vec<String> = current
+            .keys()
+            .filter(|l| scope.contains(l))
+            .map(ToString::to_string)
+            .collect();
+        if i == 0 {
+            extra.extend(created_leaves.iter().cloned());
+        }
+        for f in extra {
+            files.entry(Scope::new(f.as_str())).or_insert(f);
+        }
+        let mut changes = Changes::new();
+        for (leaf, file) in files {
+            let have = seam.file_digest(&file).map_err(git_error)?;
+            if current.get(&leaf) != have.as_ref() {
+                changes.insert(leaf, have);
+            }
+        }
+        commands.push(Command::Commit {
+            owner: actor.to_string(),
+            lease: mdkg_coord::LeaseId(lease.clone()),
+            changes,
+            source: Some(source.clone()),
+            now,
+            landed: false,
+        });
+    }
+    let refused = |e: &mdkg_coord::Error| {
+        refusal(e).with_hint("the graph changed under your lease: re-read the node and retry")
+    };
+    if let Some(mark) = mark {
+        let [commit] = commands.as_slice() else {
+            return Err(GraphError::failure(
+                Code::CoordStoreFailed,
+                "a marked write records one lease",
+            ));
+        };
+        let made = std::cell::Cell::new(None);
+        if let Some(h) = settle.as_mut() {
+            h.warm(store, &source.commit);
+        }
+        let mut check = |tx: &rusqlite::Connection| -> Result<bool, StoreError> {
+            let changeset = made.get().map(|c: mdkg_coord::ChangesetId| c.to_string());
+            match settle.as_mut() {
+                Some(h) => h.check(tx, &source.commit, changeset.as_deref()),
+                None => Ok(true),
+            }
+        };
+        let chained = store
+            .execute_then_checked(
+                commit,
+                |_, outcome| match outcome {
+                    Outcome::Committed { changeset } => {
+                        made.set(Some(*changeset));
+                        Some(mark(*changeset))
+                    }
+                    _ => None,
+                },
+                Some(&mut check),
+            )
+            .map_err(store_error)?;
+        if !chained.checked {
+            return Err(GraphError::conflict(
+                Code::EntryGateFailed,
+                "the gate refused: nothing was recorded or published",
+            ));
+        }
+        if !chained.recorded {
+            return Err(chained
+                .second
+                .as_ref()
+                .and_then(Outcome::error)
+                .map(refused)
+                .unwrap_or_else(|| {
+                    GraphError::failure(Code::CoordStoreFailed, "the record was refused")
+                }));
+        }
+        return match chained.first {
+            Outcome::Committed { changeset } => Ok(vec![changeset.to_string()]),
+            Outcome::Refused { error } => Err(refused(&error)),
+            _ => Ok(Vec::new()),
+        };
+    }
+    let mut rest = commands.clone().into_iter().skip(1);
+    let Some(first) = commands.first() else {
+        return Ok(Vec::new());
+    };
+    let chain = store
+        .execute_chain(first, |_, _| rest.next())
+        .map_err(store_error)?;
+    let mut ids = Vec::new();
+    for outcome in &chain.outcomes {
+        match outcome {
+            Outcome::Committed { changeset } => ids.push(changeset.to_string()),
+            Outcome::Refused { error } => return Err(refused(error)),
+            _ => {}
+        }
+    }
+    if !chain.recorded {
+        return Err(GraphError::failure(
+            Code::CoordStoreFailed,
+            "the request's changesets were refused together",
+        ));
+    }
+    Ok(ids)
 }
 
 /// Takes (or reuses) a lease for each edited node. Leases taken are pushed
@@ -1418,22 +1900,26 @@ fn settle_landed(
         return Ok(None);
     }
     let mode = lease.mode;
-    // Main and HEAD pinned to commits once: every check, the content
-    // named and the source are of these, so a main that moves meanwhile
-    // can't slip an unseen change in.
-    let branch = coord::main_ref(&repo.top);
-    let main = git::commit_of(&repo.top, &branch).map_err(git_error)?;
-    let head = git::commit_of(&repo.top, "HEAD").map_err(git_error)?;
+    // The settle ref (main, or the graph ref) and the graph content's
+    // commit (HEAD, or the cache's C) pinned to commits once: every check,
+    // the content named and the source are of these, so a ref that moves
+    // meanwhile can't slip an unseen change in.
+    let seam = repo.graph_git();
+    let branch = seam.settle_ref();
+    let main = seam.commit_of(&branch).map_err(git_error)?;
+    let head = seam.head().map_err(git_error)?.commit;
     let path = scope.as_str();
-    if !git::same_under(&repo.top, &main, &head, path).map_err(git_error)?
-        || git::touched_between(&repo.top, &head, &main, path).map_err(git_error)?
+    if !seam.same_under(&main, &head, path).map_err(git_error)?
+        || seam
+            .touched_between(&head, &main, path)
+            .map_err(git_error)?
     {
         return Ok(None);
     }
     // The scope's whole content as main has it: every file there, and
     // every leaf the coordinator holds there that main doesn't.
     let mut changes = Changes::new();
-    for (leaf, content) in git::leaves(&repo.top, &main, path).map_err(git_error)? {
+    for (leaf, content) in seam.leaves(&main, path).map_err(git_error)? {
         if scope.contains(&leaf) {
             changes.insert(leaf, Some(content));
         }
@@ -1446,7 +1932,7 @@ fn settle_landed(
     }
     let source = mdkg_coord::Source {
         commit: main,
-        branch,
+        branch: branch.clone(),
     };
     let commit = Command::Commit {
         owner: actor.to_string(),
@@ -1468,21 +1954,35 @@ fn settle_landed(
             })
         })
         .map_err(store_error)?;
-    // Refused: main moved under the lease after all (its content isn't
-    // what was checked), which ends the lease in conflict, before anything
-    // is written.
+    // Refused: the settle ref moved under the lease after all (its content
+    // isn't what was checked), which ends the lease in conflict, before
+    // anything is written.
     if let Some(error) = chained.first.error() {
-        return Err(refusal(error).with_hint(format!(
-            "main changed {} under your lease: merge main into your branch (`git merge {}`), \
-             resolve it, and commit",
-            output::shown(scope.as_str()),
-            output::shown(&coord::main_ref(&repo.top))
-        )));
+        return Err(refusal(error).with_hint(changed_under(repo, &branch, scope.as_str())));
     }
     Ok(match (chained.recorded, chained.second) {
         (true, Some(Outcome::Lease { lease })) => Some(lease.to_string()),
         _ => None,
     })
+}
+
+/// The hint for a change that reached the settle ref under a lease. In ref
+/// mode it's the graph ref, which no branch merges: re-read and retry. In
+/// checkout mode it's main (`branch`), merged into your branch.
+fn changed_under(repo: &Repo, branch: &str, path: &str) -> String {
+    if repo.mode.is_some() {
+        format!(
+            "the graph changed {} under your lease: re-read it and retry",
+            output::shown(path)
+        )
+    } else {
+        format!(
+            "main changed {} under your lease: merge main into your branch (`git merge {}`), \
+             resolve it, and commit",
+            output::shown(path),
+            output::shown(branch)
+        )
+    }
 }
 
 /// Another actor's lease on a node: its holder and scope as data, never in
@@ -1527,34 +2027,44 @@ fn held_elsewhere(qid: &str, h: &mdkg_coord::Lease, actor: &str) -> GraphError {
     )
 }
 
+/// An edit's new content: its fields set in the node's current text (or
+/// `retype`'s whole content).
+fn edited_content(
+    repo: &Repo,
+    lex: frontmatter::Lexical,
+    edit: &Edit,
+) -> Result<String, GraphError> {
+    let path = repo.root.join(&edit.node.path);
+    let mut content = match &edit.content {
+        Some(c) => c.clone(),
+        None => std::fs::read_to_string(&path).map_err(|e| {
+            GraphError::failure(
+                Code::IoReadFailed,
+                format!("can't read {}: {e}", edit.node.path),
+            )
+        })?,
+    };
+    for (key, value) in &edit.fields {
+        let clamped;
+        let value = match value {
+            FmValue::String(v) if *key == "updated" => {
+                clamped = FmValue::String(not_before(v, &[&edit.node.created, &edit.node.updated]));
+                &clamped
+            }
+            _ => value,
+        };
+        content = frontmatter::set_field_with(&content, &edit.node.path, key, value, lex)
+            .map_err(|e| GraphError::from_format(&e, &repo.root))?;
+    }
+    Ok(content)
+}
+
 /// Writes each edit's frontmatter fields into its file.
 fn write_fields(repo: &Repo, edits: &[Edit]) -> Result<(), GraphError> {
     let lex = lexical(&config::load(&repo.root)?);
     for edit in edits {
-        let path = repo.root.join(&edit.node.path);
-        let mut content = match &edit.content {
-            Some(c) => c.clone(),
-            None => std::fs::read_to_string(&path).map_err(|e| {
-                GraphError::failure(
-                    Code::IoReadFailed,
-                    format!("can't read {}: {e}", edit.node.path),
-                )
-            })?,
-        };
-        for (key, value) in &edit.fields {
-            let clamped;
-            let value = match value {
-                FmValue::String(v) if *key == "updated" => {
-                    clamped =
-                        FmValue::String(not_before(v, &[&edit.node.created, &edit.node.updated]));
-                    &clamped
-                }
-                _ => value,
-            };
-            content = frontmatter::set_field_with(&content, &edit.node.path, key, value, lex)
-                .map_err(|e| GraphError::from_format(&e, &repo.root))?;
-        }
-        atomic_write(&path, content.as_bytes()).map_err(|e| {
+        let content = edited_content(repo, lex, edit)?;
+        atomic_write(&repo.root.join(&edit.node.path), content.as_bytes()).map_err(|e| {
             GraphError::failure(
                 Code::IoWriteFailed,
                 format!("can't write {}: {e}", edit.node.path),
@@ -1570,7 +2080,10 @@ fn write_fields(repo: &Repo, edits: &[Edit]) -> Result<(), GraphError> {
 /// `written` in [`record_edits`]; `marked` (the store's status) and
 /// `released` (a store node's lease) in `done`; `marked` in `update`;
 /// `staged` (the synced temporary file) and `linked` (the published name,
-/// synced) in `new`.
+/// synced) in `new`. Two more `MDKG_FAIL_AFTER` values are read where the
+/// ledger settles (`entry::Settling`): `settle` refuses the settle, and
+/// `unsettled` evaluates its gate but drops its record, as an earlier
+/// build's done left it.
 /// Release builds never read either.
 pub(crate) fn fault(step: &str) -> Result<(), GraphError> {
     if !cfg!(debug_assertions) {
@@ -1642,6 +2155,7 @@ pub(crate) fn commit_and_record(
     message: &str,
     now: u64,
     mark: Option<&dyn Fn(mdkg_coord::ChangesetId) -> Command>,
+    mut settle: Option<SettleHook<'_>>,
 ) -> Result<Recorded, (GraphError, bool)> {
     let before = |e: GraphError| (e, false);
     let after = |e: GraphError| (e, true);
@@ -1713,17 +2227,46 @@ pub(crate) fn commit_and_record(
             now,
             landed: false,
         };
-        // The first lease's changeset carries the caller's mark, in the
-        // same transaction.
+        // The first lease's changeset carries the caller's mark, and its
+        // settle, in the same transaction.
+        let made = std::cell::Cell::new(None);
+        let mut hook = if i == 0 { settle.take() } else { None };
+        if let Some(h) = hook.as_mut() {
+            h.warm(store, &source.commit);
+        }
+        let mut check = |tx: &rusqlite::Connection| -> Result<bool, StoreError> {
+            let changeset = made.get().map(|c: mdkg_coord::ChangesetId| c.to_string());
+            match hook.as_mut() {
+                Some(h) => h.check(tx, &source.commit, changeset.as_deref()),
+                None => Ok(true),
+            }
+        };
+        let checked: Option<mdkg_coord_sqlite::BeforeCommit<'_>> =
+            (i == 0 && mark.is_some()).then_some(&mut check);
         let chained = store
-            .execute_then(&commit, |_, outcome| {
-                match (mark.filter(|_| i == 0), outcome) {
-                    (Some(mark), Outcome::Committed { changeset }) => Some(mark(*changeset)),
+            .execute_then_checked(
+                &commit,
+                |_, outcome| match (mark.filter(|_| i == 0), outcome) {
+                    (Some(mark), Outcome::Committed { changeset }) => {
+                        made.set(Some(*changeset));
+                        Some(mark(*changeset))
+                    }
                     _ => None,
-                }
-            })
+                },
+                checked,
+            )
             .map_err(store_error)
             .map_err(wrap)?;
+        if !chained.checked {
+            // The settle refused (its gate failed), which rolled the
+            // changeset and the mark back: the commit stays, unsettled,
+            // and the caller reports why.
+            let short = &source.commit[..source.commit.len().min(12)];
+            return Err(wrap(GraphError::conflict(
+                Code::EntryGateFailed,
+                format!("the work is committed in {short}, but not settled"),
+            )));
+        }
         if !chained.recorded {
             // The mark was refused, which rolled the changeset back too:
             // nothing is recorded and the lease is as it was, so running
@@ -1812,7 +2355,7 @@ pub(crate) fn commit_and_record(
 /// The node a typed handle names (a full id, a legacy id, a unique
 /// prefix or a title fragment), with a note naming it when the handle
 /// isn't its full id.
-fn resolve_node(repo: &Repo, target: &str) -> Result<IndexNode, GraphError> {
+pub(crate) fn resolve_node(repo: &Repo, target: &str) -> Result<IndexNode, GraphError> {
     let config = config::load(&repo.root)?;
     let index = index::build(&repo.root, &config)?;
     noted_node(&index, target, "id").cloned()
@@ -1898,9 +2441,53 @@ pub struct DoneData {
     /// nothing was committed or recorded.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub already_done: bool,
+    /// The entries `--residual` recorded residuals on (`<node>#F3`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub residuals: Vec<String>,
 }
 
 pub fn done(root: &Path, actor: Option<String>, target: &str, checkpoint: bool, json: bool) -> u8 {
+    done_with(root, actor, target, checkpoint, None, json)
+}
+
+/// Refuses when someone else holds `node`, at its leaf or under another
+/// name.
+fn refuse_other_holder(
+    repo: &Repo,
+    store: &mut Store,
+    actor: &str,
+    node: &IndexNode,
+    leaf: &Scope,
+    now: u64,
+) -> Result<(), GraphError> {
+    let state = store.coordinator().map_err(store_error)?;
+    let key = repo.node_key(leaf, &node.qid);
+    if let Some(h) = state
+        .holders(leaf)
+        .find(|l| l.owner != actor && l.deadline > now)
+        .or_else(|| {
+            state
+                .node_holder(&key)
+                .filter(|h| &h.scope != leaf && h.deadline > now)
+        })
+    {
+        return Err(held_elsewhere(&node.qid, h, actor));
+    }
+    Ok(())
+}
+
+/// `done`, with `--residual "<reason>"` when given (A29, "Residuals"):
+/// a person's or a coordinator's residual for every failure of the gate a
+/// residual may record, in one store transaction before anything else,
+/// then `done` as usual.
+pub fn done_with(
+    root: &Path,
+    actor: Option<String>,
+    target: &str,
+    checkpoint: bool,
+    residual: Option<&str>,
+    json: bool,
+) -> u8 {
     // Said whether or not what follows recording fails.
     let mut released = None;
     let report = (|| -> Result<Report<DoneData>, GraphError> {
@@ -1923,6 +2510,20 @@ pub fn done(root: &Path, actor: Option<String>, target: &str, checkpoint: bool, 
         let actor = repo.actor(actor);
         // Refused before the store is touched.
         let leaf = repo.leaf(&node.path)?;
+        // Step 1: the residuals first, all or none. They hold whether or
+        // not `done` finishes, so a rerun's gate passes on them. A `done`
+        // that would be refused for the lease records none (e2e 0.7.1 S1).
+        let residuals = match residual {
+            Some(reason) => {
+                coord::require_authority_hold(&repo, &actor, &leaf, Some(&node.qid))?;
+                let mut store = repo.store()?;
+                let now = now_ms();
+                repo.observe(&mut store, now)?;
+                refuse_other_holder(&repo, &mut store, &actor, &node, &leaf, now)?;
+                crate::entry::record_residuals(&repo, &node, &actor, reason)?
+            }
+            None => Vec::new(),
+        };
         // Already done, committed, and nothing of a `done` left to finish
         // (no lease of yours on it, no review or blocked state): says so,
         // and commits or records nothing, so a second `done` never makes a
@@ -1932,9 +2533,15 @@ pub fn done(root: &Path, actor: Option<String>, target: &str, checkpoint: bool, 
         // node's file is its record.
         if node.status.as_deref() == Some("done")
             && (coord::is_store_scope(&leaf)
-                || git::unchanged_since_head(&repo.top, leaf.as_str()).map_err(git_error)?)
-            && let Some(report) = already_done(&repo, &actor, &node, &leaf, checkpoint)?
+                || repo
+                    .graph_git()
+                    .unchanged_since_head(leaf.as_str())
+                    .map_err(git_error)?)
+            && let Some(mut report) = already_done(&repo, &actor, &node, &leaf, checkpoint)?
         {
+            if let Some(d) = report.data.as_mut() {
+                d.residuals = residuals;
+            }
             return Ok(report);
         }
         let held = coord::require_authority_hold(&repo, &actor, &leaf, Some(&node.qid))?;
@@ -1945,19 +2552,22 @@ pub fn done(root: &Path, actor: Option<String>, target: &str, checkpoint: bool, 
         let mut checkpoint_id = None;
         // Fail before writing a checkpoint if someone else holds the node,
         // here or under another name.
-        let state = store.coordinator().map_err(store_error)?;
-        let key = repo.node_key(&leaf, &node.qid);
-        if let Some(h) = state
-            .holders(&leaf)
-            .find(|l| l.owner != actor && l.deadline > now)
-            .or_else(|| {
-                state
-                    .node_holder(&key)
-                    .filter(|h| h.scope != leaf && h.deadline > now)
-            })
-        {
-            return Err(held_elsewhere(&node.qid, h, &actor));
-        }
+        refuse_other_holder(&repo, &mut store, &actor, &node, &leaf, now)?;
+        // The gate (A29): the pre-check at HEAD, refusing with nothing
+        // written; the settling transaction evaluates it again. Its env
+        // reads only git objects and takes no graph lock.
+        let mut settling = crate::entry::Settling::new(&repo, &node, &actor)?;
+        settling.precheck(&store)?;
+        // Git work's `# Ledger` section (A31), in the same commit as the
+        // status, through the edit's content; local work writes none.
+        let (content, unwritten) = if coord::is_store_scope(&leaf) {
+            (None, None)
+        } else {
+            let text = std::fs::read_to_string(repo.root.join(&node.path)).map_err(|e| {
+                GraphError::failure(Code::IoReadFailed, format!("can't read {}: {e}", node.path))
+            })?;
+            settling.ledger_text(&store, &text)?
+        };
         // A checkpoint already records the work; finishing it must not
         // wrap it in another checkpoint, even with --checkpoint.
         if checkpoint && node.node_type != "checkpoint" {
@@ -1980,7 +2590,7 @@ pub fn done(root: &Path, actor: Option<String>, target: &str, checkpoint: bool, 
         let edit = Edit {
             node: node.clone(),
             fields,
-            content: None,
+            content,
         };
         let message = format!("{}: done", output::display_ref(&node.qid));
         // On failure before its git commit, record_edits removes the
@@ -1997,9 +2607,23 @@ pub fn done(root: &Path, actor: Option<String>, target: &str, checkpoint: bool, 
             actor: mark_actor.clone(),
             now,
         };
+        // Git work settles in the mark's transaction: a failing gate rolls
+        // the changeset and the mark back, leaving the commit unsettled.
         let recorded = record_edits_marked(
-            &repo, &mut store, &actor, edit, &created, &message, now, &mark,
-        )?;
+            &repo,
+            &mut store,
+            &actor,
+            edit,
+            &created,
+            &message,
+            now,
+            &mark,
+            Some(&mut settling),
+        );
+        let recorded = match recorded {
+            Ok(r) => r,
+            Err(e) => return Err(settling.refusal().unwrap_or(e)),
+        };
         // Recorded: whatever fails next, the authority's lease goes too.
         released = coord::release_at_authority(&repo, &actor, &leaf, held.as_ref());
         // A local node has no changeset: its file is its lasting record.
@@ -2014,15 +2638,26 @@ pub fn done(root: &Path, actor: Option<String>, target: &str, checkpoint: bool, 
                 )
             })?;
             let revision = mdkg_format::Digest::of_bytes(&bytes).to_string();
-            let marked = store
-                .complete_local(
+            // Local work settles in `complete_local`'s transaction; a
+            // failing gate leaves the file done and unsettled, and the
+            // lease held, until a rerun passes.
+            let marked = {
+                let mut hook = |tx: &rusqlite::Connection| settling.settle_local(tx, &bytes);
+                store.complete_local_checked(
                     &leaf,
                     &repo.node_key(&leaf, &node.qid),
                     &actor,
                     &revision,
                     now,
+                    Some(&mut hook),
                 )
-                .map_err(store_error)?;
+            }
+            .map_err(store_error)?;
+            if !marked.checked {
+                return Err(settling.refusal().unwrap_or_else(|| {
+                    store_error(StoreError::Log("the settle was refused".into()))
+                }));
+            }
             for outcome in std::iter::once(&marked.first).chain(marked.second.iter()) {
                 if let Some(error) = outcome.error() {
                     return Err(refusal(error));
@@ -2044,8 +2679,10 @@ pub fn done(root: &Path, actor: Option<String>, target: &str, checkpoint: bool, 
             changesets: recorded.changesets,
             checkpoint: checkpoint_id,
             already_done: false,
+            residuals,
         })
-        .with(warnings))
+        .with(warnings)
+        .with(unwritten))
     })()
     .unwrap_or_else(Report::failed)
     .with(released);
@@ -2108,6 +2745,7 @@ fn already_done(
             changesets: Vec::new(),
             checkpoint: None,
             already_done: true,
+            residuals: Vec::new(),
         })
         .with(warnings)
         .with([Diagnostic::warning(
@@ -2125,13 +2763,47 @@ fn already_done(
         let (value, warnings) = node_value(repo, &node.qid)?;
         return Ok(Some(said(value, warnings, String::new())));
     }
-    // HEAD and main pinned once; this version is HEAD's bytes.
-    let branch = coord::main_ref(&repo.top);
-    let head = git::commit_of(&repo.top, "HEAD").map_err(git_error)?;
-    let version = git::leaves(&repo.top, &head, leaf.as_str())
+    // HEAD (the cache's C in ref mode) and the settle ref pinned once;
+    // this version is that commit's bytes.
+    let seam = repo.graph_git();
+    let branch = seam.settle_ref();
+    let head = seam.head().map_err(git_error)?.commit;
+    let version = seam
+        .leaves(&head, leaf.as_str())
         .map_err(git_error)?
         .get(leaf)
         .cloned();
+    // A changeset of yours holding exactly this version.
+    let recorded = state
+        .changesets()
+        .filter(|c| {
+            c.owner == actor
+                && c.state != Settlement::Abandoned
+                && c.changes.get(leaf).is_some_and(|v| *v == version)
+        })
+        .map(|c| (c.id, c.state))
+        .max_by_key(|(id, _)| id.0);
+    // Recorded, with no settle record for this revision (a mark an earlier
+    // build made): the settle first, with that changeset, then the mark
+    // below, so a crash between them leaves a settle the rerun finds (the
+    // orchestrator on #10776).
+    if let Some((changeset, _)) = recorded {
+        let mut settling = crate::entry::Settling::new(repo, node, actor)?;
+        if settling.unsettled_at(&store, &head)? {
+            SettleCheck::warm(&mut settling, &store, &head);
+            let id = changeset.to_string();
+            let settled = {
+                let mut check =
+                    |tx: &rusqlite::Connection| settling.settle_git(tx, &head, Some(&id));
+                store.check_alone(&mut check).map_err(store_error)?
+            };
+            if !settled {
+                return Err(settling
+                    .refusal()
+                    .unwrap_or_else(|| GraphError::failure(Code::EntryGit, "the settle refused")));
+            }
+        }
+    }
     // Sets the done mark (with the changeset when there is one), which
     // also clears a review or blocked state.
     let mut mark = |changeset: Option<mdkg_coord::ChangesetId>| -> Result<(), GraphError> {
@@ -2149,16 +2821,6 @@ fn already_done(
             None => Ok(()),
         }
     };
-    // A changeset of yours holding exactly this version.
-    let recorded = state
-        .changesets()
-        .filter(|c| {
-            c.owner == actor
-                && c.state != Settlement::Abandoned
-                && c.changes.get(leaf).is_some_and(|v| *v == version)
-        })
-        .map(|c| (c.id, c.state))
-        .max_by_key(|(id, _)| id.0);
     if let Some((changeset, settled)) = recorded {
         let marked = state.done_mark(leaf) == Some(changeset);
         if settled == Settlement::Committed {
@@ -2197,9 +2859,32 @@ fn already_done(
         let (value, warnings) = node_value(repo, &node.qid)?;
         return Ok(Some(said(value, warnings, head)));
     }
-    let main = git::commit_of(&repo.top, &branch).map_err(git_error)?;
-    // Main already has this version: it landed there.
-    if git::same_under(&repo.top, &main, &head, leaf.as_str()).map_err(git_error)? {
+    let main = seam.commit_of(&branch).map_err(git_error)?;
+    // Main (the graph ref) already has this version: it landed there.
+    if seam
+        .same_under(&main, &head, leaf.as_str())
+        .map_err(git_error)?
+    {
+        // Unsettled (a settle refused after `done`'s commit, or never run):
+        // the settle alone, in its own transaction, or a refusal (A29,
+        // "Completion steps": a checkout whose HEAD holds the node done
+        // settles it, main included; Terra's #10357, minor 1). Main's file
+        // is the node's done, so no mark is written and no work state:
+        // a review or blocked state is cleared below as before, only while
+        // the coordinator still holds this version (Terra's #10631, 1).
+        let mut settling = crate::entry::Settling::new(repo, node, actor)?;
+        if settling.unsettled_at(&store, &head)? {
+            crate::write::SettleCheck::warm(&mut settling, &store, &head);
+            let settled = {
+                let mut check = |tx: &rusqlite::Connection| settling.settle_git(tx, &head, None);
+                store.check_alone(&mut check).map_err(store_error)?
+            };
+            if !settled {
+                return Err(settling
+                    .refusal()
+                    .unwrap_or_else(|| GraphError::failure(Code::EntryGit, "the settle refused")));
+            }
+        }
         // A review or blocked state is cleared only while the coordinator
         // still holds this version, judged inside the write: one set on a
         // version main moved on to meanwhile stays.
@@ -2234,36 +2919,69 @@ fn already_done(
     }
     // Not recorded. Main changed the node in a commit HEAD lacks: a
     // conflict, never recorded over.
-    if git::touched_between(&repo.top, &head, &main, leaf.as_str()).map_err(git_error)? {
+    if seam
+        .touched_between(&head, &main, leaf.as_str())
+        .map_err(git_error)?
+    {
+        let (changer, hint) = if repo.mode.is_some() {
+            ("the graph", changed_under(repo, &branch, leaf.as_str()))
+        } else {
+            (
+                "main",
+                format!(
+                    "merge main into your branch (`git merge {}`), resolve {}, and commit; your \
+                     work lands with your branch",
+                    output::shown(&branch),
+                    output::shown(leaf.as_str())
+                ),
+            )
+        };
         return Err(GraphError::conflict(
             Code::CoordCasFailed,
             format!(
-                "{} is done here but not recorded: main changed it under your lease",
+                "{} is done here but not recorded: {changer} changed it under your lease",
                 output::display_ref(&node.qid)
             ),
         )
-        .with_hint(format!(
-            "merge main into your branch (`git merge {}`), resolve {}, and commit; your work \
-             lands with your branch",
-            output::shown(&branch),
-            output::shown(leaf.as_str())
-        )));
+        .with_hint(hint));
     }
     // Your lease is still held: the full command reruns, and the lease's
     // own check guards it (main's changes since were checked just above).
     if leased {
         return Ok(None);
     }
-    // Committed but not recorded: a `done` stopped after its commit.
+    // Committed but not recorded: a `done` stopped after its commit. Only
+    // a lease records the changeset and mark other worktrees read, so the
+    // claimed rerun settles it; the gate at HEAD runs first, writing
+    // nothing, so its failures are fixed or accepted before that (the
+    // orchestrator on #10776, option 1). It reads HEAD as pinned above. An
+    // error other than a failing gate keeps the hint, with the error as a
+    // warning: claim and done check everything again (Terra's #10948,
+    // minors 2 and 3).
+    let checked =
+        crate::entry::Settling::new(repo, node, actor).and_then(|s| s.precheck_at(&store, &head));
+    let warning = match checked {
+        Ok(()) => None,
+        Err(e) if e.code() == Code::EntryGateFailed => return Err(e),
+        Err(e) => {
+            let mut d = *e.diagnostic;
+            d.severity = Severity::Warning;
+            Some(d)
+        }
+    };
     let handle = output::display_ref(&node.qid);
-    Err(GraphError::not_found(
+    let no_lease = GraphError::not_found(
         Code::CoordNoLease,
         format!("{handle} is done and committed here, but not recorded (a done was interrupted)"),
     )
     .with_hint(format!(
         "record it: `{BIN} claim {handle}`, then `{BIN} done {handle}` (which may make one more \
          commit)"
-    )))
+    ));
+    match warning {
+        None => Err(no_lease),
+        Some(w) => Ok(Some(Report::failed(no_lease).with([w]))),
+    }
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -3222,8 +3940,11 @@ pub fn format(root: &Path, actor: Option<String>, ids: &[String], write: bool, j
             }
             // A profile C node's file is shared by every worktree and kept
             // nowhere else: it's rewritten under its lease, whole,
-            // and only if it still reads as format read it.
-            if mdkg_graph::store_work::is_store_path(&node.path) {
+            // and only if it still reads as format read it. In ref mode
+            // every file is: the cache changes only in a write session,
+            // which publishes the fix on the graph ref.
+            let ref_mode = crate::coord::graph_git::for_root(root).is_some();
+            if ref_mode || mdkg_graph::store_work::is_store_path(&node.path) {
                 let Some(r) = repo.as_ref() else {
                     skipped.push(node.path.clone());
                     continue;
@@ -3237,6 +3958,11 @@ pub fn format(root: &Path, actor: Option<String>, ids: &[String], write: bool, j
                 let now = now_ms();
                 // A lease past its deadline never blocks the claim below.
                 r.expire_due(store, now)?;
+                // In ref mode the lease is based on the graph tip, as the
+                // coordinator has observed it.
+                if ref_mode {
+                    r.observe(store, now)?;
+                }
                 let edit = Edit {
                     node: node.clone(),
                     fields: Vec::new(),
@@ -3261,6 +3987,7 @@ pub fn format(root: &Path, actor: Option<String>, ids: &[String], write: bool, j
                     "format",
                     now,
                     &unchanged,
+                    None,
                     None,
                 ) {
                     Ok(recorded) => {
@@ -3377,8 +4104,23 @@ pub fn format(root: &Path, actor: Option<String>, ids: &[String], write: bool, j
     })
 }
 
-/// Paths changed on this branch since main, relative to the graph root.
+/// Paths changed on this branch since main, relative to the graph root. In
+/// ref mode, the graph paths the graph tip changed since the code base
+/// (`mainRef`); none, with a warning, when no code base resolves.
 pub fn changed_graph_paths(root: &Path) -> Result<std::collections::BTreeSet<String>, GraphError> {
+    use crate::coord::graph_git::{changed_paths, for_root, graph_warning};
+    if let Some(mode) = for_root(root) {
+        return Ok(match changed_paths(&mode).map_err(git_error)? {
+            Some(changed) => changed,
+            None => {
+                output::notice(graph_warning(
+                    "graph.no_code_base",
+                    "no code base (mdkg.mainRef) resolves, so no graph path counts as changed",
+                ));
+                Default::default()
+            }
+        });
+    }
     // Read-only: a `.git` git skipped is a git problem here, not a store.
     let repo = Repo::open(root).map_err(|e| {
         if e.diagnostic.code == Code::CoordStoreFailed {
@@ -3413,6 +4155,16 @@ pub fn keep_changed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_new_name_skips_every_one_taken() {
+        let taken = [".mdkg/work/task-a.md", ".mdkg/work/task-a-2.md"];
+        let name = free_name("work", "task-a", |c| taken.contains(&c)).expect("free");
+        assert_eq!(name, ".mdkg/work/task-a-3.md");
+        let name = free_name("work", "task-b", |c| taken.contains(&c)).expect("free");
+        assert_eq!(name, ".mdkg/work/task-b.md");
+        assert!(free_name("work", "task-a", |_| true).is_err());
+    }
 
     #[test]
     fn a_path_clear_is_judged_on_the_state_it_runs_against() {

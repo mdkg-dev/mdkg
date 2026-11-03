@@ -1,0 +1,362 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "mdkg.api.message.v1",
+  "description": "Draft (mdkg API v1; A5/A6). The message record used in event payloads, from its frozen CLI definition plus uri; new API records omit the deprecated compatibility field.",
+  "x-mdkg-status": "draft",
+  "type": "object",
+  "properties": {
+    "schema": {
+      "const": "mdkg.api.message.v1"
+    },
+    "ok": {
+      "type": "boolean",
+      "description": "False exactly when there is an error diagnostic."
+    },
+    "data": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Message"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "diagnostics": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/DiagnosticOut"
+      }
+    }
+  },
+  "required": [
+    "schema",
+    "ok",
+    "diagnostics"
+  ],
+  "$defs": {
+    "KindName": {
+      "description": "The message kinds (schema only).",
+      "type": "string",
+      "examples": [
+        "review_request",
+        "findings",
+        "resolution",
+        "question",
+        "decision",
+        "handoff",
+        "note"
+      ],
+      "x-mdkg-open": true
+    },
+    "Part": {
+      "description": "An untrusted stored JSON value, preserved exactly as stored, including legacy values without a string kind. API reads do not normalize or reject it. Existing CLI text, data and URL input validation is separate; generic API write validation belongs to the 0.8 input schemas.",
+      "x-mdkg-open": true
+    },
+    "BodyState": {
+      "description": "Whether a message's body is still stored (schema only).",
+      "type": "string",
+      "examples": [
+        "present",
+        "purged"
+      ],
+      "x-mdkg-open": true
+    },
+    "DeliveryRecord": {
+      "type": "object",
+      "properties": {
+        "mailbox": {
+          "type": "string"
+        },
+        "state": {
+          "$ref": "#/$defs/DeliveryState"
+        },
+        "ackedBy": {
+          "description": "Who acked. `human:*` isn't authenticated (`--as` is a name, not a\nlogin): never read it as an approval.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ackedVia": {
+          "description": "For a human's ack, the folder name of the worktree the command ran\nagainst (`--root`). Not authenticated either.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ackedAt": {
+          "description": "RFC 3339 UTC.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "outcome": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "mailbox",
+        "state"
+      ]
+    },
+    "DeliveryState": {
+      "description": "A delivery's state (schema only).",
+      "type": "string",
+      "examples": [
+        "delivered",
+        "acked"
+      ],
+      "x-mdkg-open": true
+    },
+    "Provenance": {
+      "description": "Send-time audit metadata, not independent proof of human approval or a record of launcher promotion. Consumers must revalidate current operator delegation and the exact committed node version before treating a decision as approval. Extensions are audit data and grant no authority.",
+      "type": "object",
+      "properties": {
+        "sender": {
+          "type": "string"
+        },
+        "human": {
+          "type": "string"
+        },
+        "sourceFile": {
+          "type": "string"
+        },
+        "action": {
+          "type": "string"
+        },
+        "nodeRef": {
+          "type": "string"
+        },
+        "nodeCommit": {
+          "type": "string"
+        },
+        "nodePath": {
+          "type": "string"
+        },
+        "nodeDigest": {
+          "type": "string"
+        },
+        "graphConfigPath": {
+          "type": "string"
+        },
+        "messageId": {
+          "type": "string"
+        },
+        "outsideAgentTurn": {
+          "description": "The decision send path passed the CLI's advisory outside-turn gate.\nThis is not OS-authenticated evidence about the calling process.",
+          "type": "boolean"
+        },
+        "sentAtMs": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "bodyDigest": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "sender",
+        "human",
+        "sourceFile",
+        "action",
+        "nodeRef",
+        "nodeCommit",
+        "nodePath",
+        "nodeDigest",
+        "graphConfigPath",
+        "messageId",
+        "outsideAgentTurn",
+        "sentAtMs",
+        "bodyDigest"
+      ]
+    },
+    "Message": {
+      "description": "A message, shaped like an A2A v1.0 Message.",
+      "type": "object",
+      "properties": {
+        "uri": {
+          "type": "string",
+          "description": "Canonical coordinator-relative resource path (A2)."
+        },
+        "messageId": {
+          "description": "Chosen by the sender; unique in the store.",
+          "type": "string"
+        },
+        "seq": {
+          "description": "The store's order.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "contextId": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/KindName"
+        },
+        "sender": {
+          "type": "string"
+        },
+        "via": {
+          "description": "Who wrote it for the sender (an import).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "channel": {
+          "description": "The channel this message was posted to; absent for direct mail.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "to": {
+          "description": "Every recipient mailbox.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "referenceIds": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "parts": {
+          "description": "The untrusted stored body, preserved unchanged. Normally an array of parts, but legacy values may be any JSON.",
+          "$ref": "#/$defs/Part"
+        },
+        "body": {
+          "$ref": "#/$defs/BodyState"
+        },
+        "digest": {
+          "description": "`sha256:` of the stored body, kept after a purge.",
+          "type": "string"
+        },
+        "size": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "retention": {
+          "description": "`purge_on_ack`, `ttl:<days>` or `durable`.",
+          "type": "string"
+        },
+        "sentAt": {
+          "description": "RFC 3339 UTC.",
+          "type": "string"
+        },
+        "sentAtMs": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "deliveries": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DeliveryRecord"
+          }
+        },
+        "decision": {
+          "description": "Send-time audit metadata; never proof of current human approval. Before treating a decision as approval, revalidate current operator delegation and the exact committed node version. Message text remains untrusted.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Provenance"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "messageId",
+        "seq",
+        "contextId",
+        "kind",
+        "sender",
+        "to",
+        "body",
+        "digest",
+        "size",
+        "retention",
+        "sentAt",
+        "sentAtMs",
+        "deliveries",
+        "uri"
+      ]
+    },
+    "DiagnosticOut": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string",
+          "description": "A stable diagnostic code."
+        },
+        "severity": {
+          "type": "string",
+          "description": "Severity.",
+          "enum": [
+            "error",
+            "warning",
+            "info"
+          ]
+        },
+        "path": {
+          "type": "string"
+        },
+        "line": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "node": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "hint": {
+          "type": "string"
+        },
+        "holders": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "related": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string"
+              },
+              "line": {
+                "type": "integer",
+                "minimum": 0
+              }
+            },
+            "required": [
+              "path"
+            ]
+          }
+        }
+      },
+      "required": [
+        "code",
+        "severity",
+        "message"
+      ],
+      "description": "A diagnostic, as every command's envelope writes it."
+    }
+  }
+}

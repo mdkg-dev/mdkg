@@ -3,6 +3,7 @@
 //! A record is live only while its publisher holds its file lock. No PID
 //! probe is needed, and a record left by a killed process is ignored.
 
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{Read as _, Write as _};
 use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _};
@@ -351,18 +352,83 @@ pub fn live(run_dir: &Path) -> Result<Live, RunError> {
 impl Live {
     pub fn warnings(&self, current: &Build) -> Vec<String> {
         let mut warnings = self.problems.clone();
+        let mut stale = BTreeMap::new();
+        let mut changed = BTreeMap::new();
+        let mut stale_count = 0;
+        let mut changed_count = 0;
         for process in &self.processes {
+            let kind = match process.kind {
+                Kind::Launcher => "launcher",
+                Kind::Mcp => "MCP",
+            };
             if process.build != *current {
-                warnings.push(format!("mixed mdkg builds: {:?} pid {} runs {} at {} (built {}), this process is {} at {} (built {})", process.kind, process.pid, process.build.version, process.build.commit, process.build.built, current.version, current.commit, current.built));
+                stale_count += 1;
+                let build = &process.build;
+                stale
+                    .entry((&build.version, &build.commit, build.dirty, &build.built))
+                    .or_insert_with(BTreeMap::new)
+                    .entry(kind)
+                    .or_insert_with(Vec::new)
+                    .push(process.pid);
             }
             if !Fingerprint::read(&process.executable).is_ok_and(|now| now == process.fingerprint) {
-                warnings.push(format!(
-                    "{:?} pid {} has an executable changed on disk: {}",
-                    process.kind,
-                    process.pid,
-                    process.executable.display()
-                ));
+                changed_count += 1;
+                changed
+                    .entry(&process.executable)
+                    .or_insert_with(BTreeMap::new)
+                    .entry(kind)
+                    .or_insert_with(Vec::new)
+                    .push(process.pid);
             }
+        }
+        let pids = |kinds: BTreeMap<&str, Vec<u32>>| {
+            kinds
+                .into_iter()
+                .map(|(kind, mut ids)| {
+                    ids.sort_unstable();
+                    ids.dedup();
+                    format!(
+                        "{kind} pids [{}]",
+                        ids.iter()
+                            .map(u32::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let state = |dirty| match dirty {
+            Some(false) => "clean",
+            Some(true) => "dirty",
+            None => "dirty unknown",
+        };
+        if stale_count > 0 {
+            let groups = stale
+                .into_iter()
+                .map(|((version, commit, dirty, built), kinds)| {
+                    format!(
+                        "{version} at {commit} ({}, built {built}): {}",
+                        state(dirty),
+                        pids(kinds)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            warnings.push(format!(
+                "mixed mdkg builds: {stale_count} stale launcher/MCP process(es); current {} at {} ({}, built {}); {groups}",
+                current.version, current.commit, state(current.dirty), current.built
+            ));
+        }
+        if changed_count > 0 {
+            let groups = changed
+                .into_iter()
+                .map(|(path, kinds)| format!("{}: {}", path.display(), pids(kinds)))
+                .collect::<Vec<_>>()
+                .join("; ");
+            warnings.push(format!(
+                "{changed_count} process(es) have an executable changed on disk: {groups}"
+            ));
         }
         warnings
     }
@@ -435,6 +501,71 @@ mod tests {
         drop(held);
         assert!(live(&run).expect("live").processes.is_empty());
         assert!(dead.is_file(), "read-only inventory keeps stale records");
+    }
+
+    #[test]
+    fn warnings_group_pids_by_full_build_and_preserve_independent_problems() {
+        let d = scratch();
+        let bin = d.0.join("mdkg");
+        executable(&bin);
+        let _held = publish(&d.run(), Kind::Launcher, &bin, build("old"), vec![])
+            .unwrap()
+            .unwrap();
+        let process = live(&d.run()).unwrap().processes.remove(0);
+        let mut inventory = Live {
+            problems: vec!["unreadable receipt".into()],
+            ..Live::default()
+        };
+        for pid in (10..45).rev() {
+            let mut p = process.clone();
+            p.pid = pid;
+            inventory.processes.push(p);
+        }
+        let mut mcp = process.clone();
+        mcp.kind = Kind::Mcp;
+        mcp.pid = 50;
+        inventory.processes.push(mcp);
+        // Equal commit ids with different build metadata must stay distinct.
+        let mut other = process.clone();
+        other.pid = 60;
+        other.build.dirty = Some(true);
+        inventory.processes.push(other);
+        let mut unknown = process;
+        unknown.pid = 70;
+        unknown.build.dirty = None;
+        inventory.processes.push(unknown);
+        let warnings = inventory.warnings(&build("current"));
+        assert_eq!(warnings.len(), 2);
+        assert_eq!(warnings[0], "unreadable receipt");
+        let summary = &warnings[1];
+        assert!(
+            summary.contains("38 stale launcher/MCP process(es)"),
+            "{summary}"
+        );
+        assert_eq!(summary.matches("current").count(), 2, "{summary}");
+        assert_eq!(summary.matches("at old").count(), 3, "{summary}");
+        for state in ["clean", "dirty", "dirty unknown"] {
+            assert!(summary.contains(&format!("({state}, built ")), "{summary}");
+        }
+        assert!(
+            !summary.contains("Some(") && !summary.contains("None"),
+            "{summary}"
+        );
+        assert!(summary.contains("launcher pids [10, 11, 12"), "{summary}");
+        assert!(summary.contains("MCP pids [50]"), "{summary}");
+        assert!(summary.contains("launcher pids [60]"), "{summary}");
+        assert!(!summary.contains('\n'));
+
+        fs::remove_file(&bin).unwrap();
+        let warnings = inventory.warnings(&build("current"));
+        assert_eq!(warnings.len(), 3);
+        assert!(warnings[2].starts_with("38 process(es) have an executable changed on disk:"));
+        assert_eq!(
+            warnings[2]
+                .matches(&bin.to_string_lossy().to_string())
+                .count(),
+            1
+        );
     }
 
     #[test]

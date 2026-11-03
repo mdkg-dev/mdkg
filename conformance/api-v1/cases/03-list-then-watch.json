@@ -1,0 +1,282 @@
+{
+  "name": "03-list-then-watch",
+  "fixture": {
+    "format_version": "0.7",
+    "graph_id": "01a185ac-560e-76e0-91af-2c49dfc29b81",
+    "files": {
+      "work.txt": "initial content\n"
+    }
+  },
+  "operations": [
+    {
+      "op": "channel.create",
+      "actor": "a",
+      "args": {
+        "name": "dev",
+        "members": [
+          "b"
+        ]
+      },
+      "expect": {
+        "ok": true
+      },
+      "cli": {
+        "exit": 0,
+        "envelope": {
+          "schema": "mdkg.channel.create.v1"
+        }
+      }
+    },
+    {
+      "op": "message.send",
+      "actor": "a",
+      "args": {
+        "channel": "dev",
+        "kind": "note",
+        "id": "concurrent-0",
+        "text": "fixture message 0"
+      },
+      "expect": {
+        "ok": true,
+        "data": {
+          "duplicate": false
+        }
+      },
+      "cli": {
+        "exit": 0,
+        "envelope": {}
+      }
+    },
+    {
+      "op": "message.send",
+      "actor": "a",
+      "args": {
+        "channel": "dev",
+        "kind": "note",
+        "id": "concurrent-1",
+        "text": "fixture message 1"
+      },
+      "expect": {
+        "ok": true,
+        "data": {
+          "duplicate": false
+        }
+      },
+      "cli": {
+        "exit": 0,
+        "envelope": {}
+      }
+    },
+    {
+      "op": "message.send",
+      "actor": "a",
+      "args": {
+        "channel": "dev",
+        "kind": "note",
+        "id": "concurrent-2",
+        "text": "fixture message 2"
+      },
+      "expect": {
+        "ok": true,
+        "data": {
+          "duplicate": false
+        }
+      },
+      "cli": {
+        "exit": 0,
+        "envelope": {}
+      }
+    },
+    {
+      "op": "message.send",
+      "actor": "a",
+      "args": {
+        "channel": "dev",
+        "kind": "note",
+        "id": "concurrent-3",
+        "text": "fixture message 3"
+      },
+      "expect": {
+        "ok": true,
+        "data": {
+          "duplicate": false
+        }
+      },
+      "cli": {
+        "exit": 0,
+        "envelope": {}
+      }
+    },
+    {
+      "op": "message.send",
+      "actor": "a",
+      "args": {
+        "channel": "dev",
+        "kind": "note",
+        "id": "concurrent-4",
+        "text": "fixture message 4"
+      },
+      "expect": {
+        "ok": true,
+        "data": {
+          "duplicate": false
+        }
+      },
+      "cli": {
+        "exit": 0,
+        "envelope": {}
+      }
+    },
+    {
+      "op": "message.send",
+      "actor": "a",
+      "args": {
+        "channel": "dev",
+        "kind": "note",
+        "id": "concurrent-5",
+        "text": "fixture message 5"
+      },
+      "expect": {
+        "ok": true,
+        "data": {
+          "duplicate": false
+        }
+      },
+      "cli": {
+        "exit": 0,
+        "envelope": {}
+      }
+    },
+    {
+      "op": "message.send",
+      "actor": "a",
+      "args": {
+        "channel": "dev",
+        "kind": "note",
+        "id": "concurrent-6",
+        "text": "fixture message 6"
+      },
+      "expect": {
+        "ok": true,
+        "data": {
+          "duplicate": false
+        }
+      },
+      "cli": {
+        "exit": 0,
+        "envelope": {}
+      }
+    },
+    {
+      "op": "message.send",
+      "actor": "a",
+      "args": {
+        "channel": "dev",
+        "kind": "note",
+        "id": "concurrent-7",
+        "text": "fixture message 7"
+      },
+      "expect": {
+        "ok": true,
+        "data": {
+          "duplicate": false
+        }
+      },
+      "cli": {
+        "exit": 0,
+        "envelope": {}
+      }
+    },
+    {
+      "op": "message.send",
+      "actor": "a",
+      "args": {
+        "channel": "dev",
+        "kind": "note",
+        "id": "concurrent-8",
+        "text": "fixture message 8"
+      },
+      "expect": {
+        "ok": true,
+        "data": {
+          "duplicate": false
+        }
+      },
+      "cli": {
+        "exit": 0,
+        "envelope": {}
+      }
+    },
+    {
+      "op": "message.send",
+      "actor": "a",
+      "args": {
+        "channel": "dev",
+        "kind": "note",
+        "id": "concurrent-9",
+        "text": "fixture message 9"
+      },
+      "expect": {
+        "ok": true,
+        "data": {
+          "duplicate": false
+        }
+      },
+      "cli": {
+        "exit": 0,
+        "envelope": {}
+      }
+    },
+    {
+      "op": "message.send",
+      "actor": "a",
+      "args": {
+        "channel": "dev",
+        "kind": "note",
+        "id": "concurrent-10",
+        "text": "fixture message 10"
+      },
+      "expect": {
+        "ok": true,
+        "data": {
+          "duplicate": false
+        }
+      },
+      "cli": {
+        "exit": 0,
+        "envelope": {}
+      }
+    },
+    {
+      "op": "message.send",
+      "actor": "a",
+      "args": {
+        "channel": "dev",
+        "kind": "note",
+        "id": "concurrent-11",
+        "text": "fixture message 11"
+      },
+      "expect": {
+        "ok": true,
+        "data": {
+          "duplicate": false
+        }
+      },
+      "cli": {
+        "exit": 0,
+        "envelope": {}
+      }
+    }
+  ],
+  "expect": {
+    "properties": [
+      "atomic_list_watch_union",
+      "no_list_watch_overlap",
+      "writer_interleavings"
+    ],
+    "seeds": 16,
+    "event_type": "mdkg.message.sent",
+    "mailbox": "b"
+  },
+  "scenario": "concurrent_list_watch"
+}

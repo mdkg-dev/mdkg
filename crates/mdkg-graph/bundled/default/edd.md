@@ -17,6 +17,14 @@ updated: {{updated}}
 
 What are we building and why?
 
+# Requirements
+
+Replace this example with the behavior to deliver.
+
+```text
+- R1: The component shall perform the specified behavior. (verify: name the check)
+```
+
 # Architecture
 
 Describe the high-level structure and key components.

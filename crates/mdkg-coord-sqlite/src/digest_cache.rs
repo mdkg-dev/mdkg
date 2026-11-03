@@ -41,6 +41,25 @@ pub(crate) struct DigestCache {
 }
 
 impl DigestCache {
+    /// Reads an existing current cache; never creates or rebuilds it.
+    pub(crate) fn open_read_only(path: &Path) -> Option<Self> {
+        if !crate::store::store_file_present(path).ok()? {
+            return None;
+        }
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .ok()?;
+        conn.busy_timeout(BUSY_WAIT).ok()?;
+        conn.set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+            true,
+        )
+        .ok()?;
+        (version(&conn)? == VERSION).then_some(Self { conn })
+    }
+
     /// Opens or creates the cache at `path`. `None` when it can't be used:
     /// its folder is missing, it isn't a database, or it has a newer layout
     /// than this build's (left untouched).
@@ -167,6 +186,60 @@ fn checksum(oid: &str, size: i64, digest: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_only_cache_never_creates_repairs_or_rewrites() {
+        let dir = std::env::temp_dir().join(format!(
+            "mdkg-cache-reader-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir(&dir).expect("dir");
+        let path = dir.join(FILE);
+        assert!(DigestCache::open_read_only(&path).is_none());
+        assert!(!path.exists());
+        std::fs::write(&path, b"").expect("empty cache");
+        let wal = path.with_file_name(format!("{FILE}-wal"));
+        std::fs::write(&wal, b"preserve cache sidecar").expect("wal");
+        assert!(DigestCache::open_read_only(&path).is_none());
+        assert_eq!(
+            std::fs::read(&wal).expect("wal remains"),
+            b"preserve cache sidecar"
+        );
+        assert!(
+            std::fs::read(&path)
+                .expect("empty cache remains")
+                .is_empty()
+        );
+        std::fs::remove_file(&path).expect("remove cache artifact");
+        std::fs::remove_file(&wal).expect("remove wal artifact");
+        let mut writer = DigestCache::open(&path).expect("writer");
+        let digest = Digest::of_bytes(b"a").to_string();
+        writer.replace(&[("a1", 1, &digest)]);
+        let reader = DigestCache::open_read_only(&path).expect("reader");
+        assert_eq!(
+            reader
+                .lookup(&BTreeMap::from([("a1", 1)]))
+                .expect("lookup")
+                .0
+                .len(),
+            1
+        );
+        assert!(reader.conn.execute("DELETE FROM digests", []).is_err());
+        writer
+            .conn
+            .pragma_update(None, "user_version", 1)
+            .expect("old layout");
+        assert!(DigestCache::open_read_only(&path).is_none());
+        let version: i64 = writer
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .expect("version");
+        assert_eq!(version, 1, "not repaired");
+        drop(reader);
+        drop(writer);
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
 
     /// A newer build upgrades the layout between this build's lookup and
     /// its rewrite: the rewrite leaves the newer layout's rows alone.

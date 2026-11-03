@@ -1,6 +1,11 @@
 //! Map a hook's worktree to its actor without a process environment or a
-//! basename guess. Saved agent locations take precedence over their config;
-//! the configured worktree pattern also names actors with no launcher spec.
+//! basename guess, from the graph authority only (R1, orchestrator #10414,
+//! #11198). A saved location counts only for an actor the authority defines,
+//! and takes precedence over its configured one. The committed worktree
+//! pattern also names an actor with no definition (an interactive
+//! receiver), but never one with saved state: saved state whose definition
+//! is gone (never defined, or removed at the tip) is retired and names
+//! nobody.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -10,18 +15,45 @@ use mdkg_coord_sqlite::git;
 use serde_json::Value;
 
 use crate::RunError;
-use crate::orchestration::{AGENT, Names, load_agent_config as load_config};
+use crate::orchestration::{AGENT, Names, agent, authority_or_absent};
 use crate::state::{self, AgentState};
 
 fn bad(message: &str) -> RunError {
     RunError::failure(crate::error::CODE_UNKNOWN_AGENT, message)
 }
 
-/// Resolve exactly one actor for `cwd` in the repository containing `root`.
-/// Missing identity is `None`; conflicting or unreadable evidence is an
-/// error. Callers must not turn either case into an environment/basename
-/// fallback. This does not select a session or determine headless eligibility.
-pub fn actor_for_cwd(root: &Path, cwd: &Path) -> Result<Option<String>, RunError> {
+/// The actor and graph authority captured for one operation. Callers that
+/// need identity more than once must pass the same snapshot through the whole
+/// operation, including its already-resolved actor.
+#[derive(Debug, Clone)]
+pub struct IdentitySnapshot {
+    pub actor: Option<String>,
+    /// None is reserved for a positively identified absent checkout graph.
+    pub authority: Option<mdkg_graph::graphref::Authority>,
+}
+
+/// Capture one authority and resolve exactly one actor for `cwd` in the
+/// repository containing `root`. Conflicting or unreadable evidence is an
+/// error; callers must not guess from an environment or basename fallback.
+pub fn capture_for_cwd(root: &Path, cwd: &Path) -> Result<IdentitySnapshot, RunError> {
+    capture(root, cwd, None)
+}
+
+/// [`capture_for_cwd`] with an authority the operation already pinned for
+/// `root`, so its identity can't come from a later graph tip.
+pub fn capture_with(
+    root: &Path,
+    cwd: &Path,
+    authority: mdkg_graph::graphref::Authority,
+) -> Result<IdentitySnapshot, RunError> {
+    capture(root, cwd, Some(authority))
+}
+
+fn capture(
+    root: &Path,
+    cwd: &Path,
+    pinned: Option<mdkg_graph::graphref::Authority>,
+) -> Result<IdentitySnapshot, RunError> {
     let repo = git::check_worktree(root)
         .map_err(|e| RunError::io("can't check the hook's repository", e))?;
     let here =
@@ -29,14 +61,38 @@ pub fn actor_for_cwd(root: &Path, cwd: &Path) -> Result<Option<String>, RunError
     if here.common != repo.common {
         return Err(bad("the hook's cwd belongs to another repository"));
     }
-    let cfg = load_config(root)?;
+    let authority = match pinned {
+        Some(authority) => authority,
+        None => match authority_or_absent(root)? {
+            Some(authority) => authority,
+            // A positively absent graph names no actor, even when saved
+            // state maps this checkout (orchestrator #10414).
+            None => {
+                return Ok(IdentitySnapshot {
+                    actor: None,
+                    authority: None,
+                });
+            }
+        },
+    };
+    let cfg = agent::authority_config(&authority)?;
     let saved = saved_agents(&repo.common.join("mdkg/run"))?;
     // This is also the launcher's pattern anchor. Separate git dirs and bare
     // repositories need saved locations or explicit absolute config paths.
     let main = (repo.common.file_name().is_some_and(|s| s == ".git"))
         .then(|| repo.common.parent())
         .flatten();
-    resolve(&here.top, &here.git_dir, main, &cfg, &saved)
+    let actor = resolve(&here.top, &here.git_dir, main, &cfg, &saved)?;
+    Ok(IdentitySnapshot {
+        actor,
+        authority: Some(authority),
+    })
+}
+
+/// Resolve one actor without keeping the snapshot. Missing identity is None;
+/// this does not select a session or determine headless eligibility.
+pub fn actor_for_cwd(root: &Path, cwd: &Path) -> Result<Option<String>, RunError> {
+    Ok(capture_for_cwd(root, cwd)?.actor)
 }
 
 fn saved_agents(dir: &Path) -> Result<BTreeMap<String, AgentState>, RunError> {
@@ -140,8 +196,14 @@ fn resolve(
         Some(Value::Object(o)) => Some(o),
         Some(_) => return Err(bad("agents must be an object")),
     };
+    let defined =
+        |name: &str| name != "defaults" && configured.is_some_and(|c| c.contains_key(name));
     let mut matches = BTreeSet::new();
     for (name, agent) in saved {
+        // Saved state only chooses among actors the authority defines.
+        if !defined(name) {
+            continue;
+        }
         if location_top(&agent.spec.cwd)?.as_deref() == Some(top) {
             if let Some(pin) = &agent.spec.pinned
                 && (fs::canonicalize(&pin.top).ok().as_deref() != Some(top)
@@ -191,6 +253,7 @@ fn resolve(
     // Decode only the exact configured pattern, round-trip through the
     // launcher's filename encoder, and compare canonical parents. This is
     // not a basename default: wt-alice maps to alice, codex%3Apr1 to codex:pr1.
+    // A name with saved state is launcher-managed: undefined, it's retired.
     if let Some(main) = main
         && let Some(name) = pattern_actor(top, main, &names)?
         && !saved.contains_key(&name)
@@ -247,23 +310,52 @@ mod tests {
 
     struct Fixture(PathBuf);
     impl Fixture {
-        fn new() -> Self {
+        fn unborn() -> Self {
             let root = std::env::temp_dir().join(format!("mdkg-actor-{}", uuid::Uuid::now_v7()));
-            fs::create_dir_all(root.join(".git/objects")).expect("identity test fixture succeeds");
-            fs::create_dir_all(root.join(".git/refs")).expect("identity test fixture succeeds");
-            fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n")
-                .expect("identity test fixture succeeds");
-            fs::write(
-                root.join(".git/config"),
-                "[core]\nrepositoryformatversion = 0\nbare = false\n",
-            )
-            .expect("identity test fixture succeeds");
+            fs::create_dir_all(&root).expect("identity test fixture succeeds");
             fs::create_dir_all(root.join(".mdkg")).expect("identity test fixture succeeds");
-            Self(fs::canonicalize(root).expect("identity test fixture succeeds"))
+            let fixture = Self(fs::canonicalize(root).expect("identity test fixture succeeds"));
+            fixture.git(&["init", "-q", "-b", "main"]);
+            fixture
+        }
+        fn new() -> Self {
+            let fixture = Self::unborn();
+            fixture.config(json!({}));
+            fixture
+        }
+        fn git(&self, args: &[&str]) {
+            let output = std::process::Command::new("git")
+                .current_dir(&self.0)
+                .env_clear()
+                .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+                .env("HOME", &self.0)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_ATTR_NOSYSTEM", "1")
+                .args([
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-c",
+                    "init.templateDir=",
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                ])
+                .args(args)
+                .output()
+                .expect("run fixture git");
+            assert!(
+                output.status.success(),
+                "fixture git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
         fn config(&self, cfg: Value) {
             fs::write(self.0.join(".mdkg/config.json"), cfg.to_string())
                 .expect("identity test fixture succeeds");
+            self.git(&["add", ".mdkg/config.json"]);
+            self.git(&["commit", "-q", "--allow-empty", "-m", "fixture"]);
         }
         fn worktree(&self, rel: &str) -> PathBuf {
             let top = self.0.join(rel);
@@ -304,9 +396,45 @@ mod tests {
     }
 
     #[test]
+    fn fixture_git_ignores_inherited_repository_and_index_overrides() {
+        const CHILD: &str = "MDKG_IDENTITY_FIXTURE_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let f = Fixture::new();
+            f.config(json!({"orchestration":{"worktree":"lanes/{agent}"}}));
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("mdkg-identity-env-{}", uuid::Uuid::now_v7()));
+        fs::create_dir_all(&dir).unwrap();
+        let index = dir.join("external-index");
+        fs::write(&index, b"untouched").unwrap();
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "identity::tests::fixture_git_ignores_inherited_repository_and_index_overrides",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("GIT_DIR", dir.join("other-git"))
+            .env("GIT_WORK_TREE", dir.join("other-worktree"))
+            .env("GIT_INDEX_FILE", &index)
+            .output()
+            .unwrap();
+        let after = fs::read(&index).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(
+            result.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(after, b"untouched");
+    }
+
+    #[test]
     fn custom_pattern_and_subdirectory_resolve_the_actor_not_the_basename() {
         let f = Fixture::new();
-        f.config(json!({"orchestration":{"worktree":"lanes/wt-{agent}-code"}}));
+        f.config(json!({"orchestration":{"worktree":"lanes/wt-{agent}-code"},
+            "agents":{"alice":{"role":"worker"}}}));
         let top = f.worktree("lanes/wt-alice-code");
         let sub = top.join("src/deep");
         fs::create_dir_all(&sub).expect("identity test fixture succeeds");
@@ -320,7 +448,8 @@ mod tests {
     #[test]
     fn colon_names_round_trip_and_other_percent_spellings_do_not() {
         let f = Fixture::new();
-        f.config(json!({"orchestration":{"worktree":"lanes/wt-{agent}"}}));
+        f.config(json!({"orchestration":{"worktree":"lanes/wt-{agent}"},
+            "agents":{"codex:pr19":{"role":"worker"}}}));
         let top = f.worktree("lanes/wt-codex%3Apr19");
         assert_eq!(
             f.actor(&top).expect("identity test fixture succeeds"),
@@ -342,6 +471,7 @@ mod tests {
     #[test]
     fn nested_worktree_never_inherits_the_containing_actors_identity() {
         let f = Fixture::new();
+        f.config(json!({"agents":{"alice":{"harness":"codex"},"bob":{"harness":"codex"}}}));
         let outer = f.worktree(".worktrees/alice");
         let inner = f.worktree(".worktrees/alice/nested/bob");
         f.saved("alice", &outer);
@@ -363,6 +493,7 @@ mod tests {
     #[test]
     fn explicit_locations_and_symlinked_cwds_use_canonical_worktree_identity() {
         let f = Fixture::new();
+        f.config(json!({"agents":{"codex:alice":{"harness":"codex"}}}));
         let top = f.worktree("custom/checkout");
         let sub = top.join("src");
         fs::create_dir_all(&sub).expect("identity test fixture succeeds");
@@ -384,14 +515,14 @@ mod tests {
         let f = Fixture::new();
         let top = f.worktree("custom/checkout");
         f.saved("alice", &top);
-        f.config(json!({"agents":{"bob":{"cwd":top}}}));
+        f.config(json!({"agents":{"alice":{"harness":"codex"},"bob":{"cwd":top}}}));
         assert!(
             f.actor(&top)
                 .expect_err("identity must be refused")
                 .message
                 .contains("more than one")
         );
-        f.config(json!({}));
+        f.config(json!({"agents":{"alice":{"harness":"codex"},"bob":{"harness":"codex"}}}));
         f.saved("bob", &top);
         assert!(
             f.actor(&top)
@@ -418,6 +549,7 @@ mod tests {
     #[test]
     fn a_replacement_checkout_cannot_reuse_a_saved_git_directory_pin() {
         let f = Fixture::new();
+        f.config(json!({"agents":{"alice":{"harness":"codex"}}}));
         let top = f.worktree(".worktrees/alice");
         f.saved("alice", &top);
         let dir = f.0.join(".git/mdkg/run");
@@ -487,11 +619,69 @@ mod tests {
     }
 
     #[test]
+    fn malformed_inline_locations_do_not_assign_an_unsaved_actor() {
+        for (field, invalid, expected) in [
+            ("cwd", json!(42), "cwd must be a string"),
+            ("worktree", json!("broken"), "worktree must be a boolean"),
+        ] {
+            let f = Fixture::new();
+            f.config(json!({"agents":{"alice":{field:invalid}}}));
+            let error = f.actor(&f.0).unwrap_err();
+            assert_eq!(error.code, "usage.invalid_arguments");
+            assert!(error.message.contains(expected), "{error}");
+            f.saved("alice", &f.0);
+            let error = f.actor(&f.0).unwrap_err();
+            assert!(error.message.contains(expected), "{error}");
+        }
+    }
+
+    #[test]
     fn pattern_and_another_actors_saved_location_are_ambiguous() {
         let f = Fixture::new();
+        f.config(json!({"agents":{"alice":{"role":"worker"},"bob":{"harness":"codex"}}}));
         let top = f.worktree(".worktrees/alice");
         f.saved("bob", &top);
         assert!(f.actor(&top).is_err());
+    }
+
+    /// R1: saved state or a pattern-shaped folder never names an actor the
+    /// authority doesn't define, whether it never did or the tip removed it.
+    #[test]
+    fn saved_state_naming_an_undefined_actor_gives_no_actor() {
+        let mut failures = Vec::new();
+        for harness in ["claude", "codex", "opencode"] {
+            let f = Fixture::new();
+            let top = f.worktree(".worktrees/alice");
+            f.saved("alice", &top);
+            f.saved("bob", &f.0);
+            let mut check = |state: &str, expected: Option<&str>| match f.actor(&top) {
+                Ok(actor) if actor.as_deref() == expected => (),
+                other => failures.push(format!("{harness}, {state}: {other:?}")),
+            };
+            check("never defined", None);
+            f.config(json!({"agents":{"alice":{"harness":harness,"role":"worker"}}}));
+            check("defined", Some("alice"));
+            f.config(json!({}));
+            check("removed at the tip", None);
+            assert_eq!(
+                f.actor(&f.0).unwrap(),
+                None,
+                "{harness}: saved bob is undefined"
+            );
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// An interactive receiver has no definition and no saved state: the
+    /// committed worktree pattern still names it (orchestrator #11198).
+    #[test]
+    fn an_interactive_pattern_actor_with_no_saved_state_still_resolves() {
+        let f = Fixture::new();
+        let top = f.worktree(".worktrees/carol");
+        assert_eq!(f.actor(&top).unwrap().as_deref(), Some("carol"));
+        // Once a launcher saves it, only a definition keeps it named.
+        f.saved("carol", &top);
+        assert_eq!(f.actor(&top).unwrap(), None);
     }
 
     #[test]
@@ -532,5 +722,253 @@ mod tests {
                 .message
                 .contains("another repository")
         );
+    }
+
+    #[test]
+    fn graph_ref_definitions_identify_each_harness_without_checkout_files() {
+        let f = Fixture::new();
+        let graph_id = "0192f3a0-0000-7000-8000-000000000000";
+        f.config(json!({"schema_version":3,"format_version":"0.7","graph_id":graph_id}));
+        let dir = f.0.join(".mdkg/agents");
+        fs::create_dir_all(&dir).unwrap();
+        let mut checkouts = Vec::new();
+        for harness in ["claude", "codex", "opencode"] {
+            let top = f.worktree(&format!("custom/{harness}"));
+            fs::write(
+                dir.join(format!("{harness}.json")),
+                json!({"schema":"mdkg.agent.v1", "harness":harness, "role":"worker", "cwd":top})
+                    .to_string(),
+            )
+            .unwrap();
+            checkouts.push((harness, top));
+        }
+        f.git(&["add", ".mdkg/agents"]);
+        f.git(&["commit", "-q", "-m", "definitions"]);
+        f.git(&["update-ref", "refs/heads/mdkg-graph", "HEAD"]);
+        f.git(&["config", "mdkg.graph.ref", "refs/heads/mdkg-graph"]);
+        f.git(&[
+            "config",
+            &format!("mdkg.graph.{graph_id}.ref"),
+            "refs/heads/mdkg-graph",
+        ]);
+
+        // A code-branch commit, dirty files and absent files are all non-authority.
+        let imposter = f.worktree("custom/imposter");
+        for (harness, _) in &checkouts {
+            fs::write(
+                dir.join(format!("{harness}.json")),
+                json!({"schema":"mdkg.agent.v1", "harness":harness, "role":"worker", "cwd":imposter})
+                    .to_string(),
+            )
+            .unwrap();
+        }
+        f.git(&["add", ".mdkg/agents"]);
+        f.git(&["commit", "-q", "-m", "different code branch"]);
+        assert_eq!(f.actor(&imposter).unwrap(), None);
+        for (harness, top) in &checkouts {
+            assert_eq!(f.actor(top).unwrap().as_deref(), Some(*harness));
+        }
+        fs::write(f.0.join(".mdkg/config.json"), "{}").unwrap();
+        for (harness, _) in &checkouts {
+            fs::write(dir.join(format!("{harness}.json")), "not JSON").unwrap();
+        }
+        for (harness, top) in &checkouts {
+            assert_eq!(f.actor(top).unwrap().as_deref(), Some(*harness));
+        }
+        fs::remove_dir_all(f.0.join(".mdkg")).unwrap();
+        for (harness, top) in &checkouts {
+            assert_eq!(f.actor(top).unwrap().as_deref(), Some(*harness));
+        }
+    }
+
+    #[test]
+    fn an_uncommitted_checkout_graph_is_absent_from_identity() {
+        let mut failures = Vec::new();
+        for harness in ["claude", "codex", "opencode"] {
+            let f = Fixture::unborn();
+            fs::write(
+                f.0.join(".mdkg/config.json"),
+                json!({"agents":{"alice":{"cwd":f.0,"harness":harness}}}).to_string(),
+            )
+            .unwrap();
+            for state in ["unborn", "committed without graph"] {
+                if state != "unborn" {
+                    fs::write(f.0.join("code.txt"), "code").unwrap();
+                    f.git(&["add", "code.txt"]);
+                    f.git(&["commit", "-q", "-m", "code only"]);
+                }
+                match capture_for_cwd(&f.0, &f.0) {
+                    Ok(snapshot) if snapshot.actor.is_none() && snapshot.authority.is_none() => (),
+                    Ok(snapshot) => failures.push(format!(
+                        "{harness}, {state}: expected no actor or authority, got {snapshot:?}"
+                    )),
+                    Err(error) => failures.push(format!(
+                        "{harness}, {state}: expected absent authority, got {error}"
+                    )),
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn an_unreadable_checkout_head_is_not_absent_authority() {
+        let f = Fixture::unborn();
+        // A syntactically valid ref pointing to a missing object is not an
+        // unborn branch even though rev-parse cannot peel it to a commit.
+        fs::write(
+            f.0.join(".git/refs/heads/main"),
+            format!("{}\n", "1".repeat(40)),
+        )
+        .unwrap();
+        let error = capture_for_cwd(&f.0, &f.0).unwrap_err();
+        assert!(error.message.contains("HEAD"), "{error}");
+    }
+
+    #[test]
+    fn identity_snapshot_keeps_the_actor_and_authority_from_one_graph_tip() {
+        for harness in ["claude", "codex", "opencode"] {
+            let f = Fixture::new();
+            let graph_id = "0192f3a0-0000-7000-8000-000000000000";
+            let config = |actor: &str| {
+                json!({
+                    "schema_version":3, "format_version":"0.7", "graph_id":graph_id,
+                    "agents":{actor:{"cwd":f.0,"harness":harness}},
+                    "orchestration":{"branch":format!("{actor}/{{agent}}")}
+                })
+            };
+            f.config(config("alice"));
+            f.git(&["update-ref", "refs/heads/mdkg-graph", "HEAD"]);
+            f.git(&["config", "mdkg.graph.ref", "refs/heads/mdkg-graph"]);
+            f.git(&[
+                "config",
+                &format!("mdkg.graph.{graph_id}.ref"),
+                "refs/heads/mdkg-graph",
+            ]);
+            let first = capture_for_cwd(&f.0, &f.0).unwrap();
+            f.config(config("bob"));
+            assert_eq!(
+                crate::orchestration::Names::load(&f.0)
+                    .unwrap()
+                    .branch_for("worker"),
+                "alice/worker"
+            );
+            assert_eq!(
+                crate::orchestration::load_config(&f.0).unwrap()["orchestration"]["branch"],
+                "bob/{agent}"
+            );
+            f.git(&["update-ref", "refs/heads/mdkg-graph", "HEAD"]);
+            let second = capture_for_cwd(&f.0, &f.0).unwrap();
+            assert_eq!(
+                crate::orchestration::Names::load(&f.0)
+                    .unwrap()
+                    .branch_for("worker"),
+                "bob/worker"
+            );
+
+            assert_eq!(first.actor.as_deref(), Some("alice"));
+            assert_eq!(second.actor.as_deref(), Some("bob"));
+            assert_ne!(
+                first.authority.as_ref().unwrap().commit,
+                second.authority.as_ref().unwrap().commit
+            );
+            assert!(
+                first.authority.unwrap().config["agents"]
+                    .get("alice")
+                    .is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn saved_identity_cannot_mask_unrecorded_foreign_or_missing_graph_authority() {
+        let f = Fixture::new();
+        let graph_id = "0192f3a0-0000-7000-8000-000000000000";
+        let other_id = "0192f3a0-0000-7000-8000-000000000001";
+        f.config(json!({
+            "schema_version":3, "format_version":"0.7", "graph_id":graph_id,
+            "agents":{"alice":{"cwd":f.0}}
+        }));
+        f.saved("alice", &f.0);
+        f.git(&["update-ref", "refs/heads/mdkg-graph", "HEAD"]);
+        f.git(&["config", "mdkg.graph.ref", "refs/heads/mdkg-graph"]);
+        assert_eq!(f.actor(&f.0).unwrap_err().code, "graph.identity_unrecorded");
+        f.git(&[
+            "config",
+            &format!("mdkg.graph.{other_id}.ref"),
+            "refs/heads/mdkg-graph",
+        ]);
+        assert_eq!(f.actor(&f.0).unwrap_err().code, "graph.identity_mismatch");
+        f.git(&["config", "--unset", &format!("mdkg.graph.{other_id}.ref")]);
+        f.git(&[
+            "config",
+            &format!("mdkg.graph.{graph_id}.ref"),
+            "refs/heads/mdkg-graph",
+        ]);
+        assert_eq!(f.actor(&f.0).unwrap().as_deref(), Some("alice"));
+        f.git(&["update-ref", "-d", "refs/heads/mdkg-graph"]);
+        assert_eq!(f.actor(&f.0).unwrap_err().code, "graph.ref_missing");
+    }
+
+    #[test]
+    fn checkout_mode_uses_committed_patterns() {
+        let f = Fixture::new();
+        f.config(json!({"orchestration":{"worktree":"lanes/graph-{agent}"},
+            "agents":{"alice":{"role":"worker"},"bob":{"role":"worker"}}}));
+        let expected = f.worktree("lanes/graph-alice");
+        let forged = f.worktree("lanes/local-bob");
+        fs::write(
+            f.0.join(".mdkg/config.json"),
+            json!({"orchestration":{"worktree":"lanes/local-{agent}"}}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(f.actor(&expected).unwrap().as_deref(), Some("alice"));
+        assert_eq!(f.actor(&forged).unwrap(), None);
+    }
+
+    #[test]
+    fn a_nested_graph_reads_its_own_committed_identity() {
+        let f = Fixture::new();
+        let nested = f.0.join("nested");
+        fs::create_dir_all(nested.join(".mdkg")).unwrap();
+        fs::write(
+            nested.join(".mdkg/config.json"),
+            json!({"agents":{"nested-agent":{"cwd":f.0}}}).to_string(),
+        )
+        .unwrap();
+        f.git(&["add", "nested/.mdkg/config.json"]);
+        f.git(&["commit", "-q", "-m", "nested graph"]);
+        assert_eq!(
+            actor_for_cwd(&nested, &f.0).unwrap().as_deref(),
+            Some("nested-agent")
+        );
+        assert_eq!(f.actor(&f.0).unwrap(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_backslash_in_a_nested_graph_root_reports_how_to_repair_it() {
+        for harness in ["claude", "codex", "opencode"] {
+            let f = Fixture::new();
+            let nested = f.0.join(r"nested\literal");
+            fs::create_dir_all(nested.join(".mdkg")).unwrap();
+            fs::write(
+                nested.join(".mdkg/config.json"),
+                json!({"agents":{"worker":{"cwd":f.0,"harness":harness}}}).to_string(),
+            )
+            .unwrap();
+            f.git(&["add", r"nested\literal/.mdkg/config.json"]);
+            f.git(&["commit", "-q", "-m", "nested graph"]);
+            let error = actor_for_cwd(&nested, &f.0).unwrap_err();
+            assert_eq!(error.code, "graph.authority_invalid", "{harness}");
+            assert!(error.message.contains("backslash"), "{harness}: {error}");
+            assert!(
+                error
+                    .hint
+                    .as_deref()
+                    .is_some_and(|hint| hint.contains("rename")),
+                "{harness}: {error}"
+            );
+        }
     }
 }

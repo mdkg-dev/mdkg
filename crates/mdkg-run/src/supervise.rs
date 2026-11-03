@@ -27,9 +27,22 @@ use crate::turn::{self, Outcome, TurnOptions, TurnReport};
 use mdkg_format::program::BIN;
 
 mod control;
+mod files;
+pub mod progress;
+pub mod registry;
+pub mod reload;
+pub mod stop;
+mod watch;
 pub use control::{
-    Control, Progress, load_progress, pause, save_progress, stop_requested, wait_secs,
+    Control, Progress, drain_requested, load_progress, pause, save_progress, stop_requested,
+    supervisor_id, wait_secs,
 };
+#[cfg(test)]
+pub(crate) use control::{bounded_test, with_control};
+#[cfg(test)]
+pub(crate) use files::Scratch;
+pub use files::timestamp;
+pub use watch::{TurnWatch, WatchedOutcome};
 
 /// An agent's loop guard record: each thread's automatic turns, as
 /// milliseconds since the epoch, oldest first.
@@ -191,6 +204,8 @@ pub enum Event<'a> {
     Manual,
     /// A wait or a check failed; the agent tries again shortly.
     Trouble(&'a RunError),
+    /// `agents stop` drained the agent: it admits no more turns.
+    Stopped,
 }
 
 /// How `agents up` runs.
@@ -215,18 +230,37 @@ struct Slots {
 }
 
 impl Slots {
-    fn take(&self) {
+    fn take(&self) -> Option<Slot<'_>> {
         let mut free = self.free.lock().unwrap_or_else(|e| e.into_inner());
         while *free == 0 {
-            free = self.freed.wait(free).unwrap_or_else(|e| e.into_inner());
+            if stop_requested() {
+                return None;
+            }
+            free = self
+                .freed
+                .wait_timeout(free, Duration::from_millis(100))
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+        if stop_requested() {
+            return None;
         }
         *free -= 1;
+        Some(Slot(self))
     }
 
     fn give(&self) {
         let mut free = self.free.lock().unwrap_or_else(|e| e.into_inner());
         *free += 1;
         self.freed.notify_one();
+    }
+}
+
+/// Return capacity on every exit, including unwinding from a failed worker.
+struct Slot<'a>(&'a Slots);
+impl Drop for Slot<'_> {
+    fn drop(&mut self) {
+        self.0.give();
     }
 }
 
@@ -240,6 +274,11 @@ pub fn cap(agents: &[Supervised]) -> Option<usize> {
 /// `mail` makes each agent's own mail client, by its name. Returns the turns run per
 /// agent, in order. A policy naming a later kind refuses the whole run
 /// before anything starts.
+///
+/// A worker panic drains its siblings and returns an error. Ordinary turn
+/// errors retain their retry policy. This entry point does not yet adopt the
+/// durable turn bridge. CLI launchers use [`up_durable`], which drains on
+/// persistence/protocol errors as well as worker panics.
 pub fn up<M: Mail>(
     mail: &(dyn Fn(&str) -> M + Sync),
     dir: &Path,
@@ -247,7 +286,7 @@ pub fn up<M: Mail>(
     how: &Up,
     on: &(dyn Fn(&str, Event<'_>) + Sync),
 ) -> Result<Vec<u64>, RunError> {
-    up_inner(mail, dir, agents, how, on, None)
+    up_inner(mail, dir, agents, how, on, None, None)
 }
 
 /// A watch that can drain between turns. The caller requests stop, waits for
@@ -260,9 +299,46 @@ pub fn up_controlled<M: Mail>(
     on: &(dyn Fn(&str, Event<'_>) + Sync),
     control: &Control,
 ) -> Result<Vec<u64>, RunError> {
-    up_inner(mail, dir, agents, how, on, Some(control))
+    up_inner(mail, dir, agents, how, on, Some(control), None)
 }
 
+/// Run with one started, watch-long progress lock per selected agent. A fatal
+/// progress error drains every sibling before returning; it never permits exec.
+#[allow(clippy::too_many_arguments)]
+pub fn up_durable<M: Mail>(
+    mail: &(dyn Fn(&str) -> M + Sync),
+    dir: &Path,
+    agents: &[Supervised],
+    how: &Up,
+    on: &(dyn Fn(&str, Event<'_>) + Sync),
+    control: &Control,
+    saved: &mut [progress::Locked],
+) -> Result<Vec<u64>, RunError> {
+    if saved.len() != agents.len() {
+        return Err(RunError::failure(
+            "run.progress_invalid",
+            "progress/agent count mismatch",
+        ));
+    }
+    for (a, saved) in agents.iter().zip(saved.iter()) {
+        let record = saved.record().ok_or_else(|| {
+            RunError::failure(
+                "run.progress_invalid",
+                "supervisor progress has not started",
+            )
+        })?;
+        record.require_ready()?;
+        if record.agent != a.name || record.finished {
+            return Err(RunError::failure(
+                "run.progress_invalid",
+                "progress/agent mismatch",
+            ));
+        }
+    }
+    up_inner(mail, dir, agents, how, on, Some(control), Some(saved))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn up_inner<M: Mail>(
     mail: &(dyn Fn(&str) -> M + Sync),
     dir: &Path,
@@ -270,33 +346,116 @@ fn up_inner<M: Mail>(
     how: &Up,
     on: &(dyn Fn(&str, Event<'_>) + Sync),
     control: Option<&Control>,
+    saved: Option<&mut [progress::Locked]>,
 ) -> Result<Vec<u64>, RunError> {
     for a in agents {
         a.policy.check_supported(&a.name)?;
     }
+    // Even callers that don't watch a binary must stop siblings after a
+    // panic. Catch inside each worker, before an ordered join can wait on a
+    // different worker's idle loop. Do not expose panic payloads as diagnostics.
+    let local_control = Control::default();
+    let control = control.unwrap_or(&local_control);
     let slots = cap(agents).map(|n| Slots {
         free: Mutex::new(n),
         freed: Condvar::new(),
     });
-    let ran = std::thread::scope(|s| {
+    let records: Vec<Option<&mut progress::Locked>> = match saved {
+        Some(records) => records.iter_mut().map(Some).collect(),
+        None => agents.iter().map(|_| None).collect(),
+    };
+    let ran: Vec<Result<u64, RunError>> = std::thread::scope(|s| {
         let handles: Vec<_> = agents
             .iter()
-            .map(|a| {
+            .zip(records)
+            .map(|(a, saved)| {
                 let slots = slots.as_ref();
                 s.spawn(move || {
-                    control::with_control(control, || {
-                        let mut m = mail(&a.name);
-                        supervise(&mut m, dir, a, how, slots, on)
-                    })
+                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        control::with_control(Some(control), || {
+                            control::with_agent(&a.name, || {
+                                let mut saved = saved;
+                                let mut m = mail(&a.name);
+                                let ran = supervise(
+                                    &mut m,
+                                    dir,
+                                    a,
+                                    how,
+                                    slots,
+                                    on,
+                                    saved.as_deref_mut(),
+                                )?;
+                                if control::drain_requested() {
+                                    drained(dir, &a.name, control, saved, on)?;
+                                }
+                                Ok::<u64, RunError>(ran)
+                            })
+                        })
+                    })) {
+                        Ok(result) => {
+                            if let Err(error) = &result {
+                                control.fail(error.clone());
+                            }
+                            result
+                        }
+                        Err(_) => {
+                            let error = worker_panicked(&a.name);
+                            control.fail(error.clone());
+                            Err(error)
+                        }
+                    }
                 })
             })
             .collect();
-        handles.into_iter().map(|h| h.join().unwrap_or(0)).collect()
+        handles
+            .into_iter()
+            .zip(agents)
+            .map(|(h, a)| {
+                h.join().unwrap_or_else(|_| {
+                    let error = worker_panicked(&a.name);
+                    control.fail(error.clone());
+                    Err(error)
+                })
+            })
+            .collect()
     });
-    Ok(ran)
+    if let Some(error) = control.failure() {
+        return Err(error);
+    }
+    ran.into_iter().collect()
+}
+
+/// `agents stop` drained `name` and its worker returned at a loop
+/// boundary, with no turn in flight: finish its watch and give up its
+/// progress lock, so it can be started again while this supervisor runs
+/// its other agents; then remove the request and mark it stopped.
+fn drained(
+    dir: &Path,
+    name: &str,
+    control: &Control,
+    saved: Option<&mut progress::Locked>,
+    on: &(dyn Fn(&str, Event<'_>) + Sync),
+) -> Result<(), RunError> {
+    if let Some(saved) = saved {
+        saved.release()?;
+    }
+    stop::remove(dir, name)?;
+    if let Some(supervisor) = control.supervisor() {
+        supervisor.set(name, registry::AgentState::Stopped)?;
+    }
+    on(name, Event::Stopped);
+    Ok(())
+}
+
+fn worker_panicked(name: &str) -> RunError {
+    RunError::failure(
+        "run.agent_failed",
+        format!("{name}'s supervisor worker panicked; execution stopped"),
+    )
 }
 
 /// One agent's loop; returns the turns it ran.
+#[allow(clippy::too_many_arguments)]
 fn supervise(
     mail: &mut dyn Mail,
     dir: &Path,
@@ -304,49 +463,57 @@ fn supervise(
     how: &Up,
     slots: Option<&Slots>,
     on: &(dyn Fn(&str, Event<'_>) + Sync),
-) -> u64 {
+    mut saved: Option<&mut progress::Locked>,
+) -> Result<u64, RunError> {
     let name = a.name.as_str();
     if a.policy.trigger == Trigger::Manual {
         on(name, Event::Manual);
-        return 0;
+        return Ok(0);
     }
     if let Some(root) = a.opts.graph_root.as_deref() {
         match crate::receiver::mode(root, dir, name) {
             Ok(crate::receiver::Mode::Interactive) => {
-                return crate::receiver::supervise(mail, dir, a, how, on);
+                return match saved {
+                    Some(saved) => crate::receiver::supervise_durable(mail, dir, a, how, on, saved),
+                    None => Ok(crate::receiver::supervise(mail, dir, a, how, on)),
+                };
             }
             Ok(crate::receiver::Mode::Headless) => (),
             Err(e) => {
                 on(name, Event::Trouble(&e));
-                return 0;
+                return Ok(0);
             }
         }
     }
-    let progress = load_progress(name);
+    let progress = saved
+        .as_ref()
+        .and_then(|s| s.record())
+        .map_or_else(|| load_progress(name), |r| r.progress);
     let mut ran = progress.ran;
     let mut check_inbox = progress.check_inbox;
     // Mail at or below this is seen, and waits for a paused thread or a
     // person; newer mail wakes the agent.
     let mut seen: Option<u64> = progress.seen;
+    let mut capacity = Capacity::load(dir, name);
     let opts = TurnOptions {
         limit: a.policy.batch_max(),
         timeout: a.policy.timeout.or(a.opts.timeout),
         ..a.opts.clone()
     };
     loop {
-        save_progress(
-            name,
-            Progress {
-                ran,
-                seen,
-                check_inbox,
-            },
-        );
+        let current = Progress {
+            ran,
+            seen,
+            check_inbox,
+        };
+        checkpoint(saved.as_deref_mut(), current)?;
+        save_progress(name, current);
+        record_state(name, registry::AgentState::Idle, on);
         if stop_requested() {
-            return ran;
+            return Ok(ran);
         }
         if how.max_turns.is_some_and(|m| ran >= m) {
-            return ran;
+            return Ok(ran);
         }
         let agent = match state::load(dir, name) {
             Ok(Some(agent)) => agent,
@@ -358,7 +525,7 @@ fn supervise(
                         format!("no agent named {name}"),
                     )),
                 );
-                return ran;
+                return Ok(ran);
             }
             Err(e) => {
                 on(name, Event::Trouble(&e));
@@ -383,7 +550,7 @@ fn supervise(
                 Err(e) => {
                     on(name, Event::Trouble(&e));
                     if how.once {
-                        return ran;
+                        return Ok(ran);
                     }
                     pause(how.pause);
                     continue;
@@ -395,9 +562,6 @@ fn supervise(
                 }
                 seen = inbox.cursor.max(seen);
                 check_inbox = false;
-                if how.once {
-                    return ran;
-                }
                 continue;
             }
             let mut agent = agent;
@@ -406,20 +570,43 @@ fn supervise(
                 loop_guard: a.policy.loop_guard,
                 ..opts.clone()
             };
-            turn_opts.flags.fresh = how.fresh && ran == 0;
-            if let Some(s) = slots {
-                s.take();
-            }
+            let capacity_fresh = capacity.fresh_next();
+            turn_opts.flags.fresh = (how.fresh && ran == 0) || capacity_fresh;
+            let permit = match slots {
+                Some(s) => match s.take() {
+                    Some(permit) => Some(permit),
+                    None => return Ok(ran),
+                },
+                None => None,
+            };
             if stop_requested() {
-                if let Some(s) = slots {
-                    s.give();
+                return Ok(ran);
+            }
+            record_state(name, registry::AgentState::Running, on);
+            let durable = saved.is_some();
+            let result = if let Some(saved) = saved.as_deref_mut() {
+                let watch = TurnWatch::new(saved, inbox.cursor)?;
+                match turn::turn_watched(mail, dir, &mut agent, &turn_opts, watch)? {
+                    WatchedOutcome::Unclaimed(error) => {
+                        drop(permit);
+                        on(name, Event::Trouble(&error));
+                        if how.once {
+                            return Ok(ran);
+                        }
+                        pause(how.pause);
+                        continue;
+                    }
+                    WatchedOutcome::Completed { result, progress } => {
+                        ran = progress.ran;
+                        seen = progress.seen;
+                        check_inbox = progress.check_inbox;
+                        *result
+                    }
                 }
-                return ran;
-            }
-            let result = turn::turn(mail, dir, &mut agent, &turn_opts);
-            if let Some(s) = slots {
-                s.give();
-            }
+            } else {
+                turn::turn(mail, dir, &mut agent, &turn_opts)
+            };
+            drop(permit);
             // A lease held elsewhere (a person's `run`, an install): not a
             // turn, tried again shortly.
             if let Err(e) = &result
@@ -427,7 +614,7 @@ fn supervise(
             {
                 on(name, Event::Trouble(e));
                 if how.once {
-                    return ran;
+                    return Ok(ran);
                 }
                 pause(how.pause);
                 continue;
@@ -435,6 +622,13 @@ fn supervise(
             // The turn charged the guard itself, under its lease, before
             // the agent started.
             on(name, Event::Turn(&result));
+            capacity.after(&result, capacity_fresh);
+            if let Err(e) = capacity.save(dir, name) {
+                on(name, Event::Trouble(&e));
+            }
+            if durable {
+                continue;
+            }
             if !matches!(&result, Ok(r) if r.outcome == Outcome::Idle) {
                 ran += 1;
             }
@@ -455,7 +649,7 @@ fn supervise(
             continue;
         }
         if how.once {
-            return ran;
+            return Ok(ran);
         }
         let after = agent.cursor.max(seen);
         let wait = cooldown.map_or(how.wait_secs, |c| how.wait_secs.min(c.as_secs().max(1)));
@@ -467,6 +661,104 @@ fn supervise(
                 on(name, Event::Trouble(&e));
                 pause(how.pause);
             }
+        }
+    }
+}
+
+/// The supervisor's record is for readers; failing to write it never stops
+/// the agent.
+fn record_state(name: &str, state: registry::AgentState, on: &(dyn Fn(&str, Event<'_>) + Sync)) {
+    if let Err(e) = control::set_state(state) {
+        on(name, Event::Trouble(&e));
+    }
+}
+
+/// Persist changes only; idle polling must not rewrite an unchanged record.
+pub(crate) fn checkpoint(
+    saved: Option<&mut progress::Locked>,
+    now: Progress,
+) -> Result<(), RunError> {
+    if let Some(saved) = saved
+        && saved.record().is_none_or(|r| r.progress != now)
+    {
+        saved.checkpoint(now)?;
+    }
+    Ok(())
+}
+
+/// One agent's turns in a row that failed with the model at capacity
+/// (friction log item 21): a long resumed session can keep failing so
+/// while fresh ones of the same model work. After two, the agent's next
+/// turn starts a fresh session. A turn is never retried within itself for
+/// capacity, so nothing it did runs twice; its mail waits for the next
+/// turn, as any failed turn's does. Any other turn that ran resets the
+/// count, and an idle one leaves it. Saved in the run folder after each
+/// turn (`capacity/<agent>.json`), so a re-exec, a restart or a run of
+/// `--once` passes keeps it.
+#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Capacity {
+    streak: u32,
+}
+
+pub fn capacity_path(dir: &Path, name: &str) -> PathBuf {
+    dir.join("capacity")
+        .join(format!("{}.json", state::file_name(name)))
+}
+
+impl Capacity {
+    const FRESH_AFTER: u32 = 2;
+
+    /// The agent's saved count; none when there's no record or it can't
+    /// be read, which at worst delays a fresh session.
+    pub fn load(dir: &Path, name: &str) -> Self {
+        fs::read(capacity_path(dir, name))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default()
+    }
+
+    /// A count that can't be saved only shifts a fresh session by a turn,
+    /// so the caller warns and carries on; the error names the file.
+    pub fn save(&self, dir: &Path, name: &str) -> Result<(), RunError> {
+        let path = capacity_path(dir, name);
+        let failed = |e: std::io::Error| {
+            RunError::failure(
+                crate::error::CODE_IO,
+                format!("can't save the capacity count in {}: {e}", path.display()),
+            )
+        };
+        if self.streak == 0 {
+            return match fs::remove_file(&path) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(failed(e)),
+                _ => Ok(()),
+            };
+        }
+        let tmp = path.with_extension("json.tmp");
+        (|| -> std::io::Result<()> {
+            fs::create_dir_all(path.parent().unwrap_or(dir))?;
+            fs::write(
+                &tmp,
+                serde_json::to_vec(self).map_err(std::io::Error::other)?,
+            )?;
+            fs::rename(&tmp, &path)
+        })()
+        .map_err(failed)
+    }
+
+    pub fn fresh_next(&self) -> bool {
+        self.streak >= Self::FRESH_AFTER
+    }
+
+    /// `fresh` says this turn was the fresh one, which starts the count
+    /// again for its new session.
+    pub fn after(&mut self, result: &Result<TurnReport, RunError>, fresh: bool) {
+        if fresh {
+            self.streak = 0;
+        }
+        match result {
+            Err(e) if turn::at_capacity(e) => self.streak += 1,
+            Ok(r) if r.outcome == Outcome::Idle => {}
+            _ => self.streak = 0,
         }
     }
 }
@@ -563,6 +855,85 @@ mod tests {
     }
 
     #[test]
+    fn two_capacity_failures_in_a_row_make_the_next_turn_fresh() {
+        use crate::error::CODE_AGENT_FAILED;
+        let at_capacity = || {
+            Err(
+                RunError::failure(CODE_AGENT_FAILED, "the agent exited with exit status: 1")
+                    .and_hint(turn::CAPACITY_HINT)
+                    .and_hint("the turn's files are in /tmp/t"),
+            )
+        };
+        let other = || {
+            Err(RunError::failure(
+                CODE_AGENT_FAILED,
+                "the agent exited with exit status: 1",
+            ))
+        };
+        let mut c = Capacity::default();
+        c.after(&at_capacity(), false);
+        assert!(!c.fresh_next(), "one isn't enough");
+        // Any other failure breaks the run.
+        c.after(&other(), false);
+        c.after(&at_capacity(), false);
+        assert!(!c.fresh_next());
+        c.after(&at_capacity(), false);
+        assert!(c.fresh_next(), "two in a row");
+        // The fresh turn starts the count again for its new session, whether
+        // it then runs or is at capacity too.
+        c.after(&at_capacity(), true);
+        assert!(!c.fresh_next());
+        c.after(&at_capacity(), false);
+        assert!(c.fresh_next());
+        c.after(&other(), true);
+        assert!(!c.fresh_next());
+    }
+
+    #[test]
+    fn the_capacity_count_survives_a_restart() {
+        use crate::error::CODE_AGENT_FAILED;
+        let dir = std::env::temp_dir().join(format!("mdkg-capacity-{}", uuid::Uuid::now_v7()));
+        let failed = Err(RunError::failure(
+            CODE_AGENT_FAILED,
+            "the agent exited with exit status: 1",
+        )
+        .and_hint(turn::CAPACITY_HINT));
+        let mut c = Capacity::load(&dir, "codex:pr19");
+        c.after(&failed, false);
+        c.save(&dir, "codex:pr19").expect("save");
+        // A new process reads it back.
+        let mut c = Capacity::load(&dir, "codex:pr19");
+        assert!(!c.fresh_next());
+        c.after(&failed, false);
+        c.save(&dir, "codex:pr19").expect("save");
+        assert!(Capacity::load(&dir, "codex:pr19").fresh_next());
+        // Reset clears the file.
+        let mut c = Capacity::load(&dir, "codex:pr19");
+        c.after(&failed, true);
+        c.after(&Err(RunError::failure(CODE_AGENT_FAILED, "other")), false);
+        c.save(&dir, "codex:pr19").expect("save");
+        assert!(!capacity_path(&dir, "codex:pr19").exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_capacity_count_that_cant_be_saved_names_its_file() {
+        let dir = std::env::temp_dir().join(format!("mdkg-capacity-{}", uuid::Uuid::now_v7()));
+        fs::create_dir_all(&dir).unwrap();
+        // A file where the folder belongs: neither a save nor a reset works.
+        fs::write(dir.join("capacity"), "").unwrap();
+        let mut c = Capacity::default();
+        c.after(
+            &Err(RunError::failure(crate::error::CODE_AGENT_FAILED, "x")
+                .and_hint(turn::CAPACITY_HINT)),
+            false,
+        );
+        let e = c.save(&dir, "a").expect_err("can't save");
+        assert!(e.message.contains("capacity/a.json"), "{}", e.message);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn the_cap_is_the_smallest_set_concurrency() {
         let mk = |c: Option<usize>| Supervised {
             name: "a".into(),
@@ -589,6 +960,7 @@ mod tests {
         blocked_read: Option<BlockedRead>,
         live_mail: bool,
         claims: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        stop_on_wait: bool,
     }
 
     impl Mail for IdleMail {
@@ -628,7 +1000,11 @@ mod tests {
             self.waited
                 .send((after, seconds))
                 .expect("wait observation");
-            self.control.request_stop();
+            if self.stop_on_wait {
+                self.control.request_stop();
+            } else {
+                pause(Duration::from_secs(600));
+            }
             Ok(None)
         }
         fn import(&mut self, _: &crate::mail::Import<'_>) -> Result<String, RunError> {
@@ -699,6 +1075,49 @@ mod tests {
     }
 
     #[test]
+    fn durable_unclaimed_once_returns_without_spinning_or_charging() {
+        bounded_test(
+            "supervise::tests::durable_unclaimed_once_returns_without_spinning_or_charging",
+            || {
+                let (scratch, agent, mut how) = saved_idle_agent();
+                let dir = scratch.0.join(".git/mdkg/run");
+                fs::create_dir_all(&dir).unwrap();
+                let state = state::load(&scratch.0, "worker").unwrap().unwrap();
+                state::save(&dir, &state).unwrap();
+                let mut saved =
+                    progress::Locked::open(&dir, uuid::Uuid::now_v7(), "worker").unwrap();
+                saved.start(&"a".repeat(64), None).unwrap();
+                let before = saved.record().unwrap().clone();
+                let control = Control::default();
+                let (waited, _) = std::sync::mpsc::channel();
+                let claims = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let make = |_: &str| IdleMail {
+                    control: control.clone(),
+                    waited: waited.clone(),
+                    blocked_read: None,
+                    live_mail: true,
+                    claims: claims.clone(),
+                    stop_on_wait: false,
+                };
+                how.once = true;
+                let counts = up_durable(
+                    &make,
+                    &dir,
+                    &[agent],
+                    &how,
+                    &|_, _| (),
+                    &control,
+                    std::slice::from_mut(&mut saved),
+                )
+                .unwrap();
+                assert_eq!(counts, [0]);
+                assert_eq!(claims.load(std::sync::atomic::Ordering::Relaxed), 1);
+                assert_eq!(saved.record().unwrap(), &before);
+            },
+        );
+    }
+
+    #[test]
     fn controlled_wait_preserves_retry_cursor_and_remaining_turn_budget() {
         let (dir, agent, mut how) = saved_idle_agent();
         let progress = Progress {
@@ -715,6 +1134,7 @@ mod tests {
             blocked_read: None,
             live_mail: false,
             claims: claims.clone(),
+            stop_on_wait: true,
         };
         let ran = up_controlled(
             &make,
@@ -738,6 +1158,7 @@ mod tests {
             blocked_read: None,
             live_mail: false,
             claims: claims.clone(),
+            stop_on_wait: true,
         };
         assert_eq!(
             up_controlled(&make_resumed, &dir.0, &[agent], &how, &|_, _| (), &resumed)
@@ -746,6 +1167,128 @@ mod tests {
         );
         assert!(observations.try_recv().is_err());
         assert_eq!(claims.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn a_stop_request_drains_one_agent_and_frees_its_progress_while_a_sibling_runs() {
+        bounded_test(
+            "supervise::tests::a_stop_request_drains_one_agent_and_frees_its_progress_while_a_sibling_runs",
+            || {
+                let (scratch, worker, how) = saved_idle_agent();
+                let dir = scratch.0.join(".git/mdkg/run");
+                fs::create_dir_all(&dir).unwrap();
+                let graph = uuid::Uuid::now_v7();
+                let mut other = worker.clone();
+                other.name = "other".into();
+                let mut saved = Vec::new();
+                for name in ["other", "worker"] {
+                    let mut state = state::load(&scratch.0, "worker").unwrap().unwrap();
+                    state.spec.name = name.into();
+                    state::save(&dir, &state).unwrap();
+                    let mut locked = progress::Locked::open(&dir, graph, name).unwrap();
+                    locked.start(&"a".repeat(64), None).unwrap();
+                    saved.push(locked);
+                }
+                let names = ["other".to_string(), "worker".to_string()];
+                let supervisor = std::sync::Arc::new(
+                    registry::Registered::register(&dir, &names, None, None)
+                        .unwrap()
+                        .unwrap(),
+                );
+                let control = Control::default();
+                control.set_supervisor(supervisor.clone());
+                let (waited, observations) = std::sync::mpsc::channel();
+                let claims = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let make = |_: &str| IdleMail {
+                    control: control.clone(),
+                    waited: waited.clone(),
+                    blocked_read: None,
+                    live_mail: false,
+                    claims: claims.clone(),
+                    stop_on_wait: false,
+                };
+                let (events, stopped) = std::sync::mpsc::channel::<String>();
+                let events = Mutex::new(events);
+                let on = |name: &str, event: Event<'_>| {
+                    if matches!(event, Event::Stopped) {
+                        let _ = events.lock().unwrap().send(name.to_string());
+                    }
+                };
+                let agents = [other, worker];
+                std::thread::scope(|s| {
+                    let _stop = StopOnDrop(control.clone());
+                    let run = s.spawn(|| {
+                        up_durable(&make, &dir, &agents, &how, &on, &control, &mut saved)
+                    });
+                    // Both idle in their mail waits.
+                    for _ in 0..2 {
+                        observations.recv_timeout(STARTUP).expect("idle wait");
+                    }
+                    let request =
+                        stop::Request::drain("nick", timestamp(state::now_ms()), &supervisor.id());
+                    stop::write(&dir, "worker", &request).unwrap();
+                    // Within a poll, not at the end of its wait.
+                    assert_eq!(
+                        stopped.recv_timeout(Duration::from_secs(5)).unwrap(),
+                        "worker"
+                    );
+                    assert_eq!(stop::read(&dir, "worker").unwrap(), None);
+                    let (found, _) = registry::list(&dir).unwrap();
+                    assert_eq!(
+                        registry::running(&found, "worker").unwrap().1,
+                        registry::AgentState::Stopped
+                    );
+                    assert_eq!(
+                        registry::running(&found, "other").unwrap().1,
+                        registry::AgentState::Idle
+                    );
+                    // The drained agent's watch is finished and free; its
+                    // sibling's is still held.
+                    let mut again = progress::Locked::open(&dir, graph, "worker").unwrap();
+                    assert!(again.record().unwrap().finished);
+                    again.start(&"a".repeat(64), None).unwrap();
+                    drop(again);
+                    assert!(progress::Locked::open(&dir, graph, "other").is_err());
+                    assert!(!run.is_finished());
+                    control.request_stop();
+                    assert_eq!(run.join().unwrap().unwrap(), [0, 0]);
+                });
+                assert!(saved[1].released());
+                assert!(!saved[0].released());
+                assert_eq!(claims.load(std::sync::atomic::Ordering::Relaxed), 0);
+            },
+        );
+    }
+
+    #[test]
+    fn a_stop_request_for_another_supervisor_is_not_this_ones() {
+        let (scratch, worker, _) = saved_idle_agent();
+        let dir = scratch.0.join(".git/mdkg/run");
+        fs::create_dir_all(&dir).unwrap();
+        let supervisor = std::sync::Arc::new(
+            registry::Registered::register(&dir, &["worker".into()], None, None)
+                .unwrap()
+                .unwrap(),
+        );
+        let control = Control::default();
+        control.set_supervisor(supervisor.clone());
+        let request = stop::Request::drain("nick", timestamp(0), &uuid::Uuid::now_v7().to_string());
+        stop::write(&dir, &worker.name, &request).unwrap();
+        control::with_control(Some(&control), || {
+            control::with_agent(&worker.name, || {
+                assert!(!stop_requested());
+                stop::write(
+                    &dir,
+                    &worker.name,
+                    &stop::Request::drain("nick", timestamp(0), &supervisor.id()),
+                )
+                .unwrap();
+                assert!(stop_requested());
+                // Only this worker's agent.
+                control::with_agent("other", || assert!(!stop_requested()));
+            })
+        });
+        assert!(!control.stopped());
     }
 
     #[test]
@@ -770,6 +1313,7 @@ mod tests {
             }),
             live_mail: true,
             claims: claims.clone(),
+            stop_on_wait: true,
         };
         std::thread::scope(|s| {
             // Both guards belong to the scope body, so they drop before
@@ -812,6 +1356,164 @@ mod tests {
         bounded_timeout_test(
             "supervise::tests::in_flight_readiness_timeout_cancels_before_joining",
             || in_flight_case(true),
+        );
+    }
+
+    #[test]
+    fn worker_panic_stops_an_earlier_idle_sibling_and_returns_an_error() {
+        bounded_test(
+            "supervise::tests::worker_panic_stops_an_earlier_idle_sibling_and_returns_an_error",
+            || {
+                for controlled in [false, true] {
+                    let (dir, agent, how) = saved_idle_agent();
+                    let control = Control::default();
+                    let (waited, observations) = std::sync::mpsc::channel();
+                    let observations = Mutex::new(observations);
+                    let claims = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                    let mut second = agent.clone();
+                    second.name = "panicking-worker".into();
+                    let make = |name: &str| {
+                        if name == second.name {
+                            observations
+                                .lock()
+                                .unwrap()
+                                .recv_timeout(STARTUP)
+                                .expect("first worker waiting");
+                            panic!("fixture worker failure");
+                        }
+                        IdleMail {
+                            control: control.clone(),
+                            waited: waited.clone(),
+                            blocked_read: None,
+                            live_mail: false,
+                            claims: claims.clone(),
+                            stop_on_wait: false,
+                        }
+                    };
+                    let agents = [agent, second.clone()];
+                    let error = if controlled {
+                        up_controlled(&make, &dir.0, &agents, &how, &|_, _| (), &control)
+                    } else {
+                        up(&make, &dir.0, &agents, &how, &|_, _| ())
+                    }
+                    .unwrap_err();
+                    assert_eq!(error, worker_panicked(&second.name));
+                    if controlled {
+                        assert_eq!(control.failure(), Some(error));
+                    }
+                    assert_eq!(claims.load(std::sync::atomic::Ordering::Relaxed), 0);
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn slots_return_capacity_after_unwind_and_cancel_waiters_on_stop() {
+        let slots = Slots {
+            free: Mutex::new(1),
+            freed: Condvar::new(),
+        };
+        let control = Control::default();
+        let panicked = std::panic::catch_unwind(|| {
+            control::with_control(Some(&control), || {
+                let _permit = slots.take().unwrap();
+                panic!("fixture inside slot");
+            });
+        });
+        assert!(panicked.is_err());
+        assert_eq!(*slots.free.lock().unwrap(), 1);
+        std::thread::scope(|scope| {
+            // Drop the holder before scope joins, including readiness failure.
+            let _held = slots.take().unwrap();
+            let _stop = StopOnDrop(control.clone());
+            let (entered, waiting) = std::sync::mpsc::channel();
+            let (done, exited) = std::sync::mpsc::channel();
+            let worker_control = &control;
+            let worker_slots = &slots;
+            scope.spawn(move || {
+                control::with_control(Some(worker_control), || {
+                    entered.send(()).unwrap();
+                    let acquired = worker_slots.take().is_some();
+                    let _ = done.send(acquired);
+                })
+            });
+            waiting.recv_timeout(STARTUP).unwrap();
+            control.request_stop();
+            assert!(!exited.recv_timeout(STARTUP).expect("slot waiter cancelled"));
+            assert_eq!(*slots.free.lock().unwrap(), 0);
+        });
+        assert_eq!(*slots.free.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn fatal_stop_still_joins_in_flight_work_before_returning_error() {
+        bounded_test(
+            "supervise::tests::fatal_stop_still_joins_in_flight_work_before_returning_error",
+            || {
+                let (dir, agent, how) = saved_idle_agent();
+                let control = Control::default();
+                let (entered, reading) = std::sync::mpsc::channel();
+                let reading = Mutex::new(reading);
+                let (release, released) = std::sync::mpsc::channel::<()>();
+                let released = std::sync::Arc::new(Mutex::new(released));
+                let (waited, _) = std::sync::mpsc::channel();
+                let claims = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let mut second = agent.clone();
+                second.name = "panicking-worker".into();
+                let make = |name: &str| {
+                    if name == second.name {
+                        reading
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(STARTUP)
+                            .expect("active sibling");
+                        panic!("fixture worker failure");
+                    }
+                    IdleMail {
+                        control: control.clone(),
+                        waited: waited.clone(),
+                        blocked_read: Some(BlockedRead {
+                            entered: entered.clone(),
+                            released: released.clone(),
+                        }),
+                        live_mail: true,
+                        claims: claims.clone(),
+                        stop_on_wait: true,
+                    }
+                };
+                std::thread::scope(|scope| {
+                    let release = release;
+                    let _stop = StopOnDrop(control.clone());
+                    let (finished, returned) = std::sync::mpsc::channel();
+                    let make = &make;
+                    let worker_control = &control;
+                    let dir = &dir;
+                    let agents = [agent, second.clone()];
+                    scope.spawn(move || {
+                        let result =
+                            up_controlled(make, &dir.0, &agents, &how, &|_, _| (), worker_control);
+                        let _ = finished.send(result);
+                    });
+                    let deadline = std::time::Instant::now() + STARTUP;
+                    while control.failure().is_none() {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "fatal stop not published"
+                        );
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    assert!(matches!(
+                        returned.try_recv(),
+                        Err(std::sync::mpsc::TryRecvError::Empty)
+                    ));
+                    drop(release);
+                    assert_eq!(
+                        returned.recv_timeout(STARTUP).unwrap().unwrap_err(),
+                        worker_panicked(&second.name)
+                    );
+                });
+                assert_eq!(claims.load(std::sync::atomic::Ordering::Relaxed), 0);
+            },
         );
     }
 }

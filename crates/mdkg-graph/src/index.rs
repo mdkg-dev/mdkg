@@ -39,7 +39,8 @@ pub struct IndexNode {
     /// `scope`, as written.
     pub scope: Vec<String>,
     pub attributes: Frontmatter,
-    /// Path relative to the graph root, with `/` separators.
+    /// Path relative to the loader root, with `/` separators. Committed-tree
+    /// readers use the repository root, including a nested graph prefix.
     pub path: String,
     pub edges: EdgeMap,
     /// The body exactly as parsed (CRLF normalized, not trimmed).
@@ -413,6 +414,23 @@ pub fn relative_label(root: &Path, label: &str) -> String {
     }
 }
 
+/// The options the indexer parses every document with, for `config` and
+/// its template schemas: one set of node rules for the index and for a
+/// lookup in git objects (Terra's code review #9504, blocker 2).
+pub fn parse_options<'a>(
+    config: &'a Config,
+    templates: &'a HashMap<String, mdkg_format::TemplateSchema>,
+) -> ParseOptions<'a> {
+    ParseOptions {
+        work_status: &config.status_enum,
+        priority_min: config.priority_min,
+        priority_max: config.priority_max,
+        templates,
+        allow_extension_keys: true,
+        format: config.format,
+    }
+}
+
 /// Builds and validates the index. The first error fails the build, as the
 /// reference does for every read command.
 pub fn build(root: &Path, config: &Config) -> Result<Index, GraphError> {
@@ -425,15 +443,20 @@ pub fn build(root: &Path, config: &Config) -> Result<Index, GraphError> {
         .with_hint(crate::config::identity_v2_hint()));
     }
     let schemas = templates::load(root, config)?.schemas;
-    let opts = ParseOptions {
-        work_status: &config.status_enum,
-        priority_min: config.priority_min,
-        priority_max: config.priority_max,
-        templates: &schemas,
-        allow_extension_keys: true,
-        format: config.format,
-    };
     let documents = discovery::discover(root, config)?;
+    build_from(root, config, &schemas, &documents, read_document)
+}
+
+/// Shared parser/validator for filesystem documents and immutable object reads.
+/// The supplied paths and reader must describe one consistent source snapshot.
+pub(crate) fn build_from(
+    root: &Path,
+    config: &Config,
+    schemas: &HashMap<String, mdkg_format::node::TemplateSchema>,
+    documents: &discovery::Documents,
+    mut read: impl FnMut(&Path) -> Result<String, GraphError>,
+) -> Result<Index, GraphError> {
+    let opts = parse_options(config, schemas);
     let mut nodes = Vec::new();
     let mut workspaces = Vec::new();
     // Format 0.7 ids are unique in the whole graph, by UUID.
@@ -443,16 +466,11 @@ pub fn build(root: &Path, config: &Config) -> Result<Index, GraphError> {
         let mut seen: HashMap<String, String> = HashMap::new();
         let mut seen_legacy: HashMap<String, String> = HashMap::new();
         for file in files {
-            if file.file_name().is_some_and(|n| n == "core.md")
-                && file
-                    .parent()
-                    .and_then(Path::file_name)
-                    .is_some_and(|n| n == "core")
-            {
+            if discovery::is_core_page(file) {
                 continue;
             }
             let label = file.display().to_string();
-            let content = read_document(file)?;
+            let content = read(file)?;
             let node = match parse_node(&content, &label, &opts) {
                 Ok(node) => node,
                 // Tolerant mode skips bad files, but never usage-class errors.

@@ -91,24 +91,37 @@ fn repo() -> (Scratch, PathBuf, PathBuf) {
     let dir = fs::canonicalize(dir).expect("canonical");
     let repo = dir.join("repo");
     let conformance = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../conformance");
+    let (base, case) = (
+        conformance.join("base"),
+        conformance.join("cases/g01-valid-basic"),
+    );
     fs::create_dir_all(&repo).expect("repo");
-    copy_tree(&conformance.join("base"), &repo);
-    copy_tree(&conformance.join("cases/g01-valid-basic"), &repo);
-    fs::remove_file(repo.join("commands")).ok();
-    fs::remove_file(repo.join("README.md")).ok();
-    // The fake agent's scratch files stay out of git.
-    fs::write(
-        repo.join(".gitignore"),
-        "*.args\n*.prompt\n*.environ\n/.worktrees/\n",
-    )
-    .expect("ignore");
-    sh(&repo, &["init", "-q", "-b", "main"]);
-    sh(&repo, &["add", "."]);
-    sh(&repo, &["commit", "-q", "-m", "init"]);
-    // Keep the legacy handles while committing the graph's 0.7 identity.
-    let migration = ok(&repo, "launcher", &["migrate", "--dry-run"]);
-    let plan = migration["data"]["plan"].as_str().expect("migration plan");
-    ok(&repo, "launcher", &["migrate", "--apply", plan]);
+    // The first commit and the migration don't depend on where the fixture
+    // lives, so they're built once and copied.
+    common::template::copy(
+        "run-repo",
+        &[&base, &case],
+        |repo| {
+            copy_tree(&base, repo);
+            copy_tree(&case, repo);
+            fs::remove_file(repo.join("commands")).ok();
+            fs::remove_file(repo.join("README.md")).ok();
+            // The fake agent's scratch files stay out of git.
+            fs::write(
+                repo.join(".gitignore"),
+                "*.args\n*.prompt\n*.environ\n/.worktrees/\n",
+            )
+            .expect("ignore");
+            sh(repo, &["init", "-q", "-b", "main"]);
+            sh(repo, &["add", "."]);
+            sh(repo, &["commit", "-q", "-m", "init"]);
+            // Keep the legacy handles while committing the graph's 0.7 identity.
+            let migration = ok(repo, "launcher", &["migrate", "--dry-run"]);
+            let plan = migration["data"]["plan"].as_str().expect("migration plan");
+            ok(repo, "launcher", &["migrate", "--apply", plan]);
+        },
+        &repo,
+    );
     // The launcher's root: a worktree on its own branch, never main.
     let graph = repo.join(".worktrees/graph");
     let path = graph.to_str().expect("utf-8");
@@ -246,6 +259,60 @@ fn a_launched_agent_replies_through_the_real_mail_commands() {
     assert!(!status.to_string().contains("run:lane-agent"), "{status}");
 }
 
+/// A NO_REPLY turn's text summary says nothing was sent: no "replied ?",
+/// and no bare NO_REPLY line after it (e2e B17).
+#[test]
+fn no_reply_turn_summary() {
+    let (_dir, repo, lane) = repo();
+    ok(
+        &repo,
+        "orchestrator",
+        &[
+            "msg",
+            "send",
+            "--to",
+            "lane-agent",
+            "--kind",
+            "handoff",
+            "--text",
+            "merged",
+        ],
+    );
+    fs::write(lane.join("fake-reply"), "NO_REPLY").expect("reply");
+    let root = graph(&repo);
+    let cwd = lane.to_str().expect("utf-8");
+    let args = [
+        "turn",
+        "lane-agent",
+        "--harness",
+        "claude",
+        "--role",
+        "worker",
+        "--cwd",
+        cwd,
+    ];
+    let out = isolated(&mut Command::new(env!("CARGO_BIN_EXE_mdkg")))
+        .current_dir(&root)
+        .arg("--root")
+        .arg(&root)
+        .args(["--as", "launcher"])
+        .args(common::agent_turn_args(&root, &args))
+        .output()
+        .expect("run mdkg");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stdout}{stderr}");
+    assert!(!stdout.contains("replied ?"), "{stdout}");
+    assert!(
+        stdout.contains("answered NO_REPLY to 1 message(s); the launcher sent no final reply"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("no reply was sent"), "{stdout}");
+    assert!(!stdout.lines().any(|l| l.trim() == "NO_REPLY"), "{stdout}");
+    let lane_inbox = ok(&lane, "lane-agent", &["msg", "inbox"]);
+    assert_eq!(lane_inbox["data"]["messages"], serde_json::json!([]));
+}
+
 #[test]
 fn a_worker_in_the_graph_worktree_is_refused_and_a_reviewer_runs_there() {
     let (_dir, repo, _lane) = repo();
@@ -351,7 +418,7 @@ fn mail_from_the_launchers_own_actor_is_refused_before_the_agent_runs() {
 }
 
 #[test]
-fn a_room_post_gets_its_reply_in_the_room() {
+fn a_room_post_gets_its_reply_direct_to_its_sender() {
     let (_dir, repo, lane) = repo();
     ok(
         &repo,
@@ -380,20 +447,20 @@ fn a_room_post_gets_its_reply_in_the_room() {
         ],
     );
     assert_eq!(out["data"]["outcome"], "replied", "{out}");
+    let post = out["data"]["shown"][0].as_str().expect("the post shown");
     let inbox = ok(&repo, "orch", &["msg", "inbox"]);
     let reply = &inbox["data"]["messages"][0];
     assert_eq!(reply["sender"], "lane-agent", "{inbox}");
-    assert_eq!(reply["room"], "pair", "{inbox}");
-    // In the post's conversation, referring to it.
-    assert_eq!(reply["contextId"], "room:pair", "{inbox}");
-    let post = reply["referenceIds"][0]
-        .as_str()
-        .expect("refers to the post");
-    let thread = ok(&repo, "orch", &["msg", "thread", post]);
+    // To the post's sender alone, so the channel isn't woken again
+    // (friction 83): direct, in a new conversation, referring to the post.
+    assert!(reply["room"].is_null(), "{inbox}");
+    assert_ne!(reply["contextId"], "room:pair", "{inbox}");
+    assert_eq!(reply["referenceIds"][0], post, "{inbox}");
+    let thread = ok(&repo, "orch", &["msg", "thread", "--channel", "pair"]);
     assert_eq!(
         thread["data"]["messages"].as_array().map(Vec::len),
-        Some(2),
-        "{thread}"
+        Some(1),
+        "nothing more in the channel: {thread}"
     );
 }
 
@@ -1062,16 +1129,22 @@ fn every_role_may_call_the_pack_tool() {
 #[test]
 fn an_unknown_actor_waits_but_headless_and_reserved_invocations_are_refused() {
     let (_dir, repo, _lane) = repo();
+    // With no runtime, route, or progress record, recovery still refuses.
+    let (code, out) = mdkg(&graph(&repo), "launcher", &["agents", "resume", "nobody"]);
+    assert_eq!(code, 3, "{out}");
+    assert_eq!(out["diagnostics"][0]["code"], "run.unknown_agent");
     // Use public argv here: the `turn` fixture marker translates to this
     // interactive-capable command rather than a separate headless command.
+    // One pass over a name nothing defines, saves or registers is a typo:
+    // it fails as not found, where a watch would wait (e2e B12).
     let (code, out) = mdkg(
         &graph(&repo),
         "launcher",
         &["agents", "up", "nobody", "--once"],
     );
-    assert_eq!(code, 0, "{out}");
-    assert_eq!(out["data"]["wake"]["status"], "waiting");
-    assert_eq!(out["diagnostics"][0]["severity"], "info");
+    assert_eq!(code, 3, "{out}");
+    assert_eq!(out["ok"], false, "{out}");
+    assert_eq!(out["diagnostics"][0]["severity"], "error");
     assert_eq!(out["diagnostics"][0]["code"], "run.unknown_agent");
     assert!(!repo.join(".git/mdkg/run/nobody.json").exists());
     // A headless-only request still requires an actual definition.
@@ -1103,10 +1176,36 @@ fn an_unknown_actor_waits_but_headless_and_reserved_invocations_are_refused() {
             .unwrap_or_default()
             .contains("run:x")
     );
-    // Waiting did not create a resumable headless agent.
-    let (code, out) = mdkg(&graph(&repo), "launcher", &["agents", "resume", "nobody"]);
-    assert_eq!(code, 3, "{out}");
+    // With mail waiting for it, the name is no typo: the pass waits for
+    // its registration, as a watch does.
+    assert!(!repo.join(".git/mdkg/run/progress/nobody.json").exists());
+    ok(
+        &repo,
+        "orchestrator",
+        &[
+            "msg", "send", "--to", "nobody", "--kind", "handoff", "--text", "x",
+        ],
+    );
+    let (code, out) = mdkg(
+        &graph(&repo),
+        "launcher",
+        &["agents", "up", "nobody", "--once"],
+    );
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(out["data"]["wake"]["status"], "waiting");
+    assert_eq!(out["diagnostics"][0]["severity"], "info");
     assert_eq!(out["diagnostics"][0]["code"], "run.unknown_agent");
+    // Waiting created durable supervisor progress, but no headless agent.
+    // That record is recoverable even without runtime or a receiver route.
+    let progress_path = repo.join(".git/mdkg/run/progress/nobody.json");
+    let before = fs::read(&progress_path).expect("durable waiting watch");
+    let (code, out) = mdkg(&graph(&repo), "launcher", &["agents", "resume", "nobody"]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(out["data"]["waiting_for_prompt"], true);
+    assert_eq!(out["data"]["progress_before"]["finished"], true);
+    assert_eq!(out["data"]["progress_before"]["progress"]["ran"], 0);
+    assert_eq!(fs::read(progress_path).unwrap(), before);
+    assert!(!repo.join(".git/mdkg/run/nobody.json").exists());
 }
 
 #[test]
@@ -2002,8 +2101,13 @@ fn run_worktree_gives_a_worker_its_own_and_the_main_checkout_is_refused() {
     );
     assert_eq!(code, 1);
     // This fixture deliberately wrote an invalid definition; unlike add/edit,
-    // the fixture builder does not reject it before publication.
-    fs::remove_file(graph(&repo).join(".mdkg/agents/v.json")).unwrap();
+    // the fixture builder does not reject it before publication. It was
+    // committed setup, so its removal is committed too.
+    sh(&graph(&repo), &["rm", "-q", ".mdkg/agents/v.json"]);
+    sh(
+        &graph(&repo),
+        &["commit", "-qm", "remove fixture definition"],
+    );
     // The main checkout now holds a worktree: no worker may use it.
     let cwd = repo.to_str().expect("utf-8");
     let (code, out) = mdkg(
@@ -2615,11 +2719,27 @@ fn a_workers_node_changes_stay_uncommitted_with_or_without_a_lease() {
     let out = ok(&graph(&repo), "launcher", &run);
     assert!(out["data"]["commit_refused"].is_null(), "{out}");
     assert_eq!(head("HEAD"), before);
+    // The receipt is hidden from an inbox read unless it names the kind
+    // (A26).
     let inbox = ok(&repo, "orchestrator", &["msg", "inbox"]);
-    let messages = inbox["data"]["messages"].as_array().expect("messages");
-    assert_eq!(messages.len(), 1, "only the worker's reply: {inbox}");
-    assert_eq!(messages[0]["sender"], "lane-agent");
-    assert_eq!(messages[0]["parts"][0]["text"], "claude reply");
+    let replies = inbox["data"]["messages"].as_array().expect("messages");
+    assert_eq!(replies.len(), 1, "worker reply only: {inbox}");
+    assert_eq!(replies[0]["sender"], "lane-agent");
+    assert_eq!(replies[0]["parts"][0]["text"], "claude reply");
+    let receipts = ok(
+        &repo,
+        "orchestrator",
+        &["msg", "inbox", "--kind", "receipt"],
+    );
+    let receipts = receipts["data"]["messages"].as_array().expect("receipts");
+    assert_eq!(receipts.len(), 1, "launcher receipt");
+    assert_eq!(receipts[0]["sender"], "mdkg:receipts");
+    assert_eq!(receipts[0]["kind"], "receipt");
+    assert_eq!(
+        receipts[0]["messageId"],
+        out["data"]["receipt"]["message_id"]
+    );
+    let messages: Vec<&serde_json::Value> = replies.iter().chain(receipts).collect();
     assert!(out["data"]["commit_note"].is_null());
     for m in messages {
         ok(
@@ -2764,6 +2884,58 @@ fn dirty_lane_turn(repo: &Path, lane: &Path) -> Value {
 }
 
 #[test]
+fn new_inline_agents_refuse_self_and_reserved_receipt_targets() {
+    let (_dir, repo, lane) = repo();
+    let root = graph(&repo);
+    let config = root.join(".mdkg/config.json");
+    let mut cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    cfg["agents"] = serde_json::json!({
+        "lane-agent": {"harness":"claude", "role":"worker", "cwd":lane}
+    });
+    // This fixture owns the common directory; avoid outer-launcher trust
+    // pins when inspecting its saved-state path in the test process.
+    let state_dir = repo.join(".git/mdkg/run");
+    let saved = mdkg_run::state::state_path(&state_dir, "lane-agent");
+    let definition = root.join(".mdkg/agents/lane-agent.json");
+    for (target, code) in [
+        ("lane-agent", "usage.invalid_arguments"),
+        ("mdkg:receipts", "msg.bad_id"),
+        ("MDKG:receipts", "msg.bad_id"),
+    ] {
+        cfg["agents"]["lane-agent"]["reports_to"] = target.into();
+        fs::write(&config, cfg.to_string()).unwrap();
+        commit_graph_config(&root);
+        // Use public agents up directly: the turn fixture helper would turn
+        // this legacy inline entry into a definition and miss the path tested.
+        let (exit, out) = mdkg(&root, "launcher", &["agents", "up", "lane-agent", "--once"]);
+        assert_eq!(exit, 1, "{target}: {out}");
+        assert_eq!(out["diagnostics"][0]["code"], code, "{target}: {out}");
+        assert!(!saved.exists(), "invalid inline settings must not be saved");
+        assert!(!definition.exists(), "this must remain an inline fixture");
+        assert!(!lane.join("claude.prompt").exists());
+    }
+    cfg["agents"]["lane-agent"]["reports_to"] = "lead".into();
+    fs::write(&config, cfg.to_string()).unwrap();
+    commit_graph_config(&root);
+    ok(
+        &root,
+        "launcher",
+        &[
+            "agents",
+            "up",
+            "lane-agent",
+            "--once",
+            "--prompt",
+            "receipt-target-probe",
+        ],
+    );
+    let saved: Value = serde_json::from_slice(&fs::read(saved).unwrap()).unwrap();
+    assert_eq!(saved["spec"]["reports_to"], "lead");
+    assert!(!definition.exists());
+    assert!(lane.join("claude.prompt").exists());
+}
+
+#[test]
 fn an_orchestrator_receives_a_dirty_workers_reply_without_a_launcher_commit_note() {
     let (dir, repo, lane) = repo();
     let orch = dir.0.join("orch");
@@ -2795,8 +2967,21 @@ fn an_orchestrator_receives_a_dirty_workers_reply_without_a_launcher_commit_note
     );
     let out = dirty_lane_turn(&repo, &lane);
     assert!(out["data"]["commit_note"].is_null(), "{out}");
-    // Only the worker's own reply reaches the orchestrator.
+    // The worker's reply and its distinct launcher receipt reach the orchestrator.
     let o = orch.to_str().expect("utf-8");
+    // Its default recipient would be itself; give this orchestration agent
+    // a distinct reporting target without changing the worker's reply route.
+    let definition = graph(&repo).join(".mdkg/agents/orchestrator.json");
+    fs::create_dir_all(definition.parent().unwrap()).unwrap();
+    fs::write(
+        definition,
+        serde_json::json!({
+            "schema": "mdkg.agent.v1", "harness": "claude", "role": "worker",
+            "cwd": o, "worktree": false, "reports_to": "lead"
+        })
+        .to_string(),
+    )
+    .unwrap();
     let first = ok(&graph(&repo), "launcher", &worker_run("orchestrator", o));
     assert_eq!(first["data"]["outcome"], "replied", "{first}");
     assert_eq!(
@@ -2807,10 +2992,28 @@ fn an_orchestrator_receives_a_dirty_workers_reply_without_a_launcher_commit_note
     let prompt = fs::read_to_string(orch.join("claude.prompt")).expect("prompt");
     assert!(prompt.contains("claude reply"), "{prompt}");
     assert!(!prompt.contains("commit refused"), "{prompt}");
+    // The worker's receipt never wakes the orchestrator, and never appears
+    // in a turn (A26, R5): it waits, unseen, under its own kind.
     let second = ok(&graph(&repo), "launcher", &worker_run("orchestrator", o));
     assert_eq!(second["data"]["outcome"], "idle", "{second}");
+    let prompt = fs::read_to_string(orch.join("claude.prompt")).expect("prompt");
+    assert!(!prompt.contains("mdkg:receipts"), "{prompt}");
+    assert!(
+        !prompt.contains("Advisory launcher turn receipt"),
+        "{prompt}"
+    );
     let inbox = ok(&repo, "orchestrator", &["msg", "inbox"]);
     assert_eq!(inbox["data"]["messages"], serde_json::json!([]), "{inbox}");
+    let receipts = ok(
+        &repo,
+        "orchestrator",
+        &["msg", "inbox", "--kind", "receipt"],
+    );
+    assert_eq!(
+        receipts["data"]["messages"].as_array().map(Vec::len),
+        Some(1),
+        "{receipts}"
+    );
 }
 
 #[test]
@@ -2876,6 +3079,17 @@ fn install_takes_back_a_turn_lease_whose_holder_is_gone_and_names_a_live_one() {
         ok(&lane, "nick", &["install"]);
         assert!(!run.join("lane-agent.lease").exists(), "{holder}");
     }
+    // One killed between its claim and its record left only the record
+    // it writes first (friction 81).
+    ok(&lane, "launcher@run-orphan", &["claim", "run:lane-agent"]);
+    fs::write(
+        run.join("lane-agent.lease.pending"),
+        dead_record("launcher@run-orphan"),
+    )
+    .expect("w");
+    ok(&lane, "nick", &["install"]);
+    assert!(!run.join("lane-agent.lease.pending").exists());
+    assert!(!run.join("lane-agent.lease").exists());
     // A live launcher's turn: refused, and said so.
     let holder = format!("launcher@run-{}", std::process::id());
     ok(&lane, &holder, &["claim", "run:lane-agent"]);
@@ -3244,5 +3458,294 @@ fn codex_hook_trust_receipts_distinguish_cli_previews_and_spawn_attempts() {
             .to_string()
             .contains(mdkg_run::profile::CodexHookTrust::Required.reason()),
         "{failed}"
+    );
+}
+
+#[test]
+fn a_template_key_changes_with_either_binary_and_each_input() {
+    let dir = Scratch(fs::canonicalize(common::temp::dir("mdkg-template-key")).unwrap());
+    let (mdkg, test, input) = (dir.0.join("mdkg"), dir.0.join("test"), dir.0.join("in"));
+    fs::write(&mdkg, "mdkg").unwrap();
+    fs::write(&test, "test").unwrap();
+    fs::create_dir(&input).unwrap();
+    fs::write(input.join("a"), "a").unwrap();
+    let key = || common::template::key("k", &[mdkg.clone(), test.clone()], &[&input]);
+    let first = key();
+    assert_eq!(key(), first);
+    // A rebuilt test binary (an edited build closure) makes a new key.
+    fs::write(&test, "test, rebuilt").unwrap();
+    let rebuilt = key();
+    assert_ne!(rebuilt, first);
+    fs::write(input.join("a"), "b").unwrap();
+    assert_ne!(key(), rebuilt);
+}
+
+#[test]
+fn a_template_builds_in_a_private_folder_and_may_not_write_git_dir() {
+    use std::os::unix::fs::PermissionsExt as _;
+    // Under a permissive umask, so a folder made the ordinary way (0755)
+    // can't pass for a private one: the test reruns itself in a child.
+    if std::env::var_os("MDKG_TEST_UMASK_022").is_none() {
+        let output = Command::new("/bin/sh")
+            .args(["-c", "umask 022 && exec \"$0\" \"$@\""])
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "a_template_builds_in_a_private_folder_and_may_not_write_git_dir",
+                "--test-threads=1",
+            ])
+            .env("MDKG_TEST_UMASK_022", "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{stdout}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(stdout.contains("1 passed"), "the child ran: {stdout}");
+        return;
+    }
+    let built = Scratch(common::temp::private("mdkg-template-private"));
+    let mode = fs::metadata(&built.0).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o700, "{mode:o}");
+    // `git-dir` is the template's own name for its git folder: a build
+    // that writes one is refused, and nothing is kept.
+    let dest = Scratch(common::temp::dir("mdkg-template-reserved"));
+    // This process's build folders only: another test run sharing the
+    // temp folder builds its own meanwhile. One already here (an older
+    // run's, under a reused pid) isn't this build's either.
+    let mine = format!(
+        "mdkg-template-template-reserved-test-{}-",
+        std::process::id()
+    );
+    let builds = || -> std::collections::BTreeSet<std::ffi::OsString> {
+        fs::read_dir(std::env::temp_dir())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .filter(|n| n.to_string_lossy().starts_with(&mine))
+            .collect()
+    };
+    let before = builds();
+    let refused = std::panic::catch_unwind(|| {
+        common::template::copy(
+            "template-reserved-test",
+            &[],
+            |at: &Path| {
+                // The folder `copy` builds in is owner-only.
+                let mode = fs::metadata(at).unwrap().permissions().mode();
+                assert_eq!(mode & 0o777, 0o700, "the build folder is {mode:o}");
+                fs::create_dir(at.join(common::template::GIT_DIR)).unwrap()
+            },
+            &dest.0,
+        )
+    })
+    .expect_err("a build that wrote git-dir passed");
+    let refused = refused
+        .downcast_ref::<String>()
+        .cloned()
+        .unwrap_or_default();
+    assert!(refused.contains("a name templates reserve"), "{refused}");
+    let root = common::template::root();
+    assert!(
+        !fs::read_dir(&root)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|e| e
+                .file_name()
+                .to_string_lossy()
+                .contains("template-reserved-test")),
+        "a refused build left a template"
+    );
+    let after = builds();
+    assert!(
+        after.is_subset(&before),
+        "a refused build left its build folder: {:?}",
+        after.difference(&before).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn templates_hold_no_git_folder_until_copied() {
+    // A template is a git repository; one inside the worktree makes mdkg
+    // refuse every turn there (run.cwd_outside). Its git folder is kept
+    // under another name and is `.git` only in a test's copy.
+    let dest = Scratch(fs::canonicalize(common::temp::dir("mdkg-template-root")).unwrap());
+    common::template::copy(
+        "template-root-test",
+        &[],
+        |at: &Path| {
+            assert!(
+                Command::new("git")
+                    .args(["init", "-q"])
+                    .arg(at)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        },
+        &dest.0,
+    );
+    assert!(dest.0.join(".git").is_dir());
+    assert!(!dest.0.join(common::template::GIT_DIR).exists());
+    let target = Path::new(env!("CARGO_TARGET_TMPDIR"));
+    assert!(common::template::root().starts_with(target));
+    fn git_folders(dir: &Path, found: &mut Vec<PathBuf>) {
+        for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if entry.file_name() == ".git" {
+                found.push(path);
+            } else if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                git_folders(&path, found);
+            }
+        }
+    }
+    let mut found = Vec::new();
+    git_folders(target, &mut found);
+    assert!(
+        found.is_empty(),
+        "git folders under {}: {found:?}",
+        target.display()
+    );
+}
+
+#[test]
+fn a_template_check_refuses_a_file_that_names_the_building_test_folder() {
+    let dir = Scratch(fs::canonicalize(common::temp::dir("mdkg-template-outside")).unwrap());
+    let (built, home) = (dir.0.join("built"), dir.0.join("home"));
+    fs::create_dir_all(built.join("nested")).unwrap();
+    fs::write(built.join("nested/state.json"), "{}").unwrap();
+    common::template::names_none(&built, &home);
+    fs::write(
+        built.join("nested/state.json"),
+        format!("{{\"state\": \"{}/.local/state\"}}", home.display()),
+    )
+    .unwrap();
+    let refused = std::panic::catch_unwind(|| common::template::names_none(&built, &home));
+    assert!(refused.is_err(), "a file naming the test's HOME passed");
+    fs::write(built.join("nested/state.json"), "{}").unwrap();
+
+    // A link into the test's folder would dangle once the test ends.
+    std::os::unix::fs::symlink(home.join("state"), built.join("nested/link")).unwrap();
+    let refused = std::panic::catch_unwind(|| common::template::names_none(&built, &home));
+    assert!(refused.is_err(), "a link into the test's HOME passed");
+    fs::remove_file(built.join("nested/link")).unwrap();
+    // So would a relative one that climbs out of the template.
+    std::os::unix::fs::symlink("../../home/state", built.join("nested/link")).unwrap();
+    let refused = std::panic::catch_unwind(|| common::template::names_none(&built, &home));
+    assert!(
+        refused.is_err(),
+        "a relative link into the test's HOME passed"
+    );
+    fs::remove_file(built.join("nested/link")).unwrap();
+    // Or one through another link: any `..` is refused, since where it
+    // ends depends on the links it passes.
+    // `escape` alone is allowed, so only `link`'s `..` can be refused.
+    fs::create_dir(built.join("nested/sub")).unwrap();
+    std::os::unix::fs::symlink("sub", built.join("nested/escape")).unwrap();
+    common::template::names_none(&built, &home);
+    std::os::unix::fs::symlink("escape/../x", built.join("nested/link")).unwrap();
+    let refused = std::panic::catch_unwind(|| common::template::names_none(&built, &home))
+        .expect_err("a link through another link passed");
+    let refused = refused
+        .downcast_ref::<String>()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        refused.contains("nested/link links to escape/../x"),
+        "{refused}"
+    );
+    fs::remove_file(built.join("nested/link")).unwrap();
+    fs::remove_file(built.join("nested/escape")).unwrap();
+    fs::remove_dir(built.join("nested/sub")).unwrap();
+    // An absolute link is refused even when it names nothing of the test's.
+    std::os::unix::fs::symlink("/elsewhere/x", built.join("nested/link")).unwrap();
+    let refused = std::panic::catch_unwind(|| common::template::names_none(&built, &home))
+        .expect_err("an absolute link passed");
+    let refused = refused
+        .downcast_ref::<String>()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        refused.contains("nested/link links to /elsewhere/x"),
+        "{refused}"
+    );
+    fs::remove_file(built.join("nested/link")).unwrap();
+    // A link that stays below its own folder is fine.
+    fs::write(built.join("nested/kept"), "{}").unwrap();
+    std::os::unix::fs::symlink("kept", built.join("nested/link")).unwrap();
+    common::template::names_none(&built, &home);
+    fs::remove_file(built.join("nested/link")).unwrap();
+
+    // A path written as JSON is escaped: `"` and `\` change its bytes.
+    let odd = dir.0.join("odd\"home");
+    fs::create_dir(&odd).unwrap();
+    let json = serde_json::json!({ "home": odd.to_str().unwrap() }).to_string();
+    assert!(!json.contains(odd.to_str().unwrap()), "{json}");
+    fs::write(built.join("nested/state.json"), json).unwrap();
+    let refused = std::panic::catch_unwind(|| common::template::names_none(&built, &odd));
+    assert!(
+        refused.is_err(),
+        "a JSON-escaped path to the test's folder passed"
+    );
+}
+
+#[test]
+fn a_template_copy_names_its_own_folder_and_refuses_a_database_that_names_the_build() {
+    let dir = Scratch(fs::canonicalize(common::temp::dir("mdkg-template-copy")).unwrap());
+    let build = |at: &Path| {
+        fs::create_dir(at.join("nested")).unwrap();
+        fs::write(
+            at.join("nested/journal.json"),
+            format!("{{\"root\": \"{}\"}}\n", at.display()),
+        )
+        .unwrap();
+    };
+    for name in ["one", "two"] {
+        let dest = dir.0.join(name);
+        fs::create_dir(&dest).unwrap();
+        common::template::copy("template-test", &[], build, &dest);
+        let journal = fs::read_to_string(dest.join("nested/journal.json")).unwrap();
+        assert_eq!(journal, format!("{{\"root\": \"{}\"}}\n", dest.display()));
+        assert!(!dest.join(".mdkg-template-origin").exists());
+    }
+    let dest = dir.0.join("db");
+    fs::create_dir(&dest).unwrap();
+    let refused = std::panic::catch_unwind(|| {
+        common::template::copy(
+            "template-test-db",
+            &[],
+            |at: &Path| {
+                let mut db = b"SQLite format 3\0".to_vec();
+                db.extend_from_slice(at.display().to_string().as_bytes());
+                fs::write(at.join("coord.sqlite"), db).unwrap();
+            },
+            &dest,
+        )
+    });
+    assert!(
+        refused.is_err(),
+        "a database naming the build folder was copied"
+    );
+    // Any binary file, such as a database's write-ahead log, is refused too.
+    let dest = dir.0.join("wal");
+    fs::create_dir(&dest).unwrap();
+    let refused = std::panic::catch_unwind(|| {
+        common::template::copy(
+            "template-test-wal",
+            &[],
+            |at: &Path| {
+                let mut wal = vec![0x37, 0x7f, 0x06, 0x82, 0xff, 0x00];
+                wal.extend_from_slice(at.display().to_string().as_bytes());
+                fs::write(at.join("coord.sqlite-wal"), wal).unwrap();
+            },
+            &dest,
+        )
+    });
+    assert!(
+        refused.is_err(),
+        "a binary file naming the build folder was copied"
     );
 }

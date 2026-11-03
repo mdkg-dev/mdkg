@@ -22,7 +22,7 @@ const EDIT_TOOLS: &[(&str, &str)] = &[
     ("NotebookEdit", "notebook_path"),
 ];
 
-pub(super) fn parse(event: Event, v: &Value) -> Result<Input, String> {
+pub(crate) fn parse(event: Event, v: &Value) -> Result<Input, String> {
     let text = |k: &str| v.get(k).and_then(Value::as_str).map(String::from);
     let harness_event = event.observation().and_then(|event| {
         HarnessEvent::parse("claude", event, v.get("hook_event_name")?.as_str()?)
@@ -52,12 +52,16 @@ pub(super) fn parse(event: Event, v: &Value) -> Result<Input, String> {
             )
         }),
         stop_active: v.get("stop_hook_active").and_then(Value::as_bool) == Some(true),
+        command: (tool.as_deref() == Some("Bash"))
+            .then(|| v.pointer("/tool_input/command").and_then(Value::as_str))
+            .flatten()
+            .map(String::from),
         tool,
         paths,
     })
 }
 
-pub(super) fn render(event: Event, o: &Outcome) -> Rendered {
+pub(crate) fn render(event: Event, o: &Outcome) -> Rendered {
     match (event, o) {
         (Event::Start, Outcome::Context(line)) => Rendered {
             stdout: format!("{line}\n"),

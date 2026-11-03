@@ -353,6 +353,428 @@ fn bare_file_names_claim_and_the_main_branch_comes_from_git_config() {
 
 /// A repository with worktrees `wt-a` (branch a) and `wt-b` (branch b).
 fn two_worktrees() -> (Scratch, PathBuf, PathBuf, PathBuf) {
+    worktrees_named("wt-a", "wt-b")
+}
+
+fn bounded_output(
+    mut child: std::process::Child,
+    limit: std::time::Duration,
+) -> std::process::Output {
+    let started = std::time::Instant::now();
+    loop {
+        if child.try_wait().expect("poll child").is_some() {
+            return child.wait_with_output().expect("output");
+        }
+        if started.elapsed() >= limit {
+            child.kill().ok();
+            child.wait().ok();
+            panic!("status exceeded its {limit:?} test deadline");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn status_does_not_create_a_missing_coordinator() {
+    let (_dir, repo, wa, _wb) = two_worktrees();
+    let path = repo.join(".git/mdkg");
+    let (code, out) = run(&wa, "a", 0, &["status"]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(out["data"]["leases"], serde_json::json!([]));
+    assert!(
+        !path.exists(),
+        "status must not initialize a store or its cache"
+    );
+}
+
+#[test]
+fn status_records_observation_but_projects_expiry() {
+    if common::rerun_without_launcher_env("status_records_observation_but_projects_expiry") {
+        return;
+    }
+    let (_dir, repo, wa, _wb) = two_worktrees();
+    let (_, out) = run(&wa, "a", 0, &["claim", "task-1"]);
+    let lease = out["data"]["lease"]["id"].as_str().unwrap();
+    edit(&wa, T1, "Body text.", "Updated.");
+    sh(&wa, &["commit", "-q", "-am", "update"]);
+    commit_lease(&wa, "a", lease, T1, 1);
+    assert_eq!(run(&wa, "a", 2, &["claim", "task-2"]).0, 0);
+    sh(&repo, &["merge", "-q", "a"]);
+    let path = repo.join(".git/mdkg/coord.sqlite");
+    let store = Store::open_read_only(&path).unwrap().unwrap();
+    let state = store.coordinator().unwrap();
+    let journal = store.journal().unwrap();
+    let log = store.log_head().unwrap();
+    let (code, out) = run(&wa, "a", TTL + 10, &["status"]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(out["data"]["queue"], serde_json::json!([]));
+    assert_eq!(out["data"]["leases"], serde_json::json!([]));
+    assert_eq!(out["data"]["expired"][0]["status"], "expired");
+    let recorded = store.coordinator().unwrap();
+    assert_eq!(state.settlement_queue().len(), 1);
+    assert!(recorded.settlement_queue().is_empty());
+    assert!(recorded.leases().any(|l| l.owner == "a"
+        && l.scope == Scope::new(T2)
+        && l.status == mdkg_coord::Status::Active));
+    assert_eq!(store.journal().unwrap().len(), journal.len() + 1);
+    assert_ne!(store.log_head().unwrap(), log);
+    // A writing command still persists expiry before it acts.
+    assert_eq!(run(&wa, "b", TTL + 11, &["claim", "task-2"]).0, 0);
+    assert!(store.coordinator().unwrap().settlement_queue().is_empty());
+    assert_ne!(store.journal().unwrap(), journal);
+}
+
+#[test]
+fn status_defers_observation_without_waiting_for_a_writer() {
+    let (_dir, repo, wa, _wb) = two_worktrees();
+    assert_eq!(run(&wa, "a", 0, &["claim", "task-1"]).0, 0);
+    let conn = rusqlite::Connection::open(repo.join(".git/mdkg/coord.sqlite")).unwrap();
+    let before: i64 = conn
+        .query_row("SELECT COUNT(*) FROM journal", [], |r| r.get(0))
+        .unwrap();
+    conn.execute_batch("BEGIN IMMEDIATE;").unwrap();
+    let child = isolated(&mut Command::new(env!("CARGO_BIN_EXE_mdkg")))
+        .arg("--root")
+        .arg(&wa)
+        .args(["--as", "a", "status", "--json"])
+        .env("MDKG_NOW_MS", "1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let started = std::time::Instant::now();
+    let out = bounded_output(child, std::time::Duration::from_secs(10));
+    let status: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(out.status.code(), Some(0), "{status}");
+    assert!(
+        status["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("observation deferred: store busy"))),
+        "{status}"
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    let after: i64 = conn
+        .query_row("SELECT COUNT(*) FROM journal", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(after, before);
+    conn.execute_batch("COMMIT;").unwrap();
+}
+
+#[test]
+fn status_keeps_a_squash_landing_after_main_changes_again() {
+    if common::rerun_without_launcher_env("status_keeps_a_squash_landing_after_main_changes_again")
+    {
+        return;
+    }
+    let (_dir, repo, wa, _wb) = two_worktrees();
+    let (_, claimed) = run(&wa, "a", 0, &["claim", "task-1"]);
+    let lease = claimed["data"]["lease"]["id"].as_str().unwrap();
+    edit(&wa, T1, "Body text.", "First landing.");
+    sh(&wa, &["commit", "-q", "-am", "branch change"]);
+    let change = commit_lease(&wa, "a", lease, T1, 1);
+    sh(&repo, &["merge", "-q", "--squash", "a"]);
+    sh(&repo, &["commit", "-q", "-m", "squash landing"]);
+    let path = repo.join(".git/mdkg/coord.sqlite");
+    let store = Store::open_read_only(&path).unwrap().unwrap();
+    assert_eq!(store.coordinator().unwrap().settlement_queue().len(), 1);
+    let (code, status) = run(&wa, "a", 2, &["status"]);
+    assert_eq!(code, 0, "{status}");
+    assert_eq!(status["data"]["queue"], serde_json::json!([]));
+    assert!(store.coordinator().unwrap().settlement_queue().is_empty());
+    edit(&repo, T1, "First landing.", "Second landing.");
+    sh(&repo, &["commit", "-q", "-am", "next landing"]);
+    assert_eq!(run(&wa, "a", 3, &["renew"]).0, 0);
+    let state = store.coordinator().unwrap();
+    assert!(state.settlement_queue().is_empty());
+    assert!(
+        state
+            .changesets()
+            .any(|c| c.id.to_string() == change && c.state != mdkg_coord::Settlement::Conflicted)
+    );
+}
+
+#[test]
+fn status_does_not_block_a_writer_while_git_is_paused() {
+    if common::rerun_without_launcher_env("status_does_not_block_a_writer_while_git_is_paused") {
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let (dir, repo, wa, _wb) = two_worktrees();
+    assert_eq!(run(&wa, "a", 0, &["claim", "task-1"]).0, 0);
+    let mut writer = Store::open_for_repo(&wa, TTL).unwrap();
+    let hooks = dir.0.join("git-wrapper");
+    fs::create_dir(&hooks).unwrap();
+    let ready = dir.0.join("ready");
+    let release = dir.0.join("release");
+    struct Release(PathBuf);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            fs::write(&self.0, "release").ok();
+        }
+    }
+    let release_guard = Release(release.clone());
+    let script = hooks.join("git");
+    fs::write(&script, "#!/bin/sh\ncase \" $* \" in *\" ls-tree \"*)\n : > \"$F125_READY\"\n count=0\n while [ ! -e \"$F125_RELEASE\" ] && [ $count -lt 1500 ]; do\n sleep 0.02\n count=$((count + 1))\n done;;\n *\" cat-file --batch \"*) if [ -e \"$F125_READY\" ]; then exit 97; fi;;\nesac\nexec \"$F125_REAL_GIT\" \"$@\"\n").unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut paths = vec![hooks];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let mut child = isolated(&mut Command::new(env!("CARGO_BIN_EXE_mdkg")))
+        .arg("--root")
+        .arg(&wa)
+        .args(["--as", "a", "status", "--json"])
+        .env("PATH", std::env::join_paths(paths).unwrap())
+        .env("F125_READY", &ready)
+        .env("F125_RELEASE", &release)
+        .env("F125_REAL_GIT", &git::git_program().0)
+        .env("MDKG_NOW_MS", "1")
+        .env("MDKG_GIT_TIMEOUT_MS", "30000")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !ready.exists()
+        && child.try_wait().unwrap().is_none()
+        && std::time::Instant::now() < until
+    {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    if !ready.exists() {
+        drop(release_guard);
+        let out = bounded_output(child, std::time::Duration::from_secs(10));
+        panic!("status did not reach ls-tree: {out:?}");
+    }
+    // Refuse immediately if status owns the writer lock. A real coordinator
+    // mutation, committed before the paused status reader resumes.
+    let conn = rusqlite::Connection::open(repo.join(".git/mdkg/coord.sqlite")).unwrap();
+    conn.busy_timeout(std::time::Duration::ZERO).unwrap();
+    let lock = conn.execute_batch("BEGIN IMMEDIATE; ROLLBACK;");
+    let wrote = if lock.is_ok() {
+        Some(writer.execute(&CoordCommand::Register {
+            leaf: Scope::new("probe"),
+            content: "probe".into(),
+        }))
+    } else {
+        None
+    };
+    drop(release_guard);
+    let out = bounded_output(child, std::time::Duration::from_secs(20));
+    assert!(lock.is_ok(), "status blocked writer: {lock:?}");
+    assert!(wrote.unwrap().is_ok());
+    assert!(out.status.success(), "{out:?}");
+}
+
+#[test]
+fn status_checks_each_source_commit_once() {
+    if common::rerun_without_launcher_env("status_checks_each_source_commit_once") {
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let (dir, _repo, wa, _wb) = two_worktrees();
+    let mut leases = Vec::new();
+    for (id, path) in [("task-1", T1), ("task-2", T2)] {
+        let (code, out) = run(&wa, "a", 0, &["claim", id]);
+        assert_eq!(code, 0, "{out}");
+        leases.push((
+            path,
+            out["data"]["lease"]["id"].as_str().unwrap().to_owned(),
+        ));
+        edit(&wa, path, "Body text.", "Both changes.");
+    }
+    sh(&wa, &["commit", "-q", "-am", "two nodes, one commit"]);
+    for (path, lease) in leases {
+        commit_lease(&wa, "a", &lease, path, 1);
+    }
+    let hooks = dir.0.join("git-count");
+    fs::create_dir(&hooks).unwrap();
+    let count = dir.0.join("ancestry-count");
+    let script = hooks.join("git");
+    fs::write(&script, "#!/bin/sh\ncase \" $* \" in *\" merge-base --is-ancestor \"*) printf 'call\\n' >> \"$F125_COUNT\";; esac\nexec \"$F125_REAL_GIT\" \"$@\"\n").unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut paths = vec![hooks];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let out = isolated(&mut Command::new(env!("CARGO_BIN_EXE_mdkg")))
+        .arg("--root")
+        .arg(&wa)
+        .args(["--as", "a", "status", "--json"])
+        .env("PATH", std::env::join_paths(paths).unwrap())
+        .env("F125_COUNT", &count)
+        .env("F125_REAL_GIT", &git::git_program().0)
+        .env("MDKG_NOW_MS", "2")
+        .output()
+        .unwrap();
+    let status: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(out.status.code(), Some(0), "{status}");
+    assert_eq!(status["data"]["queue"].as_array().unwrap().len(), 2);
+    assert_eq!(fs::read_to_string(count).unwrap().lines().count(), 1);
+}
+
+#[test]
+fn status_defers_the_whole_observation_when_an_ancestry_check_fails() {
+    if common::rerun_without_launcher_env(
+        "status_defers_the_whole_observation_when_an_ancestry_check_fails",
+    ) {
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let (dir, repo, wa, _wb) = two_worktrees();
+    assert_eq!(run(&wa, "a", 0, &["claim", "task-1"]).0, 0);
+    assert_eq!(run(&wa, "a", 1, &["done", "task-1"]).0, 0);
+    sh(&repo, &["merge", "-q", "a"]);
+    edit(&repo, T1, "status: done", "status: todo");
+    sh(&repo, &["commit", "-q", "-am", "reopen on main"]);
+    let store = Store::open_read_only(&repo.join(".git/mdkg/coord.sqlite"))
+        .unwrap()
+        .unwrap();
+    let before = store.coordinator().unwrap();
+    assert_eq!(before.settlement_queue().len(), 1);
+    let journal = store.journal().unwrap();
+    let log = store.log_head().unwrap();
+    let hooks = dir.0.join("git-failure");
+    fs::create_dir(&hooks).unwrap();
+    let script = hooks.join("git");
+    fs::write(&script, "#!/bin/sh\ncase \" $* \" in *\" merge-base --is-ancestor \"*) exit 73;; esac\nexec \"$F125_REAL_GIT\" \"$@\"\n").unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut paths = vec![hooks];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let out = isolated(&mut Command::new(env!("CARGO_BIN_EXE_mdkg")))
+        .arg("--root")
+        .arg(&wa)
+        .args(["--as", "a", "status", "--json"])
+        .env("PATH", std::env::join_paths(paths).unwrap())
+        .env("F125_REAL_GIT", &git::git_program().0)
+        .env("MDKG_NOW_MS", "2")
+        .output()
+        .unwrap();
+    let status: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(out.status.code(), Some(0), "{status}");
+    assert!(
+        status["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["code"] == "coord.store_failed"
+                && d["severity"] == "warning"
+                && d["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("history validation failed"))),
+        "{status}"
+    );
+    assert_eq!(
+        status["data"]["queue"][0]["state"], "sequenced",
+        "no false conflict projected"
+    );
+    assert_eq!(store.coordinator().unwrap(), before);
+    assert_eq!(store.journal().unwrap(), journal);
+    assert_eq!(store.log_head().unwrap(), log);
+    let (code, healthy) = run(&wa, "a", 3, &["status"]);
+    assert_eq!(code, 0, "{healthy}");
+    assert!(store.coordinator().unwrap().settlement_queue().is_empty());
+    assert_eq!(
+        run(&repo, "a", 4, &["show", "task-1"]).1["data"]["node"]["status"],
+        "todo"
+    );
+}
+
+#[test]
+fn status_treats_an_absent_source_commit_as_unmerged() {
+    status_with_absent_source_commit(false);
+}
+
+#[test]
+fn status_defers_when_a_missing_source_probe_reports_an_object_store_error() {
+    status_with_absent_source_commit(true);
+}
+
+fn status_with_absent_source_commit(unavailable_alternate: bool) {
+    let (_dir, repo, wa, _wb) = two_worktrees();
+    let (code, claimed) = run(&wa, "a", 0, &["claim", "task-1"]);
+    assert_eq!(code, 0, "{claimed}");
+    let mut writer = Store::open_for_repo(&wa, TTL).expect("store");
+    let outcome = writer
+        .execute(&CoordCommand::Commit {
+            owner: "a".into(),
+            lease: LeaseId(
+                claimed["data"]["lease"]["id"]
+                    .as_str()
+                    .expect("lease id")
+                    .into(),
+            ),
+            changes: Changes::from([(Scope::new(T1), Some("absent source content".into()))]),
+            source: Some(mdkg_coord::Source {
+                commit: "1".repeat(40),
+                branch: "gone".into(),
+            }),
+            now: 1,
+            landed: false,
+        })
+        .expect("fixture write");
+    assert!(matches!(outcome, mdkg_coord::Outcome::Committed { .. }));
+    let before = writer.coordinator().expect("coordinator");
+    let journal = writer.journal().expect("journal");
+    let log = writer.log_head().expect("log head");
+    if unavailable_alternate {
+        fs::write(
+            repo.join(".git/objects/info/alternates"),
+            format!("{}\n", repo.join("unavailable-objects").display()),
+        )
+        .expect("fixture write");
+    }
+    let (code, status) = run(&repo, "a", 2, &["status"]);
+    assert_eq!(code, 0, "{status}");
+    assert_eq!(
+        codes(&status).contains(&"coord.store_failed".to_owned()),
+        unavailable_alternate,
+        "{status}",
+    );
+    assert_eq!(status["data"]["queue"][0]["state"], "sequenced");
+    assert_eq!(writer.coordinator().expect("coordinator"), before);
+    assert_eq!(writer.journal().expect("journal"), journal);
+    assert_eq!(writer.log_head().expect("log head"), log);
+}
+
+#[test]
+fn status_times_out_when_another_connection_locks_the_store() {
+    let (_dir, repo, wa, _wb) = two_worktrees();
+    assert_eq!(run(&wa, "a", 0, &["claim", "task-1"]).0, 0);
+    let conn = rusqlite::Connection::open(repo.join(".git/mdkg/coord.sqlite")).unwrap();
+    conn.execute_batch("PRAGMA locking_mode = EXCLUSIVE; BEGIN EXCLUSIVE;")
+        .unwrap();
+    let started = std::time::Instant::now();
+    let child = isolated(&mut Command::new(env!("CARGO_BIN_EXE_mdkg")))
+        .arg("--root")
+        .arg(&wa)
+        .args(["--as", "a", "status", "--json"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let out = bounded_output(child, std::time::Duration::from_secs(20));
+    let envelope: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(out.status.code(), Some(4), "{envelope}");
+    assert!(codes(&envelope).iter().any(|c| c == "coord.store_failed"));
+    let message = envelope["diagnostics"][0]["message"].as_str().unwrap();
+    assert!(
+        message.contains("bounded lock wait") && message.contains("lock holder"),
+        "{envelope}"
+    );
+    assert!(started.elapsed() >= std::time::Duration::from_secs(4));
+    conn.execute_batch("ROLLBACK").unwrap();
+}
+
+/// [`two_worktrees`], in folders with these names (an actor's default
+/// name is its worktree's).
+fn worktrees_named(a: &str, b: &str) -> (Scratch, PathBuf, PathBuf, PathBuf) {
     let dir = scratch();
     let repo = dir.0.join("repo");
     let conformance = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../conformance");
@@ -366,8 +788,8 @@ fn two_worktrees() -> (Scratch, PathBuf, PathBuf, PathBuf) {
     sh(&repo, &["init", "-q", "-b", "main"]);
     sh(&repo, &["add", "."]);
     sh(&repo, &["commit", "-q", "-m", "init"]);
-    let wa = dir.0.join("wt-a");
-    let wb = dir.0.join("wt-b");
+    let wa = dir.0.join(a);
+    let wb = dir.0.join(b);
     for (branch, wt) in [("a", &wa), ("b", &wb)] {
         let path = wt.to_str().expect("utf-8");
         sh(
@@ -834,13 +1256,57 @@ fn run_text(worktree: &Path, actor: Option<&str>, now: u64, args: &[&str]) -> St
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
-/// Sets `coordination.leases` in a worktree's config.
+/// Sets `coordination.leases` in a worktree's config, committed: the
+/// lease policy is committed authority.
 fn lease_policy(worktree: &Path, policy: Value) {
     let path = worktree.join(".mdkg/config.json");
     let mut config: Value =
         serde_json::from_str(&fs::read_to_string(&path).expect("config")).expect("json");
     config["coordination"] = serde_json::json!({ "leases": policy });
     fs::write(&path, serde_json::to_string_pretty(&config).expect("json")).expect("write");
+    sh(worktree, &["commit", "-qam", "lease policy"]);
+}
+
+/// e2e 0.7.1 (B3's sweep, orchestrator #15277): the lease policy is the
+/// committed config's. An uncommitted shared glob in an agent's worktree
+/// can't take a lease beside someone's exclusive one.
+#[test]
+fn an_uncommitted_lease_policy_shares_nothing() {
+    let (_dir, _repo, wa, wb) = two_worktrees();
+    for wt in [&wa, &wb] {
+        let path = wt.join(".mdkg/config.json");
+        let mut config: Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("config")).expect("json");
+        config["coordination"] =
+            serde_json::json!({"leases": {"paths": [{"glob": "src/**", "mode": "shared"}]}});
+        fs::write(&path, serde_json::to_string_pretty(&config).expect("json")).expect("write");
+    }
+    let (code, out) = run(&wa, "a", 0, &["claim", "src/lib.rs"]);
+    assert_eq!(
+        (code, &out["data"]["lease"]["mode"]),
+        (0, &serde_json::json!("exclusive")),
+        "{out}"
+    );
+    let (code, out) = run(&wb, "b", 1, &["claim", "src/lib.rs"]);
+    assert_eq!(code, 5, "{out}");
+    assert!(
+        codes(&out).contains(&"coord.lease_held".to_string()),
+        "{out}"
+    );
+    // Committed on both branches, it shares.
+    lease_policy(
+        &wa,
+        serde_json::json!({"paths": [{"glob": "src/**", "mode": "shared"}]}),
+    );
+    sh(&wb, &["commit", "-qam", "lease policy"]);
+    assert_eq!(run(&wa, "a", 2, &["release", "src/lib.rs"]).0, 0);
+    assert_eq!(run(&wa, "a", 3, &["claim", "src/lib.rs"]).0, 0);
+    let (code, out) = run(&wb, "b", 4, &["claim", "src/lib.rs"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(
+        codes(&out).contains(&"coord.lease_shared".to_string()),
+        "{out}"
+    );
 }
 
 #[test]
@@ -854,7 +1320,21 @@ fn new_files_are_claimed_with_intent_and_typos_still_warn() {
     assert!(hint.contains("--new"), "{out}");
     // With --new it's quiet, even for a top-level name that would
     // otherwise read as a node id.
+    // Without it, a top-level name that's no node and no path is refused
+    // as a missing path, pointing at --new and a trailing `/`.
     let (code, out) = run(&wa, "a", 1, &["claim", "NEW.md"]);
+    assert_eq!(
+        (code, codes(&out)),
+        (3, vec!["coord.path_missing".to_string()])
+    );
+    let hint = out["diagnostics"][0]["hint"].as_str().unwrap_or_default();
+    assert!(hint.contains("--new") && hint.contains("`/`"), "{out}");
+    assert!(
+        !out.to_string().contains("NEW.md"),
+        "nothing typed is quoted: {out}"
+    );
+    // Release and sync of such a name still say no node matches.
+    let (code, out) = run(&wa, "a", 1, &["release", "NOPE.md"]);
     assert_eq!((code, codes(&out)), (3, vec!["node.not_found".to_string()]));
     let (code, out) = run(&wa, "a", 2, &["claim", "--new", "NEW.md"]);
     assert_eq!(code, 0, "{out}");
@@ -932,16 +1412,41 @@ fn status_marks_expiring_leases_shows_expired_ones_and_yours_first() {
     assert_eq!(out["data"]["leases"][0]["expiring"], true, "{out}");
     assert_eq!(out["data"]["leases"][1]["expiring"], false, "{out}");
 
-    // Text: yours with --as, everyone's with --all, everyone's without --as.
+    // Text: everyone's, yours first, with or without --as; only yours
+    // with --mine, which leaves JSON whole.
     let text = run_text(&wa, Some("a"), 900, &["status"]);
     assert!(text.contains("by a until"), "{text}");
     assert!(text.contains("expires in 1 min"), "{text}");
-    assert!(!text.contains("by b"), "{text}");
-    assert!(text.contains("1 more held by others"), "{text}");
-    let text = run_text(&wa, Some("a"), 900, &["status", "--all"]);
-    assert!(text.contains("by b"), "{text}");
+    assert!(text.contains("by b until"), "{text}");
+    assert!(!text.contains("more held by others"), "{text}");
+    let text = run_text(&wb, Some("b"), 900, &["status"]);
+    let (b, a) = (text.find("by b until"), text.find("by a until"));
+    assert!(
+        b.is_some() && a.is_some() && b < a,
+        "b's own lease first: {text}"
+    );
     let text = run_text(&wa, None, 900, &["status"]);
     assert!(text.contains("by a") && text.contains("by b"), "{text}");
+    let text = run_text(&wa, Some("a"), 900, &["status", "--mine"]);
+    assert!(text.contains("by a until"), "{text}");
+    assert!(!text.contains("by b"), "{text}");
+    assert!(text.contains("1 more held by others"), "{text}");
+    let text = run_text(&wb, Some("b"), 900, &["status", "--mine"]);
+    assert!(
+        text.contains("by b until") && !text.contains("by a"),
+        "{text}"
+    );
+    let (_, out) = run(&wa, "a", 900, &["status", "--mine"]);
+    assert_eq!(
+        out["data"]["leases"].as_array().map(Vec::len),
+        Some(2),
+        "--mine filters only the text: {out}"
+    );
+    let text = run_text(&wa, Some("a"), 900, &["status", "--all"]);
+    assert!(
+        text.contains("by a until") && text.contains("by b until"),
+        "{text}"
+    );
 
     // Expired: yours, until you claim it again; everyone's with --all.
     let (_, out) = run(&wa, "a", 1_200, &["status"]);
@@ -966,6 +1471,8 @@ fn renew_renews_every_lease_of_yours_and_names_expired_ones() {
     run(&wa, "a", 0, &["claim", "task-1"]);
     run(&wa, "a", 0, &["claim", "src/lib.rs"]);
     run(&wb, "b", 0, &["claim", "task-2"]);
+    // A path lease renews while its path has changes.
+    fs::write(wa.join("src/lib.rs"), "// edited\n").expect("edit");
     let (code, out) = run(&wa, "a", 500, &["renew"]);
     assert_eq!(code, 0, "{out}");
     let renewed = out["data"]["renewed"].as_array().expect("renewed");
@@ -986,6 +1493,378 @@ fn renew_renews_every_lease_of_yours_and_names_expired_ones() {
     assert_eq!(out["data"]["renewed"].as_array().map(Vec::len), Some(0));
     assert_eq!(out["data"]["expired"].as_array().map(Vec::len), Some(2));
     assert_eq!(codes(&out), vec!["coord.past_deadline"]);
+}
+
+/// #11980: a lease on a path only another worktree has is judged there,
+/// as the claim found it: its changes there keep it, and once they're
+/// committed it lapses like any other.
+#[test]
+fn a_path_in_another_worktree_is_judged_there() {
+    let (_dir, _repo, wa, wb) = two_worktrees();
+    fs::write(wb.join("src/only_b.rs"), "// b\n").expect("only_b");
+    let (code, out) = run(&wa, "a", 0, &["claim", "src/only_b.rs"]);
+    assert_eq!(code, 0, "{out}");
+    // Past a quarter of its term: untracked in wb, so a's renew renews it.
+    let (_, out) = run(&wa, "a", 400, &["renew"]);
+    let renewed = out["data"]["renewed"].as_array().expect("renewed");
+    assert_eq!(renewed.len(), 1, "{out}");
+    assert_eq!(renewed[0]["scope"], "src/only_b.rs", "{out}");
+    assert_eq!(renewed[0]["deadline_ms"], 1_400, "{out}");
+    // Committed there, it's clean, so it lapses.
+    sh(&wb, &["add", "src/only_b.rs"]);
+    sh(&wb, &["commit", "-qm", "only b"]);
+    let (_, out) = run(&wa, "a", 800, &["renew"]);
+    assert_eq!(
+        out["data"]["not_renewed"][0]["scope"], "src/only_b.rs",
+        "{out}"
+    );
+    assert_eq!(out["data"]["not_renewed"][0]["deadline_ms"], 1_400, "{out}");
+}
+
+/// Review of 7a523b05 (orchestrator #15433): claims and mail read only the
+/// committed config, so a committed agent definition that isn't JSON
+/// blocks neither, while the committed lease policy still applies.
+#[test]
+fn a_broken_agent_definition_blocks_no_claim_or_send() {
+    let (_dir, _repo, wa, _wb) = two_worktrees();
+    fs::create_dir_all(wa.join(".mdkg/agents")).expect("agents");
+    fs::write(wa.join(".mdkg/agents/broken.json"), "{ not json").expect("definition");
+    sh(&wa, &["add", ".mdkg/agents/broken.json"]);
+    sh(&wa, &["commit", "-qm", "broken definition"]);
+    lease_policy(
+        &wa,
+        serde_json::json!({"paths": [{"glob": "src/**", "mode": "shared"}]}),
+    );
+    let (code, out) = run(&wa, "a", 0, &["claim", "src/lib.rs"]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(out["data"]["lease"]["mode"], "shared", "{out}");
+    let (code, out) = run(&wa, "a", 1, &["claim", "run:a"]);
+    assert_eq!(code, 0, "{out}");
+    let (code, out) = run(
+        &wa,
+        "a",
+        2,
+        &["msg", "send", "--to", "b", "--kind", "note", "--text", "x"],
+    );
+    assert_eq!(code, 0, "{out}");
+}
+
+/// Review of 9b00cc5d: `lease request` mails the holder, so a committed
+/// `ack_grace_days` that refuses every send refuses it too.
+#[test]
+fn lease_request_refuses_an_invalid_ack_grace() {
+    let (_dir, _repo, wa, wb) = two_worktrees();
+    let (code, out) = run(&wa, "a", 0, &["claim", "src/lib.rs"]);
+    assert_eq!(code, 0, "{out}");
+    let path = wb.join(".mdkg/config.json");
+    let mut config: Value =
+        serde_json::from_str(&fs::read_to_string(&path).expect("config")).expect("json");
+    config["coordination"] = serde_json::json!({"messages": {"ack_grace_days": 3651}});
+    fs::write(&path, serde_json::to_string_pretty(&config).expect("json")).expect("write");
+    sh(&wb, &["commit", "-qam", "bad grace"]);
+    let (code, out) = run(
+        &wb,
+        "b",
+        10,
+        &["lease", "request", "src/lib.rs", "--reason", "one commit"],
+    );
+    assert_ne!(code, 0, "{out}");
+    assert!(codes(&out).contains(&"config.invalid".to_string()), "{out}");
+    let (_, inbox) = run(&wa, "a", 20, &["msg", "inbox", "--all"]);
+    assert!(
+        !inbox.to_string().contains("Lease request"),
+        "nothing sent: {inbox}"
+    );
+}
+
+/// Friction item 76: `lease request` mails the holder a question in the
+/// lease's context, copied to whoever the requester reports to, and
+/// releases nothing.
+#[test]
+fn lease_request_mails_the_holder_and_releases_nothing() {
+    let (_dir, _repo, wa, wb) = two_worktrees();
+    // b is an agent reporting to lead, as its committed definition says.
+    fs::create_dir_all(wb.join(".mdkg/agents")).expect("agents");
+    fs::write(
+        wb.join(".mdkg/agents/b.json"),
+        r#"{"schema": "mdkg.agent.v1", "harness": "claude", "role": "worker", "reports_to": "lead"}"#,
+    )
+    .expect("definition");
+    sh(&wb, &["add", ".mdkg/agents/b.json"]);
+    sh(&wb, &["commit", "-q", "-m", "define b"]);
+    let (code, out) = run(&wa, "a", 0, &["claim", "src/lib.rs"]);
+    assert_eq!(code, 0, "{out}");
+    let lease = out["data"]["lease"]["id"].as_str().expect("id").to_string();
+
+    let reason = "a security fix needs one commit here";
+    let (code, out) = run(
+        &wb,
+        "b",
+        10,
+        &["lease", "request", "src/lib.rs", "--reason", reason],
+    );
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(out["schema"], "mdkg.lease.request.v1", "{out}");
+    assert_eq!(out["data"]["scope"], "src/lib.rs", "{out}");
+    let requests = out["data"]["requests"].as_array().expect("requests");
+    assert_eq!(requests.len(), 1, "{out}");
+    assert_eq!(requests[0]["lease"]["id"], lease.as_str());
+    assert_eq!(requests[0]["lease"]["owner"], "a");
+    let message = &requests[0]["sent"]["message"];
+    assert_eq!(message["kind"], "question", "{out}");
+    assert_eq!(message["contextId"], format!("lease:{lease}:b"), "{out}");
+    assert_eq!(message["to"], serde_json::json!(["a", "lead"]), "{out}");
+    let text = run_text(
+        &wb,
+        Some("b"),
+        11,
+        &["lease", "request", "src/lib.rs", "--reason", reason],
+    );
+    assert!(text.contains("asked a for src/lib.rs"), "{text}");
+
+    // The holder and lead each get it, with the data part; a still holds
+    // the lease.
+    for (wt, reader) in [(&wa, "a"), (&wb, "lead")] {
+        let (code, inbox) = run(wt, reader, 20, &["msg", "inbox", "--all"]);
+        assert_eq!(code, 0, "{inbox}");
+        let body = inbox.to_string();
+        assert!(
+            body.contains(&format!("lease:{lease}")),
+            "{reader}: {inbox}"
+        );
+        assert!(
+            body.contains("lease_request") && body.contains(reason),
+            "{inbox}"
+        );
+        assert!(body.contains("\"requester\":\"b\""), "{inbox}");
+    }
+    let (_, out) = run(&wa, "a", 30, &["status"]);
+    let held = out["data"]["leases"].as_array().expect("leases");
+    assert!(
+        held.iter()
+            .any(|l| l["id"] == lease.as_str() && l["owner"] == "a"),
+        "nothing was released: {out}"
+    );
+
+    // Terra-1 #12161: a second asker gets its own conversation, so its
+    // mail goes through too, and a sees both.
+    let (code, out) = run(
+        &wb,
+        "c",
+        25,
+        &["lease", "request", "src/lib.rs", "--reason", "docs"],
+    );
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(
+        out["data"]["requests"][0]["sent"]["message"]["contextId"],
+        format!("lease:{lease}:c"),
+        "{out}"
+    );
+    let (_, inbox) = run(&wa, "a", 26, &["msg", "inbox", "--all"]);
+    let body = inbox.to_string();
+    assert!(
+        body.contains(&format!("lease:{lease}:b")) && body.contains(&format!("lease:{lease}:c")),
+        "{inbox}"
+    );
+
+    // a isn't an agent, so asking b copies nobody.
+    run(&wb, "b", 40, &["claim", "task-2"]);
+    let (code, out) = run(
+        &wa,
+        "a",
+        41,
+        &["lease", "request", "task-2", "--reason", "r"],
+    );
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(
+        out["data"]["requests"][0]["sent"]["message"]["to"],
+        serde_json::json!(["b"]),
+        "{out}"
+    );
+
+    // Nothing in the way, your own lease, no reason, or a turn: refused.
+    let (code, out) = run(
+        &wb,
+        "b",
+        50,
+        &["lease", "request", "task-1", "--reason", "r"],
+    );
+    assert_eq!(
+        (code, codes(&out)),
+        (3, vec!["coord.no_lease".to_string()]),
+        "{out}"
+    );
+    let (code, out) = run(
+        &wb,
+        "b",
+        51,
+        &["lease", "request", "task-2", "--reason", "r"],
+    );
+    assert_eq!(
+        (code, codes(&out)),
+        (3, vec!["coord.no_lease".to_string()]),
+        "{out}"
+    );
+    let (code, out) = run(
+        &wb,
+        "b",
+        52,
+        &["lease", "request", "src/lib.rs", "--reason", " "],
+    );
+    assert_eq!(code, 1, "{out}");
+    assert_eq!(codes(&out), vec!["usage.invalid_arguments"], "{out}");
+    let (code, out) = run(
+        &wb,
+        "b",
+        53,
+        &["lease", "request", "run:a", "--reason", "r"],
+    );
+    assert_eq!(code, 1, "{out}");
+}
+
+/// Friction items 70 and 75, under #11931's clean-path rule: renew extends
+/// a path lease only while its path has changes in the worktree; a clean
+/// one past the first quarter of its term isn't renewed, so it lapses, and
+/// while no turn of its owner's runs, `status` flags it idle. A clean one
+/// just claimed keeps its time. Whether a `done` came first doesn't matter.
+#[test]
+fn clean_path_leases_lapse_on_renew_and_show_idle() {
+    // Named after their actors, so status finds each owner's worktree.
+    let (_dir, _repo, wa, wb) = worktrees_named("a", "b");
+    let idle_of = |out: &Value, scope: &str| {
+        out["data"]["leases"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|l| l["scope"] == scope)
+            .map(|l| l["idle"].clone())
+    };
+    let scopes = |out: &Value, key: &str| -> Vec<String> {
+        out["data"][key]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|l| l["scope"].as_str().unwrap_or_default().to_string())
+            .collect()
+    };
+    run(&wa, "a", 0, &["claim", "task-1"]);
+    run(&wa, "a", 0, &["claim", "src/lib.rs"]);
+    run(&wb, "b", 0, &["claim", "task-2"]);
+    run(&wb, "b", 0, &["claim", "--new", "src/b.rs"]);
+    // b's new file exists, untracked: a change.
+    fs::write(wb.join("src/b.rs"), "// b\n").expect("b.rs");
+
+    // Just claimed: not idle, though clean.
+    let (_, out) = run(&wb, "b", 100, &["status"]);
+    assert_eq!(
+        idle_of(&out, "src/lib.rs"),
+        Some(Value::Bool(false)),
+        "{out}"
+    );
+
+    // Past a quarter of its term, a's clean file is idle; b's isn't.
+    let (_, out) = run(&wb, "b", 300, &["status"]);
+    assert_eq!(
+        idle_of(&out, "src/lib.rs"),
+        Some(Value::Bool(true)),
+        "{out}"
+    );
+    assert_eq!(idle_of(&out, "src/b.rs"), Some(Value::Bool(false)), "{out}");
+    let text = run_text(&wb, Some("b"), 300, &["status"]);
+    assert!(text.contains("src/lib.rs by a until"), "{text}");
+    assert!(
+        text.contains("(idle: no changes in its owner's worktree, no turn running)"),
+        "{text}"
+    );
+    assert!(text.contains("release <path>"), "{text}");
+    assert_eq!(
+        text.matches("(idle:").count(),
+        1,
+        "nodes are never idle: {text}"
+    );
+
+    // While a turn of a's runs, a's leases aren't idle.
+    let (code, out) = run(&wa, "launcher", 310, &["claim", "run:a"]);
+    assert_eq!(code, 0, "{out}");
+    let (_, out) = run(&wb, "b", 320, &["status"]);
+    assert_eq!(
+        idle_of(&out, "src/lib.rs"),
+        Some(Value::Bool(false)),
+        "{out}"
+    );
+    let (code, _) = run(&wa, "launcher", 330, &["release", "run:a"]);
+    assert_eq!(code, 0);
+
+    // Renew renews a's task but not its clean file, and says so; b's
+    // renew renews both of b's.
+    let (code, out) = run(&wa, "a", 400, &["renew"]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(scopes(&out, "renewed").len(), 1, "{out}");
+    assert_eq!(scopes(&out, "not_renewed"), vec!["src/lib.rs"], "{out}");
+    assert_eq!(out["data"]["not_renewed"][0]["deadline_ms"], 1_000, "{out}");
+    assert_eq!(codes(&out), vec!["coord.not_active"], "{out}");
+    let hint = out["diagnostics"][0]["hint"].as_str().unwrap_or_default();
+    assert!(
+        hint.contains("release <path>") && hint.contains("claim"),
+        "{out}"
+    );
+    let text = run_text(&wa, Some("a"), 410, &["renew"]);
+    assert!(
+        text.contains("not renewed src/lib.rs (no changes here)"),
+        "{text}"
+    );
+    let (_, out) = run(&wb, "b", 400, &["renew"]);
+    assert_eq!(scopes(&out, "renewed").len(), 2, "{out}");
+    assert!(out["data"].get("not_renewed").is_none(), "{out}");
+
+    // Terra-2's fix round: after its done, a claims the file again and
+    // edits it; renew keeps it, and it isn't idle.
+    let (code, out) = run(&wa, "a", 500, &["done", "task-1"]);
+    assert_eq!(code, 0, "{out}");
+    run(&wa, "a", 550, &["release", "src/lib.rs"]);
+    let (code, out) = run(&wa, "a", 600, &["claim", "src/lib.rs"]);
+    assert_eq!(code, 0, "{out}");
+    fs::write(wa.join("src/lib.rs"), "// fixed\n").expect("edit");
+    let (_, out) = run(&wa, "a", 700, &["renew"]);
+    assert_eq!(scopes(&out, "renewed"), vec!["src/lib.rs"], "{out}");
+    assert_eq!(out["data"]["renewed"][0]["deadline_ms"], 1_700, "{out}");
+    assert!(codes(&out).is_empty(), "{out}");
+    let (_, out) = run(&wb, "b", 1_000, &["status"]);
+    assert_eq!(
+        idle_of(&out, "src/lib.rs"),
+        Some(Value::Bool(false)),
+        "{out}"
+    );
+
+    // Once committed, it's clean: idle, and renew lets it lapse.
+    sh(&wa, &["commit", "-qam", "fix"]);
+    let (_, out) = run(&wb, "b", 1_100, &["status"]);
+    assert_eq!(
+        idle_of(&out, "src/lib.rs"),
+        Some(Value::Bool(true)),
+        "{out}"
+    );
+    let (_, out) = run(&wa, "a", 1_100, &["renew"]);
+    assert_eq!(scopes(&out, "not_renewed"), vec!["src/lib.rs"], "{out}");
+    assert_eq!(out["data"]["not_renewed"][0]["deadline_ms"], 1_700, "{out}");
+
+    // Claimed again, it's kept for its term even while clean, and not
+    // extended: renewing can't keep a clean lease alive.
+    let (code, _) = run(&wa, "a", 1_200, &["claim", "src/lib.rs"]);
+    assert_eq!(code, 0);
+    let (_, out) = run(&wa, "a", 1_300, &["renew"]);
+    assert_eq!(scopes(&out, "kept"), vec!["src/lib.rs"], "{out}");
+    assert_eq!(out["data"]["kept"][0]["deadline_ms"], 2_200, "{out}");
+    assert!(out["data"].get("not_renewed").is_none(), "{out}");
+    assert!(codes(&out).is_empty(), "{out}");
+    let text = run_text(&wa, Some("a"), 1_300, &["renew"]);
+    assert!(text.contains("kept src/lib.rs until"), "{text}");
+    assert!(!text.contains("no active leases"), "{text}");
+    let (_, out) = run(&wa, "a", 2_300, &["status"]);
+    assert!(
+        scopes(&out, "expired").iter().any(|s| s == "src/lib.rs"),
+        "it lapsed: {out}"
+    );
 }
 
 #[test]
@@ -1284,9 +2163,12 @@ fn a_top_level_file_in_another_worktree_claims_by_its_bare_name() {
     assert_eq!(out["data"]["lease"]["scope"], "TOP.md");
     let (code, _) = run(&wa, "a", 1, &["claim", "TOP.md"]);
     assert_eq!(code, 5, "b holds it");
-    // A name in no worktree still reads as an id.
+    // A name in no worktree still reads as an id, and no node has it.
     let (code, out) = run(&wb, "b", 2, &["claim", "NOWHERE.md"]);
-    assert_eq!((code, codes(&out)), (3, vec!["node.not_found".to_string()]));
+    assert_eq!(
+        (code, codes(&out)),
+        (3, vec!["coord.path_missing".to_string()])
+    );
 }
 
 /// Review round 4 of 1932559: in a bare clone with worktrees, the bare
@@ -1332,7 +2214,7 @@ fn a_bare_repository_s_git_folder_is_not_a_worktree() {
     let (code, out) = run(&wt, "a", 0, &["claim", "config"]);
     assert_eq!(
         (code, codes(&out)),
-        (3, vec!["node.not_found".to_string()]),
+        (3, vec!["coord.path_missing".to_string()]),
         "{out}"
     );
     let (code, out) = run(&wt, "a", 1, &["claim", "hooks/"]);
@@ -1846,12 +2728,10 @@ fn lease_text_cant_carry_instructions() {
     assert_eq!(out["data"]["leases"], serde_json::json!([]), "{out}");
     // A shared folder's notice names its other holders as data.
     for wt in [&wa, &wb] {
-        let path = wt.join(".mdkg/config.json");
-        let mut config: Value =
-            serde_json::from_str(&fs::read_to_string(&path).expect("config")).expect("json");
-        config["coordination"] =
-            serde_json::json!({"leases": {"paths": [{"glob": "src/**", "mode": "shared"}]}});
-        fs::write(&path, serde_json::to_string_pretty(&config).expect("json")).expect("write");
+        lease_policy(
+            wt,
+            serde_json::json!({"paths": [{"glob": "src/**", "mode": "shared"}]}),
+        );
     }
     let (code, out) = run(&wa, "a", 200, &["claim", "src/"]);
     assert_eq!(code, 0, "{out}");

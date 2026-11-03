@@ -128,7 +128,7 @@ fn decision_schema_upgrade_is_additive_copied_and_audit_read_never_upgrades() {
         upgraded
             .backup()
             .expect("decision fixture")
-            .ends_with("coord.sqlite.pre-3+msg4-to-3+msg5.sqlite")
+            .ends_with("coord.sqlite.pre-4+msg4-to-4+msg5.sqlite")
     );
     assert_eq!(
         upgraded

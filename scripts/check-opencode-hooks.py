@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-r"""Check the canonical mdkg plugin on OpenCode 2.1.0, outside a sandbox.
+r"""Check the canonical mdkg plugin on OpenCode 2.1.0 or 2.2.5, outside a sandbox.
 
-Build the candidate and its canonical-plugin exporter first:
+Build the candidate and its exporters first:
   cargo build --locked -p mdkg-run --example opencode-hook-plugin
+  cargo build --locked -p mdkg-run --example opencode-worker-config
   cargo build --locked -p mdkg --bin mdkg
 Then, from this checkout:
   python3 -I scripts/check-opencode-hooks.py --self-test
@@ -10,6 +11,21 @@ Then, from this checkout:
   node scripts/check-opencode-plugin.mjs target/debug/examples/opencode-hook-plugin
   python3 -I scripts/check-opencode-hooks.py --live \
     --model opencode/deepseek-v4.1-flash-free > /tmp/opencode-hooks-result.json
+  python3 -I scripts/check-opencode-hooks.py --live-permissions \
+    > /tmp/opencode-permissions-result.json
+
+--live-permissions starts no session and calls no model: it starts a loopback
+server with this build's worker inline config (OPENCODE_CONFIG_CONTENT, from
+the opencode-worker-config exporter) and checks that OpenCode's resolved
+build agent denies mdkg's refusals and the credential-printing commands,
+taking the last matching rule as OpenCode does. A release that ignored the
+inline config would fail it.
+
+This is a resolved-rule check, not a shell execution test: it does not prove
+the native shell parser produces those resources, that plugins cannot alter
+permissions, or that wrappers and direct credential-store reads are blocked.
+It covers the inline config and last-matching-rule behavior for the listed
+literal spellings only; real worker shell behavior needs separate live checks.
 
 --live starts a loopback server, runs four scenarios with two queued replies,
 and writes Git only in its freshly created temporary repository. It never uses the user's
@@ -43,6 +59,7 @@ and invokes no Git commands, OpenCode process, network or model.
 """
 
 import argparse
+from contextlib import contextmanager
 import errno
 import hashlib
 import json
@@ -69,6 +86,88 @@ class CheckFailed(RuntimeError):
 
 class ObserverStopped(BaseException):
     pass
+
+
+@contextmanager
+def defer_interrupts():
+    """Register a spawned process before a single INT/TERM can unwind it.
+
+    Use handlers, not a blocked signal mask, so the child does not inherit
+    blocked shutdown signals. The caller's cleanup must enclose this scope.
+    """
+    pending = []
+    handlers = {}
+
+    def remember(signum, frame):
+        if not pending:
+            pending.append((signum, frame))
+
+    try:
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            handler = signal.getsignal(signum)
+            if handler != signal.SIG_IGN:
+                handlers[signum] = handler
+                signal.signal(signum, remember)
+        yield
+    finally:
+        for signum, handler in handlers.items():
+            signal.signal(signum, handler)
+        if pending:
+            signum, frame = pending[0]
+            handler = handlers[signum]
+            if callable(handler):
+                handler(signum, frame)
+            else:
+                raise KeyboardInterrupt
+
+
+# The releases mdkg's preflight accepts (OPENCODE_QUALIFIED in
+# crates/mdkg-run/src/profile.rs).
+QUALIFIED = ("2.1.0", "2.2.5")
+
+
+def qualified_version(text):
+    text = text.strip()
+    version = text[len("opencode v"):] if text.startswith("opencode v") else text
+    return version if version in QUALIFIED else None
+
+
+def wildcard(pattern, value):
+    """OpenCode's permission pattern: `*` any text, `?` one character."""
+    regex = "".join(".*" if c == "*" else "." if c == "?" else re.escape(c) for c in pattern)
+    return re.fullmatch(regex, value, re.S) is not None
+
+
+def last_effect(rules, action, resource):
+    for rule in reversed(rules):
+        if wildcard(rule["action"], action) and wildcard(rule["resource"], resource):
+            return rule["effect"]
+    return "ask"
+
+
+def permission_probes(mdkg):
+    """Shell commands a worker's inline config must deny, and ones it must not."""
+    deny = ["mdkg auth status", "mdkg abandon fixture-task", f"{mdkg} auth key anthropic",
+            f"{mdkg.name} agents use-key lane", "opencode auth export", "opencode auth list",
+            "/opt/homebrew/bin/opencode auth export", "opencode service get password",
+            "opencode api credential.list", "opencode debug config", "opencode pair",
+            "opencode serve --port 4097", "claude setup-token",
+            # The desktop app's CLI, spacing, quoting and global options.
+            "/Applications/OpenCode.app/Contents/Resources/opencode-cli auth export",
+            "opencode  auth\texport", 'opencode "auth" export',
+            "opencode --log-level debug auth export", "./opencode auth export",
+            "../bin/opencode-cli auth export", "'./opencode' auth export",
+            '"/Applications/OpenCode.app/Contents/Resources/opencode-cli" auth export',
+            '"opencode" auth export', "~/bin/opencode auth export", "$HOME/bin/opencode auth export",
+            '"$HOME/bin/opencode" auth export', "env NO_COLOR=1 /opt/bin/opencode auth export",
+            "command opencode auth export", "exec opencode auth export", "nohup opencode auth export",
+            "timeout 10 opencode auth export", "NO_COLOR=1 /opt/bin/opencode auth export"]
+    other = ["git status", "cargo test", "opencode --version", "opencode service status",
+             "claude auth status", "cat scripts/opencode-catalog-env.py crates/mdkg-run/src/auth.rs",
+             "rg auth scripts/opencode-catalog-env.py", "cat /opt/bin/opencode docs/auth.md",
+             "grep auth ./bin/opencode",
+             "cat scripts/claude-helper.py crates/mdkg-run/src/setup-token.rs"]
+    return deny, other
 
 
 def require(condition, message):
@@ -196,32 +295,43 @@ def stop_process(process, grace=2, wait_for_group=False):
 
 
 def command(argv, cwd, env, timeout=20, own_group=True):
-    process = subprocess.Popen([str(a) for a in argv], cwd=cwd, env=env,
-                               stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                               stderr=subprocess.PIPE, text=True, start_new_session=own_group)
-    try:
-        out, err = process.communicate(timeout=timeout)
-        require(process.returncode == 0,
-                f"{Path(argv[0]).name} {argv[1]} exited {process.returncode}: {(err or out)[-2000:]}")
-        return out
-    except subprocess.TimeoutExpired as exc:
-        raise CheckFailed(f"{Path(argv[0]).name} {argv[1]} timed out") from exc
-    finally:
+    # A CLI can exit before its large pipe-backed stdout has drained.
+    # A private regular file also lets us read the entire result to EOF.
+    with tempfile.TemporaryFile(mode="w+", encoding="utf-8", newline="") as output:
+        process = subprocess.Popen([str(a) for a in argv], cwd=cwd, env=env,
+                                   stdin=subprocess.DEVNULL, stdout=output,
+                                   stderr=subprocess.PIPE, text=True, start_new_session=own_group)
         try:
-            if own_group:
-                stop_process(process)
-            elif process.poll() is None:
-                # Observer children stay in the server group so its cleanup
-                # can stop them too; a local timeout targets this child only.
-                process.terminate()
-                try:
-                    process.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait(timeout=2)
+            _, err = process.communicate(timeout=timeout)
+            output.seek(0)
+            out = output.read()
+            require(process.returncode == 0,
+                    f"{Path(argv[0]).name} {argv[1]} exited {process.returncode}: {(err or out)[-2000:]}")
+            return out
+        except subprocess.TimeoutExpired as exc:
+            raise CheckFailed(f"{Path(argv[0]).name} {argv[1]} timed out") from exc
         finally:
-            process.stdout.close()
-            process.stderr.close()
+            try:
+                if own_group:
+                    stop_process(process)
+                elif process.poll() is None:
+                    # Observer children share the server's group.
+                    process.terminate()
+                    try:
+                        process.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=2)
+            finally:
+                process.stderr.close()
+
+
+def command_json(raw, operation):
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise CheckFailed(f"{operation} returned invalid JSON ({len(raw.encode('utf-8'))} bytes; "
+                          f"character {exc.pos})") from None
 
 
 def mdkg_json(cfg, actor, args):
@@ -410,7 +520,7 @@ class LiveCheck:
         argv = [self.args.opencode, "api", "--server", self.url, operation]
         for key, value in params.items():
             argv += ["--param", f"{key}={value}"]
-        return json.loads(self.run(argv))
+        return command_json(self.run(argv), operation)
 
     def messages(self, phase):
         messages = message_pages(lambda params: self.api("session.message.list", sessionID=self.sessions[phase], **params))
@@ -494,7 +604,7 @@ class LiveCheck:
             "safety_plugin_sha256": file_sha256(safety),
         }
         version = self.run([self.args.opencode, "--version"]).strip()
-        require(version in ("2.1.0", "opencode v2.1.0"), f"requires reviewed OpenCode 2.1.0; found {version}")
+        require(qualified_version(version), f"requires a qualified OpenCode ({', '.join(QUALIFIED)}); found {version}")
         self.report["opencode"] = version
         self.report["mdkg_version"] = self.run([self.args.mdkg, "--version"]).strip()
         cfg = self.root / "observer.json"
@@ -528,9 +638,10 @@ class LiveCheck:
             port = sock.getsockname()[1]
         self.url = f"http://127.0.0.1:{port}"
         preflight_external_config(self.root.parent)
-        self.server = subprocess.Popen([self.args.opencode, "serve", "--hostname", "127.0.0.1", "--port", str(port)],
-                                       cwd=self.repo, env=self.env, stdin=subprocess.DEVNULL,
-                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        with defer_interrupts():
+            self.server = subprocess.Popen([self.args.opencode, "serve", "--hostname", "127.0.0.1", "--port", str(port)],
+                                           cwd=self.repo, env=self.env, stdin=subprocess.DEVNULL,
+                                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
         def ready():
             try:
                 return isinstance(self.api("server.info"), dict)
@@ -640,7 +751,141 @@ class LiveCheck:
         self.report["phase"] = "complete"
 
 
+def permission_check(root, args, report, password):
+    repo = root / "project"
+    repo.mkdir()
+    env = isolated_env(root, password)
+
+    def run(argv, timeout=20):
+        preflight_external_config(root.parent)
+        return command(argv, repo, env, timeout)
+
+    cli = qualified_version(run([args.opencode, "--version"]))
+    require(cli, f"requires a qualified OpenCode ({', '.join(QUALIFIED)})")
+    report["opencode"] = cli
+    report["artifacts"] = {"mdkg_sha256": file_sha256(args.mdkg),
+                           "worker_config_sha256": file_sha256(args.worker_config),
+                           "script_sha256": file_sha256(__file__)}
+    inline = run([args.worker_config, args.mdkg, repo])
+    require(command_json(inline, "worker config").get("permission"), "the exporter printed no permissions")
+    env["OPENCODE_CONFIG_CONTENT"] = inline
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    url = f"http://127.0.0.1:{port}"
+
+    def api(operation, **params):
+        argv = [args.opencode, "api", "--server", url, operation]
+        for key, value in params.items():
+            argv += ["--param", f"{key}={value}"]
+        return command_json(run(argv), operation)
+
+    preflight_external_config(root.parent)
+    server = None
+    try:
+        with defer_interrupts():
+            server = subprocess.Popen([args.opencode, "serve", "--hostname", "127.0.0.1", "--port", str(port)],
+                                      cwd=repo, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                      stderr=subprocess.DEVNULL, start_new_session=True)
+        deadline = time.monotonic() + args.timeout
+        while True:
+            try:
+                info = api("server.info")
+                break
+            except (CheckFailed, json.JSONDecodeError):
+                require(time.monotonic() < deadline, "server readiness timed out")
+                time.sleep(0.5)
+        require(info.get("version") == cli, "the server is another release than the CLI")
+        where = {"location[directory]": str(repo)}
+        # model.list awaits config activation; agent.list alone can answer
+        # with defaults first (as mdkg's preflight does).
+        require(isinstance(api("model.list", **where).get("data"), list), "activation failed")
+        builds = [a for a in api("agent.list", **where).get("data", []) if a.get("id") == "build"]
+        require(len(builds) == 1 and isinstance(builds[0].get("permissions"), list),
+                "no single resolved build agent")
+        rules = builds[0]["permissions"]
+        deny, other = permission_probes(args.mdkg)
+        effects = {c: last_effect(rules, "shell", c) for c in deny + other}
+        report["checks"]["permissions"] = effects
+        missed = [c for c in deny if effects[c] != "deny"]
+        require(not missed, f"the inline config's refusals did not apply: {missed}")
+        blocked = [c for c in other if effects[c] == "deny"]
+        require(not blocked, f"ordinary commands were denied: {blocked}")
+    finally:
+        if server is not None:
+            stop_process(server, wait_for_group=True)
+
+
 class OfflineTests(unittest.TestCase):
+    def test_interrupt_during_server_spawn_registers_it_before_cleanup(self):
+        spawn = subprocess.Popen
+        children = []
+
+        def interrupted(_signum, _frame):
+            raise KeyboardInterrupt
+
+        def start(*_args, **_kwargs):
+            child = spawn([sys.executable, "-I", "-c", "import time; time.sleep(30)"],
+                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL, start_new_session=True)
+            children.append(child)
+            # Faithfully inject the vulnerable window: the OS has spawned
+            # the server but Popen has not returned it to its caller yet.
+            os.kill(os.getpid(), signal.SIGTERM)
+            return child
+
+        old_handler = signal.signal(signal.SIGTERM, interrupted)
+        try:
+            for mode in ("permissions", "hooks"):
+                with tempfile.TemporaryDirectory() as tmp:
+                    args = argparse.Namespace(mdkg=Path("mdkg"), opencode=Path("opencode"),
+                                              worker_config=Path("worker-config"), timeout=10)
+                    with patch.object(socket, "socket"), patch.object(subprocess, "Popen", side_effect=start), \
+                         patch(__name__ + ".preflight_external_config"), \
+                         patch(__name__ + ".file_sha256", return_value="fixture"), \
+                         patch(__name__ + ".command", side_effect=["2.2.5", '{"permission":{"bash":"deny"}}']):
+                        with self.assertRaises(KeyboardInterrupt):
+                            if mode == "permissions":
+                                permission_check(Path(tmp), args, {"checks": {}}, "test")
+                            else:
+                                check = LiveCheck(Path(tmp), args, {"checks": {}}, "test")
+                                with patch.object(check, "prepare", side_effect=check.start_server):
+                                    check.execute()
+                    self.assertIsNotNone(children[-1].poll(), f"{mode} server survived startup interruption")
+                    self.assertIs(signal.getsignal(signal.SIGTERM), interrupted)
+        finally:
+            signal.signal(signal.SIGTERM, old_handler)
+            for child in children:
+                stop_process(child, grace=.1)
+
+    def test_only_the_qualified_releases_pass(self):
+        for text in ("opencode v2.1.0", "2.1.0", "opencode v2.2.5\n", "2.2.5"):
+            self.assertIn(qualified_version(text), QUALIFIED, text)
+        for text in ("opencode v2.2.0", "opencode v2.2.6", "opencode v2.2.5-beta.1",
+                     "opencode v12.2.5", "v2.2.5", "", "not-a-version"):
+            self.assertIsNone(qualified_version(text), text)
+
+    def test_the_last_matching_rule_decides_a_shell_command(self):
+        rules = [{"action": "*", "resource": "*", "effect": "allow"},
+                 {"action": "shell", "resource": "opencode auth", "effect": "deny"},
+                 {"action": "shell", "resource": "opencode auth *", "effect": "deny"},
+                 {"action": "shell", "resource": "*/opencode auth *", "effect": "deny"},
+                 {"action": "edit", "resource": "*", "effect": "ask"}]
+        self.assertEqual(last_effect(rules, "shell", "opencode auth export"), "deny")
+        self.assertEqual(last_effect(rules, "shell", "opencode auth"), "deny")
+        self.assertEqual(last_effect(rules, "shell", "/usr/bin/opencode auth list"), "deny")
+        self.assertEqual(last_effect(rules, "shell", "opencode authors"), "allow")
+        self.assertEqual(last_effect(rules, "shell", "git status"), "allow")
+        self.assertEqual(last_effect([], "shell", "git status"), "ask")
+        self.assertTrue(wildcard("a?c", "abc") and not wildcard("a.c", "abc"))
+
+    def test_probes_cover_every_refusal_and_leave_ordinary_commands(self):
+        deny, other = permission_probes(Path("/opt/bin/mdkg-next"))
+        self.assertIn("/opt/bin/mdkg-next auth key anthropic", deny)
+        self.assertIn("mdkg-next agents use-key lane", deny)
+        self.assertTrue(set(deny).isdisjoint(other))
+
+
     def test_environment_does_not_inherit_user_config_or_credentials(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
             "OPENCODE_CONFIG": "/external", "OPENCODE_CONFIG_DIR": "/external",
@@ -819,6 +1064,41 @@ class OfflineTests(unittest.TestCase):
             with path.open("ab") as file:
                 file.write(b'{"unfinished":')
             self.assertEqual([json.loads(line) for line in path.read_bytes().split(b"\n")[:-1]], [{"event": "start"}])
+
+    def test_large_worker_config_is_read_to_eof_without_a_stdout_pipe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = {"permission": {"bash": {f"echo fixture-{n}": "allow" for n in range(12000)}},
+                      "tail": "CONFIG_END"}
+            payload = json.dumps(config)
+            self.assertGreater(len(payload.encode()), 256 * 1024)
+            path = root / "worker.json"
+            path.write_text(payload)
+            # Model a CLI whose exit cuts buffered pipe output at 256KiB.
+            program = ("import os,stat,sys; from pathlib import Path; "
+                       "data=Path(sys.argv[1]).read_text(); "
+                       "sys.stdout.write(data[:262144] if stat.S_ISFIFO(os.fstat(1).st_mode) else data)")
+            raw = command([sys.executable, "-I", "-c", program, path], root, isolated_env(root, "test"))
+            self.assertEqual(command_json(raw, "worker config"), config)
+            self.assertEqual(command_json(raw, "agent.list")["tail"], "CONFIG_END")
+            with self.assertRaisesRegex(CheckFailed, r"agent.list.*262144 bytes"):
+                command_json(payload[:262144], "agent.list")
+
+    def test_json_diagnostic_omits_body_characters_with_the_fallback_scanner(self):
+        decoder = json.JSONDecoder()
+        decoder.parse_string = json.decoder.py_scanstring
+        decoder.scan_once = json.scanner.py_make_scanner(decoder)
+        raw = '"\\☃"'
+        with self.assertRaises(json.JSONDecodeError) as original:
+            decoder.decode(raw)
+        self.assertIn("☃", original.exception.msg)
+        with patch.object(json, "loads", side_effect=decoder.decode):
+            with self.assertRaises(CheckFailed) as caught:
+                command_json(raw, "agent.list")
+        self.assertEqual(str(caught.exception),
+                         f"agent.list returned invalid JSON ({len(raw.encode('utf-8'))} bytes; "
+                         f"character {original.exception.pos})")
+        self.assertNotIn("☃", str(caught.exception))
 
     def test_command_timeout_reaps_its_process(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1085,8 +1365,10 @@ def main():
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--self-test", action="store_true")
     mode.add_argument("--live", action="store_true")
+    mode.add_argument("--live-permissions", action="store_true")
     parser.add_argument("--mdkg", default=repo / "target/debug/mdkg", type=Path)
     parser.add_argument("--generator", default=repo / "target/debug/examples/opencode-hook-plugin", type=Path)
+    parser.add_argument("--worker-config", default=repo / "target/debug/examples/opencode-worker-config", type=Path)
     parser.add_argument("--opencode", default="opencode")
     parser.add_argument("--model", help="Explicit Zen free model, opencode/<name>-free")
     parser.add_argument("--timeout", default=120, type=int, help="Per-phase limit in seconds (10..600)")
@@ -1097,14 +1379,24 @@ def main():
     report = {"ok": False, "model": args.model, "checks": {}, "sessions": {}}
     try:
         require(os.name == "posix", "this process-group cleanup check requires a POSIX host")
-        require(args.model and re.fullmatch(r"opencode/[a-z0-9][a-z0-9.-]*-free", args.model), "name an explicit opencode/*-free model; no paid/provider fallback")
         require(10 <= args.timeout <= 600, "timeout must be between 10 and 600 seconds")
+        def interrupted(_signum, _frame):
+            raise KeyboardInterrupt
+        # Before either mode starts a server: SIGTERM unwinds its cleanup.
+        signal.signal(signal.SIGTERM, interrupted)
+        if args.live_permissions:
+            temp_base = Path(tempfile.gettempdir()).resolve(strict=True)
+            preflight_external_config(temp_base)
+            args.mdkg, args.worker_config, args.opencode = map(binary, (args.mdkg, args.worker_config, args.opencode))
+            with tempfile.TemporaryDirectory(prefix="mdkg-opencode-permissions-", dir=temp_base) as tmp:
+                permission_check(Path(tmp).resolve(strict=True), args, report, password)
+            report["ok"] = True
+            print(json.dumps(redact(report, password), indent=2))
+            return 0
+        require(args.model and re.fullmatch(r"opencode/[a-z0-9][a-z0-9.-]*-free", args.model), "name an explicit opencode/*-free model; no paid/provider fallback")
         temp_base = Path(tempfile.gettempdir()).resolve(strict=True)
         preflight_external_config(temp_base)
         args.mdkg, args.generator, args.opencode = map(binary, (args.mdkg, args.generator, args.opencode))
-        def interrupted(_signum, _frame):
-            raise KeyboardInterrupt
-        signal.signal(signal.SIGTERM, interrupted)
         with tempfile.TemporaryDirectory(prefix="mdkg-opencode-hooks-", dir=temp_base) as tmp:
             LiveCheck(Path(tmp).resolve(strict=True), args, report, password).execute()
         report["ok"] = True

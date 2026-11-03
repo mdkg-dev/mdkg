@@ -23,26 +23,7 @@ pub const KEY: &str = "projections";
 /// The code an unknown projection is refused with.
 pub const CODE_CONFIG: &str = "usage.invalid_arguments";
 
-/// An agent harness a projection is for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Harness {
-    Claude,
-    Codex,
-    OpenCode,
-}
-
-impl Harness {
-    pub const ALL: [Harness; 3] = [Harness::Claude, Harness::Codex, Harness::OpenCode];
-
-    /// Its name in a projection (`mcp:claude`).
-    pub fn name(self) -> &'static str {
-        match self {
-            Harness::Claude => "claude",
-            Harness::Codex => "codex",
-            Harness::OpenCode => "opencode",
-        }
-    }
-}
+pub use crate::harness::Harness;
 
 /// The AGENTS.md block.
 pub const AGENTS_MD: &str = "agents-md";
@@ -51,28 +32,24 @@ pub const AGENTS_MD: &str = "agents-md";
 pub const MIRRORS: [&str; 2] = [".agents/skills", ".claude/skills"];
 
 /// Every projection, in the order they're listed and written.
-pub const NAMES: &[&str] = &[
-    AGENTS_MD,
-    "mcp:claude",
-    "mcp:codex",
-    "mcp:opencode",
-    "skills:.agents/skills",
-    "skills:.claude/skills",
-    "hooks:claude",
-    "hooks:codex",
-    "hooks:opencode",
-];
+macro_rules! projection_names {
+    ($(($variant:ident, $id:literal, $adapter:ident)),* $(,)?) => {
+        pub const NAMES: &[&str] = &[
+            AGENTS_MD, $(concat!("mcp:", $id),)*
+            "skills:.agents/skills", "skills:.claude/skills",
+            $(concat!("hooks:", $id),)* GIT_HOOKS,
+        ];
+        /// What a config without the key gets: every pre-projection default.
+        pub const LEGACY: &[&str] = &[
+            AGENTS_MD, $(concat!("mcp:", $id),)*
+            "skills:.agents/skills", "skills:.claude/skills",
+        ];
+    };
+}
+crate::harness_registry!(projection_names);
 
-/// What a config without the key gets: every projection there was before
-/// the key existed.
-pub const LEGACY: &[&str] = &[
-    AGENTS_MD,
-    "mcp:claude",
-    "mcp:codex",
-    "mcp:opencode",
-    "skills:.agents/skills",
-    "skills:.claude/skills",
-];
+/// git's own hooks, distinct from an agent harness.
+pub const GIT_HOOKS: &str = "hooks:git";
 
 /// The projections a project enables.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,6 +140,11 @@ impl Projections {
 
     pub fn hooks(&self, h: Harness) -> bool {
         self.has(&format!("hooks:{}", h.name()))
+    }
+
+    /// Whether git's own hooks route through mdkg (`hooks:git`).
+    pub fn git_hooks(&self) -> bool {
+        self.has(GIT_HOOKS)
     }
 
     pub fn agents_md(&self) -> bool {
@@ -261,24 +243,17 @@ pub fn write(root: &Path, p: &Projections) -> Result<(), RunError> {
 /// records, so an upgraded repository keeps exactly what it had.
 pub fn detect(root: &Path) -> Vec<&'static str> {
     let text = |rel: &str| std::fs::read_to_string(root.join(rel)).ok();
-    let json = |rel: &str| text(rel).and_then(|t| serde_json::from_str::<Value>(&t).ok());
     let mut found = Vec::new();
     if text("AGENTS.md").is_some_and(|t| {
         t.contains(crate::install::BLOCK_START) || t.contains("<!-- mdkg:harness:start -->")
     }) {
         found.push(AGENTS_MD);
     }
-    if json(".mcp.json").is_some_and(|v| v.pointer("/mcpServers/mdkg").is_some()) {
-        found.push("mcp:claude");
-    }
-    if text(".codex/config.toml")
-        .and_then(|t| t.parse::<toml_edit::DocumentMut>().ok())
-        .is_some_and(|d| d.get("mcp_servers").and_then(|t| t.get("mdkg")).is_some())
-    {
-        found.push("mcp:codex");
-    }
-    if json("opencode.json").is_some_and(|v| v.pointer("/mcp/mdkg").is_some()) {
-        found.push("mcp:opencode");
+    for adapter in crate::harness::adapters() {
+        let mcp = adapter.mcp_projection();
+        if mcp.present(root) {
+            found.push(mcp.name);
+        }
     }
     for m in MIRRORS {
         if root.join(m).join(crate::install::MANAGED_LIST).is_file() {

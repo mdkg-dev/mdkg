@@ -1,0 +1,9 @@
+{
+  "name": "11-wrapper",
+  "scenario": "wrapper",
+  "transports": [
+    "cli"
+  ],
+  "checks": "A fake wrapper records its spec and argv: the spec has its fields and mode 0600, the argv after -- is exactly the harness argv, exit 125 is run.wrapper_refused without running the harness, and a run.wrapper in the committed project config, an agent definition or the machine-local config is ignored with a warning.",
+  "cli_driver": "crates/mdkg-cli/tests/agents.rs: a_launch_wrapper_runs_each_harness_unchanged_and_can_refuse_a_turn, a_committed_launch_wrapper_is_ignored_with_a_warning_and_a_bad_one_refuses, a_turn_that_rewrites_the_machine_local_config_keeps_the_users_wrapper"
+}

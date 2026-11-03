@@ -1,0 +1,170 @@
+# npm's `mdkg` and the crates.io crates, published through each registry's
+# trusted publishing: the job exchanges GitHub's OIDC token for a
+# short-lived registry token, so no registry token is stored. A version tag
+# starts it, beside Release (release.yml) and PyPI (pypi.yml); it can also
+# be run by hand on a tag, to retry.
+#
+# Exactly two jobs can publish, each behind an environment whose required
+# reviewer approves it (docs/releasing.md has the registry setup):
+#   npm        environment `npm`        mdkg on npm, with provenance
+#   crates-io  environment `crates-io`  the workspace crates, in dependency order
+# The other jobs hold no `id-token` permission and no environment.
+#
+# Why not release.yml: cargo-dist generates it, and dist 0.32's npm job
+# reads secrets.NPM_TOKEN, with no environment or OIDC option. A dist custom
+# publish job runs as a reusable workflow called from release.yml, and the
+# registries' trusted publishing doesn't treat reusable workflows alike
+# (PyPI doesn't support them). A workflow of its own names one file for
+# every trusted-publisher entry, as pypi.yml does, and `dist generate`
+# never rewrites it.
+name: Publish
+
+on:
+  push:
+    tags:
+      # Releases only; a pre-release tag can be published by hand.
+      - "v[0-9]+.[0-9]+.[0-9]+"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Waits until release.yml has hosted the GitHub Release, whose npm
+  # package the npm job publishes; the crates follow the binaries too.
+  release-hosted:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.wait.outputs.version }}
+    steps:
+      - id: wait
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          until gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,assets \
+              --jq 'select(.isDraft | not) | .assets[].name' > assets.txt 2>/dev/null \
+            && grep -qx 'mdkg-npm-package.tar.gz' assets.txt; do
+            echo "waiting for the GitHub Release $TAG and its mdkg-npm-package.tar.gz"
+            sleep 60
+          done
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+  # Builds and verifies every crate before the crates-io job gets a token,
+  # so no build script, proc macro or test runs where an OIDC token can be
+  # requested. The crates-io job still runs the tag's own publish script,
+  # rustup and cargo (packaging only, `--no-verify`), which is trusted as
+  # the code being released.
+  crates-verify:
+    needs: release-hosted
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Install the toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Package and verify every crate (publishes nothing)
+        run: cargo publish --workspace --dry-run --locked
+      - name: Check the publish order and versions
+        env:
+          VERSION: ${{ needs.release-hosted.outputs.version }}
+        run: python3 scripts/publish-crates.py --plan --expect-version "$VERSION"
+
+  npm:
+    needs: release-hosted
+    runs-on: ubuntu-22.04
+    environment:
+      name: npm
+      url: https://www.npmjs.com/package/mdkg
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    steps:
+      # Trusted publishing needs npm 11.5.1 or later; the latest Node 24
+      # has it, and the Publish step checks.
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24"
+      # The release asset must be the tarball the tag's Release run built:
+      # anyone who can write the repository's contents could replace an
+      # asset, but not a finished run's artifact.
+      - name: Fetch the release's npm package and check it against the Release run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern mdkg-npm-package.tar.gz
+          run_id=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow release.yml --event push \
+            --commit "$GITHUB_SHA" --json databaseId,headBranch \
+            --jq '[.[] | select(.headBranch == env.TAG)][0].databaseId // empty')
+          if [ -z "$run_id" ]; then
+            echo "::error::no Release run for $TAG at $GITHUB_SHA"
+            exit 1
+          fi
+          gh run download "$run_id" --repo "$GITHUB_REPOSITORY" --name artifacts-build-global --dir release-run
+          built=$(find release-run -name mdkg-npm-package.tar.gz)
+          if [ "$(printf '%s\n' "$built" | grep -c .)" != 1 ] || ! cmp -s "$built" mdkg-npm-package.tar.gz; then
+            echo "::error::the release's mdkg-npm-package.tar.gz isn't the one Release run $run_id built"
+            exit 1
+          fi
+      - name: Publish
+        env:
+          VERSION: ${{ needs.release-hosted.outputs.version }}
+        run: |
+          npm_version=$(npm --version)
+          if ! printf '%s\n' 11.5.1 "$npm_version" | sort -C -V; then
+            echo "::error::npm $npm_version has no trusted publishing (11.5.1 or later)"
+            exit 1
+          fi
+          manifest=$(tar -xzOf mdkg-npm-package.tar.gz package/package.json)
+          name=$(jq -r .name <<<"$manifest")
+          pkg_version=$(jq -r .version <<<"$manifest")
+          if [ "$name" != mdkg ] || [ "$pkg_version" != "$VERSION" ]; then
+            echo "::error::the release's package is $name@$pkg_version, not mdkg@$VERSION"
+            exit 1
+          fi
+          if [ "$(npm view "mdkg@$VERSION" version 2>/dev/null)" = "$VERSION" ]; then
+            echo "::notice::mdkg@$VERSION is already on npm"
+            exit 0
+          fi
+          # A pre-release must not become `latest`.
+          tag=latest
+          case "$VERSION" in *-*) tag=next ;; esac
+          npm publish ./mdkg-npm-package.tar.gz --access public --provenance --ignore-scripts --tag "$tag"
+
+  crates-io:
+    needs: [release-hosted, crates-verify]
+    runs-on: ubuntu-22.04
+    environment:
+      name: crates-io
+      url: https://crates.io/crates/mdkg
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Install the toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      # A token that lasts 30 minutes; the action revokes it when the job ends.
+      - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        id: auth
+      # One crate at a time, skipping any already there, so a rerun resumes.
+      # crates-verify built them; this packages without building.
+      - name: Publish in dependency order
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+          VERSION: ${{ needs.release-hosted.outputs.version }}
+        run: python3 scripts/publish-crates.py --publish --expect-version "$VERSION" --no-verify --deadline 1500

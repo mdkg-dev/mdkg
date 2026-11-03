@@ -29,15 +29,19 @@ What problem are we solving and for whom?
 
 # Requirements
 
+Replace this example with a durable requirement.
+
+```text
+- R1: The component shall perform the specified behavior. (verify: name the check)
+```
+
 ## Functional
 
-- requirement 1
-- requirement 2
+Describe the required behavior.
 
 ## Non-functional
 
-- requirement 1
-- requirement 2
+Describe measurable quality requirements.
 
 # Acceptance Criteria
 

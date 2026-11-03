@@ -75,7 +75,14 @@ fn known_statuses(config: &Config) -> Vec<String> {
         .iter()
         .map(|s| s.to_lowercase())
         .collect();
-    let extra = ["archived", "progress", "review", "blocked"];
+    let extra = [
+        "archived",
+        "progress",
+        "review",
+        "blocked",
+        crate::entry::UNSETTLED,
+        crate::entry::UNKNOWN,
+    ];
     for s in extra.iter().chain(mdkg_format::node::DEC_STATUS) {
         if !known.iter().any(|k| k == s) {
             known.push((*s).to_string());
@@ -132,6 +139,7 @@ fn set_effective(view: &coord::View, nodes: &mut [IndexNode]) {
     for n in nodes.iter_mut() {
         n.status = view.effective_status(&n.path, Some(&n.qid), n.status.as_deref());
     }
+    view.mark_unsettled(nodes);
 }
 
 /// For read-only commands: sets each node's effective status from
@@ -152,6 +160,12 @@ pub(crate) fn effective_or_warn(
             (view, Vec::new())
         }
         Err(e) => {
+            // Only the store can say a done node settled (A29).
+            for n in nodes.iter_mut() {
+                if crate::entry::unknown_without_store(n) {
+                    n.status = Some(crate::entry::UNKNOWN.into());
+                }
+            }
             let mut d = *e.diagnostic;
             d.severity = mdkg_format::Severity::Warning;
             d.message = format!(
@@ -355,6 +369,21 @@ pub(crate) fn show_text(v: &Value) -> String {
                 ))),
                 Value::Object(inner) => {
                     for (k, val) in inner {
+                        // A nested record, such as a lease, prints its
+                        // fields under its name, escaped, never as JSON.
+                        if val.as_object().is_some_and(|o| !o.is_empty()) {
+                            let nested = std::iter::once(output::shown_path(&format!("{k}:")))
+                                .chain(crate::entry::field_lines("  ", val));
+                            // Coordination records keep every non-ASCII
+                            // character escaped, as below (review of
+                            // 6baee0b9).
+                            if key == "coordination" {
+                                lines.extend(nested.map(|l| crate::output::shown(&l)));
+                            } else {
+                                lines.extend(nested);
+                            }
+                            continue;
+                        }
                         let text = match val {
                             Value::Array(items) => items
                                 .iter()
@@ -464,20 +493,9 @@ fn warning_lines(warnings: &[&mdkg_format::Diagnostic]) -> (Vec<String>, bool) {
     for (code, list) in by_code {
         let first = list[0];
         if list.len() == 1 {
-            // The location escaped, as `eprint_diagnostic` prints it.
-            lines.push(match first.location() {
-                Some(loc) => format!(
-                    "{}: {} {}: {}",
-                    crate::output::shown_path(&loc),
-                    first.severity.as_str(),
-                    first.code.as_str(),
-                    first.message
-                ),
-                None => first.to_string(),
-            });
-            if let Some(hint) = &first.hint {
-                lines.push(format!("  hint: {hint}"));
-            }
+            // As `eprint_diagnostic` prints it: location, message and
+            // hint escaped (Terra #15588).
+            lines.extend(crate::output::diagnostic_lines(first));
             continue;
         }
         summarised = true;
@@ -493,11 +511,46 @@ fn warning_lines(warnings: &[&mdkg_format::Diagnostic]) -> (Vec<String>, bool) {
     (lines, summarised)
 }
 
+/// Whether text `validate` prints a run notice: always, except a warning
+/// under `--quiet`, which hides warnings only (orchestrator #15911).
+fn notice_shown(shown: Warnings, notice: &mdkg_format::Diagnostic) -> bool {
+    shown != Warnings::None || notice.severity != mdkg_format::Severity::Warning
+}
+
+/// In ref mode validate reads the graph cache, which holds no mirrors;
+/// `skills validate` checks the checkout's, so the cache's mirror warnings
+/// go.
+fn drop_cache_mirror_warnings(warnings: &mut Vec<Diagnostic>) {
+    warnings.retain(|d| {
+        !matches!(
+            d.code,
+            Code::SkillMirrorMissing | Code::SkillMirrorManifestMissing
+        )
+    });
+}
+
 pub fn validate(root: &Path, json: bool, shown: Warnings, changed_only: bool) -> u8 {
     let report = (|| -> Result<Report<ValidateData>, GraphError> {
         let config = config::load(root)?;
-        let receipt = v::validate(root, &config)?;
+        let mut receipt = v::validate(root, &config)?;
+        if coord::graph_git::for_root(root).is_some() {
+            drop_cache_mirror_warnings(&mut receipt.warnings);
+        }
+        // The committed mail settings, which refuse every send and ack
+        // when invalid (e2e 0.7.1 B13).
+        if let Ok(repo) = coord::Repo::open(root) {
+            match crate::msg::committed_config(&repo) {
+                Ok(committed) => receipt.errors.extend(
+                    crate::msg::mail_settings_errors(&committed)
+                        .into_iter()
+                        .map(|e| *e.diagnostic),
+                ),
+                Err(e) => receipt.errors.push(*e.diagnostic),
+            }
+        }
         let (errors, warnings, changed) = if changed_only {
+            // In ref mode, graph paths changed since the code base (none,
+            // with a warning, when no code base resolves).
             let changed = crate::write::changed_graph_paths(root)?;
             (
                 // As in 0.6.0: every error, and only warnings on changed files.
@@ -530,6 +583,16 @@ pub fn validate(root: &Path, json: bool, shown: Warnings, changed_only: bool) ->
     for d in report.diagnostics.iter().filter(|d| !is_warning(d)) {
         output::eprint_diagnostic(d);
     }
+    // Notices are about this run, not a file's warnings (such as
+    // graph.no_code_base when --changed-only has no code base): text
+    // prints each in full, as JSON carries it (e2e B11). --quiet hides
+    // warnings only: an info notice, such as a recovered write's
+    // one-time receipt, still prints (orchestrator #15911).
+    for notice in output::take_notices() {
+        if notice_shown(shown, &notice) {
+            output::eprint_diagnostic(&notice);
+        }
+    }
     let warnings: Vec<&mdkg_format::Diagnostic> =
         report.diagnostics.iter().filter(is_warning).collect();
     match shown {
@@ -561,6 +624,50 @@ mod tests {
     use super::*;
     use mdkg_format::Diagnostic;
 
+    /// Text `show` (and `next`, which shares it) prints a lease's fields
+    /// under its name, escaped, never as JSON (e2e N7).
+    #[test]
+    fn show_text_prints_a_lease_as_fields() {
+        let v = serde_json::json!({
+            "id": "task-1", "type": "task", "title": "T", "status": "todo",
+            "coordination": {
+                "lease": {"id": "lease-1", "owner": "al\u{1b}[2Jice", "until": "2026-11-03T14:55:05Z"},
+                "state": "review",
+            },
+        });
+        let text = show_text(&v);
+        let lines: Vec<&str> = text.lines().collect();
+        let at = lines.iter().position(|l| *l == "lease:").expect(&text);
+        assert_eq!(lines[at + 1], "  id: lease-1", "{text}");
+        assert!(
+            lines[at + 2].starts_with("  owner: al\\u{1b}[2Jice"),
+            "{text}"
+        );
+        assert!(lines.contains(&"state: review"), "{text}");
+        assert!(!text.contains("{\""), "{text}");
+        assert!(!text.contains('\u{1b}'), "{text}");
+        // A pending branch with an invisible joiner shows it escaped.
+        let v = serde_json::json!({
+            "id": "task-1", "type": "task", "title": "T", "status": "todo",
+            "coordination": {"pending": {"branch": "main\u{34f}", "version": "v1"}},
+        });
+        let text = show_text(&v);
+        assert!(text.contains("  branch: main\\u{34f}"), "{text}");
+        assert!(!text.contains('\u{34f}'), "{text}");
+    }
+
+    #[test]
+    fn ref_mode_drops_only_the_cache_mirror_warnings() {
+        let mut warnings = vec![
+            Diagnostic::warning(Code::SkillMirrorMissing, "missing"),
+            Diagnostic::warning(Code::SkillMirrorManifestMissing, "no manifest"),
+            Diagnostic::warning(Code::SkillLegacyFile, "legacy"),
+        ];
+        drop_cache_mirror_warnings(&mut warnings);
+        let codes: Vec<Code> = warnings.iter().map(|d| d.code).collect();
+        assert_eq!(codes, [Code::SkillLegacyFile]);
+    }
+
     #[test]
     fn repeated_warning_codes_collapse_to_one_line() {
         let w = |code, path: &str| {
@@ -587,5 +694,14 @@ mod tests {
         let (lines, summarised) = warning_lines(&refs[1..2]);
         assert!(!summarised);
         assert_eq!(lines.len(), 2);
+    }
+
+    #[test]
+    fn quiet_hides_warning_notices_only() {
+        let warning = Diagnostic::warning(Code::GraphNoCodeBase, "w");
+        let info = Diagnostic::new(Code::GraphIntents, mdkg_format::Severity::Info, "i");
+        assert!(!notice_shown(Warnings::None, &warning));
+        assert!(notice_shown(Warnings::None, &info));
+        assert!(notice_shown(Warnings::Summary, &warning));
     }
 }

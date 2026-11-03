@@ -94,6 +94,10 @@ fn codes(envelope: &Value) -> Vec<String> {
 
 /// A profile C repository with a committed design and a task in the store.
 fn c_repo(name: &str) -> (Scratch, String) {
+    repo_with_work(name, "local")
+}
+
+fn repo_with_work(name: &str, work: &str) -> (Scratch, String) {
     let dir = std::env::temp_dir().join(format!(
         "mdkg-cli-c-writes-{name}-{}-{}",
         std::process::id(),
@@ -105,7 +109,7 @@ fn c_repo(name: &str) -> (Scratch, String) {
     sh(&dir, &["init", "-q", "-b", "main"]);
     sh(&dir, &["add", "."]);
     sh(&dir, &["commit", "-q", "-m", "start"]);
-    ok(&dir, &["init", "--work", "local"]);
+    ok(&dir, &["init", "--work", work]);
     sh(&dir, &["add", "."]);
     sh(&dir, &["commit", "-q", "-m", "init"]);
     let task = ok(&dir, &["new", "task", "Ship", "the", "thing"]);
@@ -446,6 +450,49 @@ fn a_refused_local_done_is_not_a_completion_fact() {
         );
     }
     assert_ne!(file_status(&repo.0, &id), "done");
+}
+
+/// Terra's code review #10357, minor 1, for a local node: its gate ignores
+/// the node file, so a settle refused after the file is written is
+/// injected (debug builds, `MDKG_FAIL_AFTER=settle`). It records no
+/// completion and no settle, and leaves the lease held; a rerun settles
+/// and completes once, and a third run adds neither.
+#[test]
+fn a_local_settle_refused_after_the_write_recovers_on_a_rerun() {
+    let (repo, id) = c_repo("settle-refused");
+    let scope = scope_of(&id);
+    ok(&repo.0, &["claim", &id]);
+    let store = activity_store(&repo.0);
+    let before = store.activity_cursor().unwrap();
+    let node = mdkg_coord_sqlite::ledger::NodeLink::of(&id).expect("a format 0.7 id");
+    // Not held to the checked-in schemas, which gain the ledger's
+    // `entry.*` codes when they're regenerated at integration.
+    let out = isolated(&mut Command::new(env!("CARGO_BIN_EXE_mdkg")))
+        .arg("--root")
+        .arg(&repo.0)
+        .args(["--as", "lane-a", "done", &id, "--json"])
+        .env("MDKG_FAIL_AFTER", "settle")
+        .output()
+        .expect("run mdkg");
+    let envelope: Value = serde_json::from_slice(&out.stdout).expect("an envelope");
+    assert_ne!(out.status.code(), Some(0), "{envelope}");
+    assert_eq!(codes(&envelope), ["entry.git"], "{envelope}");
+    assert_eq!(file_status(&repo.0, &id), "done", "the file is written");
+    let facts = store.activity_since(&before, "lane-a", 0).unwrap();
+    assert!(facts.done_marks.is_empty(), "no completion");
+    assert!(store.ledger_settles(&node).unwrap().is_empty(), "no settle");
+    assert_eq!(store_rows(&repo.0, &scope).0.len(), 1, "the lease is held");
+    let rerun = ok(&repo.0, &["done", &id]);
+    assert_ne!(rerun["data"]["already_done"], true, "{rerun}");
+    assert_eq!(store.ledger_settles(&node).unwrap().len(), 1);
+    let facts = store.activity_since(&before, "lane-a", 0).unwrap();
+    assert_eq!(facts.done_marks, std::slice::from_ref(&scope));
+    assert!(store_rows(&repo.0, &scope).0.is_empty(), "released");
+    let third = ok(&repo.0, &["done", &id]);
+    assert_eq!(third["data"]["already_done"], true, "{third}");
+    assert_eq!(store.ledger_settles(&node).unwrap().len(), 1);
+    let again = store.activity_since(&facts.through, "lane-a", 0).unwrap();
+    assert!(again.done_marks.is_empty());
 }
 
 #[test]
@@ -1071,5 +1118,132 @@ fn a_loops_scope_refs_are_text() {
     assert!(
         !codes(&out).contains(&"edge.private_target".to_string()),
         "{out}"
+    );
+}
+
+/// Fixed fixture layout only. Production receipt collection will use the CLI's
+/// captured graph configuration; this adapter parses the actual committed node.
+struct CompletionGraph {
+    path: String,
+    roots: Vec<String>,
+}
+
+impl mdkg_run::turn::receipt::tasks::Resolver for CompletionGraph {
+    fn validate(&self, span: &mdkg_run::turn::receipt::GitSpan) -> Result<(), String> {
+        if span
+            .commits
+            .iter()
+            .flat_map(|c| &c.changes)
+            .any(|c| c.path != self.path)
+        {
+            return Err("fixture changed outside the one node".into());
+        }
+        Ok(())
+    }
+
+    fn roots(&self) -> &[String] {
+        &self.roots
+    }
+
+    fn candidate(&self, path: &str) -> bool {
+        path == self.path
+    }
+
+    fn resolve(
+        &self,
+        path: &str,
+        bytes: &[u8],
+    ) -> Result<Option<mdkg_run::turn::receipt::tasks::Task>, String> {
+        use mdkg_format::node::{FormatVersion, ParseOptions, parse_node};
+        let work_status = vec!["backlog".into(), "todo".into(), "done".into()];
+        let options = ParseOptions {
+            work_status: &work_status,
+            priority_min: 0,
+            priority_max: 9,
+            templates: mdkg_format::schema07::schemas(),
+            allow_extension_keys: true,
+            format: FormatVersion::V07,
+        };
+        let text = std::str::from_utf8(bytes).map_err(|e| e.to_string())?;
+        let node = parse_node(text, path, &options).map_err(|e| e.to_string())?;
+        assert_eq!(node.node_type, "task");
+        Ok(Some(mdkg_run::turn::receipt::tasks::Task {
+            key: format!(".mdkg#{}", node.id),
+            done: node.status.as_deref() == Some("done"),
+            metadata: mdkg_run::turn::receipt::tasks::Metadata {
+                node_type: node.node_type,
+                title: node.title,
+            },
+        }))
+    }
+}
+
+#[test]
+fn receipt_lists_native_done_once_when_git_normalizes_its_revision() {
+    use mdkg_run::turn::receipt::{harvest, tasks};
+    let (repo, id) = repo_with_work("receipt-crlf", "shared");
+    let root = &repo.0;
+    let path = file_of(root, &id);
+    let rel = path
+        .strip_prefix(root)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    sh(root, &["config", "core.autocrlf", "true"]);
+    let text = fs::read_to_string(&path).unwrap().replace("\r\n", "\n");
+    fs::write(&path, text.replace('\n', "\r\n")).unwrap();
+    sh(root, &["add", "."]);
+    sh(root, &["commit", "-q", "-m", "task baseline"]);
+    sh(root, &["checkout", "-q", "-b", "completion"]);
+    let head = sh(root, &["rev-parse", "HEAD"]);
+    let store = activity_store(root);
+    let before = store.activity_cursor().unwrap();
+    ok(root, &["done", &id]);
+    let native = store
+        .activity_since(&before, "lane-a", 0)
+        .unwrap()
+        .completions;
+    let pin = mdkg_run::state::Pinned {
+        top: root.clone(),
+        git_dir: root.join(".git"),
+    };
+    let graph = CompletionGraph {
+        path: rel,
+        roots: vec![".mdkg".into()],
+    };
+    let evidence = tasks::collect(&pin, &harvest(&pin, Some(&head)).unwrap(), &graph).unwrap();
+    let committed = &evidence.completed;
+    assert_eq!(native.len(), 1);
+    assert_eq!(committed.len(), 1);
+    assert_eq!(native[0].node, committed[0].node);
+    assert_eq!(
+        native[0].revision,
+        mdkg_format::Digest::of_bytes(&fs::read(&path).unwrap()).to_string()
+    );
+    assert_ne!(
+        native[0].revision, committed[0].revision,
+        "real native CRLF fact differs from the committed LF blob"
+    );
+    assert_eq!(
+        mdkg_coord_sqlite::completions_for_receipt(&native, committed).len(),
+        2
+    );
+    assert!(
+        !evidence.metadata.contains_key(&native[0]),
+        "no guessed CRLF metadata"
+    );
+    assert_eq!(evidence.metadata[&committed[0]].node_type, "task");
+    let rendered = tasks::render_completed(&native, committed, &evidence.metadata).unwrap();
+    assert_eq!(rendered.matches(&id).count(), 1, "{rendered}");
+    assert_eq!(rendered.lines().count(), 6);
+    let entry: serde_json::Value =
+        serde_json::from_str(rendered.lines().nth(4).unwrap().strip_prefix("- ").unwrap()).unwrap();
+    assert_eq!(entry["labels"].as_array().unwrap().len(), 2);
+    assert!(
+        entry["labels"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!({"type":"unknown","title":"unknown"}))
     );
 }

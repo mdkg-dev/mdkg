@@ -1,6 +1,6 @@
 [package]
 name = "mdkg"
-version = "0.7.0"
+version = "0.7.1"
 description = "Local-first knowledge graph and coordination kernel for humans and coding agents"
 edition.workspace = true
 license.workspace = true
@@ -17,13 +17,22 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
-mdkg-coord = { path = "../mdkg-coord", version = "0.7.0" }
-mdkg-coord-sqlite = { path = "../mdkg-coord-sqlite", version = "0.7.0" }
-mdkg-log = { path = "../mdkg-log", version = "0.7.0" }
-mdkg-format = { path = "../mdkg-format", version = "0.7.0" }
-mdkg-graph = { path = "../mdkg-graph", version = "0.7.0" }
-mdkg-index = { path = "../mdkg-index", version = "0.7.0" }
-mdkg-run = { path = "../mdkg-run", version = "0.7.0" }
+mdkg-coord = { path = "../mdkg-coord", version = "0.7.1" }
+mdkg-coord-sqlite = { path = "../mdkg-coord-sqlite", version = "0.7.1" }
+mdkg-log = { path = "../mdkg-log", version = "0.7.1" }
+mdkg-format = { path = "../mdkg-format", version = "0.7.1" }
+# The ref-mode probe reads a refused repository's common config through
+# its isolated config parser (orchestrator #11014).
+mdkg-git = { path = "../mdkg-git", version = "0.7.1" }
+mdkg-graph = { path = "../mdkg-graph", version = "0.7.1" }
+mdkg-index = { path = "../mdkg-index", version = "0.7.1" }
+# The operation registry, and the backend trait serve runs requests through.
+mdkg-ops = { path = "../mdkg-ops", version = "0.7.1" }
+mdkg-run = { path = "../mdkg-run", version = "0.7.1" }
+# serve: its lock and state files and the socket's peer checks, and the
+# HTTP/1.1 codec it shares with the client.
+mdkg-serve = { path = "../mdkg-serve", version = "0.7.1" }
+mdkg-wire = { path = "../mdkg-wire", version = "0.7.1" }
 # doctor reads the coordinator store's version read-only, never upgrading it;
 # migrate snapshots the store with SQLite's backup API.
 rusqlite.workspace = true
@@ -32,6 +41,10 @@ rustix.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# A long-running `agents up` drains on SIGTERM, and `msg watch` closes on
+# SIGINT or SIGTERM: the workspace forbids unsafe code, and signal-hook's flag
+# registration is a safe API. No features.
+signal-hook = { version = "=0.3.18", default-features = false }
 # doctor reads the Codex MCP config.
 toml_edit.workspace = true
 # init mints the graph's graph_id.

@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "mdkg.run.fault.v1",
+  "description": "A fault's data part (a-flow A26): the `data` of the `kind: \"data\"` part\nof a `fault` message from `mdkg:supervisor`. It names no changed path\nand quotes no mail body or harness output.",
+  "type": "object",
+  "properties": {
+    "schema": {
+      "const": "mdkg.run.fault.v1"
+    },
+    "fault_id": {
+      "description": "The occurrence's id (a UUID), derived from what it reports, so a\nresend is the same occurrence; its copies are\n`fault.<fault_id>.r<k>`.",
+      "type": "string"
+    },
+    "agent": {
+      "type": "string"
+    },
+    "code": {
+      "description": "The error code, such as `run.agent_failed`.",
+      "type": "string"
+    },
+    "message": {
+      "description": "The code's own one-line summary, never an error's free text.",
+      "type": "string"
+    },
+    "turn_id": {
+      "description": "The turn that ended in the error, for a turn's fault.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "supervisor_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "nodes": {
+      "description": "The nodes the agent holds leases on.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "worktree": {
+      "description": "The agent's worktree, when it could be read.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/FaultWorktree"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "first_at": {
+      "description": "When the first occurrence of this agent and code that is still open\nwas sent, RFC 3339 UTC.",
+      "type": "string"
+    },
+    "count": {
+      "description": "How many occurrences of this agent and code the open fault stands\nfor: one more each time a new one supersedes it.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 1
+    },
+    "clears": {
+      "description": "What clears it.",
+      "type": "string"
+    },
+    "suggested": {
+      "description": "One command to run next.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema",
+    "fault_id",
+    "agent",
+    "code",
+    "message",
+    "turn_id",
+    "supervisor_id",
+    "nodes",
+    "worktree",
+    "first_at",
+    "count",
+    "clears",
+    "suggested"
+  ],
+  "$defs": {
+    "FaultWorktree": {
+      "description": "A fault's worktree: whether it holds uncommitted changes and how many\npaths, never which.",
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "dirty": {
+          "type": "boolean"
+        },
+        "changed": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "path",
+        "dirty",
+        "changed"
+      ]
+    }
+  }
+}

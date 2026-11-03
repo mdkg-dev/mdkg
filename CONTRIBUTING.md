@@ -7,20 +7,40 @@ Thanks for helping. mdkg is a Rust workspace, pinned to the toolchain in
 
 ```sh
 cargo build
-cargo test --workspace
+cargo nextest run --workspace
+cargo test --workspace --doc
 scripts/check.sh
 ```
+
+The tests run on [cargo-nextest](https://nexte.st): install it with
+`brew install cargo-nextest` (or `cargo install cargo-nextest --locked`).
+It runs each test in its own process and every binary's tests in one pool,
+so a slow binary no longer holds up the ones after it; the profile in
+`.config/nextest.toml` keeps going after a failure and kills a test that
+runs three minutes without finishing. nextest runs no doctests, so run
+those with `cargo test --doc`.
+
+The repository's `affected` rules cover every source file. When adding or
+moving one, keep its test-selection rule current; unmapped paths fall back to
+the full selection. See [scoping test runs](docs/affected.md).
 
 `scripts/check.sh` is the gate CI runs. It runs:
 - `cargo fmt --check`;
 - clippy with warnings as errors;
-- the tests;
+- the tests on cargo-nextest, then the doctests on `cargo test --doc`;
 - with mdkg 0.6.0 installed, the checks that 0.6.0 still reads what 0.7
   reads from 0.6 graphs. Point `MDKG_NODE24` at Node 24 and `MDKG_TS_CLI`
   at 0.6.0's `dist/cli.js`; otherwise they're skipped.
 
 The tests need git 2.41 or later, and a git identity (`user.name` and
 `user.email`) for the commits they make in temporary repositories.
+
+On Linux, building needs `pkg-config` and the libudev headers
+(`libudev-dev` on Debian and Ubuntu, `systemd-devel` on Fedora): the
+FIDO2 transport in `crates/mdkg-presence` builds against libudev. CI
+installs them on its Ubuntu leg. The tests use a fake security key, so
+none needs a real one. Using a real key on Linux needs a udev rule that
+gives your user that key's hidraw device alone, as the README says.
 
 ## Where things are
 

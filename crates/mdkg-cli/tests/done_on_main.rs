@@ -375,7 +375,8 @@ fn main_moving_while_landed_is_checked_still_conflicts() {
     sh(&wt, &["commit", "-q", "-am", "mine"]);
     sh(&repo, &["merge", "-q", "--no-ff", "--no-edit", "b"]);
     // A git on PATH that, when done checks main's history for the node,
-    // first lands someone's unseen edit on main and has it observed.
+    // first lands someone's unseen edit on main and has status record its
+    // observation through the separate zero-wait writer.
     let real = String::from_utf8(
         Command::new("sh")
             .args(["-c", "command -v git"])

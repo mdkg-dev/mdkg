@@ -1,0 +1,9 @@
+{
+  "name": "14-reattach-across-turns",
+  "scenario": "reattach_across_turns",
+  "transports": [
+    "cli"
+  ],
+  "checks": "From an idle agent's follow_from, a turn that starts before the follow attaches and a later one both arrive in number order with no gap; the same from turn:1 for an agent that has never run, whose first turn ends before the follow attaches; an agent.state frame arrives first.",
+  "cli_driver": "crates/mdkg-cli/tests/agents.rs: conformance_14_re_attach_across_turns_and_before_the_first"
+}

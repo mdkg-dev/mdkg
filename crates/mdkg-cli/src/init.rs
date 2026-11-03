@@ -22,9 +22,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::io::{IsTerminal, Read, Write};
-use std::path::Path;
-#[cfg(test)]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Args, ValueEnum};
 use mdkg_format::node::FormatVersion;
@@ -54,6 +52,44 @@ pub const WORKFLOW_SKILL: &str = include_str!("workflow_skill.md");
 pub const WORKFLOW_PATH: &str = ".mdkg/skills/mdkg-workflow/SKILL.md";
 pub const README_PATH: &str = ".mdkg/README.md";
 pub const INIT_README: &str = include_str!("init_readme.md");
+/// Ref mode's "Start agents" section, in place of the checkout's.
+const REF_START: &str = include_str!("init_readme_ref.md");
+
+/// The guide ref mode commits to the graph ref: [`INIT_README`] with its
+/// "Start agents" section (a graph checkout, merges into `main`) replaced
+/// by ref mode's (publishes to the graph ref, no merge), and its skill
+/// steps replaced: in ref mode install refreshes the mirrors from the
+/// graph ref, and `skills sync` and `skills add` refuse there.
+pub fn ref_readme() -> String {
+    const REPLACED: [(&str, &str); 3] = [
+        ("\nmdkg skills sync\nmdkg doctor\n", "\nmdkg doctor\n"),
+        (
+            "Edit canonical skills in\n`.mdkg/skills/`, then run `mdkg skills sync` to refresh \
+             the enabled mirrors.\n",
+            "Canonical skills are in\n`.mdkg/skills/` on the graph ref, not in this checkout. \
+             `mdkg install`\nrefreshes the enabled mirrors from the graph ref; `mdkg skills \
+             sync` refuses\nhere.\n",
+        ),
+        (
+            "With\n`--graph-only`, the skill is omitted; add it later with\n`mdkg skills add \
+             mdkg-workflow`.\n",
+            "With\n`--graph-only`, the skill is omitted; in ref mode `mdkg skills add` refuses, \
+             so\nleave `--graph-only` off to keep it.\n",
+        ),
+    ];
+    let mut guide = INIT_README.to_owned();
+    for (from, to) in REPLACED {
+        assert!(guide.contains(from), "the guide has {from:?}");
+        guide = guide.replacen(from, to, 1);
+    }
+    let start = guide
+        .find("## Start agents\n")
+        .expect("the guide has a Start agents section");
+    let end = guide
+        .find("## Work with the graph\n")
+        .expect("the guide has a Work with the graph section");
+    format!("{}{REF_START}\n{}", &guide[..start], &guide[end..])
+}
 
 /// The folders init stages files in.
 const STAGED_IN: [&str; 3] = [".", ".mdkg", ".mdkg/skills"];
@@ -126,6 +162,18 @@ pub struct InitArgs {
     /// Show what would change and write nothing.
     #[arg(long)]
     pub dry_run: bool,
+    /// In ref mode (`mdkg.graph.ref` set), write `.mdkg/` into this
+    /// checkout as 0.7.0 did, instead of creating the graph ref.
+    #[arg(long)]
+    pub in_checkout: bool,
+    /// Start a new graph even though a fetched ref (any
+    /// `refs/remotes/...` whose tip has a committed `.mdkg/config.json`)
+    /// may hold this repository's graph, or git couldn't check. Without
+    /// it, init refuses; for a graph it found, it names both ways to get
+    /// it: merge the team's default branch (checkout mode) or `install`
+    /// (ref mode).
+    #[arg(long)]
+    pub new_graph: bool,
     /// Print JSON.
     #[arg(long)]
     pub json: bool,
@@ -191,6 +239,10 @@ pub struct InitData {
     /// Each file init wrote, or would write with `--dry-run` (named as
     /// install and skills sync name theirs).
     pub changes: Vec<InitFile>,
+    /// In ref mode, the graph ref the files were committed to; the
+    /// checkout is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub graph_ref: Option<String>,
     pub dry_run: bool,
     /// Whether the folder is inside a git repository; coordination needs
     /// one.
@@ -205,18 +257,29 @@ pub fn run(root: &Path, args: &InitArgs) -> u8 {
     let report = init(root, args).unwrap_or_else(Report::failed);
     output::emit("init", args.json, report, |d| {
         if d.already {
+            // A rerun can still finish or preview a step (the exclusion):
+            // its notes say what changed or would.
+            let rest = if d.notes.is_empty() {
+                "; nothing to do"
+            } else {
+                ""
+            };
             println!(
-                "{} already has graph {} ({} work); nothing to do",
+                "{} already has graph {} ({} work){rest}",
                 output::shown_path(&d.root),
                 d.graph_id,
                 d.work
             );
+            for note in &d.notes {
+                println!("  {}", output::shown(note));
+            }
             return;
         }
-        let (wrote, updated) = if d.dry_run {
-            ("would write", "would update")
-        } else {
-            ("wrote", "updated")
+        let (wrote, updated) = match (d.dry_run, d.graph_ref.is_some()) {
+            (true, false) => ("would write", "would update"),
+            (false, false) => ("wrote", "updated"),
+            (true, true) => ("would commit", "would commit"),
+            (false, true) => ("committed", "committed"),
         };
         for f in &d.changes {
             let verb = match f.action {
@@ -224,7 +287,11 @@ pub fn run(root: &Path, args: &InitArgs) -> u8 {
                 FileAction::Updated => updated,
                 FileAction::Kept => "kept",
             };
-            println!("{verb} {}", output::shown_path(&f.path));
+            match &d.graph_ref {
+                // A path on the graph ref, not in this checkout.
+                Some(r) => println!("{verb} {} to {r}", f.path),
+                None => println!("{verb} {}", output::shown_path(&f.path)),
+            }
         }
         println!(
             "{} graph {} ({} work: work.location {})",
@@ -264,9 +331,22 @@ fn init_observed(
     // runs, then init's stricter ones for what it writes.
     check_pattern("--branch-pattern", args.branch(), init_branch_problem)?;
     check_pattern("--worktree-pattern", args.worktree(), init_worktree_problem)?;
+    // Ref mode: the graph is created on the graph ref, never in a checkout
+    // (edd-01a18867, "Creating a graph without a checkout").
+    if !args.in_checkout && in_git(root) {
+        // Init may create `root`: ask git from the nearest folder that
+        // exists, which is in the same repository.
+        let probe = root.ancestors().find(|d| d.is_dir()).unwrap_or(root);
+        let graph = mdkg_graph::graphref::resolve(probe)
+            .map_err(|e| crate::coord::graph_git::graph_error(e.code, e.message))?;
+        if let Some(graph) = graph {
+            return init_ref(root, args, &graph);
+        }
+    }
     if config::has_config(root) {
         return existing(root, args);
     }
+    refuse_fork(root, args)?;
     // One init at a time per folder, held until it's done: two at once
     // could publish each other's files. A stop releases it.
     let locked = if args.dry_run {
@@ -384,12 +464,502 @@ fn init_observed(
         agents: false,
         mcp_command: None,
         changes: files,
+        graph_ref: None,
         dry_run: args.dry_run,
         git,
         notes,
         next,
     })
     .with(warnings))
+}
+
+/// `node edit`'s copies stay out of git in ref mode, as `install --setup`
+/// leaves it (B18): adds the exclusion once, and a dry run says it would.
+fn exclude_edit(top: &Path, dry_run: bool, notes: &mut Vec<String>) -> Result<(), GraphError> {
+    use crate::run::setup;
+    let common = crate::coord::graph_git::git::common_dir(top).map_err(crate::coord::git_error)?;
+    let edit = setup::EDIT_IGNORE;
+    let file = common.join("info/exclude");
+    if dry_run {
+        if !setup::excluded(top, edit)? {
+            notes.push(format!("init would add {edit} to {}", file.display()));
+        }
+    } else if setup::exclude(top, &common, edit)? {
+        notes.push(format!("{edit} added to {}", file.display()));
+    }
+    Ok(())
+}
+
+/// Ref mode's init: the graph's first commit on an orphan graph ref (the
+/// config with its identity, the setup README and, unless
+/// `--graph-only`, the workflow skill; never `.mdkg/graph.json`),
+/// validated strictly, then published by a create compare-and-swap. The
+/// clone's identity record (`mdkg.graph.<graph_id>.ref`) follows. No file
+/// appears in any checkout, and no code branch changes. A graph ref that
+/// already exists is reported as the existing graph, and its identity
+/// recorded when the clone has none yet.
+fn init_ref(
+    root: &Path,
+    args: &InitArgs,
+    graph: &mdkg_graph::graphref::GraphRef,
+) -> Result<Report<InitData>, GraphError> {
+    use crate::coord::graph_git::graph_error;
+    use mdkg_graph::refwrite::{self, Change, LockKind, LockMode, Request};
+    let from_ref = |e: mdkg_graph::graphref::Error| graph_error(e.code, e.message);
+    let from_write = |e: refwrite::Error| graph_error(e.code(), e.to_string());
+    // Nothing is written at `root` in ref mode, and it may not exist yet:
+    // git runs from the nearest folder that does.
+    let at = root.ancestors().find(|d| d.is_dir()).unwrap_or(root);
+    let top = crate::coord::graph_git::git::toplevel(at).map_err(crate::coord::git_error)?;
+    // A creation that didn't finish (a crash, a failed write) resumes with
+    // its own id rather than minting another (g-core, Opus #8345).
+    let pending = graph
+        .pending_creation()
+        .map_err(from_ref)?
+        .filter(|(_, root, dir)| root.is_empty() && dir == ".mdkg")
+        .map(|(id, _, _)| id);
+    match mdkg_graph::graphref::tip(&top, graph) {
+        Ok(tip) => {
+            let authority = mdkg_graph::graphref::authority_at(&top, &tip).map_err(from_ref)?;
+            let completing = pending.as_deref() == Some(authority.graph_id.as_str());
+            if completing && !args.dry_run {
+                // Published before a crash: record the identity now.
+                graph.complete_creation(&top).map_err(from_ref)?;
+            } else if !completing {
+                // Recording a graph ref this init didn't create is
+                // adoption, which is install's (`mdkg install`).
+                graph
+                    .check_identity(&authority.graph_id)
+                    .map_err(from_ref)?;
+            }
+            let raw = authority.config.clone();
+            let cfg = config::from_snapshot(authority.config)?;
+            let mut report = existing_graph(root, args, cfg, &raw)?;
+            // A retry after a crash between publication and the exclusion
+            // finishes it.
+            if let Some(data) = report.data.as_mut() {
+                exclude_edit(&top, args.dry_run, &mut data.notes)?;
+            }
+            if completing
+                && args.dry_run
+                && let Some(data) = report.data.as_mut()
+            {
+                data.notes.push(format!(
+                    "a creation of graph {} published before it finished; init would complete it \
+                     (record this clone's identity)",
+                    authority.graph_id
+                ));
+            }
+            return Ok(report);
+        }
+        // A creation this clone started resumes; anything else would
+        // fork a graph the clone fetched.
+        Err(e) if e.code == "graph.ref_missing" => {
+            if pending.is_none() {
+                refuse_fork(root, args)?;
+            }
+        }
+        Err(e) => return Err(from_ref(e)),
+    }
+    let work = match args.work {
+        Some(p) => p,
+        None if !args.json && !args.dry_run && interactive() => ask_work()?,
+        None => Work::default(),
+    };
+    let graph_id = pending.unwrap_or_else(|| uuid::Uuid::now_v7().hyphenated().to_string());
+    let mut planned: Vec<(&str, String)> = Vec::new();
+    if !args.graph_only {
+        planned.push((WORKFLOW_PATH, WORKFLOW_SKILL.into()));
+    }
+    planned.push((README_PATH, ref_readme()));
+    planned.push((CONFIG_PATH, config_text(&graph_id, work, args)));
+    let files: Vec<InitFile> = planned
+        .iter()
+        .map(|(path, _)| InitFile {
+            path: (*path).into(),
+            action: FileAction::Created,
+        })
+        .collect();
+    if !args.dry_run {
+        let repo = crate::coord::Repo::open(at)?;
+        let actor = repo.actor(None);
+        let clone = repo
+            .store()?
+            .store_id()
+            .map_err(crate::coord::store_error)?;
+        // The creator records a durable creation intent first, so a crash
+        // anywhere below is finished by the next init.
+        let writer = graph
+            .creator(&top, LockMode::Local, &graph_id, "")
+            .map_err(from_ref)?;
+        let request = Request {
+            id: format!("init-{graph_id}"),
+            base: None,
+            changes: planned
+                .iter()
+                .map(|(path, text)| Change::Put {
+                    path: (*path).into(),
+                    bytes: text.clone().into_bytes(),
+                })
+                .collect(),
+            message: format!("init {graph_id}"),
+            trailers: vec![("Mdkg-Actor".into(), actor), ("Mdkg-Clone".into(), clone)],
+        };
+        let lock = writer.lock(LockKind::Exclusive).map_err(from_write)?;
+        let prepared = writer.prepare(&lock, &request).map_err(from_write)?;
+        // Strictly valid before anything can read it as authority.
+        let checked = mdkg_graph::committed::load_strict(&top, &prepared.commit, "", &graph_id);
+        if let Err(e) = checked {
+            writer.unpin(&lock, &prepared).ok();
+            return Err(e);
+        }
+        writer.publish(&lock, &prepared).map_err(from_write)?;
+        writer.unpin(&lock, &prepared).map_err(from_write)?;
+        drop(lock);
+        graph.complete_creation(&top).map_err(from_ref)?;
+    }
+    let mut notes = vec![format!(
+        "the graph lives on {}, and this checkout is unchanged; read its setup guide with \
+         `git show {}`",
+        graph.name,
+        shell_word(&format!("{}:{README_PATH}", graph.name))
+    )];
+    exclude_edit(&top, args.dry_run, &mut notes)?;
+    Ok(Report::ok(InitData {
+        root: root.display().to_string(),
+        graph_id,
+        work: work.label().into(),
+        work_location: work.location().into(),
+        profile: work.legacy_profile().into(),
+        work_committed: work.committed().into(),
+        orchestration: Orchestration {
+            branch: args.branch().into(),
+            worktree: args.worktree().into(),
+        },
+        already: false,
+        agents: false,
+        mcp_command: None,
+        changes: files,
+        graph_ref: Some(graph.name.clone()),
+        dry_run: args.dry_run,
+        git: true,
+        notes,
+        next: vec![
+            format!("{BIN} doctor"),
+            format!("{BIN} new goal \"...\""),
+            format!("{BIN} new task \"...\" --status todo"),
+            format!("{BIN} next"),
+        ],
+    }))
+}
+
+/// What the clone's remote-tracking refs say about a graph it hasn't
+/// adopted: none, one (`refs/remotes/...` whose tip has a committed
+/// config, origin's `mdkg-graph` first), or git couldn't say.
+pub(crate) enum Fetched {
+    None,
+    /// A fetched graph: `graph`, the ref a ref-mode clone would adopt
+    /// (else the default branch), and `default`, a remote's default branch
+    /// holding the graph, the branch a checkout-mode team merges.
+    Graph {
+        graph: String,
+        default: Option<String>,
+    },
+    Unknown,
+}
+
+/// The ref personal setup adopts, the only one a hint names a command for.
+const PERSONAL_REF: &str = "refs/remotes/origin/mdkg-graph";
+
+impl Fetched {
+    /// How to adopt it: personal setup for origin's `mdkg-graph`; for any
+    /// other ref, which setup fits isn't certain, so install's help.
+    fn adopt(refname: Option<&str>) -> String {
+        if refname == Some(PERSONAL_REF) {
+            format!("run `{BIN} install --setup personal`")
+        } else {
+            format!(
+                "adopt it with `{BIN} install --setup <personal|professional>` (see `{BIN} install \
+                 --help` for the setup whose remote and branch hold it)"
+            )
+        }
+    }
+}
+
+/// `value` as one shell word: as it is when plain, else single-quoted, so
+/// a ref or remote name pasted from a hint runs nothing.
+fn shell_word(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_./:@%+=,-".contains(&b))
+    {
+        value.into()
+    } else {
+        format!("'{}'", value.replace('\'', "'\"'\"'"))
+    }
+}
+
+/// The fetched graph at `root`'s repository: any remote-tracking ref whose
+/// tip has a committed config, since any of them may be the graph this
+/// clone should adopt, at the repository's top or at `root`. Only a folder
+/// git places in no repository has
+/// none; a repository git can't list or read, a ref name that isn't
+/// UTF-8, or a tree that isn't local is [`Fetched::Unknown`], so init
+/// fails closed. `ls-tree` reads trees only, so a config whose blob a
+/// partial clone hasn't fetched still counts.
+pub(crate) fn fetched_graph(root: &Path) -> Fetched {
+    let Some(at) = root.ancestors().find(|d| d.is_dir()) else {
+        return Fetched::None;
+    };
+    let git = |args: &[&str]| {
+        crate::coord::graph_git::git::command(at)
+            .args(args)
+            .run(None)
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| o.stdout)
+    };
+    // With a `.git` here or above, a failed probe is a repository git
+    // can't inspect, never the absence of one.
+    if !in_git(at) && git(&["rev-parse", "--git-dir"]).is_none() {
+        return Fetched::None;
+    }
+    let Some(listed) = git(&[
+        "for-each-ref",
+        "--format=%(refname)%00%(symref)",
+        "refs/remotes",
+    ])
+    .and_then(|out| String::from_utf8(out).ok()) else {
+        return Fetched::Unknown;
+    };
+    // A remote's symbolic `HEAD` (exactly `refs/remotes/<remote>/HEAD`)
+    // names its default branch, listed on its own; any other ref, such as
+    // a branch `feature/HEAD`, is probed.
+    let mut refs = Vec::new();
+    let mut defaults = Vec::new();
+    for line in listed.lines().filter(|l| !l.is_empty()) {
+        let Some((name, target)) = line.split_once('\0') else {
+            return Fetched::Unknown;
+        };
+        let remote_head = name
+            .strip_prefix("refs/remotes/")
+            .and_then(|rest| rest.strip_suffix("/HEAD"))
+            .is_some_and(|remote| !remote.is_empty() && !remote.contains('/'));
+        if remote_head && !target.is_empty() {
+            defaults.push(target);
+        } else {
+            refs.push(name);
+        }
+    }
+    if refs.is_empty() {
+        return Fetched::None;
+    }
+    // Default branches first, then personal setup's ref.
+    refs.sort_by_key(|r| (!defaults.contains(r), *r != PERSONAL_REF));
+    // The configs a second graph would collide with: the repository top's
+    // and the selected root's (`services/api/.mdkg/config.json`), as
+    // paths from the top.
+    let Some(prefix) = git(&["rev-parse", "--show-prefix"])
+        .and_then(|out| String::from_utf8(out).ok())
+        .map(|p| p.trim_end_matches('\n').to_owned())
+    else {
+        return Fetched::Unknown;
+    };
+    let mut nested = prefix;
+    for part in root.strip_prefix(at).unwrap_or(Path::new("")).components() {
+        match part {
+            std::path::Component::Normal(name) => match name.to_str() {
+                Some(name) => {
+                    nested.push_str(name);
+                    nested.push('/');
+                }
+                None => return Fetched::Unknown,
+            },
+            std::path::Component::CurDir => {}
+            _ => return Fetched::Unknown,
+        }
+    }
+    let nested = format!("{nested}{CONFIG_PATH}");
+    let mut paths = vec![CONFIG_PATH];
+    if nested != CONFIG_PATH {
+        paths.push(&nested);
+    }
+    // A default branch is the code a checkout-mode team merges only when
+    // it holds code as well as the graph and isn't the configured graph
+    // remote's ref: a graph remote whose host made `mdkg-graph` its
+    // default branch is a graph ref like any other.
+    let configured = mdkg_graph::graphref::resolve(at)
+        .ok()
+        .flatten()
+        .and_then(|g| g.remote)
+        .map(|r| {
+            let branch = r
+                .remote_ref
+                .strip_prefix("refs/heads/")
+                .unwrap_or(&r.remote_ref);
+            format!("refs/remotes/{}/{branch}", r.name)
+        });
+    let top = git(&["rev-parse", "--show-toplevel"])
+        .and_then(|out| String::from_utf8(out).ok())
+        .map(|t| PathBuf::from(t.trim_end_matches('\n')));
+    let folders: Vec<String> = paths
+        .iter()
+        .filter_map(|p| p.strip_suffix("/config.json").map(str::to_owned))
+        .collect();
+    // The folders the ref's own graph owns (its config's workspaces and
+    // subgraphs too), else the root's and the selected root's; a config
+    // that can't be read proves no code.
+    // A top-level config listed but unreadable (a blob a blobless clone
+    // hasn't fetched) proves no code either.
+    let code_default = |r: &str, top_config: bool| {
+        configured.as_deref() != Some(r)
+            && top.as_deref().is_some_and(|top| {
+                let owned = match crate::run::setup::committed_graph_paths(top, r) {
+                    Ok(Some(owned)) => owned,
+                    Ok(None) if !top_config => folders.clone(),
+                    Ok(None) | Err(_) => return false,
+                };
+                crate::run::setup::full_shape(top, r, &owned).unwrap_or(false)
+            })
+    };
+    // Every default branch is checked before any other ref (they sort
+    // first), so a graph-only default hides no later code default.
+    let mut default = None;
+    let mut graph = None;
+    for r in refs {
+        // `--full-tree`: the paths are from the repository's top, whichever
+        // folder git runs in. `--literal-pathspecs`: a folder name is a
+        // name, so `:api` or `*` is no pathspec magic. Only a file entry
+        // is a config.
+        let mut args = vec!["--literal-pathspecs", "ls-tree", "--full-tree", r, "--"];
+        args.extend(&paths);
+        let Some(entries) = git(&args) else {
+            return Fetched::Unknown;
+        };
+        if entries
+            .split(|b| *b == b'\n')
+            .any(|e| e.split(|b| *b == b' ').nth(1) == Some(b"blob"))
+        {
+            if !defaults.contains(&r) {
+                return Fetched::Graph {
+                    graph: graph.unwrap_or(r).to_owned(),
+                    default,
+                };
+            }
+            let top_config = entries.split(|b| *b == b'\n').any(|e| {
+                e.split(|b| *b == b'\t').nth(1) == Some(CONFIG_PATH.as_bytes())
+                    && e.split(|b| *b == b' ').nth(1) == Some(b"blob")
+            });
+            if code_default(r, top_config) {
+                default.get_or_insert_with(|| r.to_owned());
+            } else {
+                graph.get_or_insert(r);
+            }
+        }
+    }
+    match (graph, default) {
+        (Some(g), default) => Fetched::Graph {
+            graph: g.to_owned(),
+            default,
+        },
+        (None, Some(d)) => Fetched::Graph {
+            graph: d.clone(),
+            default: Some(d),
+        },
+        (None, None) => Fetched::None,
+    }
+}
+
+impl Fetched {
+    /// Both ways to get the graph, since a fetched graph doesn't say which
+    /// mode the team uses: a checkout-mode team merges it into its code,
+    /// so a branch that predates it switches to or merges the default
+    /// branch; a ref-mode team keeps it on a ref, which install adopts.
+    /// With no `graph` (git couldn't say), install's help.
+    fn routes(graph: Option<&str>, default: Option<&str>) -> String {
+        let branch = match default {
+            Some(d) => {
+                // `refs/remotes/<remote>/<branch>`: a remote HEAD's
+                // remote has no `/`, so the rest is the branch.
+                let short = d
+                    .strip_prefix("refs/remotes/")
+                    .and_then(|rest| rest.split_once('/'))
+                    .map_or(d, |(_, b)| b);
+                let d = shell_word(d);
+                format!(
+                    "merge {d} (`git merge {d}`), or switch to {} once it's up to date with {d}",
+                    shell_word(short)
+                )
+            }
+            None => "switch to or merge your team's default branch".to_owned(),
+        };
+        format!(
+            "if your team merges the graph into its code (checkout mode), {branch}; if it keeps \
+             the graph on a ref of its own (ref mode), {}",
+            Fetched::adopt(graph)
+        )
+    }
+
+    /// The ref named as found: the default branch when it holds the graph.
+    fn found<'a>(graph: &'a str, default: Option<&'a str>) -> &'a str {
+        default.unwrap_or(graph)
+    }
+}
+
+/// The hint for a folder with no config: adopt the fetched graph if the
+/// clone has one, else start a graph or look elsewhere.
+pub(crate) fn missing_config_hint(root: &Path) -> String {
+    match fetched_graph(root) {
+        Fetched::None => {
+            format!("run from the repository root, pass --root <path>, or run `{BIN} init`")
+        }
+        Fetched::Graph { graph, default } => format!(
+            "this clone fetched a graph on {}, which it hasn't adopted (`{BIN} init` would start \
+             a second graph): {}",
+            shell_word(Fetched::found(&graph, default.as_deref())),
+            Fetched::routes(Some(&graph), default.as_deref())
+        ),
+        Fetched::Unknown => format!(
+            "run from the repository root or pass --root <path>; git couldn't list this clone's \
+             fetched refs, so check `git for-each-ref refs/remotes` for a graph before `{BIN} \
+             init --new-graph`: {}",
+            Fetched::routes(None, None)
+        ),
+    }
+}
+
+/// Init starts no second graph beside a fetched one unless `--new-graph`
+/// asks for it: the clone's first step is adopting the graph. When git
+/// can't say, init refuses too.
+fn refuse_fork(root: &Path, args: &InitArgs) -> Result<(), GraphError> {
+    if args.new_graph {
+        return Ok(());
+    }
+    let (message, hint) = match fetched_graph(root) {
+        Fetched::None => return Ok(()),
+        Fetched::Graph { graph, default } => (
+            format!(
+                "{} holds a graph of this repository, and init would start a second one",
+                shell_word(Fetched::found(&graph, default.as_deref()))
+            ),
+            format!(
+                "{}; or `{BIN} init --new-graph` to start another graph anyway",
+                Fetched::routes(Some(&graph), default.as_deref())
+            ),
+        ),
+        Fetched::Unknown => (
+            "git couldn't list this clone's fetched refs, so init can't tell whether it would \
+             start a second graph"
+                .to_owned(),
+            format!(
+                "check `git for-each-ref refs/remotes` for a graph: {}; or run `{BIN} init \
+                 --new-graph` to start one anyway",
+                Fetched::routes(None, None)
+            ),
+        ),
+    };
+    Err(GraphError::usage(Code::InitGraphFetched, message).with_hint(hint))
 }
 
 /// A folder that has a config: a no-op for the same 0.7 graph, and a
@@ -401,6 +971,21 @@ fn existing(root: &Path, args: &InitArgs) -> Result<Report<InitData>, GraphError
         ));
         e
     })?;
+    let raw: Value = std::fs::read_to_string(root.join(CONFIG_PATH))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or(Value::Null);
+    existing_graph(root, args, cfg, &raw)
+}
+
+/// [`existing`] for a config already read (a checkout's, or the graph
+/// ref's).
+fn existing_graph(
+    root: &Path,
+    args: &InitArgs,
+    cfg: config::Config,
+    raw: &Value,
+) -> Result<Report<InitData>, GraphError> {
     if cfg.format == FormatVersion::Legacy {
         return Err(GraphError::usage(
             Code::InitNeedsMigrate,
@@ -411,10 +996,6 @@ fn existing(root: &Path, args: &InitArgs) -> Result<Report<InitData>, GraphError
             "`{BIN} migrate --dry-run` plans its move to 0.7 (docs/migrating-from-0.6.md)"
         )));
     }
-    let raw: Value = std::fs::read_to_string(root.join(CONFIG_PATH))
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or(Value::Null);
     let text = |ptr: &str, default: &str| {
         raw.pointer(ptr)
             .and_then(Value::as_str)
@@ -464,6 +1045,7 @@ fn existing(root: &Path, args: &InitArgs) -> Result<Report<InitData>, GraphError
         agents: false,
         mcp_command: None,
         changes: Vec::new(),
+        graph_ref: None,
         dry_run: args.dry_run,
         git: in_git(root),
         notes: Vec::new(),
@@ -893,7 +1475,8 @@ fn stage(dir: &Folder, name: &OsStr, rel: &str, content: &str) -> Result<OsStrin
         name.to_string_lossy(),
         &run[20..]
     ));
-    let mut f = at::create_file(&dir.fd, &tmp).map_err(|e| write_failed(rel, &e))?;
+    // Project files are committed: the umask's mode, not 0600 (e2e S7).
+    let mut f = at::create_public_file(&dir.fd, &tmp).map_err(|e| write_failed(rel, &e))?;
     f.write_all(content.as_bytes())
         .and_then(|()| f.sync_all())
         .map_err(|e| {
@@ -1176,6 +1759,21 @@ mod tests {
     }
 
     #[test]
+    fn adoption_hints_quote_what_a_shell_would_read() {
+        assert_eq!(
+            shell_word("refs/heads/mdkg-graph:.mdkg/README.md"),
+            "refs/heads/mdkg-graph:.mdkg/README.md"
+        );
+        assert_eq!(shell_word("refs/heads/$(id):x"), "'refs/heads/$(id):x'");
+        assert_eq!(shell_word("it's"), "'it'\"'\"'s'");
+        assert_eq!(
+            Fetched::adopt(Some(PERSONAL_REF)),
+            format!("run `{BIN} install --setup personal`")
+        );
+        assert!(!Fetched::adopt(Some("refs/remotes/g$(id)/mdkg-graph")).contains("$(id)"));
+    }
+
+    #[test]
     fn a_config_stage_is_init_s_only_if_it_is_a_prefix_of_its_shape() {
         let args = InitArgs {
             work: None,
@@ -1185,6 +1783,8 @@ mod tests {
             agent: false,
             no_gitignore: false,
             dry_run: false,
+            in_checkout: false,
+            new_graph: false,
             json: false,
         };
         let full = config_text("01a170d6-ab7e-70d7-a4e0-a2aa54d9aa0b", Work::Local, &args);

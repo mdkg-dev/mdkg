@@ -20,6 +20,9 @@ pub struct Project {
     paths: Paths,
     input: Input,
     root: PathBuf,
+    /// The authority's source label when the project layer comes from the
+    /// graph ref, not a file.
+    graph_source: Option<String>,
 }
 
 /// Effective JSON and its origins can be shown even if a setting fails typed
@@ -114,7 +117,54 @@ impl Project {
             .and_then(Path::parent)
             .expect("project path has .mdkg parent")
             .to_path_buf();
-        Ok(Self { paths, input, root })
+        Ok(Self {
+            paths,
+            input,
+            root,
+            graph_source: None,
+        })
+    }
+
+    /// The project layer from a pinned graph-ref [`Authority`], never from
+    /// a checkout's `.mdkg/config.json`: the user and local layer paths are
+    /// discovered for `root` (a checkout of the clone, which needn't hold a
+    /// `.mdkg`), and the project input is the authority's committed config,
+    /// with its schema and identity checked as `capture` checks them. Its
+    /// origin is the authority's source (`graph:<ref>@<sha12>`), and a
+    /// scoped project replacement must name that origin.
+    ///
+    /// [`Authority`]: crate::graphref::Authority
+    pub fn from_authority(
+        authority: &crate::graphref::Authority,
+        root: &Path,
+        environment: Environment<'_>,
+    ) -> Result<Self, GraphError> {
+        let mut paths = Paths::discover(root, environment).map_err(settings_error)?;
+        let origin = Origin::file(Layer::Project, PathBuf::from(&authority.source));
+        let input = Input::new(origin, authority.config.clone()).map_err(settings_error)?;
+        super::check_schema_version(&input.value, false)?;
+        super::read_identity(&input.value)?;
+        // No file backs this layer. The path names a place no write can
+        // create (under /dev/null), so a caller that still writes "the
+        // project file" fails instead of creating one; the label lives in
+        // the origin.
+        paths.project = PathBuf::from("/dev/null/mdkg-graph-authority/config.json");
+        let root = std::fs::canonicalize(root).map_err(|e| {
+            GraphError::failure(Code::ConfigUnreadable, format!("{}: {e}", root.display()))
+        })?;
+        Ok(Self {
+            paths,
+            input,
+            root,
+            graph_source: Some(authority.source.clone()),
+        })
+    }
+
+    /// The authority's source label (`graph:<ref>@<sha12>`) when the
+    /// project layer comes from the graph ref. Such a project has no file:
+    /// a project-scope write must refuse and change it by a graph write.
+    pub fn graph_source(&self) -> Option<&str> {
+        self.graph_source.as_deref()
     }
 
     pub fn paths(&self) -> &Paths {
@@ -173,7 +223,9 @@ impl Project {
 
     fn check_replacement(&self, replacement: &Input) -> Result<(), GraphError> {
         let expected = match replacement.origin.layer {
-            Layer::Project => Some(&self.paths.project),
+            // The captured project's own origin: its file, or the graph
+            // authority's label.
+            Layer::Project => self.input.origin.path.as_ref(),
             Layer::User => self.paths.user.as_ref(),
             Layer::Local => self.paths.local.as_ref(),
             _ => None,

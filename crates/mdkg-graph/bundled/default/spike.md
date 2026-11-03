@@ -28,6 +28,14 @@ updated: {{updated}}
 
 State the question this spike must answer.
 
+# Requirements
+
+Replace this example with a question the spike must answer.
+
+```text
+- R1: What question must this spike answer?
+```
+
 # Context And Constraints
 
 - constraint 1

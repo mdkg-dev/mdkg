@@ -38,10 +38,23 @@
     "StatusData": {
       "type": "object",
       "properties": {
+        "event_cursor": {
+          "description": "The event stream's head, read with this snapshot: `msg watch\n--after` it to see every change since (A10). Absent without a store.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "agents": {
           "type": "array",
           "items": {
             "$ref": "#/$defs/AgentStatus"
+          }
+        },
+        "config_warnings": {
+          "type": "array",
+          "items": {
+            "type": "string"
           }
         },
         "threads": {
@@ -70,14 +83,23 @@
           "items": {
             "type": "string"
           }
+        },
+        "progress": {
+          "description": "Durable watches, including interrupted actors without runtime state.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ProgressStatus"
+          }
         }
       },
       "required": [
         "agents",
+        "config_warnings",
         "threads",
         "receivers",
         "processes",
-        "build_warnings"
+        "build_warnings",
+        "progress"
       ]
     },
     "AgentStatus": {
@@ -86,6 +108,17 @@
       "properties": {
         "name": {
           "type": "string"
+        },
+        "effective": {
+          "description": "Layered file definition for the next preparation; saved state fields\nbelow continue to describe the last prepared agent.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EffectiveAgentData"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "configured": {
           "description": "Named in the config's `agents`.",
@@ -143,6 +176,24 @@
             "null"
           ]
         },
+        "receipt": {
+          "description": "Latest advisory receipt; delivery failure never makes this agent unrunnable.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeliveryStatus"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "receipt_problem": {
+          "description": "Why the local receipt status could not be read, distinct from no receipt yet.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "dropped_allow": {
           "description": "Its allow rules that are never passed to its harness: unreadable,\nor letting mdkg run with open arguments, each with what to allow\ninstead. Read against this binary; a turn reads them against the\n`--binary` it runs, and its report names any it drops.",
           "type": "array",
@@ -160,6 +211,65 @@
               "type": "null"
             }
           ]
+        },
+        "billing": {
+          "description": "The key, offered or marked: after a usage limit, the `agents use-key`\ncommand to bill the next turn on it; a mark waiting for that turn;\nor a mark held because it couldn't be recorded durably.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "description": "What a client needs to re-attach (API v1 A18): `stopped`, `idle`,\n`running`, `draining` or `paused` (an open set).",
+          "type": "string"
+        },
+        "supervisor": {
+          "description": "The supervisor running it, or the last one whose record names it\nwhen that one is gone (`stale`); null when none.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SupervisorView"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "current_turn": {
+          "description": "The turn running now; null when none.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CurrentTurn"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "last_turn": {
+          "description": "The last turn that isn't running; null when none.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LastTurn"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "follow_from": {
+          "description": "The position `agents logs <agent> --follow --after` takes to pick up\nfrom this snapshot: never \"from now\", so a turn that starts or ends\nin between is still delivered.",
+          "type": "string"
+        },
+        "code_base": {
+          "description": "A worker's branch against mainRef (ref mode, G15): absent when\nthere's no mainRef here, or no worktree yet.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CodeBase"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -167,7 +277,64 @@
         "configured",
         "known",
         "turns",
-        "policy"
+        "policy",
+        "state",
+        "supervisor",
+        "current_turn",
+        "last_turn",
+        "follow_from"
+      ]
+    },
+    "EffectiveAgentData": {
+      "description": "Source-attributed settings used for a file-backed agent's next preparation.",
+      "type": "object",
+      "properties": {
+        "values": true,
+        "origins": {
+          "description": "Full config JSON pointers, matching `config show --effective`.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/OriginData"
+          }
+        },
+        "redacted": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "values",
+        "origins",
+        "redacted"
+      ]
+    },
+    "OriginData": {
+      "type": "object",
+      "properties": {
+        "layer": {
+          "$ref": "#/$defs/SourceLayer"
+        },
+        "path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "layer"
+      ]
+    },
+    "SourceLayer": {
+      "type": "string",
+      "enum": [
+        "built_in",
+        "user",
+        "project",
+        "local",
+        "flags"
       ]
     },
     "Harness": {
@@ -446,7 +613,7 @@
       ]
     },
     "Auth": {
-      "description": "Which account an agent's turns bill: its harness's subscription login\nfirst, and an API key from the Keychain only when `api_key_fallback` is\non.",
+      "description": "Which account an agent's turns bill: its harness's subscription login,\nand an API key from the Keychain only for a turn `mdkg agents use-key`\nmarks, which `api_key_fallback` permits.",
       "type": "object",
       "properties": {
         "prefer": {
@@ -454,7 +621,7 @@
           "$ref": "#/$defs/Prefer"
         },
         "api_key_fallback": {
-          "description": "Use the key when the harness isn't logged in, or once when the\nsubscription hits its usage limit.",
+          "description": "Permits `mdkg agents use-key`, which bills one turn on the key. It\nnever uses the key automatically: not for a harness that isn't\nlogged in, and not after a usage limit (decided 2026-10-29).",
           "type": "boolean"
         }
       },
@@ -467,6 +634,41 @@
       "type": "string",
       "enum": [
         "subscription"
+      ]
+    },
+    "DeliveryStatus": {
+      "type": "object",
+      "properties": {
+        "turn_id": {
+          "type": "string"
+        },
+        "path": {
+          "description": "Immutable local receipt, retained even when mail delivery is refused.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "error": {
+          "description": "Non-fatal receipt failure; never means the agent should run again.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "turn_id",
+        "path",
+        "message_id",
+        "error"
       ]
     },
     "DroppedAllow": {
@@ -492,7 +694,7 @@
       "type": "object",
       "properties": {
         "source": {
-          "description": "`subscription`, `api_key` (the fallback), `own_config` (OpenCode) or\n`none`.",
+          "description": "`subscription`, `own_config` (OpenCode) or `none`; never `api_key`\n(0.7.0's fallback), since the key bills only a turn use-key marks.",
           "type": "string"
         },
         "method": {
@@ -514,6 +716,158 @@
         "source",
         "api_key_fallback",
         "key_in_keychain"
+      ]
+    },
+    "SupervisorView": {
+      "description": "The supervisor running the agent, or the last one whose record names\nit when that one is gone (`stale`).",
+      "type": "object",
+      "properties": {
+        "supervisor_id": {
+          "type": "string"
+        },
+        "pid": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "started_at": {
+          "type": "string"
+        },
+        "build": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Build"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "state": {
+          "description": "`running` or `stale` (its record is there, its process is gone).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "supervisor_id",
+        "pid",
+        "started_at",
+        "build",
+        "state"
+      ]
+    },
+    "Build": {
+      "type": "object",
+      "properties": {
+        "version": {
+          "type": "string"
+        },
+        "commit": {
+          "type": "string"
+        },
+        "dirty": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "built": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "commit",
+        "dirty",
+        "built"
+      ]
+    },
+    "CurrentTurn": {
+      "type": "object",
+      "properties": {
+        "turn_id": {
+          "type": "string"
+        },
+        "number": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "started_at": {
+          "type": "string"
+        },
+        "output_after": {
+          "description": "The latest `seq` in its output journal.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "turn_id",
+        "number",
+        "started_at",
+        "output_after"
+      ]
+    },
+    "LastTurn": {
+      "type": "object",
+      "properties": {
+        "turn_id": {
+          "type": "string"
+        },
+        "number": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "outcome": {
+          "description": "`replied`, `ran`, `idle`, `dry_run`, `failed`, `interrupted` or\n`not_started`; an open set.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ended_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "turn_id",
+        "number",
+        "outcome",
+        "ended_at"
+      ]
+    },
+    "CodeBase": {
+      "description": "How a worker's branch stands against the code base it follows.",
+      "type": "object",
+      "properties": {
+        "main_ref": {
+          "description": "mainRef's full name.",
+          "type": "string"
+        },
+        "ahead": {
+          "description": "Commits on the worker's branch that mainRef lacks.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "behind": {
+          "description": "Commits on mainRef that the worker's branch lacks.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "main_ref",
+        "ahead",
+        "behind"
       ]
     },
     "Thread": {
@@ -985,31 +1339,52 @@
         "ctime_ns"
       ]
     },
-    "Build": {
+    "ProgressStatus": {
       "type": "object",
       "properties": {
-        "version": {
+        "agent": {
           "type": "string"
         },
-        "commit": {
-          "type": "string"
+        "active": {
+          "description": "A watch held the existing progress lock during this snapshot.",
+          "type": "boolean"
         },
-        "dirty": {
+        "record": {
+          "description": "Display only; the versioned progress record validates independently."
+        },
+        "current_store": {
           "type": [
-            "boolean",
+            "string",
             "null"
           ]
         },
-        "built": {
-          "type": "string"
+        "archive": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "problem": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "repair": {
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
-      "additionalProperties": false,
       "required": [
-        "version",
-        "commit",
-        "dirty",
-        "built"
+        "agent",
+        "active",
+        "record",
+        "current_store",
+        "archive",
+        "problem",
+        "repair"
       ]
     },
     "DiagnosticOut": {
@@ -1078,6 +1453,10 @@
       "type": "string",
       "enum": [
         "usage.invalid_arguments",
+        "api.bad_cursor",
+        "api.cursor_reset",
+        "api.cursor_foreign",
+        "api.cursor_expired",
         "usage.empty_query",
         "usage.bad_limit",
         "usage.unsupported_type",
@@ -1220,11 +1599,29 @@
         "msg.unknown_context",
         "msg.not_holder",
         "msg.not_shown",
+        "msg.not_sender",
         "msg.wait_timeout",
+        "channel.unknown",
+        "channel.exists",
+        "channel.not_member",
+        "channel.human_member",
         "room.unknown",
         "room.exists",
         "room.not_member",
         "room.human_member",
+        "entry.bad_op",
+        "entry.bad_text",
+        "entry.not_found",
+        "entry.no_node",
+        "entry.bad_transition",
+        "entry.not_allowed",
+        "entry.fix_after_range",
+        "entry.not_covered",
+        "entry.range_mismatch",
+        "entry.unknown_commit",
+        "entry.git",
+        "entry.gate_failed",
+        "ledger.out_of_scope",
         "mcp.call_timeout",
         "mcp.cli_failed",
         "run.unknown_agent",
@@ -1232,6 +1629,8 @@
         "run.sandbox_mismatch",
         "run.no_reply",
         "run.mail_failed",
+        "run.progress_invalid",
+        "run.turn_interrupted",
         "run.io_failed",
         "run.unsupported",
         "run.branch_refused",
@@ -1247,10 +1646,12 @@
         "skill.mirror_drift",
         "skill.mirror_stale",
         "skill.mirror_targets_unsupported",
+        "skill.ref_mode",
         "skill.exists",
         "init.needs_migrate",
         "init.conflict",
         "init.unexplained",
+        "init.graph_fetched",
         "usage.deprecated",
         "migrate.plan_mismatch",
         "migrate.dirty",
@@ -1260,7 +1661,132 @@
         "migrate.store_changed",
         "migrate.unsupported",
         "migrate.already_migrated",
-        "migrate.step_failed"
+        "migrate.step_failed",
+        "api.output_gone",
+        "api.unknown_resource",
+        "api.unsupported",
+        "api.unauthenticated",
+        "api.refused_by_check",
+        "api.serve_running",
+        "api.key_required",
+        "api.key_expired",
+        "api.too_large",
+        "api.rate_limited",
+        "api.origin_refused",
+        "api.draining",
+        "api.check_failed",
+        "api.machine_revoked",
+        "api.machine_pending",
+        "api.enroll_pending",
+        "api.enroll_exists",
+        "api.enroll_changed",
+        "api.clock_skew",
+        "api.replayed",
+        "api.graph_unknown",
+        "api.actor_not_allowed",
+        "api.unreachable",
+        "api.remote_bound",
+        "api.remote_conflict",
+        "api.remote_attaching",
+        "api.coordinator_mismatch",
+        "api.shown_mismatch",
+        "run.not_placed",
+        "run.machine_lost",
+        "run.machine_revoked",
+        "run.turn_ended",
+        "run.recovery_failed",
+        "run.push_refused",
+        "run.bad_agent_name",
+        "coord.commit_unknown",
+        "coord.branch_not_pushable",
+        "api.key_skewed",
+        "api.person_unknown",
+        "api.person_signature_required",
+        "run.nothing_to_do",
+        "api.attestation_failed",
+        "api.machine_grade_required",
+        "ledger.block_invalid",
+        "graph.ref_missing",
+        "graph.ref_invalid",
+        "graph.ref_exists",
+        "graph.config_invalid",
+        "graph.identity_mismatch",
+        "graph.checkout_missing",
+        "graph.identity_unrecorded",
+        "graph.identity_unset",
+        "graph.authority_invalid",
+        "graph.lock_required",
+        "graph.write_invalid",
+        "graph.write_stale",
+        "graph.write_contended",
+        "graph.request_reused",
+        "graph.git",
+        "graph.io",
+        "graph.checkout_read",
+        "graph.cache_edit",
+        "graph.session_discarded",
+        "graph.unleased_edit",
+        "graph.intent_stale",
+        "graph.intents",
+        "graph.settled_elsewhere",
+        "graph.import_stale",
+        "graph.import_unfinished_op",
+        "graph.hand_edits",
+        "graph.migrating",
+        "graph.overlapping_workspace",
+        "graph.shape",
+        "graph.remote_invalid",
+        "graph.remote_changed",
+        "graph.open_changesets",
+        "graph.uncommitted",
+        "graph.diverged",
+        "graph.remote_is_code",
+        "graph.remote_rewritten",
+        "graph.remote_unreachable",
+        "graph.remote_auth",
+        "graph.push_refused",
+        "graph.push_large",
+        "graph.secret",
+        "graph.secret_scan_unavailable",
+        "graph.sync_conflict",
+        "graph.sync_contended",
+        "graph.sync_in_turn",
+        "graph.sync_invalid",
+        "graph.publish_disabled",
+        "graph.design_current",
+        "graph.design_drift",
+        "graph.view",
+        "run.authority_override",
+        "coord.abandon_published",
+        "graph.edit_path_unsafe",
+        "graph.edit_copy_kept",
+        "graph.edit_unexcluded",
+        "graph.nothing_to_sync",
+        "graph.no_code_base",
+        "graph.unsupported",
+        "graph.write_noop",
+        "msg.reserved_id",
+        "store.integrity",
+        "run.not_logged_in",
+        "run.supervisor_exited",
+        "run.mail_set_aside",
+        "run.loop_paused",
+        "run.wrapper_refused",
+        "run.no_base",
+        "entry.verdict_unbacked",
+        "entry.fix_absent",
+        "msg.review_unranged",
+        "msg.review_multi_node",
+        "entry.round_unanchored",
+        "entry.ledger_unwritten",
+        "req.missing",
+        "req.bad_line",
+        "req.duplicate_id",
+        "req.not_ears",
+        "req.vague",
+        "req.not_question",
+        "req.bad_relation",
+        "req.relation_on_design"
       ]
     },
     "SeverityName": {

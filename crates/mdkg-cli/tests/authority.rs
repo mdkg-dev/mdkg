@@ -811,6 +811,7 @@ fn a_host_grants_what_a_worker_resolved() {
         serde_json::from_str(&fs::read_to_string(&path).expect("config")).expect("json");
     config["coordination"] = json!({"leases": {"paths": [{"glob": "src/**", "mode": "shared"}]}});
     fs::write(&path, serde_json::to_string_pretty(&config).expect("json")).expect("write");
+    commit_config(&s.repo);
     let (code, out) = s.run("a", &["claim", "src/", "--mode", "shared"]);
     assert_eq!(code, 0, "{out}");
     assert_eq!(out["data"]["lease"]["mode"], "shared");
@@ -1018,6 +1019,8 @@ fn a_worker_and_its_host_agree() {
     fs::write(&path, serde_json::to_string_pretty(&config).expect("json")).expect("write");
     let wpath = s.repo.join(".mdkg/config.json");
     fs::write(&wpath, serde_json::to_string_pretty(&config).expect("json")).expect("write");
+    commit_config(&p.host);
+    commit_config(&s.repo);
     let (code, out) = s.run("a", &["claim", "--new", "gen/"]);
     assert_eq!(
         (code, &out["data"]["lease"]["mode"]),
@@ -1832,4 +1835,22 @@ fn receiver_local_turn_renewal_never_starts_configured_authority() {
         assert_ne!(code, 0);
     }
     assert!(!s.dir.0.join("authority-invoked").exists());
+}
+
+/// Commits `dir`'s config: the lease policy is committed authority.
+fn commit_config(dir: &Path) {
+    let out =
+        isolated(
+            Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["commit", "-qam", "lease policy"]),
+        )
+        .output()
+        .expect("git");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }

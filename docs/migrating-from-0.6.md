@@ -1,22 +1,21 @@
 # Migrating from mdkg 0.6
 
-mdkg 0.7.0 replaces the TypeScript mdkg 0.6.x under the same name. It reads
-a 0.6.x graph as it is. `mdkg migrate` then moves the graph to the 0.7
+mdkg 0.7.0 replaced the TypeScript mdkg 0.6.x under the same name. This
+guide targets mdkg 0.7.1 or later, which reads a 0.6.x graph as it is. `mdkg migrate` then moves the graph to the 0.7
 format, in one reviewed commit that you can roll back.
 
 ## Before you start
 
-- **One workspace only, for now.** `mdkg migrate` in 0.7.0 converts a
-  graph of one workspace, `.mdkg` at the graph's root. It refuses a graph
-  with several enabled workspaces, or one kept elsewhere
-  (`migrate.unsupported`). Such a graph needs nothing to keep working:
-  0.7.0 reads and writes it in its 0.6 form, so stay on that until a
-  migration that keeps workspaces lands (planned for 0.7.1). One in
-  identity format v2 (below) is the exception: 0.7.0 refuses it outside
-  `migrate`, so keep it on mdkg 0.6.x until then. Don't merge
-  the workspaces by hand to get past the refusal: their nodes can share
-  old ids (`root:task-1` and `aux:task-1`), and their refs name each
-  other's.
+- **Every workspace moves together.** A graph of several workspaces
+  migrates in one commit: each enabled workspace's folder stays where it
+  is, with its config entry, and gets new ids. 0.6.0 ids are unique only
+  in a workspace, so `root:task-1` and `aux:task-1` get different ids,
+  and every ref, qualified or not, gets the id of the node it named in
+  0.6.0 (an unqualified one names a node in its own workspace). The plan
+  lists the workspaces (`workspaces` in `--json`) and its hash covers
+  them. A disabled workspace isn't read, so it's left as it is. An
+  identity v2 graph (below) still migrates only with one workspace;
+  keep a v2 graph of several on mdkg 0.6.x.
 - **The whole repository moves at once.** After the migration, 0.6.x
   refuses the graph rather than misread it (its config is
   `schema_version: 3`). Upgrade every machine, CI job and agent that runs
@@ -31,12 +30,12 @@ format, in one reviewed commit that you can roll back.
 - **Merge what you can first.** Every branch that will still merge needs
   its own migration, before it merges ("Branches that merge later",
   below).
-- **Install 0.7.0** (see the README) and check the setup:
+- **Install 0.7.1 or later** (see the README) and check the setup:
 
   ```sh
-  mdkg --version      # mdkg 0.7.0 (commit …)
+  mdkg --version      # mdkg 0.7.1 (commit …), or the newer version installed
   mdkg doctor         # warns "no graph_id: a 0.6.0-era graph", as expected
-  mdkg validate       # 0.7.0 reads the 0.6 graph as it is
+  mdkg validate       # 0.7.1 reads the 0.6 graph as it is
   ```
 
   If `mdkg --version` prints a 0.6 version, the old CLI comes first on
@@ -74,12 +73,8 @@ Read the plan. For each node it says:
   the node as a read-only `legacy_id`, and commands still resolve it.
   Each node that stays a file keeps its name and path (`task-19-parser.md`
   stays where it is); only its contents change.
-- **Its plane:** what stays a knowledge file, and what becomes coordination
-  records:
-  - checkpoints become log records, each leaving a one-line summary;
-  - finished test nodes become check results;
-  - `events.jsonl` lines become legacy log records;
-  - progress and review-ledger sections become review records.
+- **Its plane:** what stays a knowledge file, and, only with
+  `--work-history store` (below), what becomes coordination records.
 - **Rewritten refs:** every ref field in the graph moves to the new ids. A
   mention of an old id in a body's prose becomes a link to the node,
   `[task-19](task-<uuid>)`, and in code the new id. Every other value keeps
@@ -92,6 +87,35 @@ Read the plan. For each node it says:
   `colour` beside `x_local_colour`) stop the plan.
 - **Goal gates:** gates that call `capability search` are rewritten to
   `mdkg search`.
+
+### Work history: in git, or in the store
+
+The plan says where the graph's work history goes (`work_history` in
+`--json`), and its hash covers that choice:
+
+- **`git`, for a graph that commits its work.** That is a graph whose
+  config says `work.location: "git"`, or says nothing about where work
+  lives, which is every 0.6 graph: 0.6 kept work in `.mdkg/work`, in
+  git. Nothing leaves git. Checkpoints and finished tests stay
+  `checkpoint` and `test` nodes, with new ids like every other node and
+  their refs rewritten; refs to them stay. Progress and review-ledger
+  sections stay in their nodes, and `events.jsonl` files stay as they
+  are. No log records are written, so the coordinator store isn't
+  touched. The config says `work.location: "git"` from then on. Every
+  `.mdkg/work` file that was tracked before is tracked after.
+- **`store`, only when you ask:** `mdkg migrate --dry-run --work-history
+  store`, then `mdkg migrate --apply <plan-hash> --work-history store`.
+  This is how 0.7.0 migrated. Checkpoints become log records, each
+  leaving a one-line summary in the nodes they covered; finished tests
+  become check results; `events.jsonl` lines become legacy log records;
+  progress and review-ledger sections become review records, each
+  leaving one line. Those files and sections leave git, and the records
+  live only in the coordinator store under `.git`, which isn't pushed.
+
+The work stays in git because the store is local: a graph that commits
+its work as a backup, or to work across machines, would otherwise lose
+its history from every other clone. Kept as nodes, it stays readable by
+`show`, `search` and `pack`, and refs to it stay valid.
 
 Warnings name what migrate leaves for you: tier C content kept as plain
 nodes, a ref it couldn't resolve, a key it couldn't split.
@@ -121,6 +145,11 @@ still unfinished (`migrate.in_progress`). Before it changes anything, it backs u
 - a full copy of `.mdkg`, in the migration's folder.
 
 It then swaps the graph in at once and writes the migration as one commit.
+A graph of several workspaces has a folder each, swapped one after
+another, the one holding the config last; HEAD moves only once every
+folder is swapped and the graph validates. A crash between two folders'
+swaps leaves some new and some old until `--apply <plan-hash>` finishes
+them or `--rollback` undoes them, as after any other stop.
 If it stops part way, run the same `--apply <plan-hash>` again to finish,
 or `--rollback` to undo it from any stage. A rollback that stops part way
 is finished by `--rollback` again; `--apply` refuses it. `mdkg migrate
@@ -147,6 +176,14 @@ Check the patched file is right, then delete the `.migrate-<pid>` file.
 Or apply it yourself later with `git apply`, after reading it.
 
 ## A trial run in a separate worktree
+
+Migrate runs in a linked worktree (`git worktree add`) as in the main
+checkout: it changes only that worktree's files and its branch, so the
+main checkout, its uncommitted work included, is left as it is. The
+migration's folder is kept per worktree in the shared git folder, and so
+is its journal, so `--status` and `--rollback` run in the same worktree
+as the apply. The [migrate tests](../crates/mdkg-cli/tests/migrate.rs)
+run one this way, on a graph of two workspaces.
 
 To see the result before main moves, migrate a throwaway branch in its own
 worktree, check it, and only then bring main to it:
@@ -184,7 +221,8 @@ mdkg list --status todo
 mdkg show <old id>   # a legacy_id still resolves
 ```
 
-Migration preserves work definitions in git. New projects default to local
+Migration preserves work definitions in git, and with them the work
+history (unless you chose `--work-history store`). New projects default to local
 work with `mdkg init --work local`; use `mdkg init --work shared` to commit
 work definitions. Config uses `work.location: "local"|"git"`; the older
 `work.committed: "none"|"definitions"` spellings remain readable aliases.
@@ -232,9 +270,14 @@ overwrite conflicts or prune stale records automatically. See
 [the graph checkout](agents.md#the-graph-checkout).
 
 `mdkg config show --effective --json` now reports merged settings and their
-sources. User and machine-local agent, orchestration and projection settings
-are displayed with a transitional notice; runtime commands do not yet apply
-those overrides. See [configuration inspection](agents.md#inspecting-configuration).
+sources. `agents up` and `agents status` apply user and machine-local named
+overrides to file-backed definitions and orchestration settings. Legacy
+inline and saved-only agents do not receive optional named agent overrides;
+migrate an inline agent with `mdkg agents edit <name>`. Optional `agents.defaults` is
+ignored and projections remain project-only. Watches capture settings at
+startup, so restart them after changes. See
+[configuration inspection](agents.md#inspecting-configuration) for precedence
+and saved-state limits.
 
 Workers now commit their own work; the launcher never stages or commits it.
 Claude Code, Codex and OpenCode are equally supported, using the harness's
@@ -242,22 +285,45 @@ permissions and your settings. The default worker mode is `auto`; reviewers
 remain read-only. Follow [the current setup sequence](agents.md) for native
 overrides and [graph checkout updates and recovery](agents.md#the-graph-checkout).
 
-OpenCode workers now require version 2.1.0 and an enabled `build` agent.
+OpenCode workers require exactly 2.1.0 or 2.2.5 and an enabled `build` agent.
 Each actual launch checks OpenCode's resolved configuration before starting
 the worker. The check uses ordinary OpenCode state and can have native
 startup side effects. See [OpenCode worker checks](agents.md#opencode-worker-checks).
 
-Delegated approval is an explicit local opt-in. Grants belong in user or
-machine-local settings; project configuration and ordinary mail cannot grant
-them. Approval binds one permitted action to an exact committed node version.
+Delegated approval is an explicit local opt-in. Grants belong only in the
+user settings file; move any machine-local grants there. Machine-local
+settings may revoke a user grant but cannot add one. Project configuration
+and ordinary mail cannot grant authority. Approval binds one permitted
+action to an exact committed node version.
 See [delegated decisions](delegated-decisions.md) for configuration and the
 advisory limits.
 
-Turn-end receipts sent by mail, durable headless turn progress and crash
-recovery, runtime configuration layering for `agents up`, and `config set`
-are planned for 0.7.1. The existing loop-guard `agents resume`, paused-thread
-status and interactive Codex routing recovery remain available; see the
-[turn policy](agents.md#waking-agents-agents-up-and-the-turn-policy).
+Supervisor progress now survives restarts of the same unfinished invocation.
+An unfinished turn or receiver dispatch requires inspection with
+`mdkg agents status` and explicit recovery;
+stop its supervisor before plain `mdkg agents resume <agent>`. To clear only
+a loop-guard pause while the watch runs, use `--thread "<thread>"` from status.
+Recovery preserves metadata and charges interrupted work conservatively,
+without replaying it. See [durable progress](agents.md#durable-supervisor-progress).
+
+Progress records use `mdkg.supervisor-progress.v3`. Compatible v1/v2 records
+are rewritten as v3 when `mdkg agents up` opens them; read-only status
+inspection leaves them unchanged. Older builds may reject or ignore these
+records. Keep progress records and recovery
+archives intact and use a compatible build; restoring the coordinator store is not
+a progress-record downgrade procedure.
+
+Admitted headless turns now produce advisory [turn receipts](agents.md#turn-receipts),
+retained locally before mail delivery to `reports_to`. Unavailable evidence
+is explicit, and receipt failure never reruns the agent. Mailed summaries
+can be shortened while full local summaries remain available.
+
+After upgrading from 0.7.0, restart supervisors still running that old
+build once. Supervisors already running 0.7.1 detect executable replacement
+and committed changes to their selected definitions/config, drain turns
+and re-exec; see [reloads](agents.md#reloads-restarts-and-stopping).
+`config set`, interactive receiver policy refresh and broader
+receipt-evidence previews are [deferred beyond 0.7.1](agents.md#deferred-beyond-071).
 
 ## Making shared work local
 
@@ -307,20 +373,73 @@ staleness, reference and lease refusals, exact commit scope and idempotence;
 [filesystem tests](../crates/mdkg-cli/src/work/apply.rs) cover interruption
 and non-overwrite behavior.
 
+## Bringing back history 0.7.0 moved out of git
+
+A graph migrated by mdkg 0.7.0, or with `--work-history store`, lost its
+checkpoints, finished tests and event logs from git: they became log
+records in the coordinator store, which isn't pushed. To bring them back
+into git, as a migration that kept them would have:
+
+```sh
+mdkg migrate --restore-history --dry-run
+mdkg migrate --restore-history --apply <plan-hash>
+mdkg validate
+```
+
+It reads them from git itself, not the store or a backup: the parent of
+the migration commit holds every file the migration deleted. The
+migration commit is found by its config gaining a `graph_id`, so one
+squashed or reworded on GitHub is found too; a shallow clone is refused
+(`git fetch --unshallow`). Each checkpoint and finished test comes back
+at its old path as a `checkpoint` or `test` node, with the id a migration
+that kept it would have minted and its refs rewritten to the ids the
+graph's nodes have now; a ref to a node the graph no longer has moves to
+its body, as migrate does. Event logs come back as they were. A node the
+graph already has again by that `legacy_id` is skipped, with a
+`migrate.history_present` warning.
+
+The apply writes those files and commits them in one commit on HEAD, after
+checking the graph still validates; undo it with `git revert`. It refuses
+a dirty worktree or staged changes (`migrate.dirty`), and a graph that
+keeps its work local. The summary lines 0.7.0 left in nodes stay, and so
+do the refs to these nodes it dropped from other nodes' frontmatter.
+Progress and review-ledger sections stay in the store, and so do the log
+records the migration wrote for what comes back: after a restore, that
+history is both a node in git and a record in the store (the store isn't
+changed). A restore is found from every side of a merge, so a migration
+merged with `--no-ff` comes back as the main line had it; one migrated by
+another graph that used the same folder is never taken. If a restore
+stops part way, run the same `--apply <plan-hash>` again: it finishes,
+the index update included (a dry run warns `migrate.restore_unfinished`
+until then). If you staged changes since, the apply refuses: `git reset
+-q` (your files stay) puts the index at the restore, and you stage them
+again. Each file is written whole beside its place first, then linked
+into place, so a stop never leaves part of one (a filesystem without hard
+links can't take a restore). The [migrate
+tests](../crates/mdkg-cli/tests/migrate.rs) cover it
+(`restore_history_*`).
+
 ## Branches that merge later
 
-A branch cut before the migration still has 0.6 files. **Migrate it on its
-own, before it merges**, not after merging main into it (a branch that has
-main's migrated config is refused as already migrated):
+A branch cut before the migration still has 0.6 files. **Migrate it before
+main migrates**, or merge it into main first: this release refuses to
+migrate a branch whose main is already migrated (`migrate.unsupported`),
+whether main migrated here or through a pull request on GitHub and was
+fetched (`mdkg.mainRef`, or `main`; the local branch or a remote-tracking
+copy).
 
 1. In the branch's worktree, with a clean `git status`, run `mdkg migrate
    --dry-run`, then `mdkg migrate --apply <plan-hash>`.
-2. Merge it as usual. The ids are deterministic, so the branch rewrote
-   every node it shares with main exactly as main's migration did: git sees
-   the same change on both sides, and only the branch's own edits can
-   conflict. Use the same mdkg release main migrated with, so both sides
-   rewrite alike. Records main's migration already put in the coordinator
-   store aren't imported twice.
+2. Merge main into it, or it into main, as usual. Only the branch's own
+   edits can conflict. A node the branch moved to another file conflicts
+   as modify/delete at its old path (git can't pair the small 0.6 file
+   with its 0.7 rewrite): keep the branch's move with `git rm <old path>`.
+
+A branch whose main migrated first has to merge main in by hand: take
+main's file for each node that conflicts and redo the branch's change in
+it, and make each node only the branch has again on 0.7 (`mdkg new`).
+Migrating such a branch against main, with main's ids for the nodes they
+share, comes in 0.7.2.
 
 A branch that will never merge needs nothing.
 

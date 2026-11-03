@@ -384,7 +384,7 @@ fn a_snapshot_is_a_copy_restore_takes() {
     drop(store);
     let copy = mdkg_coord_sqlite::snapshot(&dir.db(), "migrate").unwrap();
     assert!(
-        copy.ends_with("coord.sqlite.pre-3+msg5-to-migrate.sqlite"),
+        copy.ends_with("coord.sqlite.pre-4+msg5-to-migrate.sqlite"),
         "{copy:?}"
     );
     let listed = mdkg_coord_sqlite::backups(&dir.db()).unwrap();

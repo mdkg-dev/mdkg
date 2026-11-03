@@ -6,9 +6,13 @@
 //!   configured auth. The provider key variables in [`KEY_VARS`] never
 //!   reach an agent, so a stray key in the launcher's shell can't switch a
 //!   turn to API billing. The rest of the environment passes through.
-//! - **A key only through config.** With `auth.api_key_fallback` on, a
-//!   Claude or Codex turn uses an API key when the harness isn't logged in,
-//!   or retries once with it when the subscription hits its usage limit.
+//! - **A key only by the user's choice.** Nothing bills the key on its own
+//!   (decided 2026-10-29): `mdkg agents use-key <agent>` bills the agent's
+//!   next turn, one, on it, where `auth.api_key_fallback` allows that. A
+//!   harness that isn't logged in refuses the turn, and a usage limit ends
+//!   it; both name use-key. 0.7.0's automatic key turns (after a limit, and
+//!   for a harness that isn't logged in) are gone, and a turn is never
+//!   re-run on the key within itself.
 //!   The key comes from the macOS Keychain (`mdkg-anthropic`,
 //!   `mdkg-openai`), never a file, the config or the agent's environment:
 //!   Claude reads it through an `apiKeyHelper` (`mdkg auth key`), and Codex
@@ -114,12 +118,17 @@ const KEPT_ANTHROPIC: &[&str] = &[
     "ANTHROPIC_CUSTOM_MODEL_OPTION*",
 ];
 
-/// Every environment variable OpenCode 2.1.0's provider catalog declares,
-/// one per line, as `scripts/opencode-catalog-env.py` extracts them from
-/// its binary. OpenCode bills a provider through the key one names when
-/// nothing is stored for it, so all of them but [`KEPT_GENERAL`] are
-/// withheld (review of c569050; the orchestrator's option A). A newer
-/// catalog can add names: refresh the file with the script.
+/// Every environment variable the provider catalogs of the qualified
+/// OpenCode releases declare (2.1.0 and 2.2.5, `OPENCODE_QUALIFIED` in
+/// profile.rs), one per line: the union of what
+/// `scripts/opencode-catalog-env.py` extracts from each binary, sorted.
+/// 2.2.5's came from the desktop app's
+/// `/Applications/OpenCode.app/Contents/Resources/opencode-cli`. None is
+/// dropped while a release naming it stays qualified. OpenCode bills a
+/// provider through the key one names when nothing is stored for it, so
+/// all of them but [`KEPT_GENERAL`] are withheld (review of c569050; the
+/// orchestrator's option A). Before qualifying another release, add its
+/// script output to the union.
 pub const OPENCODE_CATALOG: &str = include_str!("opencode-catalog-env.txt");
 
 /// The general cloud and service credentials an agent's own work may need,
@@ -278,9 +287,11 @@ pub fn host_session(name: &std::ffi::OsStr) -> bool {
 
 /// The variables to take out of an agent's environment, and its login
 /// check's: every one [`withheld`] or a host session's own in this
-/// process's, and [`KEY_VARS`] whether set or not.
+/// process's, and [`KEY_VARS`] and a re-execed supervisor's exec token
+/// whether set or not.
 pub fn withheld_vars() -> Vec<std::ffi::OsString> {
     let mut vars: Vec<std::ffi::OsString> = KEY_VARS.iter().map(Into::into).collect();
+    vars.push(crate::supervise::reload::EXEC_ENV.into());
     vars.extend(
         std::env::vars_os()
             .map(|(k, _)| k)
@@ -330,14 +341,9 @@ impl std::fmt::Debug for Secret {
     }
 }
 
-/// The Keychain service an API key for a harness is under.
+/// The Keychain service an API key for a harness is under (its adapter's).
 pub fn keychain_service(h: Harness) -> Option<&'static str> {
-    match h {
-        Harness::Claude => Some("mdkg-anthropic"),
-        Harness::Codex => Some("mdkg-openai"),
-        // OpenCode's own config names its providers and their keys.
-        Harness::OpenCode => None,
-    }
+    h.adapter().keychain_service()
 }
 
 /// The provider name `mdkg auth key <provider>` takes for a service.
@@ -436,69 +442,34 @@ pub enum Login {
     Own,
 }
 
-/// The command that logs a harness in.
+/// The command that logs a harness in (its adapter's).
 pub fn login_command(h: Harness) -> &'static str {
-    match h {
-        Harness::Claude => "claude auth login",
-        Harness::Codex => "codex login",
-        Harness::OpenCode => "opencode auth login",
-    }
+    h.adapter().login_command()
 }
 
 /// Asks the harness whether it's logged in (`claude auth status --json`,
-/// `codex login status`), running it as an agent would start, in the
-/// agent's folder and with no key variables: a stray key doesn't count as
-/// a login. Prints nothing it says.
+/// `codex login status`), through its adapter, which reads the answer from
+/// [`login_probe`]. Prints nothing it says.
 pub fn login(h: Harness, program: &Path, cwd: &Path) -> Login {
+    h.adapter().login(program, cwd)
+}
+
+/// Runs a harness's login check, `program args`, as an agent would start
+/// it: in the agent's folder and with no key variables, so a stray key
+/// doesn't count as a login. `None` when it can't run or finish in time.
+pub(crate) fn login_probe(
+    program: &Path,
+    cwd: &Path,
+    args: &[&str],
+) -> Option<std::process::Output> {
     let mut cmd = Command::new(program);
     cmd.current_dir(cwd);
     for k in withheld_vars() {
         cmd.env_remove(k);
     }
     cmd.stdin(std::process::Stdio::null());
-    match h {
-        Harness::Claude => {
-            cmd.args(["auth", "status", "--json"]);
-            let Ok(out) = bounded(&mut cmd) else {
-                return Login::Out;
-            };
-            let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
-            if v["loggedIn"] != true {
-                return Login::Out;
-            }
-            let method = v["authMethod"].as_str().unwrap_or("unknown").to_string();
-            Login::In {
-                // A claude.ai account, by its OAuth login or a long-lived
-                // subscription token, on Anthropic's own API.
-                subscription: matches!(method.as_str(), "claude.ai" | "oauth_token")
-                    && v["apiProvider"].as_str().is_none_or(|p| p == "firstParty"),
-                method,
-            }
-        }
-        Harness::Codex => {
-            cmd.args(["login", "status"]);
-            let Ok(out) = bounded(&mut cmd) else {
-                return Login::Out;
-            };
-            let text = String::from_utf8_lossy(&out.stdout).to_string()
-                + &String::from_utf8_lossy(&out.stderr);
-            match text
-                .lines()
-                .find_map(|l| l.trim().strip_prefix("Logged in using "))
-            {
-                Some(rest) if out.status.success() => {
-                    // `an API key - sk-…`: only the words before any dash.
-                    let method = rest.split(" - ").next().unwrap_or(rest).trim().to_string();
-                    Login::In {
-                        subscription: method == "ChatGPT",
-                        method,
-                    }
-                }
-                _ => Login::Out,
-            }
-        }
-        Harness::OpenCode => Login::Own,
-    }
+    cmd.args(args);
+    bounded(&mut cmd).ok()
 }
 
 /// What a turn bills.
@@ -510,58 +481,811 @@ pub enum Billing {
     ApiKey { service: &'static str, key: Secret },
 }
 
-/// The account a turn starts on: the harness's login, else the key when
-/// the policy allows it, else a refusal naming the login command.
-pub fn choose(
-    h: Harness,
-    program: &Path,
-    cwd: &Path,
-    policy: &crate::policy::Auth,
-    keys: &KeySource,
-) -> Result<Billing, RunError> {
+/// The account a turn's login gives it: the harness's subscription (or
+/// OpenCode's own configured auth), else a refusal naming the login command
+/// and `agents use-key`. It never picks the key: only a turn whose use-key
+/// mark is consumed bills it (crate::turn). 0.7.0's fallback to the key for
+/// a harness that isn't logged in, or that bills a key of its own, is gone
+/// (decided 2026-10-29), and no setting bills the key on every turn.
+pub fn choose(h: Harness, program: &Path, cwd: &Path, agent: &str) -> Result<Billing, RunError> {
     let login = login(h, program, cwd);
     match &login {
         Login::In {
             subscription: true, ..
         }
         | Login::Own => Ok(Billing::Subscription),
-        // Not logged in, or logged in with a key the harness keeps: a key
-        // bills only as the policy allows, and only the Keychain's.
-        Login::Out | Login::In { .. } => match (policy.api_key_fallback, keychain_service(h)) {
-            (true, Some(service)) => Ok(Billing::ApiKey {
-                service,
-                key: keys.read(service)?,
-            }),
-            _ => Err(RunError::usage(
-                CODE_UNSUPPORTED,
-                match &login {
-                    Login::In { method, .. } => format!(
-                        "{} is logged in with {method}, an API key rather than a subscription, \
-                         and this agent's policy bills no key",
-                        h.as_str()
-                    ),
-                    _ => format!(
-                        "{} isn't logged in, so the turn has no account to run on",
-                        h.as_str()
-                    ),
-                },
-            )
-            .with_hint(format!(
-                "run `{}` once{}",
-                login_command(h),
-                if keychain_service(h).is_some() {
-                    ", or turn on `auth.api_key_fallback` in the agent's policy with a key in \
-                     the Keychain"
-                } else {
-                    ""
+        Login::Out | Login::In { .. } => Err(RunError::usage(
+            CODE_UNSUPPORTED,
+            match &login {
+                Login::In { method, .. } => format!(
+                    "{} is logged in with {method}, an API key rather than a subscription, \
+                     and nothing marked this turn to bill mdkg's key",
+                    h.as_str()
+                ),
+                _ => format!(
+                    "{} isn't logged in, so the turn has no account to run on",
+                    h.as_str()
+                ),
+            },
+        )
+        .with_hint(format!(
+            "run `{}` once{}",
+            login_command(h),
+            if keychain_service(h).is_some() {
+                format!(
+                    ", or `{} agents use-key {agent}` to bill your API key for its next turn \
+                     (auth.api_key_fallback allows it)",
+                    mdkg_format::program::BIN
+                )
+            } else {
+                String::new()
+            }
+        ))),
+    }
+}
+
+/// The mark `agents use-key` writes, so the agent's next turn bills the key
+/// (`auth.api_key_fallback` allows it). Only that command writes it:
+/// nothing arms a key charge automatically, and nothing is re-run within a
+/// turn, for a limit or any other reason.
+pub fn key_next_path(dir: &Path, agent: &str) -> PathBuf {
+    dir.join("billing")
+        .join(format!("{}.json", crate::state::file_name(agent)))
+}
+
+/// Syncs the folder holding the mark, so a rename or removal in it
+/// survives a crash.
+fn sync_folder(path: &Path) -> std::io::Result<()> {
+    std::fs::File::open(path.parent().unwrap_or(Path::new(".")))?.sync_all()
+}
+
+fn mark_error(path: &Path, what: &str, e: std::io::Error) -> RunError {
+    RunError::failure(
+        crate::error::CODE_IO,
+        format!("can't {what} the key fallback in {}: {e}", path.display()),
+    )
+}
+
+/// Whether `folder`, a billing folder, is there and fit to use (orchestrator,
+/// 2026-10-30, option B on #6097): never a link, a folder, owned by this
+/// user and writable by no one else. `Ok(false)` is absence; anything unfit
+/// is an error, never followed. Races with a same-user writer of the run
+/// folder are the stated residual (D1).
+fn checked_folder(folder: &Path) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt as _;
+    let m = match std::fs::symlink_metadata(folder) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    let unfit = |why: &str| Err(std::io::Error::other(format!("{} {why}", folder.display())));
+    if m.file_type().is_symlink() || !m.is_dir() {
+        return unfit("is a link or not a folder");
+    }
+    if m.uid() != rustix::process::getuid().as_raw() {
+        return unfit("isn't owned by you");
+    }
+    if m.mode() & 0o022 != 0 {
+        return unfit("is writable by others");
+    }
+    Ok(true)
+}
+
+/// The run folder's `billing/`, checked ([`checked_folder`]) and created
+/// owner-only if it's missing. Every folder this makes, the run folder too
+/// for an agent that has never run, and the existing ones every time, are
+/// synced into their parents, top down, so a mark written in it survives a
+/// crash, even after an earlier sync failed (reviews of e52416d5 and
+/// 7ff5295e).
+fn billing_folder(dir: &Path) -> std::io::Result<PathBuf> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    let folder = dir.join("billing");
+    // The run folder and billing/ always; above them, whatever this makes.
+    let mut chain = vec![folder.clone(), dir.to_path_buf()];
+    if !checked_folder(&folder)? {
+        let mut at = dir;
+        while !at.exists() {
+            match at.parent() {
+                Some(p) if !p.as_os_str().is_empty() => {
+                    chain.push(p.to_path_buf());
+                    at = p;
                 }
+                _ => break,
+            }
+        }
+        std::fs::DirBuilder::new().recursive(true).create(dir)?;
+        match std::fs::DirBuilder::new().mode(0o700).create(&folder) {
+            Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(e),
+            _ => {}
+        }
+        if !checked_folder(&folder)? {
+            return Err(std::io::Error::other(format!(
+                "{} wasn't made",
+                folder.display()
+            )));
+        }
+    }
+    // Top down: each folder's entry in its parent.
+    for path in chain.iter().rev() {
+        sync_folder(path)?;
+    }
+    Ok(folder)
+}
+
+/// Reads a billing file of at most 4 KiB, never following a link: it must be
+/// a regular file before it's opened, and the opened file must be that same
+/// file (device and inode). `Ok(None)` is absence, as is a billing folder
+/// that isn't there; an unfit folder or file is an error.
+fn read_small(path: &Path) -> std::io::Result<Option<String>> {
+    use std::io::Read as _;
+    use std::os::unix::fs::MetadataExt as _;
+    if !checked_folder(path.parent().unwrap_or(Path::new(".")))? {
+        return Ok(None);
+    }
+    let before = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    if !before.is_file() || before.len() > 4096 {
+        return Err(std::io::Error::other(format!(
+            "{} isn't a file of at most 4 KiB",
+            path.display()
+        )));
+    }
+    let file = std::fs::File::open(path)?;
+    let after = file.metadata()?;
+    if (after.dev(), after.ino()) != (before.dev(), before.ino()) {
+        return Err(std::io::Error::other(format!(
+            "{} changed while it was read",
+            path.display()
+        )));
+    }
+    let mut text = String::new();
+    file.take(4096).read_to_string(&mut text)?;
+    Ok(Some(text))
+}
+
+/// Creates `path` afresh: anything already there, a link included, is
+/// removed first (removing a link never touches its target), and the file
+/// is created exclusively, which never follows a link planted meanwhile.
+fn create_fresh(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+}
+
+/// Whether something is at `path`, without following a link: `NotFound` is
+/// absence, and any other error is an error, never taken for absence
+/// (review of 807dde3a).
+fn present(path: &Path) -> Result<bool, RunError> {
+    match checked_folder(path.parent().unwrap_or(Path::new("."))) {
+        Ok(true) => {}
+        Ok(false) => return Ok(false),
+        Err(e) => return Err(mark_error(path, "check", e)),
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(mark_error(path, "check", e)),
+    }
+}
+
+/// The file that holds a mark whose state is uncertain: a mark that may be
+/// in place but couldn't be removed durably. While it exists, no turn bills
+/// the key on the mark ([`settle_held`]).
+pub fn held_path(dir: &Path, agent: &str) -> PathBuf {
+    dir.join("billing")
+        .join(format!("{}.unsure", crate::state::file_name(agent)))
+}
+
+/// Serializes everything that writes, consumes or revokes an agent's mark
+/// (use-key, a turn, a policy change), so a turn consumes exactly the mark
+/// it read. Held until dropped.
+fn mark_lock(dir: &Path, agent: &str) -> Result<std::fs::File, RunError> {
+    let path = dir
+        .join("billing")
+        .join(format!("{}.lock", crate::state::file_name(agent)));
+    (|| -> std::io::Result<std::fs::File> {
+        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+        billing_folder(dir)?;
+        // Made exclusively when missing; otherwise a regular file, opened
+        // without truncation and checked to be the file looked at. Another
+        // caller making it first is the existing lock (review of 7c674f52).
+        let open_existing = || -> std::io::Result<std::fs::File> {
+            let m = std::fs::symlink_metadata(&path)?;
+            if !m.is_file() {
+                return Err(std::io::Error::other("the lock is a link or not a file"));
+            }
+            let f = std::fs::OpenOptions::new().write(true).open(&path)?;
+            let opened = f.metadata()?;
+            if (opened.dev(), opened.ino()) != (m.dev(), m.ino()) {
+                return Err(std::io::Error::other(
+                    "the lock changed while it was opened",
+                ));
+            }
+            Ok(f)
+        };
+        let file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => open_existing()?,
+            Err(e) => return Err(e),
+        };
+        file.lock()?;
+        Ok(file)
+    })()
+    .map_err(|e| mark_error(&path, "lock", e))
+}
+
+/// A use-key mark: the harness and the Keychain service it was written for,
+/// so it bills only that harness's key, and an id, so a turn consumes the
+/// very mark it read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Mark {
+    pub harness: String,
+    pub service: String,
+    pub id: String,
+}
+
+impl Mark {
+    /// Whether this mark bills `h`'s key: written for that harness and its
+    /// service. A mark for another harness never bills this one.
+    pub fn bills(&self, h: Harness) -> bool {
+        self.harness == h.as_str() && keychain_service(h) == Some(self.service.as_str())
+    }
+
+    fn json(&self) -> String {
+        format!(
+            "{}\n",
+            serde_json::json!({"harness": self.harness, "service": self.service, "id": self.id})
+        )
+    }
+}
+
+/// An agent's mark, as read: none, one, or one that can't be read (a file
+/// that can't be opened, isn't a mark, or is an older build's empty mark),
+/// which fails closed: it bills nothing and refuses the turn until cleared.
+#[derive(Debug)]
+pub enum MarkRead {
+    None,
+    For(Mark),
+    Unreadable(RunError),
+}
+
+pub fn read_mark(dir: &Path, agent: &str) -> MarkRead {
+    let path = key_next_path(dir, agent);
+    let text = match read_small(&path) {
+        Ok(Some(t)) => t,
+        Ok(None) => return MarkRead::None,
+        Err(e) => return MarkRead::Unreadable(mark_error(&path, "read", e)),
+    };
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+    let field = |k: &str| v.get(k).and_then(|f| f.as_str()).map(String::from);
+    match (field("harness"), field("service"), field("id")) {
+        (Some(harness), Some(service), Some(id)) => MarkRead::For(Mark {
+            harness,
+            service,
+            id,
+        }),
+        _ => MarkRead::Unreadable(RunError::failure(
+            crate::error::CODE_IO,
+            format!("{} isn't a use-key mark", path.display()),
+        )),
+    }
+}
+
+/// How [`mark_key_next`] went, which decides what use-key may promise about
+/// the next turn's billing.
+#[derive(Debug)]
+pub enum Marked {
+    /// Recorded durably: the next turn bills the key.
+    Armed,
+    /// Not recorded, and any mark it placed was removed and that removal
+    /// synced: the next turn stays on the subscription.
+    Absent(RunError),
+    /// The mark may be in place, but it is held ([`held_path`]): the next
+    /// turn clears it rather than bill the key, and refuses until it can.
+    Held(RunError),
+    /// The mark may be in place and couldn't be held: the next turn may
+    /// bill the key.
+    MayBill(RunError),
+}
+
+/// The file operations [`mark_key_next`] can fail at, for failure-injection
+/// tests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Step {
+    Write,
+    SyncMark,
+    Remove,
+    SyncRemoval,
+    Hold,
+}
+
+/// Writes `mark`: to a temporary file, synced, renamed into place and the
+/// folder synced, so a mark is whole or absent after a crash. A failure
+/// anywhere removes the mark again; only a removal that's synced promises
+/// the subscription ([`Marked::Absent`]). One that isn't holds the mark
+/// ([`Marked::Held`]), or, if even that fails, says the next turn may bill
+/// the key ([`Marked::MayBill`]). Errors name the file. The caller holds
+/// [`mark_lock`].
+fn mark_key_next(dir: &Path, agent: &str, mark: &Mark) -> Marked {
+    mark_key_next_with(dir, agent, mark, &|_| Ok(()))
+}
+
+fn mark_key_next_with(
+    dir: &Path,
+    agent: &str,
+    mark: &Mark,
+    fault: &dyn Fn(Step) -> std::io::Result<()>,
+) -> Marked {
+    use std::io::Write as _;
+    let path = key_next_path(dir, agent);
+    let tmp = path.with_extension("json.tmp");
+    let folder = path.parent().unwrap_or(dir);
+    let written = (|| -> std::io::Result<()> {
+        fault(Step::Write)?;
+        billing_folder(dir)?;
+        let mut file = create_fresh(&tmp)?;
+        file.write_all(mark.json().as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, &path)?;
+        fault(Step::SyncMark)?;
+        sync_folder(&path)
+    })();
+    let Err(e) = written else {
+        return Marked::Armed;
+    };
+    let _ = std::fs::remove_file(&tmp);
+    let error = mark_error(&path, "record", e);
+    let removed = (|| -> std::io::Result<()> {
+        fault(Step::Remove)?;
+        match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+        fault(Step::SyncRemoval)?;
+        // Synced even when nothing was there: a rename that failed may
+        // still have reached the folder.
+        if folder.is_dir() {
+            sync_folder(&path)?;
+        }
+        Ok(())
+    })();
+    if removed.is_ok() {
+        return Marked::Absent(error);
+    }
+    match hold(dir, agent, fault) {
+        Ok(()) => Marked::Held(error),
+        Err(_) => Marked::MayBill(error),
+    }
+}
+
+/// Writes the hold on an agent's mark, durably.
+fn hold(
+    dir: &Path,
+    agent: &str,
+    fault: &dyn Fn(Step) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let held = held_path(dir, agent);
+    fault(Step::Hold)?;
+    billing_folder(dir)?;
+    // A hold already there is kept, never removed and recreated: a crash
+    // between the two would leave an uncertain mark unheld (review of
+    // 9989c849). Anything else at the path, a link included, is replaced.
+    if std::fs::symlink_metadata(&held).is_ok_and(|m| m.is_file()) {
+        std::fs::File::open(&held)?.sync_all()?;
+    } else {
+        create_fresh(&held)?.sync_all()?;
+    }
+    sync_folder(&held)
+}
+
+/// The note a turn the subscription's usage limit ended leaves, so `agents
+/// status` can offer the key. Display only: it never bills anything.
+pub fn limited_path(dir: &Path, agent: &str) -> PathBuf {
+    dir.join("billing")
+        .join(format!("{}.limited", crate::state::file_name(agent)))
+}
+
+/// Leaves the note; a failure only costs the status line.
+pub fn note_limited(dir: &Path, agent: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let path = limited_path(dir, agent);
+    let tmp = path.with_extension("limited.tmp");
+    billing_folder(dir)?;
+    create_fresh(&tmp)?.write_all(format!("{}\n", crate::state::now_ms()).as_bytes())?;
+    std::fs::rename(&tmp, &path)
+}
+
+/// Takes the note away once a turn is admitted; absent is fine.
+pub fn clear_limited(dir: &Path, agent: &str) -> std::io::Result<()> {
+    // Never through a billing folder that's a link or unfit (option B, #6097
+    // item 2): that could remove a file elsewhere.
+    if !checked_folder(&dir.join("billing"))? {
+        return Ok(());
+    }
+    match std::fs::remove_file(limited_path(dir, agent)) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
+}
+
+/// What a turn the subscription's usage limit ended says, as its hint and
+/// in `agents status`: the key is offered, never charged.
+pub fn limit_hint(h: Harness, agent: &str, policy: &crate::policy::Auth) -> String {
+    let mut hint = "subscription limit reached".to_string();
+    if keychain_service(h).is_some() {
+        hint.push_str(&format!(
+            "; `{} agents use-key {agent}` bills your API key for its next turn",
+            mdkg_format::program::BIN
+        ));
+        if !policy.api_key_fallback {
+            hint.push_str(" (once auth.api_key_fallback allows it)");
+        }
+    }
+    hint
+}
+
+/// What `agents status` says about the key for an agent: a hold, a mark
+/// waiting for its next turn (or one for another harness, or unreadable),
+/// or the offer after a limit.
+pub fn billing_note(
+    dir: &Path,
+    agent: &str,
+    h: Harness,
+    policy: &crate::policy::Auth,
+) -> Option<String> {
+    if held_path(dir, agent).is_file() {
+        return Some(format!(
+            "a key mark couldn't be recorded or removed durably and is held ({}): the next turn \
+             clears it instead of billing the API key",
+            held_path(dir, agent).display()
+        ));
+    }
+    match read_mark(dir, agent) {
+        MarkRead::Unreadable(e) => Some(format!(
+            "{}: no turn bills the key on it, and turns are refused until it's removed",
+            e.message
+        )),
+        MarkRead::For(m) if !m.bills(h) => Some(format!(
+            "a use-key mark for {} waits, but this agent runs {}: the next turn removes it",
+            m.harness,
+            h.as_str()
+        )),
+        MarkRead::For(_) if !policy.api_key_fallback => Some(
+            "a use-key mark waits, but auth.api_key_fallback is off: the next turn removes it"
+                .to_string(),
+        ),
+        MarkRead::For(_) => Some("use-key: the next turn bills the API key".to_string()),
+        MarkRead::None if limited_path(dir, agent).is_file() => Some(limit_hint(h, agent, policy)),
+        MarkRead::None => None,
+    }
+}
+
+/// The note `agents use-key` sends the agent to wake its supervisor. From
+/// the launcher's own actor it's set aside unseen when its message id is
+/// one use-key recorded ([`record_wake`]), or its text is exactly this,
+/// never merely starting so (orchestrator, 2026-10-29/30, #6209 D-5). Any
+/// other note is mail.
+pub const USE_KEY_NOTE: &str = "use-key: your next turn bills the user's API key. The mail the \
+                                usage limit left unread is still waiting; carry on with it.";
+
+/// The wake notes' ids use-key recorded for an agent, newest last.
+fn wake_path(dir: &Path, agent: &str) -> PathBuf {
+    dir.join("billing")
+        .join(format!("{}.wake", crate::state::file_name(agent)))
+}
+
+/// The ids of the wake notes use-key sent the agent, as recorded. A record
+/// that's a link, isn't a file or is over 4 KiB counts as none, whole
+/// (review of 37c6c894): a note it would have named is then known only by
+/// its exact text.
+pub fn wake_ids(dir: &Path, agent: &str) -> Vec<String> {
+    read_small(&wake_path(dir, agent))
+        .ok()
+        .flatten()
+        .map(|text| {
+            text.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// How many wake-note ids the record keeps: well more than the notes an
+/// agent leaves unread, and within [`read_small`]'s 4 KiB.
+const WAKE_IDS: usize = 64;
+
+/// Records `id`, the wake note use-key is about to send, keeping the last
+/// [`WAKE_IDS`], under the mark lock, so two use-key runs can't lose each
+/// other's id (review of 37c6c894).
+pub fn record_wake(dir: &Path, agent: &str, id: &str) -> Result<(), RunError> {
+    use std::io::Write as _;
+    let path = wake_path(dir, agent);
+    let _lock = mark_lock(dir, agent)?;
+    let mut ids = wake_ids(dir, agent);
+    ids.push(id.to_string());
+    let keep = ids.len().saturating_sub(WAKE_IDS);
+    let tmp = path.with_extension("wake.tmp");
+    (|| -> std::io::Result<()> {
+        billing_folder(dir)?;
+        let mut file = create_fresh(&tmp)?;
+        file.write_all(format!("{}\n", ids[keep..].join("\n")).as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, &path)?;
+        sync_folder(&path)
+    })()
+    .map_err(|e| mark_error(&path, "record the wake note for", e))
+}
+
+/// `agents use-key`: bills the agent's next turn, one, on its harness's API
+/// key. It refuses unless the policy allows it (`auth.api_key_fallback`)
+/// and the harness has a key fallback (Claude, Codex; not OpenCode). A
+/// hold on an earlier mark is settled first, or the command refuses, so a
+/// new mark is never reported armed and then cleared. The mark is written
+/// durably, bound to the harness; one that fails is removed again or held,
+/// as [`mark_key_next`] says, and the error says what the next turn does.
+/// Who may run it is the CLI's to check: never an agent.
+pub fn use_key(
+    dir: &Path,
+    agent: &str,
+    h: Harness,
+    policy: &crate::policy::Auth,
+) -> Result<PathBuf, RunError> {
+    let Some(service) = keychain_service(h) else {
+        return Err(RunError::usage(
+            CODE_UNSUPPORTED,
+            format!("{} has no API key fallback", h.as_str()),
+        ));
+    };
+    if !policy.api_key_fallback {
+        return Err(RunError::usage(
+            CODE_UNSUPPORTED,
+            format!("{agent}'s policy doesn't allow use-key"),
+        )
+        .with_hint(
+            "turn on `auth.api_key_fallback` in the agent's policy, with a key in the Keychain",
+        ));
+    }
+    let _lock = mark_lock(dir, agent)?;
+    // A hold that can't be removed would clear the new mark at the next
+    // turn: refuse rather than report it armed (review of 807dde3a).
+    if let Some(w) = settle_held_locked(dir, agent)? {
+        return Err(RunError::failure(crate::error::CODE_IO, w).with_hint(held_hint(dir, agent)));
+    }
+    let mark = Mark {
+        harness: h.as_str().to_string(),
+        service: service.to_string(),
+        id: uuid::Uuid::now_v7().to_string(),
+    };
+    marked(dir, agent, mark_key_next(dir, agent, &mark))
+}
+
+/// What a mark's outcome means for the next turn: the subscription is
+/// promised only once a failed mark's removal is synced.
+fn marked(dir: &Path, agent: &str, m: Marked) -> Result<PathBuf, RunError> {
+    match m {
+        Marked::Armed => Ok(key_next_path(dir, agent)),
+        Marked::Absent(e) => {
+            Err(e.and_hint("nothing is marked: the next turn stays on the subscription"))
+        }
+        Marked::Held(e) => Err(e.and_hint(format!(
+            "the mark may be in place, so {} holds it: the next turn clears it instead of \
+             billing the API key, and is refused until it can",
+            held_path(dir, agent).display()
+        ))),
+        Marked::MayBill(e) => Err(e.and_hint(
+            "the mark may be in place and couldn't be held: the next turn may bill the API key",
+        )),
+    }
+}
+
+/// Consumes `mark`, the one the turn read, before the turn is admitted and
+/// its key charged: renamed away (which fails if it's gone, so a missing
+/// mark is never a consume), checked to be the same mark, and the rename
+/// synced. Any failure refuses the turn: it never falls back to another
+/// account, the harness's own key included.
+pub fn consume_mark(dir: &Path, agent: &str, mark: &Mark) -> Result<(), RunError> {
+    let _lock = mark_lock(dir, agent)?;
+    let path = key_next_path(dir, agent);
+    // A hold written since the turn read the mark (use-key's write that
+    // couldn't be synced or undone) means the mark may not stand: never
+    // billed on (review of bc72ad53).
+    if present(&held_path(dir, agent))? {
+        return Err(RunError::failure(
+            crate::error::CODE_IO,
+            format!(
+                "the use-key mark in {} is held: it couldn't be recorded durably",
+                path.display()
+            ),
+        )
+        .with_hint(held_hint(dir, agent)));
+    }
+    // Compared before it's moved, under the lock every writer takes, so a
+    // mark that replaced the one read is never moved aside (review of
+    // 807dde3a).
+    match read_mark(dir, agent) {
+        MarkRead::For(m) if m.id == mark.id => {}
+        MarkRead::None => {
+            return Err(RunError::failure(
+                crate::error::CODE_IO,
+                format!("the use-key mark in {} is gone", path.display()),
+            ));
+        }
+        _ => {
+            return Err(RunError::failure(
+                crate::error::CODE_IO,
+                format!(
+                    "the use-key mark in {} changed after this turn read it",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    let taken = path.with_extension("json.consumed");
+    std::fs::rename(&path, &taken).map_err(|e| mark_error(&path, "consume", e))?;
+    sync_folder(&path).map_err(|e| mark_error(&path, "consume", e))?;
+    let _ = std::fs::remove_file(&taken);
+    Ok(())
+}
+
+/// Revokes the agent's mark durably: when the policy doesn't allow a key,
+/// or the mark is for another harness, so it can't bill a later turn. A
+/// mark that can't be removed is held instead, which blocks billing on it
+/// until it's cleared; one that can't be held either refuses the turn.
+/// `Ok(Some(_))` is a warning.
+pub fn revoke_mark(dir: &Path, agent: &str) -> Result<Option<String>, RunError> {
+    revoke(dir, agent, None)
+}
+
+/// [`revoke_mark`] for the mark with id `id` only: under the lock, a mark
+/// written since it was read (a new use-key) is left alone (review of
+/// 807dde3a).
+pub fn revoke_mark_read(dir: &Path, agent: &str, id: &str) -> Result<Option<String>, RunError> {
+    revoke(dir, agent, Some(id))
+}
+
+/// A billing folder that isn't fit to use ([`checked_folder`]) refuses
+/// every turn, fallback on or off, so its error says what to fix: the
+/// folder, not a mark (review of 7c674f52).
+fn unfit_folder(dir: &Path) -> Result<(), RunError> {
+    let folder = dir.join("billing");
+    checked_folder(&folder).map(|_| ()).map_err(|e| {
+        RunError::failure(crate::error::CODE_IO, e.to_string()).with_hint(format!(
+            "make it a folder of yours that no one else can write: `chmod 700 {}`, or \
+             remove it if it isn't yours; turns are refused until then",
+            folder.display()
+        ))
+    })
+}
+
+fn revoke(dir: &Path, agent: &str, id: Option<&str>) -> Result<Option<String>, RunError> {
+    unfit_folder(dir)?;
+    let path = key_next_path(dir, agent);
+    let held = held_path(dir, agent);
+    // An error here isn't absence: it goes on to the revoke, which fails
+    // closed.
+    if !present(&path).unwrap_or(true) && !present(&held).unwrap_or(true) {
+        return Ok(None);
+    }
+    let lock = mark_lock(dir, agent);
+    if lock.is_ok()
+        && let Some(id) = id
+        // Only a mark read whole, with another id, is a newer one; one that
+        // can't be read is revoked, failing closed (review of 9989c849).
+        && matches!(read_mark(dir, agent), MarkRead::For(m) if m.id != id)
+        && !present(&held).unwrap_or(true)
+    {
+        return Ok(None);
+    }
+    let cleared = lock
+        .as_ref()
+        .map_err(Clone::clone)
+        .and_then(|_| clear_key_next(dir, agent));
+    match cleared {
+        Ok(()) => Ok(clear_held(dir, agent).err().map(|e| e.message)),
+        Err(e) if present(&held).unwrap_or(false) => {
+            Ok(Some(format!("{}; it stays held", e.message)))
+        }
+        Err(e) => match hold(dir, agent, &|_| Ok(())) {
+            Ok(()) => Ok(Some(format!(
+                "{}; {} holds it, so no turn bills the key on it",
+                e.message,
+                held.display()
+            ))),
+            Err(_) => Err(e.and_hint(format!(
+                "the mark can't be removed or held, so turns are refused until {} is removed",
+                path.display()
             ))),
         },
     }
 }
 
+/// Settles a held mark ([`Marked::Held`]) before a turn chooses its
+/// account: the mark is cleared durably and the hold removed, so no turn
+/// bills the key on it. A mark that still can't be cleared refuses the
+/// turn. `Ok(Some(_))` is a warning: the mark is gone but the hold stayed.
+pub fn settle_held(dir: &Path, agent: &str) -> Result<Option<String>, RunError> {
+    unfit_folder(dir)?;
+    if !present(&held_path(dir, agent)).map_err(|e| e.and_hint(held_hint(dir, agent)))? {
+        return Ok(None);
+    }
+    let _lock = mark_lock(dir, agent).map_err(|e| e.and_hint(held_hint(dir, agent)))?;
+    settle_held_locked(dir, agent)
+}
+
+fn held_hint(dir: &Path, agent: &str) -> String {
+    format!(
+        "an earlier mark couldn't be recorded or removed durably, so no turn bills the API key \
+         on it, and turns are refused until it's cleared: remove {} and {}, or turn \
+         auth.api_key_fallback off",
+        key_next_path(dir, agent).display(),
+        held_path(dir, agent).display()
+    )
+}
+
+fn settle_held_locked(dir: &Path, agent: &str) -> Result<Option<String>, RunError> {
+    if !present(&held_path(dir, agent)).map_err(|e| e.and_hint(held_hint(dir, agent)))? {
+        return Ok(None);
+    }
+    clear_key_next(dir, agent).map_err(|e| e.and_hint(held_hint(dir, agent)))?;
+    Ok(clear_held(dir, agent).err().map(|e| e.message))
+}
+
+/// Removes the hold, durably; absent is fine.
+pub fn clear_held(dir: &Path, agent: &str) -> Result<(), RunError> {
+    let held = held_path(dir, agent);
+    match std::fs::remove_file(&held) {
+        Ok(()) => sync_folder(&held).map_err(|e| mark_error(&held, "clear the hold on", e)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(mark_error(&held, "clear the hold on", e)),
+    }
+}
+
+/// Whether a mark file is there, read or not.
+pub fn key_next(dir: &Path, agent: &str) -> bool {
+    key_next_path(dir, agent).exists()
+}
+
+/// Removes the mark durably (removed, then the folder synced). An error
+/// means the mark may still be there. Revoking, not consuming: a missing
+/// mark is fine here, never in [`consume_mark`].
+fn clear_key_next(dir: &Path, agent: &str) -> Result<(), RunError> {
+    let path = key_next_path(dir, agent);
+    match std::fs::remove_file(&path) {
+        Ok(()) => sync_folder(&path).map_err(|e| mark_error(&path, "clear", e)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(mark_error(&path, "clear", e)),
+    }
+}
+
+/// Whether `line`, a line of a harness's final output, is that harness's own
+/// usage-limit error in the form its CLI prints it, not a phrase quoted
+/// inside some other line (its adapter's
+/// [`usage_limit`](crate::harness::HarnessAdapter::usage_limit)). It only
+/// offers the key (`agents use-key`), never charges it, so a miss costs
+/// only the hint.
+pub fn usage_limit_error(h: Harness, line: &str) -> bool {
+    h.adapter().usage_limit(line)
+}
+
 /// Whether a failed turn's output says the subscription hit its usage
-/// limit, which the key fallback retries once.
+/// limit, after which the key fallback bills the agent's next turn.
 pub fn usage_limited(text: &str) -> bool {
     let t = text.to_ascii_lowercase();
     [
@@ -574,12 +1298,64 @@ pub fn usage_limited(text: &str) -> bool {
     .any(|p| t.contains(p))
 }
 
+/// Whether text says the model is at capacity: the provider turned the
+/// request away, not the subscription's limit. A long resumed session can
+/// keep failing so while fresh ones of the same model work, so after two
+/// such turns in a row the supervisor starts the agent's next turn in a
+/// fresh session; nothing is retried within a turn. The wording is Codex's
+/// (friction log item 21). Claude's "Overloaded" (HTTP 529) isn't matched:
+/// that's provider-wide, and a fresh session wouldn't help. OpenCode passes
+/// its provider's text through, so an OpenAI model's matches. A turn counts
+/// only the harness's own error form ([`capacity_error`]).
+pub fn model_at_capacity(text: &str) -> bool {
+    let t = text.to_ascii_lowercase();
+    ["model is at capacity", "model_at_capacity"]
+        .iter()
+        .any(|p| t.contains(p))
+}
+
+/// Whether `line`, a harness's final error line, is its own capacity
+/// error, not the phrase quoted in some other line (review of 6b4ee963): an
+/// `ERROR:` line whose message starts "Selected model is at capacity", or a
+/// JSON error event (Codex's, or OpenCode's passing its provider's text on)
+/// whose code is `model_at_capacity` or whose message starts so.
+pub fn capacity_error(line: &str) -> bool {
+    const MESSAGE: &str = "selected model is at capacity";
+    let starts = |m: &str| m.trim_start().to_ascii_lowercase().starts_with(MESSAGE);
+    let line = line.trim();
+    if let Some(rest) = line
+        .get(..6)
+        .filter(|p| p.eq_ignore_ascii_case("error:"))
+        .map(|_| &line[6..])
+    {
+        return starts(rest);
+    }
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+        return false;
+    };
+    let nested = v.get("error").filter(|e| e.is_object());
+    let is_error = nested.is_some()
+        || matches!(
+            v.get("type").and_then(|t| t.as_str()),
+            Some("error" | "turn.failed")
+        );
+    let event = nested.unwrap_or(&v);
+    let text = |e: &serde_json::Value, k: &str| e.get(k).and_then(|f| f.as_str()).map(String::from);
+    is_error
+        && (text(event, "code").as_deref() == Some("model_at_capacity")
+            || text(event, "message").is_some_and(|m| starts(&m))
+            || event
+                .get("data")
+                .and_then(|d| text(d, "message"))
+                .is_some_and(|m| starts(&m)))
+}
+
 /// The account a harness would bill now, for `agents status` and `doctor`,
 /// without reading any key.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct AuthStatus {
-    /// `subscription`, `api_key` (the fallback), `own_config` (OpenCode) or
-    /// `none`.
+    /// `subscription`, `own_config` (OpenCode) or `none`; never `api_key`
+    /// (0.7.0's fallback), since the key bills only a turn use-key marks.
     pub source: String,
     /// The login method the harness reports, when logged in.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -598,15 +1374,15 @@ pub fn status(
 ) -> AuthStatus {
     let service = keychain_service(h);
     let key_in_keychain = service.is_some_and(|s| keys.has(s));
-    let fallback = policy.api_key_fallback && key_in_keychain;
     let (source, method) = match login(h, program, cwd) {
         Login::In {
             method,
             subscription: true,
         } => ("subscription", Some(method)),
         Login::Own => ("own_config", None),
-        Login::In { method, .. } => (if fallback { "api_key" } else { "none" }, Some(method)),
-        Login::Out => (if fallback { "api_key" } else { "none" }, None),
+        // The key bills only a turn use-key marks, never on its own.
+        Login::In { method, .. } => ("none", Some(method)),
+        Login::Out => ("none", None),
     };
     AuthStatus {
         source: source.into(),
@@ -632,6 +1408,361 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_mark_is_removed_held_or_said_to_maybe_bill_as_far_as_it_got() {
+        let dir = std::env::temp_dir().join(format!("mdkg-mark-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fail_at = |steps: &'static [Step]| {
+            move |s: Step| {
+                if steps.contains(&s) {
+                    Err(std::io::Error::other("injected"))
+                } else {
+                    Ok(())
+                }
+            }
+        };
+        let hint = |m: Marked| match marked(&dir, "lane", m) {
+            Ok(_) => "the next turn bills the API key".to_string(),
+            Err(e) => e.hint.unwrap_or_default(),
+        };
+        let mark = Mark {
+            harness: "claude".into(),
+            service: "mdkg-anthropic".into(),
+            id: "m1".into(),
+        };
+        // The first mark creates its folder and is armed.
+        let m = mark_key_next(&dir, "lane", &mark);
+        assert!(matches!(m, Marked::Armed), "{m:?}");
+        assert!(hint(m).contains("the next turn bills the API key"));
+        clear_key_next(&dir, "lane").unwrap();
+        // The folder sync after the rename fails: the mark is removed and
+        // that removal synced, so the subscription is promised.
+        let m = mark_key_next_with(&dir, "lane", &mark, &fail_at(&[Step::SyncMark]));
+        assert!(matches!(m, Marked::Absent(_)), "{m:?}");
+        assert!(!key_next(&dir, "lane"));
+        assert!(hint(m).contains("stays on the subscription"));
+        assert!(!key_next(&dir, "lane"));
+        // A failure before the rename leaves nothing either.
+        let m = mark_key_next_with(&dir, "lane", &mark, &fail_at(&[Step::Write]));
+        assert!(matches!(m, Marked::Absent(_)), "{m:?}");
+        // The removal's sync fails too: the mark is held, never promised.
+        let m = mark_key_next_with(
+            &dir,
+            "lane",
+            &mark,
+            &fail_at(&[Step::SyncMark, Step::Remove]),
+        );
+        assert!(matches!(m, Marked::Held(_)), "{m:?}");
+        assert!(key_next(&dir, "lane") && held_path(&dir, "lane").is_file());
+        let h = hint(m);
+        assert!(h.contains("instead of billing the API key"), "{h}");
+        assert!(!h.contains("stays on the subscription"), "{h}");
+        // The next turn settles it: the mark and the hold are cleared.
+        assert_eq!(settle_held(&dir, "lane").unwrap(), None);
+        assert!(!key_next(&dir, "lane") && !held_path(&dir, "lane").exists());
+        // Nothing can be removed or held: the hint says it may bill.
+        let m = mark_key_next_with(
+            &dir,
+            "lane",
+            &mark,
+            &fail_at(&[Step::SyncMark, Step::SyncRemoval, Step::Hold]),
+        );
+        assert!(matches!(m, Marked::MayBill(_)), "{m:?}");
+        assert!(hint(m).contains("may bill the API key"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_mark_bills_only_its_harness_and_is_consumed_only_as_read() {
+        let dir = std::env::temp_dir().join(format!("mdkg-mark-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let on = crate::policy::Auth {
+            api_key_fallback: true,
+            ..crate::policy::Auth::default()
+        };
+        use_key(&dir, "lane", Harness::Claude, &on).unwrap();
+        let MarkRead::For(mark) = read_mark(&dir, "lane") else {
+            panic!("a mark")
+        };
+        assert!(mark.bills(Harness::Claude));
+        assert!(!mark.bills(Harness::Codex), "never another harness's key");
+        assert!(!mark.bills(Harness::OpenCode));
+        // A mark replaced since it was read isn't the one consumed: it's
+        // put back, and the consume fails.
+        let stale = Mark {
+            id: "older".into(),
+            ..mark.clone()
+        };
+        assert!(consume_mark(&dir, "lane", &stale).is_err());
+        assert!(key_next(&dir, "lane"), "the newer mark is kept");
+        consume_mark(&dir, "lane", &mark).unwrap();
+        assert!(!key_next(&dir, "lane"));
+        // A missing mark is never a successful consume.
+        assert!(consume_mark(&dir, "lane", &mark).is_err());
+        // An older build's empty mark, or any other file, fails closed.
+        std::fs::write(key_next_path(&dir, "lane"), "{}\n").unwrap();
+        assert!(matches!(read_mark(&dir, "lane"), MarkRead::Unreadable(_)));
+        // Revoking removes it; a hold on an earlier mark is settled before
+        // use-key reports a new one armed.
+        assert_eq!(revoke_mark(&dir, "lane").unwrap(), None);
+        assert!(!key_next(&dir, "lane"));
+        std::fs::write(held_path(&dir, "lane"), "").unwrap();
+        use_key(&dir, "lane", Harness::Codex, &on).unwrap();
+        assert!(!held_path(&dir, "lane").exists());
+        assert!(matches!(read_mark(&dir, "lane"), MarkRead::For(m) if m.bills(Harness::Codex)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn billing_writes_never_follow_a_planted_link() {
+        use std::os::unix::fs::symlink;
+        let dir = std::env::temp_dir().join(format!("mdkg-mark-{}", uuid::Uuid::now_v7()));
+        let billing = dir.join("billing");
+        std::fs::create_dir_all(&billing).unwrap();
+        let victim = dir.join("victim");
+        std::fs::write(&victim, "keep").unwrap();
+        let on = crate::policy::Auth {
+            api_key_fallback: true,
+            ..crate::policy::Auth::default()
+        };
+        // Links at the mark's temporary file, the hold, the limit note and
+        // its temporary file: each is replaced, never written through.
+        for name in [
+            "lane.json.tmp",
+            "lane.limited",
+            "lane.limited.tmp",
+            "lane.unsure",
+            "lane.wake.tmp",
+        ] {
+            symlink(&victim, billing.join(name)).unwrap();
+        }
+        use_key(&dir, "lane", Harness::Claude, &on).unwrap();
+        note_limited(&dir, "lane").unwrap();
+        hold(&dir, "lane", &|_| Ok(())).unwrap();
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
+        assert!(
+            !std::fs::symlink_metadata(limited_path(&dir, "lane"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        // A billing folder that's a link is refused outright.
+        let other = std::env::temp_dir().join(format!("mdkg-mark-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&other).unwrap();
+        let elsewhere = other.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        symlink(&elsewhere, other.join("billing")).unwrap();
+        assert!(use_key(&other, "lane", Harness::Claude, &on).is_err());
+        assert!(std::fs::read_dir(&elsewhere).unwrap().next().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&other);
+    }
+
+    #[test]
+    fn a_mark_held_after_the_turn_read_it_is_never_consumed() {
+        // use-key's write published the mark, then couldn't sync or undo
+        // it and held it: a turn that read the mark meanwhile doesn't bill
+        // on it.
+        let dir = std::env::temp_dir().join(format!("mdkg-mark-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let on = crate::policy::Auth {
+            api_key_fallback: true,
+            ..crate::policy::Auth::default()
+        };
+        use_key(&dir, "lane", Harness::Claude, &on).unwrap();
+        let MarkRead::For(mark) = read_mark(&dir, "lane") else {
+            panic!("a mark")
+        };
+        hold(&dir, "lane", &|_| Ok(())).unwrap();
+        let e = consume_mark(&dir, "lane", &mark).expect_err("held");
+        assert!(e.message.contains("is held"), "{}", e.message);
+        assert!(key_next(&dir, "lane"), "not consumed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn revoking_a_read_mark_never_removes_a_newer_one() {
+        let dir = std::env::temp_dir().join(format!("mdkg-mark-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let on = crate::policy::Auth {
+            api_key_fallback: true,
+            ..crate::policy::Auth::default()
+        };
+        use_key(&dir, "lane", Harness::Claude, &on).unwrap();
+        let MarkRead::For(old) = read_mark(&dir, "lane") else {
+            panic!("a mark")
+        };
+        // A new use-key since the turn read the old mark: revoking the old
+        // one leaves the new one alone.
+        use_key(&dir, "lane", Harness::Codex, &on).unwrap();
+        assert_eq!(revoke_mark_read(&dir, "lane", &old.id).unwrap(), None);
+        assert!(matches!(read_mark(&dir, "lane"), MarkRead::For(m) if m.bills(Harness::Codex)));
+        let MarkRead::For(new) = read_mark(&dir, "lane") else {
+            panic!("a mark")
+        };
+        revoke_mark_read(&dir, "lane", &new.id).unwrap();
+        assert!(!key_next(&dir, "lane"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn use_key_refuses_while_a_hold_cant_be_removed_and_reads_fail_closed() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("mdkg-mark-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let on = crate::policy::Auth {
+            api_key_fallback: true,
+            ..crate::policy::Auth::default()
+        };
+        // The lock file exists; then a hold that the read-only folder
+        // keeps: a new mark would be cleared by it, so none is armed.
+        use_key(&dir, "lane", Harness::Claude, &on).unwrap();
+        revoke_mark(&dir, "lane").unwrap();
+        hold(&dir, "lane", &|_| Ok(())).unwrap();
+        let billing = dir.join("billing");
+        std::fs::set_permissions(&billing, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let refused = use_key(&dir, "lane", Harness::Claude, &on);
+        // A folder that can't be looked into fails closed: not "no hold".
+        std::fs::set_permissions(&billing, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable = settle_held(&dir, "lane");
+        std::fs::set_permissions(&billing, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(refused.is_err(), "{refused:?}");
+        assert!(!key_next(&dir, "lane"), "nothing armed");
+        assert!(unreadable.is_err(), "{unreadable:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_hold_already_in_place_is_kept_never_removed_and_recreated() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = std::env::temp_dir().join(format!("mdkg-mark-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        hold(&dir, "lane", &|_| Ok(())).unwrap();
+        let before = std::fs::metadata(held_path(&dir, "lane")).unwrap().ino();
+        hold(&dir, "lane", &|_| Ok(())).unwrap();
+        let after = std::fs::metadata(held_path(&dir, "lane")).unwrap().ino();
+        assert_eq!(before, after, "the same file: no window without a hold");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn revoking_a_read_mark_that_became_unreadable_fails_closed() {
+        let dir = std::env::temp_dir().join(format!("mdkg-mark-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let on = crate::policy::Auth {
+            api_key_fallback: true,
+            ..crate::policy::Auth::default()
+        };
+        use_key(&dir, "lane", Harness::Claude, &on).unwrap();
+        let MarkRead::For(read) = read_mark(&dir, "lane") else {
+            panic!("a mark")
+        };
+        // Unreadable since it was read: not a newer mark, so it's revoked.
+        std::fs::write(key_next_path(&dir, "lane"), "not a mark").unwrap();
+        revoke_mark_read(&dir, "lane", &read.id).unwrap();
+        assert!(!key_next(&dir, "lane"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn use_key_creates_a_missing_run_folder_too() {
+        // An agent that has never run: neither the run folder nor billing/
+        // exists yet. Both are created (and synced) for the mark.
+        let root = std::env::temp_dir().join(format!("mdkg-mark-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&root).unwrap();
+        let dir = root.join("run");
+        let on = crate::policy::Auth {
+            api_key_fallback: true,
+            ..crate::policy::Auth::default()
+        };
+        use_key(&dir, "lane", Harness::Claude, &on).unwrap();
+        assert!(matches!(read_mark(&dir, "lane"), MarkRead::For(_)));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_unfit_billing_folder_or_mark_is_refused_never_used() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("mdkg-mark-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let on = crate::policy::Auth {
+            api_key_fallback: true,
+            ..crate::policy::Auth::default()
+        };
+        // Made owner-only.
+        use_key(&dir, "lane", Harness::Claude, &on).unwrap();
+        let billing = dir.join("billing");
+        let mode = std::fs::metadata(&billing).unwrap().permissions().mode();
+        assert_eq!(mode & 0o077, 0, "{mode:o}");
+        // Writable by others: refused, and its mark isn't read.
+        std::fs::set_permissions(&billing, std::fs::Permissions::from_mode(0o770)).unwrap();
+        assert!(use_key(&dir, "lane", Harness::Claude, &on).is_err());
+        // The refusal a turn gets, fallback on or off, names the folder's
+        // fault and its fix, not a mark (review of 7c674f52).
+        for e in [
+            revoke_mark(&dir, "lane").unwrap_err(),
+            settle_held(&dir, "lane").unwrap_err(),
+        ] {
+            assert!(e.message.contains("is writable by others"), "{}", e.message);
+            assert!(e.hint.unwrap_or_default().contains("chmod 700"));
+        }
+        assert!(matches!(read_mark(&dir, "lane"), MarkRead::Unreadable(_)));
+        assert!(clear_limited(&dir, "lane").is_err());
+        std::fs::set_permissions(&billing, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // A mark over 4 KiB is never read whole: unreadable, failing closed.
+        std::fs::write(key_next_path(&dir, "lane"), "x".repeat(5000)).unwrap();
+        assert!(matches!(read_mark(&dir, "lane"), MarkRead::Unreadable(_)));
+        // A billing folder that's a link isn't used, even to remove a note.
+        let other = std::env::temp_dir().join(format!("mdkg-mark-{}", uuid::Uuid::now_v7()));
+        let elsewhere = other.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("lane.limited"), "keep").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, other.join("billing")).unwrap();
+        assert!(clear_limited(&other, "lane").is_err());
+        assert!(elsewhere.join("lane.limited").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&other);
+    }
+
+    #[test]
+    fn two_first_time_lockers_both_get_the_lock() {
+        // The second to make the lock file opens the one the first made,
+        // never failing because it appeared (review of 7c674f52).
+        let dir = std::env::temp_dir().join(format!("mdkg-mark-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let dir = dir.clone();
+                std::thread::spawn(move || mark_lock(&dir, "lane").map(drop))
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap().unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn capacity_is_the_harness_s_own_error_never_a_quote() {
+        for own in [
+            "ERROR: Selected model is at capacity. Please try a different model.",
+            "error: Selected model is at capacity.",
+            "{\"type\":\"error\",\"message\":\"Selected model is at capacity.\"}",
+            "{\"type\":\"turn.failed\",\"error\":{\"code\":\"model_at_capacity\"}}",
+            "{\"type\":\"error\",\"error\":{\"data\":{\"message\":\"Selected model is at capacity\"}}}",
+        ] {
+            assert!(capacity_error(own), "{own}");
+        }
+        for quoted in [
+            "ERROR: tests failed; mail says Selected model is at capacity",
+            "mail says: ERROR: Selected model is at capacity",
+            "{\"type\":\"item.completed\",\"message\":\"Selected model is at capacity\"}",
+            "Selected model is at capacity",
+        ] {
+            assert!(!capacity_error(quoted), "{quoted}");
+        }
+    }
+
+    #[test]
     fn usage_limit_errors_are_recognized() {
         assert!(usage_limited("Claude AI usage limit reached|1792900000"));
         assert!(usage_limited(
@@ -639,6 +1770,66 @@ mod tests {
         ));
         assert!(usage_limited("{\"code\":\"usage_limit_reached\"}"));
         assert!(!usage_limited("the agent exited with exit status: 1"));
+        assert!(model_at_capacity(
+            "ERROR: Selected model is at capacity. Please try a different model."
+        ));
+        assert!(model_at_capacity("{\"code\":\"model_at_capacity\"}"));
+        assert!(!model_at_capacity("usage limit reached"));
+        assert!(!usage_limited("Selected model is at capacity"));
+        // The exact lines, never a phrase inside another.
+        assert!(usage_limit_error(
+            Harness::Claude,
+            "{\"type\":\"result\",\"is_error\":true,\"result\":\"Claude AI usage limit reached|1792900000\"}"
+        ));
+        assert!(usage_limit_error(
+            Harness::Claude,
+            "Claude AI usage limit reached|1792900000"
+        ));
+        assert!(usage_limit_error(
+            Harness::Codex,
+            "ERROR: You've hit your usage limit. Upgrade to Pro"
+        ));
+        assert!(usage_limit_error(
+            Harness::Codex,
+            "{\"code\":\"usage_limit_reached\"}"
+        ));
+        assert!(usage_limit_error(
+            Harness::Codex,
+            "ERROR: You\u{2019}ve hit your usage limit. Try again later."
+        ));
+        assert!(usage_limit_error(
+            Harness::Codex,
+            "{\"type\":\"error\",\"message\":\"You've hit your usage limit. Try again later.\"}"
+        ));
+        assert!(usage_limit_error(
+            Harness::Codex,
+            "{\"type\":\"turn.failed\",\"error\":{\"message\":\"You've hit your usage limit.\"}}"
+        ));
+        // A message on some other event is quoted text, not the error.
+        assert!(!usage_limit_error(
+            Harness::Codex,
+            "{\"type\":\"item.completed\",\"message\":\"You've hit your usage limit.\"}"
+        ));
+        assert!(!usage_limit_error(
+            Harness::Claude,
+            "{\"type\":\"result\",\"is_error\":false,\"result\":\"Claude AI usage limit reached|1\"}"
+        ));
+        for quoted in [
+            "ERROR: tests failed; mail said 'usage limit reached'",
+            "ERROR: something else (Claude AI usage limit reached)",
+            "{\"type\":\"assistant\",\"text\":\"Claude AI usage limit reached\"}",
+        ] {
+            assert!(!usage_limit_error(Harness::Claude, quoted), "{quoted}");
+            assert!(!usage_limit_error(Harness::Codex, quoted), "{quoted}");
+        }
+        assert!(usage_limit_error(
+            Harness::OpenCode,
+            "{\"type\":\"error\",\"error\":{\"name\":\"APIError\",\"data\":{\"message\":\"usage_limit_reached\"}}}"
+        ));
+        assert!(!usage_limit_error(
+            Harness::OpenCode,
+            "{\"code\":\"usage_limit_reached\"}"
+        ));
     }
 
     /// A host session's own variables are taken out, the user's login and
@@ -693,7 +1884,7 @@ mod tests {
         }
     }
 
-    /// Every name OpenCode 2.1.0's catalog declares is withheld, but the
+    /// Every name the qualified releases' catalogs declare is withheld, but the
     /// general credentials kept on purpose; the pinned list is the
     /// script's output, sorted and whole.
     #[test]

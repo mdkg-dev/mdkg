@@ -1,0 +1,22 @@
+[package]
+name = "mdkg-ops"
+version = "0.7.1"
+description = "The one kernel behind the CLI, MCP and HTTP: the operation registry, the request context and the wire traits. Internal to mdkg, no stable API; depend on the mdkg binary"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+readme = "README.md"
+
+[dependencies]
+mdkg-format = { path = "../mdkg-format", version = "0.7.1" }
+mdkg-graph = { path = "../mdkg-graph", version = "0.7.1" }
+mdkg-coord-sqlite = { path = "../mdkg-coord-sqlite", version = "0.7.1" }
+# Served writes apply inside the kernel's open store transaction (S16).
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

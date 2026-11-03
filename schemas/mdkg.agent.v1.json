@@ -78,6 +78,14 @@
         "null"
       ]
     },
+    "follow": {
+      "description": "How a worker follows the code base (mainRef). `notes`, the default:\nin ref mode (`mdkg.graph.ref` set) with a mainRef this clone holds,\neach turn `agents up` runs tells the worker how far its branch is\nbehind, when it is; checkout mode, a level branch or a mainRef not\nhere give no note. `merge` is accepted but acts as `notes` in 0.7.1:\nnothing is merged, and the note says the launcher's automatic merge\ncomes in 0.7.2.",
+      "type": "string",
+      "enum": [
+        "notes",
+        "merge"
+      ]
+    },
     "instructions": {
       "type": [
         "string",

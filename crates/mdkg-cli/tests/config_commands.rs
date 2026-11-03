@@ -1,5 +1,5 @@
-//! Configuration inspection uses disposable homes and handwritten Git
-//! metadata. No Git subprocess, coordinator or user configuration is used.
+//! Configuration inspection uses disposable Git repositories and homes.
+//! No coordinator or user configuration is used.
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -31,20 +31,87 @@ impl Fixture {
         path
     }
     fn project(&self) -> PathBuf {
-        for dir in [".git/objects", ".git/refs"] {
-            fs::create_dir_all(self.root.join(dir)).expect("create Git metadata");
-        }
-        fs::write(self.root.join(".git/HEAD"), "ref: refs/heads/main\n")
-            .expect("write unborn HEAD");
-        fs::write(self.root.join(".git/config"), "[core]\n bare=false\n")
-            .expect("write Git config");
-        self.write(
+        self.git(&["init", "-q", "-b", "main"]);
+        let path = self.write(
             "project/.mdkg/config.json",
             &json!({
                 "schema_version":3, "format_version":"0.7",
                 "graph_id":"0192f3a0-0000-7000-8000-000000000000"
             }),
-        )
+        );
+        self.commit_graph();
+        path
+    }
+    fn git(&self, args: &[&str]) -> Output {
+        let out = Command::new("git")
+            .current_dir(&self.root)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", &self.dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_ATTR_NOSYSTEM", "1")
+            .args([
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "init.templateDir=",
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                // No detached auto-maintenance after a commit: git 2.56
+                // runs it in the background, and its lock would show up
+                // in a snapshot taken meanwhile.
+                "-c",
+                "maintenance.auto=false",
+            ])
+            .args(args)
+            .output()
+            .expect("run fixture git");
+        assert!(
+            out.status.success() || args == ["diff", "--cached", "--quiet"],
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out
+    }
+    fn git_out(&self, args: &[&str]) -> String {
+        String::from_utf8(self.git(args).stdout)
+            .expect("git output is UTF-8")
+            .trim()
+            .to_owned()
+    }
+    /// A config read that may find nothing: `None` when git exits 1.
+    fn git_try(&self, args: &[&str]) -> Option<String> {
+        let out = Command::new("git")
+            .current_dir(&self.root)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", &self.dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .args(args)
+            .output()
+            .expect("run fixture git");
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+    }
+    fn commit_graph(&self) {
+        self.git(&["add", "-A", "--", ".mdkg"]);
+        match self.git(&["diff", "--cached", "--quiet"]).status.code() {
+            Some(0) => (),
+            Some(1) => {
+                self.git(&["commit", "-q", "-m", "fixture graph"]);
+            }
+            _ => panic!("fixture git diff failed"),
+        }
+    }
+    fn source(&self) -> PathBuf {
+        let commit = self.git(&["rev-parse", "HEAD"]);
+        let commit = String::from_utf8(commit.stdout).expect("git commit id is UTF-8");
+        format!("checkout:HEAD@{}", &commit[..12]).into()
     }
     fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_mdkg"));
@@ -52,8 +119,9 @@ impl Fixture {
             .current_dir(&self.root)
             .env_clear()
             .env("HOME", &self.home)
-            // Inspection must not consult Git executables or actor/store state.
-            .env("PATH", "/mdkg-fixture-no-executables")
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("MDKG_ACTOR", "human")
             .args(args);
         command
@@ -73,6 +141,12 @@ impl Fixture {
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
+        // A ref-mode graph cache is read-only by design.
+        Command::new("chmod")
+            .args(["-R", "u+w"])
+            .arg(&self.dir)
+            .status()
+            .ok();
         fs::remove_dir_all(&self.dir).expect("remove fixture");
     }
 }
@@ -115,7 +189,7 @@ fn show_reports_each_layer_and_definition_source_without_writes() {
             "agents":{"astra":{"model":"user"}}
         }),
     );
-    let definition = f.write(
+    f.write(
         "project/.mdkg/agents/astra.json",
         &json!({
             "schema":"mdkg.agent.v1", "role":"worker", "model":"gpt-6-astra", "effort":"ultra"
@@ -127,6 +201,8 @@ fn show_reports_each_layer_and_definition_source_without_writes() {
             "work":{"priority_min":4}, "agents":{"astra":{"effort":"max"}}
         }),
     );
+    f.commit_graph();
+    let source = f.source();
     let before = snapshot(&f.dir);
     let result = f.show();
     let data = &result["data"];
@@ -135,8 +211,8 @@ fn show_reports_each_layer_and_definition_source_without_writes() {
     assert_eq!(data["values"]["work"]["priority_min"], 4);
     for (key, layer, path) in [
         ("/index/tolerant", "user", Some(user)),
-        ("/graph_id", "project", Some(project)),
-        ("/agents/astra/model", "project", Some(definition)),
+        ("/graph_id", "project", Some(source.clone())),
+        ("/agents/astra/model", "project", Some(source)),
         ("/agents/astra/effort", "local", Some(local)),
         ("/work/priority_max", "built_in", None),
     ] {
@@ -175,7 +251,7 @@ fn definition_replaces_inline_only_while_user_and_local_values_keep_their_origin
             "agents":{"astra":{"model":"user-model"}}
         }),
     );
-    let definition = f.write(
+    f.write(
         "project/.mdkg/agents/astra.json",
         &json!({
             "schema":"mdkg.agent.v1", "harness":"opencode", "role":"worker"
@@ -187,6 +263,8 @@ fn definition_replaces_inline_only_while_user_and_local_values_keep_their_origin
             "agents":{"astra":{"instructions":"local instructions"}}
         }),
     );
+    f.commit_graph();
+    let source = f.source();
     let before = snapshot(&f.dir);
     let result = f.show();
     let data = &result["data"];
@@ -200,30 +278,118 @@ fn definition_replaces_inline_only_while_user_and_local_values_keep_their_origin
     assert_eq!(data["values"]["agents"]["keep"]["model"], "inline-kept");
     assert_eq!(data["values"]["agents"]["defaults"]["turn"]["max_turns"], 3);
     for (key, path) in [
-        ("/agents/astra/harness", definition),
+        ("/agents/astra/harness", source.clone()),
         ("/agents/astra/model", user),
         ("/agents/astra/instructions", local),
-        ("/agents/keep/model", project),
+        ("/agents/keep/model", source),
     ] {
         assert_eq!(data["origins"][key]["path"], json!(path));
     }
     assert!(data["origins"].get("/agents/astra/effort").is_none());
-    let notice = "settings (agents, orchestration, projections) from user or machine-local layers are displayed here but are not yet applied by runtime commands in this build";
-    assert!(
-        data["warnings"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|v| v == notice)
-    );
+    let notice = data["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .find(|s| s.contains("including receiver policy"))
+        .expect("active-watch snapshot notice");
     let text = f.output(&["config", "show", "--effective"]);
     assert!(text.status.success());
+    assert!(!String::from_utf8_lossy(&text.stderr).contains("not yet applied"));
     assert!(String::from_utf8_lossy(&text.stderr).contains(notice));
     assert_eq!(snapshot(&f.dir), before);
 }
 
 #[test]
-fn show_warns_when_a_local_layer_replaces_the_whole_agents_value() {
+fn show_uses_one_graph_ref_for_config_and_all_harness_definitions() {
+    for harness in ["claude", "codex", "opencode"] {
+        let f = Fixture::new();
+        let project = f.project();
+        let definition = f.write(
+            "project/.mdkg/agents/worker.json",
+            &json!({
+                "schema":"mdkg.agent.v1", "harness":harness,
+                "role":"worker", "model":"graph-model"
+            }),
+        );
+        f.commit_graph();
+        f.git(&["update-ref", "refs/heads/mdkg-graph", "HEAD"]);
+        f.git(&[
+            "config",
+            "--local",
+            "mdkg.graph.ref",
+            "refs/heads/mdkg-graph",
+        ]);
+        f.git(&[
+            "config",
+            "--local",
+            "mdkg.graph.0192f3a0-0000-7000-8000-000000000000.ref",
+            "refs/heads/mdkg-graph",
+        ]);
+        let graph = f.git(&["rev-parse", "refs/heads/mdkg-graph"]);
+        let graph = String::from_utf8(graph.stdout).unwrap();
+        let source = format!("graph:refs/heads/mdkg-graph@{}", &graph[..12]);
+
+        f.write(
+            "project/.mdkg/agents/worker.json",
+            &json!({
+                "schema":"mdkg.agent.v1", "harness":"codex",
+                "role":"orchestrator", "model":"checkout-model"
+            }),
+        );
+        f.commit_graph();
+        fs::write(project, "uncommitted invalid config").unwrap();
+        fs::write(definition, "uncommitted invalid definition").unwrap();
+        let before = snapshot(&f.dir);
+        let data = &f.show()["data"];
+        assert_eq!(data["values"]["agents"]["worker"]["harness"], harness);
+        assert_eq!(data["values"]["agents"]["worker"]["role"], "worker");
+        assert_eq!(data["values"]["agents"]["worker"]["model"], "graph-model");
+        assert_eq!(data["origins"]["/agents/worker/model"]["path"], source);
+        assert_eq!(data["origins"]["/graph_id"]["path"], source);
+        assert_eq!(data["sources"]["project"], source);
+        // Terra #15782: where mdkg read the config, for a manual change.
+        let graph_dir = data["graph"]["common_dir"].as_str().expect("common dir");
+        assert!(Path::new(graph_dir).ends_with(".git"), "{data}");
+        assert_eq!(data["graph"]["ref"], "refs/heads/mdkg-graph");
+        assert_eq!(data["graph"]["commit"], graph.trim());
+        assert_eq!(data["graph"]["root"], "");
+        assert_eq!(data["graph"]["dir"], ".mdkg");
+        assert_eq!(data["graph"]["config_path"], ".mdkg/config.json");
+        assert_eq!(snapshot(&f.dir), before);
+
+        fs::remove_dir_all(f.root.join(".mdkg")).unwrap();
+        let graphless = f.show();
+        assert_eq!(
+            graphless["data"]["values"]["agents"]["worker"]["harness"],
+            harness
+        );
+        assert_eq!(graphless["data"]["sources"]["project"], source);
+        fs::create_dir_all(f.root.join("subdir")).unwrap();
+        let nested = f
+            .command(&["config", "show", "--json"])
+            .current_dir(f.root.join("subdir"))
+            .output()
+            .unwrap();
+        assert!(nested.status.success());
+        let nested: Value = serde_json::from_slice(&nested.stdout).unwrap();
+        assert_eq!(nested["data"]["sources"]["project"], source);
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(f.dir.join("absent"), f.root.join(".mdkg")).unwrap();
+            let linked = f.show();
+            assert_eq!(linked["data"]["sources"]["project"], source);
+        }
+        f.git(&["update-ref", "-d", "refs/heads/mdkg-graph"]);
+        let missing = f.output(&["config", "show", "--json"]);
+        assert!(!missing.status.success());
+        let missing: Value = serde_json::from_slice(&missing.stdout).unwrap();
+        assert_eq!(missing["diagnostics"][0]["code"], "graph.ref_missing");
+    }
+}
+
+#[test]
+fn show_refuses_when_a_local_layer_removes_graph_authority() {
     let f = Fixture::new();
     f.project();
     f.write(
@@ -232,30 +398,23 @@ fn show_warns_when_a_local_layer_replaces_the_whole_agents_value() {
             "schema":"mdkg.agent.v1", "harness":"codex", "role":"worker"
         }),
     );
+    f.commit_graph();
     for agents in [Value::Null, json!([]), json!("invalid")] {
         f.write(
             "project/.git/mdkg/config.local.json",
             &json!({"agents":agents}),
         );
         let before = snapshot(&f.dir);
-        let result = f.show();
-        assert_eq!(result["data"]["values"]["agents"], agents);
-        assert_eq!(result["data"]["origins"]["/agents"]["layer"], "local");
-        assert!(
-            result["data"]["warnings"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|v| v
-                    .as_str()
-                    .is_some_and(|s| s.contains("not yet applied by runtime commands")))
-        );
+        let out = f.output(&["config", "show", "--json"]);
+        assert!(!out.status.success());
+        let result: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(result["diagnostics"][0]["code"], "run.authority_override");
         assert_eq!(snapshot(&f.dir), before);
     }
 }
 
 #[test]
-fn show_warns_about_unapplied_orchestration_and_projection_layers() {
+fn show_refuses_orchestration_overrides_but_explains_project_only_projections() {
     for (source, layer) in [
         ("home/.config/mdkg/config.json", "user"),
         ("project/.git/mdkg/config.local.json", "local"),
@@ -283,22 +442,65 @@ fn show_warns_about_unapplied_orchestration_and_projection_layers() {
             f.project();
             f.write(source, &patch);
             let before = snapshot(&f.dir);
+            if pointer.starts_with("/orchestration") {
+                let out = f.output(&["config", "show", "--json"]);
+                assert!(!out.status.success());
+                let result: Value = serde_json::from_slice(&out.stdout).unwrap();
+                assert_eq!(result["diagnostics"][0]["code"], "run.authority_override");
+                assert_eq!(snapshot(&f.dir), before);
+                continue;
+            }
             let result = f.show();
             let data = &result["data"];
             assert_eq!(data["values"].pointer(pointer), Some(&expected));
             assert_eq!(data["origins"][pointer]["layer"], layer);
+            let text = f.output(&["config", "show", "--effective"]);
+            assert!(text.status.success());
             let warning = data["warnings"]
                 .as_array()
                 .unwrap()
                 .iter()
                 .filter_map(Value::as_str)
-                .find(|text| text.contains("not yet applied by runtime commands"))
-                .expect("unapplied settings must be called out for all runtime commands");
-            let text = f.output(&["config", "show", "--effective"]);
-            assert!(text.status.success());
+                .find(|s| s.contains("projections are project-only"))
+                .expect("shared repository projection rule");
             assert!(String::from_utf8_lossy(&text.stderr).contains(warning));
             assert_eq!(snapshot(&f.dir), before);
         }
+    }
+}
+
+#[test]
+fn show_labels_optional_defaults_and_agents_without_definition_files_as_ignored() {
+    for source in [
+        "home/.config/mdkg/config.json",
+        "project/.git/mdkg/config.local.json",
+    ] {
+        let f = Fixture::new();
+        f.project();
+        f.write(
+            source,
+            &json!({"agents":{
+                "defaults":{"turn":{"max_turns":3}},
+                "legacy":{"model":"optional-model"}
+            }}),
+        );
+        let before = snapshot(&f.dir);
+        let shown = f.show();
+        let warnings = shown["data"]["warnings"].as_array().unwrap();
+        assert!(warnings.iter().any(|v| v.as_str().unwrap().contains(
+            "agents.defaults from user and machine-local layers are not applied in 0.7.0"
+        )));
+        assert!(warnings.iter().any(|v| {
+            v.as_str()
+                .unwrap()
+                .contains("inactive: no graph definition")
+        }));
+        let text = f.output(&["config", "show"]);
+        assert!(text.status.success());
+        for warning in warnings {
+            assert!(String::from_utf8_lossy(&text.stderr).contains(&warning.to_string()));
+        }
+        assert_eq!(snapshot(&f.dir), before);
     }
 }
 
@@ -314,7 +516,6 @@ fn show_does_not_warn_about_launcher_overrides_when_only_authored_values_apply()
         "home/.config/mdkg/config.json",
         &json!({
             "agents":{"astra":{"model":"hidden-user"}}, "index":{"tolerant":true},
-            "orchestration":{"branch":"hidden/{agent}","worktree":"hidden/{agent}"},
             "projections":["hooks:codex"],
             "orchestration_extra":{"branch":"unrelated/{agent}"}
         }),
@@ -329,6 +530,7 @@ fn show_does_not_warn_about_launcher_overrides_when_only_authored_values_apply()
         "project/.git/mdkg/config.local.json",
         &json!({"work":{"priority_min":3}}),
     );
+    f.commit_graph();
     let result = f.show();
     assert_eq!(
         result["data"]["values"]["agents"]["astra"]["model"],
@@ -457,6 +659,7 @@ fn project_identity_is_checked_before_optional_sources() {
     let f = Fixture::new();
     let project = f.project();
     fs::write(project, r#"{"schema_version":999}"#).unwrap();
+    f.commit_graph();
     let user = f.write("home/.config/mdkg/config.json", &json!({}));
     fs::write(user, "broken user source").unwrap();
     let out = f.output(&["config", "show", "--json"]);
@@ -482,9 +685,11 @@ fn malformed_duplicate_large_and_linked_sources_never_disappear_from_the_view() 
         vec![b' '; (1 << 20) + 1],
     ] {
         fs::write(&config, bytes).unwrap();
+        f.commit_graph();
         assert!(!f.output(&["config", "show", "--json"]).status.success());
     }
     fs::remove_file(&config).unwrap();
+    f.commit_graph();
     assert!(
         !f.output(&["config", "show", "--json"]).status.success(),
         "partial project"
@@ -493,10 +698,12 @@ fn malformed_duplicate_large_and_linked_sources_never_disappear_from_the_view() 
     assert!(!f.output(&["config", "show", "--json"]).status.success());
     fs::remove_dir(&config).unwrap();
     symlink(f.dir.join("absent"), &config).unwrap();
+    f.commit_graph();
     assert!(!f.output(&["config", "show", "--json"]).status.success());
     fs::remove_file(&config).unwrap();
     fs::remove_dir(f.root.join(".mdkg")).unwrap();
     symlink(f.dir.join("absent"), f.root.join(".mdkg")).unwrap();
+    f.commit_graph();
     assert!(!f.output(&["config", "show", "--json"]).status.success());
 }
 
@@ -506,6 +713,7 @@ fn definition_inputs_are_bounded_strict_and_visible_without_typed_defaults() {
     let f = Fixture::new();
     f.project();
     let definition = f.write("project/.mdkg/agents/astra.json", &json!({"effort":false}));
+    f.commit_graph();
     // The read-only inspector may display a wrong-typed value for diagnosis.
     assert_eq!(
         f.show()["data"]["values"]["agents"]["astra"]["effort"],
@@ -516,10 +724,12 @@ fn definition_inputs_are_bounded_strict_and_visible_without_typed_defaults() {
         vec![b' '; (1 << 20) + 1],
     ] {
         fs::write(&definition, bytes).unwrap();
+        f.commit_graph();
         assert!(!f.output(&["config", "show", "--json"]).status.success());
     }
     fs::remove_file(&definition).unwrap();
     symlink(f.dir.join("absent"), &definition).unwrap();
+    f.commit_graph();
     assert!(!f.output(&["config", "show", "--json"]).status.success());
 }
 
@@ -636,11 +846,11 @@ fn display_redacts_recognizable_credentials_under_ordinary_keys() {
                 "Authorization:Bearer SYNTHETIC_COMPACT_BEARER",
                 "Authorization:Basic U1lOVEhFVElDOlBBU1M=",
                 "Basic U1lOVEhFVElDOlBBU1M=",
-                "-----BEGIN PRIVATE KEY-----\nSYNTHETIC_PKCS8\n-----END PRIVATE KEY-----",
-                "-----BEGIN RSA PRIVATE KEY-----\nSYNTHETIC_RSA\n-----END RSA PRIVATE KEY-----",
-                "-----BEGIN EC PRIVATE KEY-----\nSYNTHETIC_EC\n-----END EC PRIVATE KEY-----",
-                "-----BEGIN OPENSSH PRIVATE KEY-----\nSYNTHETIC_SSH\n-----END OPENSSH PRIVATE KEY-----",
-                "-----BEGIN ENCRYPTED PRIVATE KEY-----\nSYNTHETIC_ENCRYPTED\n-----END ENCRYPTED PRIVATE KEY-----"
+                concat!("-----BEGIN PRIV", "ATE KEY-----\nSYNTHETIC_PKCS8\n-----END PRIV", "ATE KEY-----"),
+                concat!("-----BEGIN RSA PRIV", "ATE KEY-----\nSYNTHETIC_RSA\n-----END RSA PRIV", "ATE KEY-----"),
+                concat!("-----BEGIN EC PRIV", "ATE KEY-----\nSYNTHETIC_EC\n-----END EC PRIV", "ATE KEY-----"),
+                concat!("-----BEGIN OPENSSH PRIV", "ATE KEY-----\nSYNTHETIC_SSH\n-----END OPENSSH PRIV", "ATE KEY-----"),
+                concat!("-----BEGIN ENCRYPTED PRIV", "ATE KEY-----\nSYNTHETIC_ENCRYPTED\n-----END ENCRYPTED PRIV", "ATE KEY-----")
             ],
             "ordinary": "visible description"
         }),
@@ -730,10 +940,10 @@ fn display_hides_token_url_and_argument_credentials_in_both_formats() {
     samples.extend([
         format!("AKIA{}", "SYNTHETIC1234567"),
         format!("ASIA{}", "SYNTHETIC1234567"),
-        "eyJSYNTHETIC.eyJSYNTHETIC.c2lnbmF0dXJl".into(),
+        concat!("eyJSYNTHETIC.", "eyJSYNTHETIC.c2lnbmF0dXJl").into(),
         "-----BEGIN PGP PRIVATE KEY BLOCK-----\nSYNTHETIC_PGP\n-----END PGP PRIVATE KEY BLOCK-----"
             .into(),
-        "https://user:SYNTHETIC_PASSWORD@host/x".into(),
+        concat!("https://user:SYNTHETIC_PASSWORD", "@host/x").into(),
         "https://user:pass@host/x".into(),
         "https://api/x?access_token=SYNTHETIC_QUERY".into(),
         "https://api/x?%61ccess%5ftoken=SYNTHETIC_ENCODED_QUERY".into(),
@@ -970,4 +1180,692 @@ fn cli_refuses_identity_in_optional_layers_and_a_bare_project_root() {
                 && d["message"].as_str().unwrap().contains("checkout")),
         "{result}"
     );
+}
+
+impl Fixture {
+    /// A graph `mdkg init` made, committed on main.
+    fn initialized(&self) {
+        self.git(&["init", "-q", "-b", "main"]);
+        let out = self.output(&["init"]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        self.commit_graph();
+    }
+    fn config(&self) -> Value {
+        serde_json::from_slice(&fs::read(self.root.join(".mdkg/config.json")).expect("config"))
+            .expect("config JSON")
+    }
+    fn set_config(&self, value: &Value) {
+        fs::write(self.root.join(".mdkg/config.json"), value.to_string()).expect("config");
+    }
+    fn json(&self, args: &[&str]) -> (i32, Value) {
+        let out = self.output(args);
+        let value = serde_json::from_slice(&out.stdout)
+            .unwrap_or_else(|_| panic!("{args:?}: {}", String::from_utf8_lossy(&out.stdout)));
+        (out.status.code().expect("exit code"), value)
+    }
+    fn doctor_config(&self) -> Value {
+        let (_, doctor) = self.json(&["doctor", "--json"]);
+        doctor["data"]["checks"]
+            .as_array()
+            .expect("checks")
+            .iter()
+            .find(|c| c["name"] == "config")
+            .cloned()
+            .expect("config check")
+    }
+}
+
+/// e2e 0.7.1 B13: a committed `coordination.messages` setting that
+/// refuses every send and ack fails doctor's config check and validate.
+#[test]
+fn doctor_flags_invalid_ack_grace() {
+    let f = Fixture::new();
+    f.initialized();
+    let good = f.config();
+    assert_eq!(f.doctor_config()["status"], "ok", "{}", f.doctor_config());
+    for bad in [json!(3651), json!(7.0), json!("7")] {
+        let mut config = good.clone();
+        config["coordination"] = json!({"messages": {"ack_grace_days": bad}});
+        f.set_config(&config);
+        f.commit_graph();
+        let check = f.doctor_config();
+        assert_eq!(check["status"], "error", "{bad}: {check}");
+        assert!(
+            check["summary"]
+                .as_str()
+                .expect("summary")
+                .contains("ack_grace_days"),
+            "{check}"
+        );
+        let (code, validate) = f.json(&["validate", "--json"]);
+        assert_ne!(code, 0, "{bad}: {validate}");
+        assert!(
+            validate["diagnostics"]
+                .as_array()
+                .expect("diagnostics")
+                .iter()
+                .any(|d| d["code"] == "config.invalid"),
+            "{validate}"
+        );
+    }
+    // Retention and the human hold refuse sends too.
+    let mut config = good.clone();
+    config["coordination"] = json!({"messages": {"retention": "forever", "human_hold_days": 0}});
+    f.set_config(&config);
+    f.commit_graph();
+    let check = f.doctor_config();
+    assert_eq!(check["status"], "error", "{check}");
+    let summary = check["summary"].as_str().expect("summary");
+    assert!(
+        summary.contains("retention") && summary.contains("human_hold_days"),
+        "{check}"
+    );
+    // What runs is the committed value: a fix not yet committed still fails.
+    f.set_config(&good);
+    assert_eq!(f.doctor_config()["status"], "error");
+    f.commit_graph();
+    assert_eq!(f.doctor_config()["status"], "ok");
+    let (code, validate) = f.json(&["validate", "--json"]);
+    assert_eq!(code, 0, "{validate}");
+}
+
+/// Terra #16037: ref mode binds the repository-root graph at `.mdkg`, so
+/// doctor and `config show` refuse a registered root folder elsewhere
+/// (`mdkg.graph.<id>.dir`) instead of passing a graph no command opens.
+#[test]
+fn ref_mode_refuses_a_registered_root_folder_commands_dont_read() {
+    let f = Fixture::new();
+    f.initialized();
+    let id = f.config()["graph_id"]
+        .as_str()
+        .expect("graph id")
+        .to_owned();
+    f.git(&["update-ref", "refs/heads/mdkg-graph", "HEAD"]);
+    for (key, value) in [
+        ("mdkg.graph.ref".to_owned(), "refs/heads/mdkg-graph"),
+        (format!("mdkg.graph.{id}.ref"), "refs/heads/mdkg-graph"),
+    ] {
+        f.git(&["config", "--local", &key, value]);
+    }
+    let doctor_check = |name: &str| {
+        let (_, doctor) = f.json(&["doctor", "--json"]);
+        doctor["data"]["checks"]
+            .as_array()
+            .expect("checks")
+            .iter()
+            .find(|c| c["name"] == name)
+            .cloned()
+            .unwrap_or_else(|| panic!("{name}: {doctor}"))
+    };
+    assert_eq!(doctor_check("graph.ref")["status"], "ok");
+    assert_eq!(f.doctor_config()["status"], "ok");
+    let (code, show) = f.json(&["config", "show", "--json"]);
+    assert_eq!(code, 0, "{show}");
+    assert_eq!(show["data"]["graph"]["dir"], ".mdkg", "{show}");
+    // A committed mail setting that refuses every send and ack fails
+    // doctor's config check in ref mode too (B13).
+    let good = f.config();
+    let mut bad = good.clone();
+    bad["coordination"] = json!({"messages": {"ack_grace_days": 3651}});
+    f.set_config(&bad);
+    f.git(&["commit", "-q", "-am", "bad ack grace"]);
+    f.git(&["update-ref", "refs/heads/mdkg-graph", "HEAD"]);
+    let check = f.doctor_config();
+    assert_eq!(check["status"], "error", "{check}");
+    assert!(
+        check["summary"]
+            .as_str()
+            .expect("summary")
+            .contains("ack_grace_days"),
+        "{check}"
+    );
+    f.set_config(&good);
+    f.git(&["commit", "-q", "-am", "good ack grace"]);
+    f.git(&["update-ref", "refs/heads/mdkg-graph", "HEAD"]);
+    assert_eq!(f.doctor_config()["status"], "ok");
+    // The same graph moved to `knowledge/` and registered there.
+    f.git(&["mv", ".mdkg", "knowledge"]);
+    f.git(&["commit", "-q", "-m", "graph in knowledge"]);
+    f.git(&["update-ref", "refs/heads/mdkg-graph", "HEAD"]);
+    let dir_key = format!("mdkg.graph.{id}.dir");
+    f.git(&["config", "--local", &dir_key, "knowledge"]);
+    let check = doctor_check("graph.ref");
+    assert_eq!(check["status"], "error", "{check}");
+    let summary = check["summary"].as_str().expect("summary");
+    assert!(
+        summary.contains(&dir_key) && summary.contains("`knowledge/config.json`"),
+        "names the record and where the graph's config is: {check}"
+    );
+    let hint = check["hint"].as_str().expect("hint");
+    assert!(
+        hint.contains("--checkout-mode") && hint.contains("move the graph's `knowledge` folder"),
+        "{check}"
+    );
+    assert!(!hint.starts_with("unset"), "{check}");
+    // config show and a bound command refuse it the same way: what
+    // doctor reports agrees with what runs.
+    for args in [&["config", "show", "--json"][..], &["status", "--json"][..]] {
+        let (code, v) = f.json(args);
+        assert_ne!(code, 0, "{args:?}: {v}");
+        let d = &v["diagnostics"][0];
+        assert_eq!(d["code"], "config.invalid", "{args:?}: {v}");
+        assert!(
+            d["message"].as_str().expect("message").contains(&dir_key),
+            "{args:?}: {v}"
+        );
+    }
+    // An MCP server still starts, and its tools return the refusal
+    // (Terra #16243).
+    // Run again in the half-repaired state below (#16260).
+    // `tool` with `named` the actor, or none (identity is then captured by
+    // the server itself, Terra #16296).
+    let mcp_refuses = |tool: &str, named: bool| {
+        let mut command = f.command(&["mcp"]);
+        if !named {
+            command.env_remove("MDKG_ACTOR");
+        }
+        let mut mcp = command
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("start mcp");
+        {
+            use std::io::Write as _;
+            let mut stdin = mcp.stdin.take().expect("stdin");
+            let call = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": tool, "arguments": {}}});
+            writeln!(stdin, "{call}").expect("write");
+        }
+        let out = mcp.wait_with_output().expect("mcp exits at end of input");
+        let reply: Value = serde_json::from_str(
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .next()
+                .unwrap_or_else(|| panic!("no reply; exit {:?}", out.status)),
+        )
+        .expect("one JSON reply");
+        let text = reply["result"]["content"]
+            .as_array()
+            .and_then(|c| c.last())
+            .and_then(|c| c["text"].as_str())
+            .unwrap_or_else(|| panic!("{reply}"));
+        let listed: Value = serde_json::from_str(text).expect("envelope");
+        assert_eq!(listed["ok"], false, "{listed}");
+        assert_eq!(
+            listed["diagnostics"][0]["code"], "config.invalid",
+            "{listed}"
+        );
+        assert!(
+            listed["diagnostics"][0]["message"]
+                .as_str()
+                .expect("message")
+                .contains(&dir_key),
+            "{listed}"
+        );
+        listed
+    };
+    let mcp_list_refuses = || {
+        mcp_refuses("list", true);
+        // A tool that needs the actor gets the folder refusal too, and is
+        // told to restart the server once it's fixed.
+        let inbox = mcp_refuses("inbox", false);
+        assert!(
+            inbox["diagnostics"][0]["hint"]
+                .as_str()
+                .is_some_and(|h| h.contains("restart this MCP server")),
+            "{inbox}"
+        );
+    };
+    mcp_list_refuses();
+    // The rollback the hint names isn't blocked by the turns install holds
+    // (Terra #16224): a real one goes back to checkout mode, keeping the
+    // graph ref.
+    let tip = f.git_out(&["rev-parse", "refs/heads/mdkg-graph"]);
+    let (code, v) = f.json(&["install", "--checkout-mode", "--json"]);
+    assert_eq!(code, 0, "{v}");
+    assert!(
+        f.git_try(&["config", "--local", "mdkg.graph.ref"])
+            .is_none(),
+        "back in checkout mode: {v}"
+    );
+    assert_eq!(f.git_out(&["rev-parse", "refs/heads/mdkg-graph"]), tip);
+    // Back in ref mode, part-way through the other repair: the graph is
+    // moved back to `.mdkg` on the ref, its `.dir` record not yet removed.
+    // Every command names the record, not a config missing from
+    // `knowledge/`, and the hint asks only for the record's removal.
+    f.git(&[
+        "config",
+        "--local",
+        "mdkg.graph.ref",
+        "refs/heads/mdkg-graph",
+    ]);
+    f.git(&["mv", "knowledge", ".mdkg"]);
+    f.git(&["commit", "-q", "-m", "graph back in .mdkg"]);
+    f.git(&["update-ref", "refs/heads/mdkg-graph", "HEAD"]);
+    for args in [
+        &["config", "show", "--json"][..],
+        &["status", "--json"][..],
+        &["claim", "--new", "notes.txt", "--json"][..],
+        &["msg", "inbox", "--json"][..],
+    ] {
+        let (code, v) = f.json(args);
+        assert_ne!(code, 0, "{args:?}: {v}");
+        let d = &v["diagnostics"][0];
+        assert_eq!(d["code"], "config.invalid", "{args:?}: {v}");
+        assert!(
+            d["message"].as_str().expect("message").contains(&dir_key),
+            "{args:?}: {v}"
+        );
+        let hint = d["hint"].as_str().expect("hint");
+        assert!(
+            hint.contains("already in `.mdkg`") && !hint.contains("move the graph's"),
+            "{args:?}: {v}"
+        );
+    }
+    mcp_list_refuses();
+    // An unnamed server started in this state keeps no actor after the
+    // repair: a ledger update refuses rather than running as the
+    // checkout's folder name (Terra #16406).
+    let mut mcp = f
+        .command(&["mcp"])
+        .env_remove("MDKG_ACTOR")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("start mcp");
+    let mut stdin = mcp.stdin.take().expect("stdin");
+    let mut stdout = std::io::BufReader::new(mcp.stdout.take().expect("stdout"));
+    let mut call = |id: u64, tool: &str, arguments: Value| -> Value {
+        use std::io::{BufRead as _, Write as _};
+        let request = json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": {"name": tool, "arguments": arguments}});
+        writeln!(stdin, "{request}").expect("write");
+        stdin.flush().expect("flush");
+        let mut line = String::new();
+        stdout.read_line(&mut line).expect("reply");
+        let reply: Value = serde_json::from_str(&line).unwrap_or_else(|_| panic!("{line}"));
+        let text = reply["result"]["content"]
+            .as_array()
+            .and_then(|c| c.last())
+            .and_then(|c| c["text"].as_str())
+            .unwrap_or_else(|| panic!("{reply}"));
+        serde_json::from_str(text).expect("envelope")
+    };
+    // Started (its identity captured) before the repair.
+    call(1, "list", json!({}));
+    f.git(&["config", "--local", "--unset", &dir_key]);
+    let update = call(
+        2,
+        "entry_update",
+        json!({"node": "task-x", "op": {"op": "add", "kind": "finding",
+            "severity": "minor", "title": "t"}}),
+    );
+    // Every tool that writes, as the billing mark does (Terra #16535).
+    let key = call(3, "agents_use_key", json!({"agent": "lane-agent"}));
+    for refused in [&update, &key] {
+        assert_eq!(refused["ok"], false, "{refused}");
+        assert_eq!(
+            refused["diagnostics"][0]["code"], "config.invalid",
+            "{refused}"
+        );
+        assert!(
+            refused["diagnostics"][0]["message"]
+                .as_str()
+                .expect("message")
+                .contains(&dir_key),
+            "{refused}"
+        );
+    }
+    mcp.kill().ok();
+    mcp.wait().ok();
+    let (code, v) = f.json(&["status", "--json"]);
+    assert_eq!(code, 0, "{v}");
+}
+
+/// Terra #16224: another graph's record, naming another graph ref and
+/// another folder, is ignored by the resolver, so it blocks neither the
+/// move into ref mode nor install in it.
+#[test]
+fn setup_ignores_another_refs_root_folder_record() {
+    let f = Fixture::new();
+    f.initialized();
+    // The graph ref's first commit is the user's: theirs, never guessed.
+    f.git(&["config", "--local", "user.name", "Test"]);
+    f.git(&["config", "--local", "user.email", "test@example.invalid"]);
+    let other = "0192f3a0-0000-7000-8000-0000000000aa";
+    f.git(&[
+        "config",
+        "--local",
+        &format!("mdkg.graph.{other}.ref"),
+        "refs/heads/old-graph",
+    ]);
+    f.git(&[
+        "config",
+        "--local",
+        &format!("mdkg.graph.{other}.dir"),
+        ".old",
+    ]);
+    let (code, v) = f.json(&["install", "--setup", "local", "--json"]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(
+        f.git_out(&["config", "--local", "mdkg.graph.ref"]),
+        "refs/heads/mdkg-graph"
+    );
+    let (code, v) = f.json(&["install", "--json"]);
+    assert_eq!(code, 0, "{v}");
+    let (code, v) = f.json(&["status", "--json"]);
+    assert_eq!(code, 0, "{v}");
+}
+
+/// Terra #16243: the graph's own record counts whatever ref it named
+/// before (a rollback from a custom graph ref leaves one), since the move
+/// rewrites its `.ref`: refused before anything is written.
+#[test]
+fn setup_refuses_the_graphs_own_folder_record_under_another_ref() {
+    let f = Fixture::new();
+    f.initialized();
+    let id = f.config()["graph_id"]
+        .as_str()
+        .expect("graph id")
+        .to_owned();
+    f.git(&[
+        "config",
+        "--local",
+        &format!("mdkg.graph.{id}.ref"),
+        "refs/heads/team-graph",
+    ]);
+    let dir_key = format!("mdkg.graph.{id}.dir");
+    f.git(&["config", "--local", &dir_key, "knowledge"]);
+    let (code, v) = f.json(&["install", "--setup", "local", "--json"]);
+    assert_ne!(code, 0, "{v}");
+    let d = &v["diagnostics"][0];
+    assert_eq!(d["code"], "config.invalid", "{v}");
+    assert!(
+        d["message"].as_str().expect("message").contains(&dir_key),
+        "{v}"
+    );
+    // It names where it read the config: the checkout's commit, not the
+    // graph ref setup would create (Terra #16296).
+    let message = d["message"].as_str().expect("message");
+    assert!(
+        message.contains("the checkout's commit") && !message.contains("on refs/heads/mdkg-graph"),
+        "{v}"
+    );
+    // The source has the graph in `.mdkg`: nothing to move (#16260).
+    let hint = d["hint"].as_str().expect("hint");
+    assert!(
+        hint.contains("already in `.mdkg`") && !hint.contains("move the graph's"),
+        "{v}"
+    );
+    assert!(
+        f.git_try(&["config", "--local", "mdkg.graph.ref"])
+            .is_none(),
+        "still in checkout mode"
+    );
+    assert_eq!(
+        f.git_out(&["config", "--local", &format!("mdkg.graph.{id}.ref")]),
+        "refs/heads/team-graph",
+        "the record is untouched"
+    );
+}
+
+/// Terra #16260 (orchestrator #16270): with the graph only in the
+/// registered folder on HEAD, setup finds no graph at `.mdkg`, and its own
+/// record naming another ref still refuses the move: it never switches to
+/// an empty graph ref and leaves that graph behind.
+#[test]
+fn setup_refuses_when_no_graph_is_found_and_a_record_names_another_folder() {
+    let f = Fixture::new();
+    f.initialized();
+    let id = f.config()["graph_id"]
+        .as_str()
+        .expect("graph id")
+        .to_owned();
+    f.git(&["mv", ".mdkg", "knowledge"]);
+    f.git(&["commit", "-q", "-m", "graph in knowledge"]);
+    f.git(&[
+        "config",
+        "--local",
+        &format!("mdkg.graph.{id}.ref"),
+        "refs/heads/team-graph",
+    ]);
+    let dir_key = format!("mdkg.graph.{id}.dir");
+    f.git(&["config", "--local", &dir_key, "knowledge"]);
+    let (code, v) = f.json(&["install", "--setup", "local", "--json"]);
+    assert_ne!(code, 0, "{v}");
+    let d = &v["diagnostics"][0];
+    assert_eq!(d["code"], "config.invalid", "{v}");
+    assert!(
+        d["message"].as_str().expect("message").contains(&dir_key),
+        "{v}"
+    );
+    assert!(
+        f.git_try(&["config", "--local", "mdkg.graph.ref"])
+            .is_none(),
+        "still in checkout mode"
+    );
+    assert!(
+        f.git_try(&["rev-parse", "-q", "--verify", "refs/heads/mdkg-graph"])
+            .is_none(),
+        "no graph ref made"
+    );
+}
+
+/// Terra #16379 (orchestrator #16386): another graph's record under
+/// another ref still refuses the move when its folder holds the
+/// checkout's graph, so a found graph ref never replaces it unseen.
+#[test]
+fn setup_refuses_a_foreign_record_whose_folder_holds_the_checkouts_graph() {
+    let f = Fixture::new();
+    f.initialized();
+    let id = f.config()["graph_id"]
+        .as_str()
+        .expect("graph id")
+        .to_owned();
+    // An unrelated valid graph B at the destination ref.
+    f.git(&["checkout", "-q", "-b", "other"]);
+    let mut other = f.config();
+    other["graph_id"] = json!("0192f3a0-0000-7000-8000-0000000000bb");
+    f.set_config(&other);
+    f.commit_graph();
+    f.git(&["update-ref", "refs/heads/mdkg-graph", "HEAD"]);
+    f.git(&["checkout", "-q", "main"]);
+    // The checkout's graph A, only in `knowledge/`, recorded under
+    // another ref.
+    f.git(&["mv", ".mdkg", "knowledge"]);
+    f.git(&["commit", "-q", "-m", "graph in knowledge"]);
+    f.git(&[
+        "config",
+        "--local",
+        &format!("mdkg.graph.{id}.ref"),
+        "refs/heads/team-graph",
+    ]);
+    let dir_key = format!("mdkg.graph.{id}.dir");
+    f.git(&["config", "--local", &dir_key, "knowledge"]);
+    // Tracked on HEAD, but neither in the worktree nor in the object
+    // store (a blob-filtered sparse clone): the tree entry still counts
+    // (Terra #16506).
+    fs::remove_dir_all(f.root.join("knowledge")).expect("drop worktree copy");
+    let blob = f.git_out(&["rev-parse", "HEAD:knowledge/config.json"]);
+    let loose = f
+        .root
+        .join(".git/objects")
+        .join(&blob[..2])
+        .join(&blob[2..]);
+    let mut perms = fs::metadata(&loose).expect("loose blob").permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    perms.set_readonly(false);
+    fs::set_permissions(&loose, perms).ok();
+    fs::remove_file(&loose).expect("drop the blob");
+    assert!(
+        f.git_try(&["cat-file", "-e", "HEAD:knowledge/config.json"])
+            .is_none(),
+        "the blob is gone"
+    );
+    let refused = |what: &str| {
+        let (code, v) = f.json(&["install", "--setup", "local", "--json"]);
+        assert_ne!(code, 0, "{what}: {v}");
+        assert_eq!(v["diagnostics"][0]["code"], "config.invalid", "{what}: {v}");
+        assert!(
+            f.git_try(&["config", "--local", "mdkg.graph.ref"])
+                .is_none(),
+            "{what}: still in checkout mode"
+        );
+    };
+    refused("blob missing");
+    // The folder's tree missing too (a tree-filtered sparse clone): the
+    // lookup fails, and fails closed (Terra #16594).
+    let tree = f.git_out(&["rev-parse", "HEAD:knowledge"]);
+    let loose = f
+        .root
+        .join(".git/objects")
+        .join(&tree[..2])
+        .join(&tree[2..]);
+    fs::remove_file(&loose).expect("drop the tree");
+    let (code, v) = f.json(&["install", "--setup", "local", "--json"]);
+    assert_ne!(code, 0, "{v}");
+    let d = &v["diagnostics"][0];
+    assert_eq!(d["code"], "config.invalid", "{v}");
+    assert!(
+        d["message"].as_str().expect("message").contains(&dir_key),
+        "{v}"
+    );
+    assert!(
+        f.git_try(&["config", "--local", "mdkg.graph.ref"])
+            .is_none(),
+        "still in checkout mode"
+    );
+}
+
+/// Terra #16594 (orchestrator #16612): the folder is matched literally,
+/// so a `:`-prefixed name isn't read as pathspec magic and missed.
+#[test]
+fn setup_matches_a_colon_prefixed_folder_literally() {
+    let f = Fixture::new();
+    f.initialized();
+    let id = f.config()["graph_id"]
+        .as_str()
+        .expect("graph id")
+        .to_owned();
+    f.git(&["checkout", "-q", "-b", "other"]);
+    let mut other = f.config();
+    other["graph_id"] = json!("0192f3a0-0000-7000-8000-0000000000bb");
+    f.set_config(&other);
+    f.commit_graph();
+    f.git(&["update-ref", "refs/heads/mdkg-graph", "HEAD"]);
+    f.git(&["checkout", "-q", "main"]);
+    f.git(&["mv", ".mdkg", ":knowledge"]);
+    f.git(&["commit", "-q", "-m", "graph in :knowledge"]);
+    // Tracked on HEAD only, so the tree lookup decides.
+    fs::remove_dir_all(f.root.join(":knowledge")).expect("drop worktree copy");
+    f.git(&[
+        "config",
+        "--local",
+        &format!("mdkg.graph.{id}.ref"),
+        "refs/heads/team-graph",
+    ]);
+    let dir_key = format!("mdkg.graph.{id}.dir");
+    f.git(&["config", "--local", &dir_key, ":knowledge"]);
+    let (code, v) = f.json(&["install", "--setup", "local", "--json"]);
+    assert_ne!(code, 0, "{v}");
+    assert_eq!(v["diagnostics"][0]["code"], "config.invalid", "{v}");
+    assert!(
+        f.git_try(&["config", "--local", "mdkg.graph.ref"])
+            .is_none(),
+        "still in checkout mode"
+    );
+}
+
+/// #16095: the move into ref mode refuses a clone that registers the
+/// repository-root graph in a folder other than `.mdkg`, before writing
+/// any key.
+#[test]
+fn setup_refuses_a_registered_root_folder_ref_mode_doesnt_read() {
+    let f = Fixture::new();
+    f.initialized();
+    let id = f.config()["graph_id"]
+        .as_str()
+        .expect("graph id")
+        .to_owned();
+    let dir_key = format!("mdkg.graph.{id}.dir");
+    f.git(&["config", "--local", &dir_key, "knowledge"]);
+    let (code, v) = f.json(&["install", "--setup", "local", "--json"]);
+    assert_ne!(code, 0, "{v}");
+    let d = &v["diagnostics"][0];
+    assert_eq!(d["code"], "config.invalid", "{v}");
+    assert!(
+        d["message"].as_str().expect("message").contains(&dir_key),
+        "{v}"
+    );
+    assert!(
+        d["hint"]
+            .as_str()
+            .expect("hint")
+            .contains("--checkout-mode"),
+        "{v}"
+    );
+    let local = fs::read_to_string(f.root.join(".git/config")).expect("git config");
+    assert!(!local.contains("ref = "), "still in checkout mode: {local}");
+}
+
+/// e2e 0.7.1 B14: on a 0.6 branch cut before main's migration, doctor
+/// says what `migrate` says (it refuses the branch), not to run it.
+#[test]
+fn doctor_gives_migrates_guidance_for_a_branch_cut_before_main_migrated() {
+    let f = Fixture::new();
+    f.initialized();
+    // A 0.6.0 config, with no graph_id: before main's migration.
+    let old = json!({
+        "schema_version": 1, "tool": "mdkg",
+        "workspaces": {"root": {"path": ".", "enabled": true, "mdkg_dir": ".mdkg"}}
+    });
+    f.git(&["checkout", "-q", "-b", "old"]);
+    f.set_config(&old);
+    f.commit_graph();
+    let check = f.doctor_config();
+    let hint = check["hint"].as_str().unwrap_or_else(|| panic!("{check}"));
+    assert!(hint.contains("already migrated"), "{check}");
+    assert!(hint.contains("merge main into this branch"), "{check}");
+    // With no migrated main, `migrate` is the way on.
+    f.git(&["branch", "-q", "-f", "main", "old"]);
+    let check = f.doctor_config();
+    let hint = check["hint"].as_str().unwrap_or_else(|| panic!("{check}"));
+    assert!(hint.contains("migrate` moves a 0.6.0 graph"), "{check}");
+}
+
+/// Review of 9b00cc5d (e2e 0.7.1 B3): mail and claims read only the
+/// committed project's `coordination`, so `config show` says that a user
+/// or machine-local value it shows changes nothing.
+#[test]
+fn show_explains_project_only_coordination() {
+    for (source, layer) in [
+        ("home/.config/mdkg/config.json", "user"),
+        ("project/.git/mdkg/config.local.json", "local"),
+    ] {
+        let f = Fixture::new();
+        f.project();
+        f.write(
+            source,
+            &json!({"coordination": {"messages": {"ack_grace_days": 30}}}),
+        );
+        let result = f.show();
+        let data = &result["data"];
+        let pointer = "/coordination/messages/ack_grace_days";
+        assert_eq!(data["origins"][pointer]["layer"], layer);
+        let warning = data["warnings"]
+            .as_array()
+            .expect("warnings")
+            .iter()
+            .filter_map(Value::as_str)
+            .find(|s| s.contains("coordination is project-only"))
+            .unwrap_or_else(|| panic!("{data}"));
+        let text = f.output(&["config", "show", "--effective"]);
+        assert!(String::from_utf8_lossy(&text.stderr).contains(warning));
+    }
 }

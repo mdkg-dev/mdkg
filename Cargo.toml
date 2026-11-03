@@ -32,6 +32,39 @@ toml_edit = "=0.25.16"
 # forbids unsafe code, so libc is out; rustix wraps them safely. Already in
 # Cargo.lock (through tempfile). Only its `fs` feature.
 rustix = { version = "1.1.5", default-features = false, features = ["std", "fs"] }
+# Person keys (L16, S41; decided 2026-10-29). The Secure Enclave signer, macOS
+# only, through Apple's Security framework; safe API only.
+security-framework = { version = "3.7.0", features = ["OSX_10_15"] }
+# The FIDO2 signer: CTAP 2 over USB HID, on macOS and Linux.
+ctap-hid-fido2 = "3.6"
+# Signature checks and the file key (Ed25519, ECDSA P-256), and the OS random
+# source; the crypto provider wire uses too.
+ring = "0.17.14"
+# A FIDO2 attestation's x5c chain to the roots the approving person supplies.
+rustls-webpki = { version = "0.103.13", default-features = false, features = ["std", "ring"] }
+# The certificate, trust-anchor and time types rustls-webpki takes.
+rustls-pki-types = { version = "1.14", features = ["std"] }
+# base64url fingerprints and wire fields.
+base64 = "0.22.1"
+
+# mdkg-wire (serve L1): TLS 1.3 for `serve --listen`, with the ring
+# provider (no cmake or C toolchain beyond ring's own), TLS 1.2 off.
+# Approved 2026-10-29.
+rustls = { version = "0.23.36", default-features = false, features = ["ring", "std"] }
+# mdkg-wire: HTTP/1.1 request and response heads, zero-copy and bounded.
+httparse = "1.10.1"
+# mdkg-wire: Ed25519 machine keys and request signatures (RFC 9421).
+ed25519-dalek = { version = "2.2.0", default-features = false, features = ["std", "zeroize"] }
+# mdkg-serve, on macOS, iOS and FreeBSD: the Unix socket's peer user
+# (getpeereid), which neither std (unstable) nor rustix offers there
+# (R9, moved from mdkg-wire by #10568). mdkg-presence, on every Unix: the
+# OS user's home directory (getpwuid) for the person-key lock. Its safe
+# wrapper keeps unsafe code out of the workspace. Approved 2026-10-29.
+nix = { version = "0.29", default-features = false, features = ["socket", "user"] }
+# mdkg-wire: clears transient copies of key material on drop. Already in
+# the tree through ed25519-dalek's zeroize feature, at the version
+# Cargo.lock resolves. Approved 2026-10-30 (#10001).
+zeroize = { version = "1.8.2", default-features = false, features = ["alloc"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

@@ -1,0 +1,41 @@
+[package]
+name = "mdkg-serve"
+version = "0.7.1"
+description = "mdkg serve: the coordinator's listeners, request authentication, enrolment endpoints and event fan-out. Internal to mdkg, no stable API; depend on the mdkg binary"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+readme = "README.md"
+
+[dependencies]
+mdkg-format = { path = "../mdkg-format", version = "0.7.1" }
+mdkg-git = { path = "../mdkg-git", version = "0.7.1" }
+mdkg-graph = { path = "../mdkg-graph", version = "0.7.1" }
+mdkg-ops = { path = "../mdkg-ops", version = "0.7.1" }
+# The pairing code, fingerprints and the proof of possession (decided
+# 2026-10-29; orchestrator #8168).
+mdkg-wire = { path = "../mdkg-wire", version = "0.7.1" }
+# One attestation adapter, from person-keys' outcome to serve-store's
+# approval check (#10686 item 4; orchestrator, 2026-10-30).
+mdkg-coord-sqlite = { path = "../mdkg-coord-sqlite", version = "0.7.1" }
+mdkg-presence = { path = "../mdkg-presence", version = "0.7.1" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# The peer-user check (SO_PEERCRED), the lock file opened without
+# following links, our own uid and a live-pid probe; already a workspace
+# dependency (orchestrator, #6550).
+rustix = { workspace = true, features = ["net", "process"] }
+
+[target.'cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))'.dependencies]
+# The socket peer's user there (`getpeereid`), which neither std nor
+# rustix offers; Linux reads SO_PEERCRED through rustix. Approved with
+# mdkg-wire's dependencies (decided 2026-10-29).
+nix.workspace = true
+
+[lints]
+workspace = true

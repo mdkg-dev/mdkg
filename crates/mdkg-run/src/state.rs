@@ -33,6 +33,9 @@ pub struct AgentSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approvals: Option<String>,
     /// Recipient of deterministic turn receipts and decision questions.
+    /// Its mail goes first: of the page a turn loads (`limit`, after mail
+    /// set aside and paused threads), its oldest conversation is answered
+    /// before older mail from others (dec-01a18ee0 item 14).
     #[serde(default = "default_reports_to")]
     pub reports_to: String,
     /// Extra allowed commands for a Claude worker, in Claude's rule syntax
@@ -42,7 +45,9 @@ pub struct AgentSpec {
     /// Branches besides `main` a worker may never move or commit to.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub protect: Vec<String>,
-    /// For a reviewer: the commit or branch whose AGENTS.md gives the rules.
+    /// A commit or branch. For a reviewer, the one whose AGENTS.md gives
+    /// the rules; for a worker, where a new worktree starts, before any
+    /// dependency or `main_ref` (`turn::resolve_base`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base: Option<String>,
     /// The worktree `cwd` is in and its git folder, pinned by the launcher
@@ -91,6 +96,11 @@ pub struct AgentState {
     /// is made: the next prompt says so.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit_refused: Option<String>,
+    /// The commit the launcher cut the agent's worktree from, and why
+    /// ([`crate::turn::resolve_base`]); cleared when the agent moves to
+    /// another folder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_base: Option<crate::turn::WorkBase>,
 }
 
 /// Agent names become file names and lease scopes, so they stay plain.
@@ -105,7 +115,7 @@ pub fn check_name(name: &str) -> Result<(), RunError> {
                 c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_' | '.' | ':')
             })
         && !name.starts_with('.')
-        && !["human:", "role:", "run:"].iter().any(|p| {
+        && !["human:", "role:", "run:", "mdkg:"].iter().any(|p| {
             name.get(..p.len())
                 .is_some_and(|n| n.eq_ignore_ascii_case(p))
         });
@@ -116,9 +126,24 @@ pub fn check_name(name: &str) -> Result<(), RunError> {
         // role): the orchestrator's D2, 2026-10-24. The rule goes in the
         // hint, and the name isn't quoted.
         Err(RunError::usage("msg.bad_id", "that isn't a valid agent name").with_hint(
-            "an agent name is 1 to 120 of lowercase letters, digits, '-', '_', '.' and ':', and not human:*, role:* or run:*",
+            "an agent name is 1 to 120 of lowercase letters, digits, '-', '_', '.' and ':', and not human:*, role:*, run:* or mdkg:*",
         ))
     }
+}
+
+/// Receipt delivery must never wake the agent that just completed a turn.
+/// The launcher actor remains a valid recipient; only the agent itself and
+/// reserved/invalid actor names are refused.
+pub fn check_reports_to(agent_name: &str, reports_to: &str) -> Result<(), RunError> {
+    check_name(reports_to)?;
+    if reports_to == agent_name {
+        return Err(RunError::usage(
+            "usage.invalid_arguments",
+            "reports_to must name a different actor from the agent",
+        )
+        .with_hint("set reports_to to another actor in the agent definition"));
+    }
+    Ok(())
 }
 
 /// The launcher's folder in the coordination plane.
@@ -334,6 +359,36 @@ pub fn lease_record_path(dir: &Path, name: &str) -> PathBuf {
     dir.join(format!("{}.lease", file_name(name)))
 }
 
+/// The record a claimant writes before it claims an agent's turn lease,
+/// under the record lock, and renames to [`lease_record_path`] once it
+/// holds the lease: a claimant killed between its claim and the record
+/// is still named (friction 81).
+pub fn pending_record_path(dir: &Path, name: &str) -> PathBuf {
+    dir.join(format!("{}.lease.pending", file_name(name)))
+}
+
+/// A holder record at `path`, if there's a readable one.
+pub fn read_lease_record(path: &Path) -> Option<LeaseRecord> {
+    mdkg_coord_sqlite::git::read_capped(path, 65536)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+}
+
+/// Writes a holder record whole: to a temporary file, then renamed.
+pub fn write_lease_record(path: &Path, record: &LeaseRecord) -> std::io::Result<()> {
+    let tmp = path.with_extension(format!(
+        "{}.tmp",
+        path.extension().and_then(|e| e.to_str()).unwrap_or("lease")
+    ));
+    // Synced before the rename: after an OS crash, an empty record would
+    // name no holder, and a dead one would never be found (review of
+    // 350e4288).
+    let mut file = fs::File::create(&tmp)?;
+    std::io::Write::write_all(&mut file, &serde_json::to_vec(record)?)?;
+    file.sync_all()?;
+    fs::rename(&tmp, path)
+}
+
 /// Serialize holder-record publication and conditional removal. The stable
 /// lock is separate from the expiring coordinator lease: an old process may
 /// resume after takeover, but cannot unlink a replacement's record.
@@ -370,6 +425,182 @@ pub fn remove_lease_record(dir: &Path, name: &str, holder: &str) {
         .is_some_and(|r| r.holder == holder);
     if own {
         let _ = fs::remove_file(path);
+    }
+}
+
+/// How many turns showed a message to the agent without acking it
+/// (friction 62): a failed turn acks nothing, so its mail comes again. The
+/// prompt marks a repeat, and after [`SHOWS_MAX`] shows the message is set
+/// aside. Kept per agent in the launcher's folder and written under the
+/// turn lease; a missing or unreadable record counts nothing. A failed
+/// turn gives its shows back unless the failure was its own (decided,
+/// dec-01a18ee0 item 8), but a launcher killed between counting and that
+/// take-back leaves them standing: rare, and accepted for 0.7.1 (review
+/// of c5e4782a).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Shows {
+    /// By message id.
+    #[serde(default)]
+    pub messages: std::collections::BTreeMap<String, Shown>,
+}
+
+/// One message's shows ([`Shows`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Shown {
+    /// Its sequence, so the oldest go first when the record is full.
+    pub seq: u64,
+    /// Turns that showed it and didn't ack it.
+    pub shows: u32,
+}
+
+/// Shows without an ack after which a message is set aside.
+pub const SHOWS_MAX: u32 = 3;
+
+/// The most messages [`Shows`] keeps: the oldest go first. A turn shows at
+/// most a page of mail, and acked mail never comes again.
+const SHOWS_KEPT: usize = 256;
+
+pub fn shows_path(dir: &Path, name: &str) -> PathBuf {
+    dir.join(format!("{}.shows", file_name(name)))
+}
+
+impl Shows {
+    pub fn load(dir: &Path, name: &str) -> Self {
+        mdkg_coord_sqlite::git::read_capped(&shows_path(dir, name), 1 << 20)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default()
+    }
+
+    /// How many earlier turns showed `id` without acking it.
+    pub fn count(&self, id: &str) -> u32 {
+        self.messages.get(id).map_or(0, |s| s.shows)
+    }
+
+    /// Counts one more show of each message.
+    pub fn shown<'a>(&mut self, messages: impl IntoIterator<Item = (&'a str, u64)>) {
+        for (id, seq) in messages {
+            let e = self.messages.entry(id.to_string()).or_default();
+            e.seq = seq;
+            e.shows = e.shows.saturating_add(1);
+        }
+        while self.messages.len() > SHOWS_KEPT {
+            let oldest = self
+                .messages
+                .iter()
+                .min_by_key(|(id, s)| (s.seq, (*id).clone()))
+                .map(|(id, _)| id.clone());
+            match oldest {
+                Some(id) => self.messages.remove(&id),
+                None => break,
+            };
+        }
+    }
+
+    /// Takes back one show of each message, for a failed turn that never
+    /// delivered its prompt or whose failure wasn't the mail's: the model at
+    /// capacity or the subscription's usage limit.
+    pub fn unshown<'a>(&mut self, ids: impl IntoIterator<Item = &'a String>) {
+        for id in ids {
+            if let Some(e) = self.messages.get_mut(id) {
+                e.shows = e.shows.saturating_sub(1);
+                if e.shows == 0 {
+                    self.messages.remove(id);
+                }
+            }
+        }
+    }
+
+    /// Forgets messages that were acked.
+    pub fn acked<'a>(&mut self, ids: impl IntoIterator<Item = &'a String>) {
+        for id in ids {
+            self.messages.remove(id);
+        }
+    }
+
+    pub fn save(&self, dir: &Path, name: &str) -> Result<(), RunError> {
+        fs::create_dir_all(dir).map_err(|e| RunError::io("can't create the launcher folder", e))?;
+        let path = shows_path(dir, name);
+        let tmp = path.with_extension("shows.tmp");
+        let text = serde_json::to_vec(self)
+            .map_err(|e| RunError::failure(crate::error::CODE_IO, e.to_string()))?;
+        fs::write(&tmp, text).map_err(|e| RunError::io("can't record the mail shown", e))?;
+        fs::rename(&tmp, &path).map_err(|e| RunError::io("can't record the mail shown", e))
+    }
+}
+
+/// The mail an agent's turns set aside in the last [`SET_ASIDE_KEPT_MS`]
+/// (friction 62): each set-aside raises one `run.mail_set_aside` fault
+/// naming all of it, since the store keeps only an agent's latest fault
+/// of a code open (a new one supersedes the last; orchestrator, #12818).
+/// Kept per agent beside [`Shows`], written whole under the turn lease.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetAside {
+    #[serde(default)]
+    pub messages: Vec<SetAsideMessage>,
+}
+
+/// One message set aside ([`SetAside`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetAsideMessage {
+    pub id: String,
+    pub sender: String,
+    /// When it was set aside, epoch milliseconds.
+    pub at_ms: u64,
+}
+
+/// How long a set-aside message stays named in the agent's fault: a day.
+pub const SET_ASIDE_KEPT_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// The most messages [`SetAside`] keeps: the oldest go first.
+const SET_ASIDE_MAX: usize = 64;
+
+pub fn set_aside_path(dir: &Path, name: &str) -> PathBuf {
+    dir.join(format!("{}.set-aside", file_name(name)))
+}
+
+impl SetAside {
+    /// The record, without what's older than a day at `now_ms`; a missing
+    /// or unreadable one holds nothing.
+    pub fn load(dir: &Path, name: &str, now_ms: u64) -> Self {
+        let mut s: Self = mdkg_coord_sqlite::git::read_capped(&set_aside_path(dir, name), 1 << 20)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
+        s.messages
+            .retain(|m| m.at_ms.saturating_add(SET_ASIDE_KEPT_MS) > now_ms);
+        s
+    }
+
+    /// Adds a message set aside at `now_ms`; one already named keeps its
+    /// first time.
+    pub fn add(&mut self, id: &str, sender: &str, now_ms: u64) {
+        if !self.messages.iter().any(|m| m.id == id) {
+            self.messages.push(SetAsideMessage {
+                id: id.into(),
+                sender: sender.into(),
+                at_ms: now_ms,
+            });
+        }
+        while self.messages.len() > SET_ASIDE_MAX {
+            self.messages.remove(0);
+        }
+    }
+
+    /// Written whole: a temporary file, synced, then renamed into place.
+    pub fn save(&self, dir: &Path, name: &str) -> Result<(), RunError> {
+        fs::create_dir_all(dir).map_err(|e| RunError::io("can't create the launcher folder", e))?;
+        let path = set_aside_path(dir, name);
+        let tmp = path.with_extension("set-aside.tmp");
+        let text = serde_json::to_vec(self)
+            .map_err(|e| RunError::failure(crate::error::CODE_IO, e.to_string()))?;
+        let write = || -> std::io::Result<()> {
+            let mut f = fs::File::create(&tmp)?;
+            std::io::Write::write_all(&mut f, &text)?;
+            f.sync_all()?;
+            fs::rename(&tmp, &path)
+        };
+        write().map_err(|e| RunError::io("can't record the mail set aside", e))
     }
 }
 
@@ -454,19 +685,8 @@ pub fn check_configured_effort(
         return Ok(());
     };
     let accepted = match harness {
-        Some(Harness::Claude) => CLAUDE_EFFORTS,
-        Some(Harness::Codex) => CODEX_EFFORTS,
+        Some(h) => return h.adapter().validate_effort(e),
         None => EFFORTS,
-        Some(Harness::OpenCode) => {
-            return Err(RunError::usage(
-                "usage.invalid_arguments",
-                "OpenCode takes no effort setting",
-            )
-            .with_hint(format!(
-                "name the model's variant with --model <provider>/<model>#<variant>; if there is no file definition, replace saved or inline settings with an effort-free definition: `{} agents add <name> --harness opencode --role <role>`; if .mdkg/agents/<name>.json exists, remove its effort field there, then commit that file in the graph checkout",
-                mdkg_format::program::BIN
-            )));
-        }
     };
     if !accepted.contains(&e) {
         return Err(RunError::usage(
@@ -491,7 +711,10 @@ pub fn resolve(
     // A move to OpenCode with no --effort drops the effort it had, which
     // OpenCode can't take; one asked for there is still refused (review
     // of 3d10456).
-    let drop_effort = flags.harness == Some(Harness::OpenCode) && flags.effort.is_none();
+    let drop_effort = flags
+        .harness
+        .is_some_and(|h| h.adapter().efforts().is_none())
+        && flags.effort.is_none();
     let mut state = resolve_spec(name, existing, flags, default_cwd)?;
     if let Some(spec) = definition {
         state = resolve_definition(state, spec, fresh)?;
@@ -513,7 +736,7 @@ pub(crate) fn check_execution(spec: &AgentSpec) -> Result<(), RunError> {
         spec.sandbox.as_deref(),
         spec.approvals.as_deref(),
     )?;
-    check_name(&spec.reports_to)?;
+    check_reports_to(&spec.name, &spec.reports_to)?;
     Ok(())
 }
 
@@ -536,17 +759,7 @@ pub(crate) fn check_native(
             "reviewers are read-only; sandbox and approvals overrides are not allowed",
         ));
     }
-    if harness == Harness::Claude && sandbox.is_some() {
-        return Err(error(
-            "Claude has no native sandbox string override; use approvals for its permission mode",
-        ));
-    }
-    if harness == Harness::OpenCode && (sandbox.is_some() || approvals.is_some()) {
-        return Err(error(
-            "OpenCode sandbox and approvals overrides are not supported; its user defaults apply",
-        ));
-    }
-    Ok(())
+    harness.adapter().validate_overrides(sandbox, approvals)
 }
 
 /// Apply a complete committed definition to the latest machine-local state.
@@ -577,6 +790,9 @@ pub fn resolve_definition(
         existing.session = None;
         existing.user_session = false;
         existing.commit_refused = None;
+    }
+    if moved {
+        existing.work_base = None;
     }
     spec.pinned = if moved {
         None
@@ -626,6 +842,7 @@ fn resolve_spec(
                 turns: 0,
                 cursor: None,
                 commit_refused: None,
+                work_base: None,
             })
         }
         Some(mut state) => {
@@ -653,6 +870,7 @@ fn resolve_spec(
                 if c != state.spec.cwd {
                     state.session = None;
                     state.commit_refused = None;
+                    state.work_base = None;
                 }
                 state.spec.cwd = c;
             }
@@ -712,6 +930,69 @@ mod tests {
     use super::*;
 
     #[test]
+    fn shows_count_forget_and_keep_the_newest_when_full() {
+        let dir = std::env::temp_dir().join(format!("mdkg-shows-{}", uuid::Uuid::now_v7()));
+        assert_eq!(Shows::load(&dir, "a"), Shows::default(), "none yet");
+        let mut s = Shows::default();
+        s.shown([("m1", 1), ("m2", 2)]);
+        s.shown([("m1", 1)]);
+        assert_eq!((s.count("m1"), s.count("m2"), s.count("m3")), (2, 1, 0));
+        s.unshown(&["m1".to_string(), "m2".to_string(), "m3".to_string()]);
+        assert_eq!((s.count("m1"), s.count("m2")), (1, 0), "taken back");
+        assert!(!s.messages.contains_key("m2"), "none left is forgotten");
+        s.shown([("m1", 1)]);
+        s.acked(&["m1".to_string()]);
+        assert_eq!(s.count("m1"), 0);
+        s.save(&dir, "a").expect("save");
+        assert_eq!(Shows::load(&dir, "a"), s);
+        fs::write(shows_path(&dir, "a"), "{not json").expect("w");
+        assert_eq!(
+            Shows::load(&dir, "a"),
+            Shows::default(),
+            "unreadable counts nothing"
+        );
+        let ids: Vec<String> = (0..SHOWS_KEPT as u64 + 5)
+            .map(|n| format!("x{n}"))
+            .collect();
+        let mut s = Shows::default();
+        s.shown(
+            ids.iter()
+                .enumerate()
+                .map(|(n, id)| (id.as_str(), n as u64)),
+        );
+        assert_eq!(s.messages.len(), SHOWS_KEPT);
+        assert_eq!(s.count("x0"), 0, "the oldest went first");
+        assert_eq!(s.count(&format!("x{}", SHOWS_KEPT + 4)), 1);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn set_aside_keeps_a_day_once_each_and_the_newest_when_full() {
+        let dir = std::env::temp_dir().join(format!("mdkg-set-aside-{}", uuid::Uuid::now_v7()));
+        let day = SET_ASIDE_KEPT_MS;
+        assert_eq!(SetAside::load(&dir, "a", day), SetAside::default());
+        let mut s = SetAside::default();
+        s.add("m1", "x", 1_000);
+        s.add("m2", "y", day);
+        s.add("m1", "x", day + 5);
+        assert_eq!(s.messages.len(), 2, "once each");
+        assert_eq!(s.messages[0].at_ms, 1_000, "keeps its first time");
+        s.save(&dir, "a").expect("save");
+        assert_eq!(SetAside::load(&dir, "a", day), s);
+        // A day after m1, only m2 is named.
+        let later = SetAside::load(&dir, "a", day + 1_000);
+        assert_eq!(later.messages.len(), 1);
+        assert_eq!(later.messages[0].id, "m2");
+        let mut full = SetAside::default();
+        for n in 0..SET_ASIDE_MAX + 3 {
+            full.add(&format!("x{n}"), "s", n as u64);
+        }
+        assert_eq!(full.messages.len(), SET_ASIDE_MAX);
+        assert_eq!(full.messages[0].id, "x3", "the oldest went first");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn native_settings_round_trip_and_legacy_state_gets_auto_defaults() {
         let state = resolve(
             "worker",
@@ -740,6 +1021,133 @@ mod tests {
         assert_eq!(old.spec.mode, "auto");
         assert_eq!(old.spec.reports_to, "orchestrator");
         assert!(old.spec.sandbox.is_none() && old.spec.approvals.is_none());
+    }
+
+    #[test]
+    fn a_work_base_round_trips_and_a_move_clears_it() {
+        let flags = SpecFlags {
+            harness: Some(Harness::Codex),
+            role: Some(Role::Worker),
+            ..Default::default()
+        };
+        let mut saved = resolve("worker", None, flags, Path::new("/repo/a")).unwrap();
+        assert!(saved.work_base.is_none());
+        let json = serde_json::to_value(&saved).unwrap();
+        assert!(json.get("work_base").is_none(), "absent until set");
+        saved.work_base = Some(crate::turn::WorkBase {
+            commit: "a".repeat(40),
+            from: "refs/remotes/origin/main".into(),
+            source: crate::turn::BaseSource::MainRef,
+            notes: vec!["a note".into()],
+            turns: 0,
+        });
+        let json = serde_json::to_value(&saved).unwrap();
+        assert_eq!(json["work_base"]["source"], "main_ref");
+        assert_eq!(serde_json::from_value::<AgentState>(json).unwrap(), saved);
+        // The same folder keeps it; another drops it.
+        let same = SpecFlags {
+            cwd: Some("/repo/a".into()),
+            ..Default::default()
+        };
+        let kept = resolve("worker", Some(saved.clone()), same, Path::new("/repo/a")).unwrap();
+        assert_eq!(kept.work_base, saved.work_base);
+        let moved = SpecFlags {
+            cwd: Some("/repo/b".into()),
+            ..Default::default()
+        };
+        let moved = resolve("worker", Some(saved.clone()), moved, Path::new("/repo/a")).unwrap();
+        assert!(moved.work_base.is_none());
+        // A definition that moves the agent drops it too.
+        let mut spec = saved.spec.clone();
+        spec.cwd = "/repo/c".into();
+        let redefined = resolve_definition(saved, spec, false).unwrap();
+        assert!(redefined.work_base.is_none());
+    }
+
+    #[test]
+    fn receipt_targets_reject_self_and_reserved_names_in_new_and_saved_state() {
+        let flags = SpecFlags {
+            harness: Some(Harness::Codex),
+            role: Some(Role::Worker),
+            ..Default::default()
+        };
+        let saved = resolve("worker", None, flags.clone(), Path::new("/repo/worker")).unwrap();
+        assert_eq!(saved.spec.reports_to, "orchestrator");
+        for target in ["worker", "mdkg:receipts", "mdkg:other", "MDKG:receipts"] {
+            let expected = if target == "worker" {
+                "usage.invalid_arguments"
+            } else {
+                "msg.bad_id"
+            };
+            let mut fresh_flags = flags.clone();
+            fresh_flags.reports_to = Some(target.into());
+            let error =
+                resolve("worker", None, fresh_flags, Path::new("/repo/worker")).unwrap_err();
+            assert_eq!(error.code, expected);
+            let mut json = serde_json::to_value(&saved).unwrap();
+            json["spec"]["reports_to"] = target.into();
+            let invalid_saved: AgentState = serde_json::from_value(json).unwrap();
+            let error = resolve(
+                "worker",
+                Some(invalid_saved),
+                SpecFlags::default(),
+                Path::new("/repo/worker"),
+            )
+            .unwrap_err();
+            assert_eq!(error.code, expected);
+            let mut spec = saved.spec.clone();
+            spec.reports_to = target.into();
+            assert_eq!(
+                resolve_definition(saved.clone(), spec, false)
+                    .unwrap_err()
+                    .code,
+                expected
+            );
+        }
+        let mut flags = flags;
+        flags.reports_to = Some("launcher".into());
+        assert_eq!(
+            resolve("worker", None, flags, Path::new("/repo/worker"))
+                .unwrap()
+                .spec
+                .reports_to,
+            "launcher"
+        );
+    }
+
+    #[test]
+    fn an_explicit_receipt_target_repairs_invalid_saved_state_without_losing_the_session() {
+        let mut saved = resolve(
+            "worker",
+            None,
+            SpecFlags {
+                harness: Some(Harness::Codex),
+                role: Some(Role::Worker),
+                ..Default::default()
+            },
+            Path::new("/repo/worker"),
+        )
+        .unwrap();
+        saved.spec.reports_to = "worker".into();
+        saved.session = Some("existing-session".into());
+        let flags = SpecFlags {
+            reports_to: Some("lead".into()),
+            ..Default::default()
+        };
+        let fixed = resolve(
+            "worker",
+            Some(saved.clone()),
+            flags,
+            Path::new("/repo/worker"),
+        )
+        .unwrap();
+        assert_eq!(fixed.spec.reports_to, "lead");
+        assert_eq!(fixed.session, saved.session);
+        let mut definition = saved.spec.clone();
+        definition.reports_to = "lead".into();
+        let fixed = resolve_definition(saved.clone(), definition, false).unwrap();
+        assert_eq!(fixed.spec.reports_to, "lead");
+        assert_eq!(fixed.session, saved.session);
     }
 
     #[test]
@@ -1153,13 +1561,38 @@ mod tests {
 
     #[test]
     fn a_holder_ps_cant_be_asked_about_is_never_gone() {
-        // Review of 08ff0f9: a failed `ps` counted as a dead holder. A pid
-        // past any system's limit makes ps fail with a message.
+        // A recorded start time must remain protected when inspection fails.
+        // This assertion runs even when the sandbox denies every ps call.
         let mut r = crate::turn::lease_record("launcher@run-x".into());
-        assert!(!crate::turn::holder_gone(&r), "this process is alive");
+        r.started = "Thu Jan  1 00:00:00 1970".into();
         r.pid = u32::MAX;
         assert!(!crate::turn::holder_gone(&r));
-        // One that ran and ended is gone.
+    }
+
+    #[test]
+    fn a_known_holder_is_live_until_it_exits() {
+        // Probe the OS directly so a production metadata regression still fails.
+        let available = ["/bin/ps", "/usr/bin/ps"]
+            .into_iter()
+            .find(|path| std::path::Path::new(path).is_file())
+            .and_then(|ps| {
+                std::process::Command::new(ps)
+                    .args(["-o", "lstart=", "-p", &std::process::id().to_string()])
+                    .output()
+                    .ok()
+            })
+            .is_some_and(|out| {
+                out.status.success() && out.stdout.iter().any(|b| !b.is_ascii_whitespace())
+            });
+        if !available {
+            std::io::Write::write_all(
+                &mut std::io::stderr(),
+                b"skipped: a_known_holder_is_live_until_it_exits: process metadata (ps lstart) unavailable\n",
+            ).expect("skip reason");
+            return;
+        }
+        let mut r = crate::turn::lease_record("launcher@run-x".into());
+        assert!(!crate::turn::holder_gone(&r), "this process is alive");
         let mut child = std::process::Command::new("/usr/bin/true")
             .spawn()
             .expect("true");
@@ -1292,12 +1725,14 @@ mod tests {
     }
 
     #[test]
-    fn names_are_plain_and_never_human() {
+    fn names_are_plain_and_never_reserved() {
         for bad in [
             "",
             "human:nick",
             "Role:x",
             "run:a",
+            "mdkg:receipts",
+            "MDKG:other",
             "a/b",
             "../x",
             ".hidden",
@@ -1306,7 +1741,14 @@ mod tests {
         ] {
             assert!(check_name(bad).is_err(), "{bad}");
         }
-        for good in ["go-lane-b", "codex:pr19-4226245", "a.b_c"] {
+        for good in [
+            "go-lane-b",
+            "codex:pr19-4226245",
+            "a.b_c",
+            "mdkg",
+            "mdkg-worker",
+            "x:mdkg:receipt",
+        ] {
             assert!(check_name(good).is_ok(), "{good}");
         }
     }

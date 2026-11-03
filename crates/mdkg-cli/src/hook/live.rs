@@ -9,7 +9,7 @@ use mdkg_coord::Status;
 use mdkg_coord_sqlite::mail::InboxQuery;
 use mdkg_format::Code;
 
-use super::{Changes, Holds, Lease, Mail, MailSource, Reminded};
+use super::{Changes, Finished, Holds, Lease, Mail, MailSource, Reminded};
 use crate::coord::{Repo, now_ms};
 
 pub(super) struct Live {
@@ -66,6 +66,12 @@ impl MailSource for Live {
             .messages
             .into_iter()
             .map(|m| Mail {
+                own_reply: mdkg_run::hooks::own_reply(
+                    &m.kind,
+                    &m.reference_ids,
+                    &self.actor,
+                    |id| store.message(id, now).ok().map(|r| r.sender),
+                ),
                 seq: m.seq,
                 kind: m.kind,
                 sender: m.sender,
@@ -250,6 +256,17 @@ impl Changes for Live {
     }
 }
 
+/// A worktree's own entries' leases, by the path git reports (a staged
+/// file, say), never through a link to its target: a link is its own
+/// file, whatever it points at.
+pub struct Entries<'a>(pub &'a Live);
+
+impl Holds for Entries<'_> {
+    fn lease(&self, path: &str) -> Result<Lease, String> {
+        self.0.held(&self.0.root, path)
+    }
+}
+
 impl Reminded for Live {
     fn last(&self, session: &str) -> u64 {
         self.common().map_or(0, |c| {
@@ -273,6 +290,33 @@ impl Reminded for Live {
     fn claim_audit(&self, session: &str, fingerprint: u64) -> bool {
         self.common()
             .is_some_and(|c| mdkg_run::hooks::claim_audit(&c, &self.actor, session, fingerprint))
+    }
+
+    fn claim_done(&self, session: &str, fingerprint: u64) -> bool {
+        self.common()
+            .is_some_and(|c| mdkg_run::hooks::claim_done(&c, &self.actor, session, fingerprint))
+    }
+}
+
+impl Finished for Live {
+    /// From the coordinator: the actor's latest `done` is its newest node
+    /// lease that a commit ended; the leases still held are its active
+    /// path leases (never a role, a turn or a node).
+    fn held_after_done(&self, since_ms: u64) -> Result<Option<(u64, Vec<String>)>, String> {
+        let repo = Repo::open(&self.root).map_err(|e| e.diagnostic.message)?;
+        let store = repo.store().map_err(|e| e.diagnostic.message)?;
+        let state = store.coordinator().map_err(|e| e.to_string())?;
+        Ok(
+            crate::coord::held_after_done(&state, &self.actor, since_ms, now_ms()).map(
+                |(done, held)| {
+                    let mut held: Vec<String> =
+                        held.iter().map(|l| l.scope.as_str().to_string()).collect();
+                    held.sort();
+                    held.dedup();
+                    (done, held)
+                },
+            ),
+        )
     }
 }
 

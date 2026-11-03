@@ -18,16 +18,43 @@ pub const STORE_WORK_TYPES: &[&str] = &["task", "bug", "spike", "test", "checkpo
 /// `%25`), so each graph in a repository has its own. A `.git` that is
 /// there but can't be read, or isn't what git writes, is an error, never
 /// "not a repository".
+///
+/// In ref mode a graph's root is the clone's graph cache,
+/// `<common>/mdkg/graph/cache[/<prefix>]`, which mirrors the repository's
+/// layout and is inside the git folder, where no checkout is found. Its
+/// work stays where checkout mode keeps it, `under(common, prefix)`, so
+/// local work survives a move to the graph ref (edd-01a18867, Config,
+/// "Local work stays local"; R1, C25).
 pub fn work_dir(root: &Path) -> Result<Option<PathBuf>, String> {
-    Ok(mdkg_format::settings::git::discover(root)?.map(|repo| {
-        let prefix = repo
-            .prefix
-            .components()
-            .map(|c| c.as_os_str().to_string_lossy().into_owned())
-            .collect::<Vec<_>>()
-            .join("/");
-        under(&repo.common, &prefix)
-    }))
+    let found = match mdkg_format::settings::git::discover(root) {
+        Ok(found) => found,
+        Err(e) => return in_cache(root).map(Some).ok_or(e),
+    };
+    Ok(found.map(|repo| under(&repo.common, &slashed(&repo.prefix))))
+}
+
+fn slashed(prefix: &Path) -> String {
+    prefix
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// The work folder for a root inside a git common folder's graph cache:
+/// only a root `discover` refused, whose ancestor `<C>/mdkg/graph/cache`
+/// has a `C` that is a git folder (`HEAD`, `objects`, `refs`).
+fn in_cache(root: &Path) -> Option<PathBuf> {
+    let root = std::fs::canonicalize(root).ok()?;
+    let cache = root.ancestors().find(|d| {
+        d.ends_with("mdkg/graph/cache")
+            && d.ancestors().nth(3).is_some_and(|c| {
+                c.join("HEAD").is_file() && c.join("objects").is_dir() && c.join("refs").is_dir()
+            })
+    })?;
+    let common = cache.ancestors().nth(3)?;
+    let prefix = root.strip_prefix(cache).ok()?;
+    Some(under(common, &slashed(prefix)))
 }
 
 /// Whether a node's path (as the index gives it) is in the store's work
@@ -91,6 +118,30 @@ mod tests {
         assert_eq!(work_dir(&main), Ok(Some(under(&common, ""))));
         assert_eq!(work_dir(&wt), Ok(Some(under(&common, ""))));
         assert_eq!(work_dir(&wt.join("sub")), Ok(Some(under(&common, "sub"))));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Ref mode: a graph root in the graph cache keeps checkout mode's
+    /// work folder, and a look-alike outside a git folder isn't one.
+    #[test]
+    fn a_graph_cache_root_keeps_the_checkout_s_work_folder() {
+        let dir = std::env::temp_dir().join(format!("mdkg-store-work-c-{}", std::process::id()));
+        let common = dir.join("r/.git");
+        repository(&common);
+        let cache = common.join("mdkg/graph/cache");
+        std::fs::create_dir_all(cache.join("sub/dir")).unwrap();
+        let common = std::fs::canonicalize(&common).unwrap();
+        assert_eq!(work_dir(&cache), Ok(Some(under(&common, ""))));
+        assert_eq!(
+            work_dir(&cache.join("sub/dir")),
+            Ok(Some(under(&common, "sub/dir")))
+        );
+        // The same names in a folder that isn't a git folder.
+        let fake = dir.join("plain/mdkg/graph/cache");
+        std::fs::create_dir_all(&fake).unwrap();
+        assert_eq!(work_dir(&fake), Ok(None));
+        // Elsewhere inside the git folder is still refused.
+        assert!(work_dir(&common.join("mdkg")).is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 

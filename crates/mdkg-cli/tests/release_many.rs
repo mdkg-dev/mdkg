@@ -262,6 +262,8 @@ fn release_takes_a_target_or_all_never_both() {
         &["release", "--all", "--scope", "lib.txt"],
         &["release", "--merged"],
         &["release"],
+        &["release", "task-1", "--clean"],
+        &["release", "--all", "--clean"],
     ] {
         let (code, out) = run(&wt, "a", args);
         assert_eq!(code, 1, "{args:?}: {out}");
@@ -382,4 +384,78 @@ fn profile_c_node_leases_go_too() {
     want.sort();
     assert_eq!(scopes(&out["data"]["released"]), want, "{out}");
     assert!(held(&repo, "a").is_empty());
+}
+
+/// `release --clean` at `minutes` past now (the store's clock).
+fn clean_at(worktree: &Path, actor: &str, minutes: u64) -> Value {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis() as u64
+        + minutes * 60_000;
+    let out = isolated(&mut Command::new(env!("CARGO_BIN_EXE_mdkg")))
+        .arg("--root")
+        .arg(worktree)
+        .args(["--as", actor, "release", "--clean", "--json"])
+        .env("MDKG_NOW_MS", now.to_string())
+        .output()
+        .expect("run mdkg");
+    let envelope: Value = serde_json::from_slice(&out.stdout).expect("JSON");
+    common::conforms_envelope(&envelope);
+    assert!(out.status.success(), "{envelope}");
+    envelope
+}
+
+/// f-wake step 5 (orchestrator, #12639): `--clean` frees the path leases
+/// `renew` lets lapse (a file lease protects uncommitted edits only):
+/// a clean path claimed over 30 minutes ago goes; a path with changes, a
+/// fresh claim, a node, a role and anyone else's stay.
+#[test]
+fn release_clean_frees_only_clean_path_leases_past_their_first_30_minutes() {
+    let dir = scratch();
+    let (repo, wt) = setup(&dir);
+    ok(&wt, "a", &["claim", "lib.txt"]);
+    ok(&wt, "a", &["claim", "notes/a.txt"]);
+    ok(&wt, "a", &["claim", "task-1"]);
+    ok(&wt, "a", &["claim", "role:reviewer"]);
+    ok(&repo, "b", &["claim", "notes/b.txt"]);
+    fs::write(wt.join("notes/a.txt"), "edited\n").expect("edit");
+
+    // Just claimed: nothing goes yet, dirty or not.
+    let out = clean_at(&wt, "a", 0);
+    assert_eq!(out["data"]["released"], serde_json::json!([]), "{out}");
+    let text = isolated(&mut Command::new(env!("CARGO_BIN_EXE_mdkg")))
+        .arg("--root")
+        .arg(&wt)
+        .args(["--as", "a", "release", "--clean"])
+        .output()
+        .expect("run mdkg");
+    assert_eq!(
+        String::from_utf8_lossy(&text.stdout).trim(),
+        "no clean leases to release"
+    );
+
+    // Past the first 30 minutes: the clean path goes, the edited one stays.
+    let out = clean_at(&wt, "a", 31);
+    assert_eq!(scopes(&out["data"]["released"]), vec!["lib.txt"], "{out}");
+    assert_eq!(out["data"]["failed"], serde_json::json!([]));
+    assert_eq!(
+        held(&wt, "a"),
+        vec![T1.to_string(), "notes/a.txt".into(), "role:reviewer".into()]
+    );
+    assert_eq!(
+        held(&repo, "b"),
+        vec!["notes/b.txt".to_string()],
+        "b's stays"
+    );
+
+    // Committed, the edited path is clean too, and goes.
+    sh(&wt, &["commit", "-q", "-am", "edit"]);
+    let out = clean_at(&wt, "a", 31);
+    assert_eq!(
+        scopes(&out["data"]["released"]),
+        vec!["notes/a.txt"],
+        "{out}"
+    );
+    assert_eq!(held(&wt, "a"), vec![T1.to_string(), "role:reviewer".into()]);
 }

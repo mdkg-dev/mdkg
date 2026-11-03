@@ -2,7 +2,8 @@
 //! Claude Code's settings entries, and OpenCode's plugin. Each entry is one
 //! line calling `mdkg hook <event> --harness <h>`, where all the logic is.
 //!
-//! Claude's entries go into a `.claude/settings.json` the user also edits.
+//! Claude's entries go into a `.claude/settings.local.json` the user also
+//! edits.
 //! JSON carries no marker, so ours are the entries whose every command runs
 //! an mdkg binary's `hook`: [`merge_claude`] replaces them and keeps the
 //! rest, and [`unmerge_claude`] takes them out.
@@ -20,11 +21,14 @@ pub struct Mail {
     pub seq: u64,
     pub kind: String,
     pub sender: String,
-    /// The room it was posted to; `None` for direct mail.
+    /// The channel it was posted to; `None` for direct mail.
     pub room: Option<String>,
+    /// A note answering a message the agent sent itself: a reply to a
+    /// handoff or a turn's reply, which needs no new turn.
+    pub own_reply: bool,
 }
 
-/// The room kinds that wake an agent; direct mail always does. Only room
+/// The channel kinds that wake an agent; direct mail always does. Only channel
 /// notes wait for the next turn; request a review with `review_request`
 /// so it wakes the reviewer.
 pub const ROOM_WAKE_KINDS: &[&str] = &[
@@ -36,15 +40,37 @@ pub const ROOM_WAKE_KINDS: &[&str] = &[
     "resolution",
 ];
 
-/// Whether a message wakes an agent, or keeps it from stopping.
+/// Whether a message wakes an agent, or keeps it from stopping. A note
+/// replying to the agent's own message never does: otherwise two agents
+/// acknowledging each other would wake each other in turn. A turn's
+/// receipt never does either: it is set aside unseen (A26, R5).
 pub fn wakes(m: &Mail) -> bool {
+    if m.kind == "receipt" || (m.own_reply && m.kind == "note") {
+        return false;
+    }
     m.room.is_none() || ROOM_WAKE_KINDS.contains(&m.kind.as_str())
+}
+
+/// Whether a message is a note replying to `actor`'s own message: the
+/// first message it references, the one it answers, was sent by `actor`.
+/// `sender_of` is asked only for a note that replies; a sender it can't
+/// find leaves the note waking as before.
+pub fn own_reply(
+    kind: &str,
+    references: &[String],
+    actor: &str,
+    sender_of: impl FnOnce(&str) -> Option<String>,
+) -> bool {
+    kind == "note"
+        && references
+            .first()
+            .is_some_and(|id| sender_of(id).as_deref() == Some(actor))
 }
 
 /// The most messages a line names before "and N more".
 const LISTED: usize = 5;
 
-/// The line naming mail: number, kind and sender (and room), never a body.
+/// The line naming mail: number, kind and sender (and channel), never a body.
 /// `None` for no mail.
 pub fn mail_line(mail: &[Mail]) -> Option<String> {
     if mail.is_empty() {
@@ -61,7 +87,7 @@ pub fn mail_line(mail: &[Mail]) -> Option<String> {
                 name_word(&m.sender)
             );
             if let Some(r) = m.room.as_deref().filter(|r| is_id(r)) {
-                s.push_str(&format!(" in room {r}"));
+                s.push_str(&format!(" in channel {r}"));
             }
             s
         })
@@ -364,6 +390,18 @@ pub fn audited(common: &Path, actor: &str, session: &str) -> std::io::Result<u64
 /// from the session's last and is recorded, under the record's lock.
 pub fn claim_audit(common: &Path, actor: &str, session: &str, fingerprint: u64) -> bool {
     update_record(&reminded_file(common, actor, "audited"), session, |last| {
+        (fingerprint != last.seq).then_some(Told {
+            seq: fingerprint,
+            ..last
+        })
+    })
+    .unwrap_or(false)
+}
+
+/// Claims `lease.done`'s block for a set of leases still held after a
+/// `done`, as [`claim_audit`] does the audit's, in a record of its own.
+pub fn claim_done(common: &Path, actor: &str, session: &str, fingerprint: u64) -> bool {
+    update_record(&reminded_file(common, actor, "done"), session, |last| {
         (fingerprint != last.seq).then_some(Told {
             seq: fingerprint,
             ..last
@@ -1088,15 +1126,16 @@ pub fn changed_paths(top: &Path) -> Result<Vec<String>, String> {
 
 /// Claude's canonical hooks file, `.mdkg/hooks/claude/settings.json`: the
 /// fragment calling `bin`, as pretty JSON. The projection merges it into
-/// `.claude/settings.json` (lane 6's install).
+/// `.claude/settings.local.json` (lane 6's install; dec-01a18ee0 item 11).
 pub fn claude_canonical(bin: &str) -> String {
     let mut s = serde_json::to_string_pretty(&claude_fragment(bin)).unwrap_or_default();
     s.push('\n');
     s
 }
 
-/// The Claude tools whose call the edit guard checks.
-pub const CLAUDE_EDIT_MATCHER: &str = "Edit|Write|MultiEdit|NotebookEdit";
+/// The Claude tools whose call the router checks before it runs: the edit
+/// tools (`lease.edit`), and Bash, whose git pushes `git.protect` reads.
+pub const CLAUDE_EDIT_MATCHER: &str = "Edit|Write|MultiEdit|NotebookEdit|Bash";
 
 /// How long Claude lets the idle wait run, in seconds; the wait itself
 /// stops a minute sooner, so it ends quietly rather than being killed.
@@ -1114,7 +1153,8 @@ fn shell_word(s: &str) -> String {
     }
 }
 
-/// The `{"hooks": …}` object for `.claude/settings.json`, calling `bin`.
+/// The `{"hooks": …}` object for `.claude/settings.local.json`, calling
+/// `bin`.
 pub fn claude_fragment(bin: &str) -> Value {
     let cmd = |event: &str| format!("{} hook {event} --harness claude", shell_word(bin));
     let entry = |event: &str| json!({"type": "command", "command": cmd(event)});
@@ -1265,6 +1305,11 @@ pub const OPENCODE_FILE_TOOLS: &[&str] = &["edit", "write", "multiedit"];
 /// OpenCode tools that write the files a patch names.
 pub const OPENCODE_PATCH_TOOLS: &[&str] = &["patch", "apply_patch"];
 
+/// OpenCode's shell tool, whose git pushes `git.protect` reads: `bash` in
+/// 2.1, `shell` in 2.2, whose built-in input repair also renames a model's
+/// `bash` call to `shell` before any plugin sees it.
+pub const OPENCODE_SHELL_TOOLS: &[&str] = &["bash", "shell"];
+
 /// Where OpenCode loads mdkg's plugin from: a plugin is a folder, its entry
 /// `server.ts` (spike, 2026-10-25: plain files in `plugins/` are skipped).
 pub const OPENCODE_PLUGIN_PATH: &str = ".opencode/plugins/mdkg/server.ts";
@@ -1282,6 +1327,55 @@ pub const OPENCODE_PLUGIN_PATH: &str = ".opencode/plugins/mdkg/server.ts";
 /// Small on purpose: OpenCode runs project plugins with no trust prompt,
 /// and doctor checks this file's content.
 pub fn opencode_plugin(bin: &str) -> String {
+    opencode_plugin_routing(bin, OPENCODE_SHELL_TOOLS)
+}
+
+/// The shell tools the plugin routed before 2.2's `shell` (0.7.0, 0.7.1
+/// before 3cf0a80d).
+const OPENCODE_SHELL_TOOLS_BEFORE_2_2: &[&str] = &["bash"];
+
+/// This build's plugin, for a canonical plugin `text` that is exactly one
+/// an earlier mdkg shipped (routing only `bash`), calling the same binary.
+/// `None` for anything else: a plugin someone changed is theirs to update.
+pub fn opencode_plugin_upgrade(text: &str) -> Option<String> {
+    let bin = text.lines().find_map(|l| l.strip_prefix("const BIN = "))?;
+    let bin: String = serde_json::from_str(bin).ok()?;
+    let current = opencode_plugin(&bin);
+    (text != current
+        && (text == opencode_plugin_routing(&bin, OPENCODE_SHELL_TOOLS_BEFORE_2_2)
+            || text == opencode_plugin_before_shell_routing(&bin)))
+    .then_some(current)
+}
+
+/// The default shipped in 0.7.0-rc.3, before shell routing was added.
+fn opencode_plugin_before_shell_routing(bin: &str) -> String {
+    let template = OPENCODE_PLUGIN
+        .replace("const SHELL_TOOLS = new Set([__SHELL_TOOLS__])\n", "")
+        .replace(
+            "      const tool = String(d?.tool ?? \"\").toLowerCase()\n      const shell = SHELL_TOOLS.has(tool)\n      if (!EDIT_TOOLS.has(tool) && !shell) return\n",
+            "      if (!EDIT_TOOLS.has(String(d?.tool ?? \"\").toLowerCase())) return\n",
+        )
+        .replace(
+            "      // A shell command mdkg couldn't check runs: only an edit fails closed.\n      if (!r.ok && shell) return\n",
+            "",
+        );
+    render_opencode_plugin(&template, bin, &[])
+}
+
+/// Only an exact current default can establish routing without trying
+/// to interpret arbitrary customized JavaScript.
+pub fn opencode_plugin_is_current(text: &str) -> bool {
+    text.lines()
+        .find_map(|line| line.strip_prefix("const BIN = "))
+        .and_then(|bin| serde_json::from_str::<String>(bin).ok())
+        .is_some_and(|bin| text == opencode_plugin(&bin))
+}
+
+fn opencode_plugin_routing(bin: &str, shell_tools: &[&str]) -> String {
+    render_opencode_plugin(OPENCODE_PLUGIN, bin, shell_tools)
+}
+
+fn render_opencode_plugin(template: &str, bin: &str, shell_tools: &[&str]) -> String {
     let list = |tools: &[&str]| {
         tools
             .iter()
@@ -1289,14 +1383,17 @@ pub fn opencode_plugin(bin: &str) -> String {
             .collect::<Vec<_>>()
             .join(", ")
     };
-    OPENCODE_PLUGIN
-        .replace(
-            "\"__MDKG_BIN__\"",
-            &serde_json::to_string(bin).unwrap_or_else(|_| "\"mdkg\"".into()),
-        )
+    template
         .replace(
             "__EDIT_TOOLS__",
             &list(&[OPENCODE_FILE_TOOLS, OPENCODE_PATCH_TOOLS].concat()),
+        )
+        .replace("__SHELL_TOOLS__", &list(shell_tools))
+        // Insert the binary last: placeholder-looking text in a valid
+        // path must stay literal (including the rc.3 recognizer).
+        .replace(
+            "\"__MDKG_BIN__\"",
+            &serde_json::to_string(bin).unwrap_or_else(|_| "\"mdkg\"".into()),
         )
 }
 
@@ -1304,6 +1401,7 @@ const OPENCODE_PLUGIN: &str = r#"// mdkg's OpenCode hooks, written by `mdkg inst
 // Each calls `mdkg hook <event> --harness opencode`; the logic is mdkg's.
 const BIN = "__MDKG_BIN__"
 const EDIT_TOOLS = new Set([__EDIT_TOOLS__])
+const SHELL_TOOLS = new Set([__SHELL_TOOLS__])
 
 async function call(event: string, cwd: string, input: object): Promise<{ ok: boolean; out: any }> {
   try {
@@ -1344,8 +1442,12 @@ export default {
     // can move.
     const dir = () => ctx.location?.directory ?? ctx.directory ?? process.cwd()
     await ctx.tool.hook("execute.before", async (d: any) => {
-      if (!EDIT_TOOLS.has(String(d?.tool ?? "").toLowerCase())) return
+      const tool = String(d?.tool ?? "").toLowerCase()
+      const shell = SHELL_TOOLS.has(tool)
+      if (!EDIT_TOOLS.has(tool) && !shell) return
       const r = await call("edit", dir(), { sessionID: d?.sessionID, tool: d?.tool, args: d?.input })
+      // A shell command mdkg couldn't check runs: only an edit fails closed.
+      if (!r.ok && shell) return
       if (!r.ok) throw new Error("mdkg couldn't check this edit; inspect the plugin log before retrying")
       if (r.out.deny) throw new Error(r.out.deny)
     })
@@ -1395,20 +1497,21 @@ mod tests {
             kind: kind.into(),
             sender: sender.into(),
             room: room.map(Into::into),
+            own_reply: false,
         }
     }
 
     #[test]
     fn the_line_names_number_kind_and_sender_never_a_body() {
         let line = mail_line(&[
-            mail(212, "handoff", "v07-work-state", None),
+            mail(212, "handoff", "work-state", None),
             mail(214, "question", "orchestrator", Some("release-0.7")),
         ])
         .expect("line");
         assert!(
             line.starts_with(
-                "You have mdkg mail: #212 handoff from v07-work-state; \
-                 #214 question from orchestrator in room release-0.7."
+                "You have mdkg mail: #212 handoff from work-state; \
+                 #214 question from orchestrator in channel release-0.7."
             ),
             "{line}"
         );
@@ -1456,6 +1559,24 @@ mod tests {
             assert!(wakes(&mail(1, k, "a", Some("r"))), "{k}");
         }
         assert!(!wakes(&mail(1, "note", "a", Some("r"))));
+        // A receipt never wakes; a fault is direct mail, and does (A26).
+        assert!(!wakes(&mail(1, "receipt", "mdkg:receipts", None)));
+        assert!(wakes(&mail(1, "fault", "mdkg:supervisor", None)));
+    }
+
+    #[test]
+    fn a_note_replying_to_the_agents_own_message_never_wakes_it() {
+        let own = |kind: &str, room: Option<&str>| Mail {
+            own_reply: true,
+            ..mail(1, kind, "o", room)
+        };
+        assert!(!wakes(&own("note", None)));
+        assert!(!wakes(&own("note", Some("r"))));
+        // Only a note: a question or a decision answering it still wakes.
+        for k in ["question", "decision", "handoff", "findings"] {
+            assert!(wakes(&own(k, None)), "{k}");
+            assert!(wakes(&own(k, Some("r"))), "{k}");
+        }
     }
 
     fn scratch(name: &str) -> PathBuf {
@@ -2022,6 +2143,26 @@ mod tests {
 
     #[test]
     fn a_live_attach_binds_its_session_and_a_hook_keeps_the_binding() {
+        // Probe the OS directly so a production metadata regression still fails.
+        let available = ["/bin/ps", "/usr/bin/ps"]
+            .into_iter()
+            .find(|path| std::path::Path::new(path).is_file())
+            .and_then(|ps| {
+                std::process::Command::new(ps)
+                    .args(["-o", "lstart=", "-p", &std::process::id().to_string()])
+                    .output()
+                    .ok()
+            })
+            .is_some_and(|out| {
+                out.status.success() && out.stdout.iter().any(|b| !b.is_ascii_whitespace())
+            });
+        if !available {
+            std::io::Write::write_all(
+                &mut std::io::stderr(),
+                b"skipped: a_live_attach_binds_its_session_and_a_hook_keeps_the_binding: process metadata (ps lstart) unavailable\n",
+            ).expect("skip reason");
+            return;
+        }
         let common = scratch("threads");
         let cwd = common.join("worktree");
         init_worktree(&cwd);
@@ -2095,10 +2236,17 @@ mod tests {
         assert!(!owner(1, me.pid, "").gone());
         // The threads' lock is one stable file, never removed.
         assert!(threads_lock(&common).is_file());
-        // An unreadable record is an error, never "unbound".
-        std::fs::write(thread_file(&common, "codex", "thr/1"), "garbage").expect("w");
-        assert!(bound_actor(&common, "codex", "thr/1", None).is_err());
         std::fs::remove_dir_all(&common).ok();
+    }
+
+    #[test]
+    fn a_corrupt_thread_binding_is_refused_without_process_metadata() {
+        let common = scratch("corrupt-binding");
+        let path = thread_file(&common, "codex", "thr/1");
+        std::fs::create_dir_all(path.parent().unwrap()).expect("binding folder");
+        std::fs::write(path, "garbage").expect("corrupt binding");
+        assert!(bound_actor(&common, "codex", "thr/1", None).is_err());
+        std::fs::remove_dir_all(&common).expect("cleanup");
     }
 
     /// Threads no live attach owns are pruned by age and count; the one
@@ -2495,12 +2643,55 @@ mod tests {
     }
 
     #[test]
+    fn only_a_plugin_mdkg_shipped_before_2_2_is_upgraded() {
+        for bin in ["/opt/a \"b\"/mdkg", "mdkg", "/opt/__SHELL_TOOLS__/mdkg"] {
+            let old = opencode_plugin_routing(bin, &["bash"]);
+            assert!(old.contains(r#"const SHELL_TOOLS = new Set(["bash"])"#));
+            assert!(!opencode_plugin_is_current(&old));
+            assert_eq!(opencode_plugin_upgrade(&old), Some(opencode_plugin(bin)));
+            let rc3 = opencode_plugin_before_shell_routing(bin);
+            assert!(!rc3.contains("const SHELL_TOOLS"));
+            assert_eq!(opencode_plugin_upgrade(&rc3), Some(opencode_plugin(bin)));
+            assert_eq!(opencode_plugin_upgrade(&(rc3 + "// custom\n")), None);
+            // Current, changed, or for another shell list: left alone.
+            assert_eq!(opencode_plugin_upgrade(&opencode_plugin(bin)), None);
+            assert!(opencode_plugin_is_current(&opencode_plugin(bin)));
+            let changed = old.replace("console.warn(err.trim())", "console.log(err)");
+            assert_ne!(changed, old);
+            assert_eq!(opencode_plugin_upgrade(&changed), None);
+            assert!(!opencode_plugin_is_current(&changed));
+            assert_eq!(
+                opencode_plugin_upgrade(&opencode_plugin_routing(bin, &["sh"])),
+                None
+            );
+        }
+        assert_eq!(opencode_plugin_upgrade("not a plugin"), None);
+    }
+
+    #[test]
+    fn customized_plugins_never_establish_shell_routing() {
+        let current = opencode_plugin("mdkg");
+        assert!(opencode_plugin_is_current(&current));
+        let rc3 = opencode_plugin_before_shell_routing("mdkg");
+        for custom in [
+            current.clone() + "// custom\n",
+            rc3.clone() + "const SHELL_TOOLS = new Set(['shell'])\n",
+            format!("const fake = /const SHELL_TOOLS = new Set([\"shell\"])/;\n{rc3}"),
+            format!("// const SHELL_TOOLS = new Set(['shell'])\n{rc3}"),
+        ] {
+            assert!(!opencode_plugin_is_current(&custom));
+        }
+    }
+
+    #[test]
     fn the_plugin_names_the_binary_as_a_js_string() {
         let p = opencode_plugin("/opt/a \"b\"/mdkg");
         assert!(p.contains(r#"const BIN = "/opt/a \"b\"/mdkg""#), "{p}");
         assert!(p.contains(r#"new Set(["edit", "write", "multiedit", "patch", "apply_patch"])"#));
         assert!(p.contains("export default"));
         assert!(!p.contains("__MDKG_BIN__") && !p.contains("__EDIT_TOOLS__"));
+        // 2.1's shell tool and 2.2's, so git.protect sees either.
+        assert!(p.contains(r#"const SHELL_TOOLS = new Set(["bash", "shell"])"#));
         // An edit mdkg can't check is refused, not let through.
         assert!(p.contains("if (!r.ok) throw new Error(\"mdkg couldn't check this edit; inspect the plugin log before retrying\")"));
         assert!(!p.contains("r.why"));

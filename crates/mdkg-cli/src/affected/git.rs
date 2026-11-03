@@ -17,6 +17,13 @@ use std::process::{Command, Output};
 /// A git command in `dir` with the read-only settings above.
 fn command(dir: &Path) -> Command {
     let mut c = Command::new("git");
+    // Git's inherited repository, object and configuration overrides must
+    // not redirect either the code history or the graph authority root.
+    for (name, _) in std::env::vars_os() {
+        if name.to_string_lossy().starts_with("GIT_") {
+            c.env_remove(name);
+        }
+    }
     c.arg("-C")
         .arg(dir)
         .args([
@@ -33,14 +40,19 @@ fn command(dir: &Path) -> Command {
             "core.quotepath=off",
         ])
         // `git config` alone reads GIT_CONFIG, as if `--file` were given,
-        // which would hide the partial-clone settings from the check.
+        // which would hide the partial-clone settings from the check. The
+        // loop above removes it only when it's set; this always does.
         .env_remove("GIT_CONFIG")
+        // Global and system config are not inputs to affected's selection.
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
         // No grafts: `--no-replace-objects` doesn't turn them off, and one
         // would redirect `HEAD~1`. A path under a file can't be opened, so
         // git reads none.
         .env("GIT_GRAFT_FILE", "/dev/null/no-grafts")
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ALLOW_PROTOCOL", "none")
         // Newer git also honours these; `--no-replace-objects` and the
         // partial-clone check cover older git.
         .env("GIT_NO_REPLACE_OBJECTS", "1")
@@ -118,6 +130,68 @@ impl Repo {
             Some(1) => Ok(false),
             _ => Err(failure("merge-base --is-ancestor", &out)),
         }
+    }
+
+    /// The full ref name `rev` resolves to (`refs/heads/main` for `main`),
+    /// or `None` when it names no ref (a SHA, or nothing).
+    pub fn full_ref_name(&self, rev: &str) -> io::Result<Option<String>> {
+        let out = self.run([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "--symbolic-full-name",
+            "--end-of-options",
+            rev,
+        ])?;
+        if !out.status.success() {
+            return Ok(None);
+        }
+        let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        Ok((name.starts_with("refs/") && !name.contains('\n')).then_some(name))
+    }
+
+    /// `mdkg.mainRef` from the repository's own config file only: not a
+    /// worktree's `config.worktree`, the environment, or global config.
+    pub fn configured_main(&self) -> Option<String> {
+        let out = self.run(["rev-parse", "--git-common-dir"]).ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let common = PathBuf::from(String::from_utf8(out.stdout).ok()?.trim_end_matches('\n'));
+        // A relative common dir is relative to the top, where git ran.
+        let file = self.top.join(common).join("config");
+        let out = command(&self.top)
+            .args(["config", "--file"])
+            .arg(file)
+            .args(["--get", "mdkg.mainRef"])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let name = String::from_utf8(out.stdout).ok()?;
+        let name = name.trim();
+        (!name.is_empty()).then(|| name.to_string())
+    }
+
+    /// The best common ancestors of `a` and `b`, sorted; empty when they
+    /// share no history. `Err` when git can't tell.
+    pub fn merge_bases(&self, a: &str, b: &str) -> io::Result<Vec<String>> {
+        let out = self.run(["merge-base", "--all", "--end-of-options", a, b])?;
+        match out.status.code() {
+            Some(0) => {}
+            // Exit 1 with no output: no common ancestor.
+            Some(1) if out.stdout.is_empty() => return Ok(Vec::new()),
+            _ => return Err(failure("merge-base --all", &out)),
+        }
+        let text = String::from_utf8(out.stdout).map_err(|e| io::Error::other(e.to_string()))?;
+        let mut shas: Vec<String> = text.lines().map(str::to_string).collect();
+        if shas.is_empty() || !shas.iter().all(|s| is_sha(s)) {
+            return Err(io::Error::other("unexpected merge-base output"));
+        }
+        shas.sort();
+        shas.dedup();
+        Ok(shas)
     }
 
     /// Whether the repository is a shallow clone.

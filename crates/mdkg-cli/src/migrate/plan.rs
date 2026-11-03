@@ -23,12 +23,47 @@ use super::rewrite::{self, Token};
 /// The plan format; part of the hash.
 pub const PLAN_FORMAT: u32 = 1;
 
+/// Where a graph's work history goes: checkpoints, finished tests, event
+/// logs, and progress and review-ledger sections.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum History {
+    /// It stays in git, for a graph that commits its work (`work.location`
+    /// "git", which a 0.6 config with neither storage key is): checkpoints
+    /// and finished tests stay nodes with new ids, and sections and event
+    /// logs stay as they are. No log records are written.
+    Git,
+    /// It moves to the coordinator store's log, as 0.7.0 migrated, and
+    /// leaves git. The default when a stored plan names neither, since
+    /// 0.7.0's plans didn't: a plan 0.7.0 stored in a migration's journal
+    /// keeps its hash when this build resumes it. A 0.7.0 dry run's hash
+    /// that no apply started doesn't apply here (the config change differs:
+    /// `work.location` is said now); plan again.
+    #[default]
+    Store,
+}
+
+impl History {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            History::Git => "git",
+            History::Store => "store",
+        }
+    }
+
+    fn is_store(&self) -> bool {
+        *self == History::Store
+    }
+}
+
 /// A node file as the graph holds it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct NodeFile {
     /// Relative to the repository's top.
     pub path: String,
     pub content: String,
+    /// The alias of the workspace it's in (`root`).
+    pub ws: String,
 }
 
 /// Any other text file the migration may change.
@@ -37,6 +72,8 @@ pub struct TextFile {
     /// Relative to the repository's top.
     pub path: String,
     pub content: String,
+    /// For an event log or a core list, its workspace's alias.
+    pub ws: String,
 }
 
 /// A subgraph's new ids, as planning the child graph computes them.
@@ -61,8 +98,11 @@ pub struct ForeignNode {
     pub node_type: String,
     pub status: Option<String>,
     pub created: String,
-    /// Its path inside the graph folder (`work/<legacy-id>-<slug>.md`).
+    /// The path its id is minted from ([`Source::mint_path`]):
+    /// `work/<legacy-id>-<slug>.md` in the root workspace.
     pub path: String,
+    /// Its workspace's alias.
+    pub ws: String,
 }
 
 /// What an identity format v2 graph brings (format 0.7, section 10.2).
@@ -90,8 +130,8 @@ pub struct Source {
     pub nodes: Vec<NodeFile>,
     /// Every `events.jsonl` under the work folders.
     pub events: Vec<TextFile>,
-    /// `.mdkg/core/core.md`, the core list: one id per line.
-    pub core_list: Option<TextFile>,
+    /// Each workspace's `core/core.md`, the core list: one id per line.
+    pub core_lists: Vec<TextFile>,
     /// Instruction files outside the node folders: AGENTS.md, CLAUDE.md,
     /// skills and scripts. Their changes form the `--rewrite-refs` patch.
     pub outside: Vec<TextFile>,
@@ -100,6 +140,14 @@ pub struct Source {
     pub examples: Vec<String>,
     /// The graph folder, relative to the repository's top (`.mdkg/`).
     pub mdkg_prefix: String,
+    /// The graph's root, relative to the repository's top (`` or `sub/`).
+    pub graph_prefix: String,
+    /// Each enabled workspace's folder, relative to the repository's top
+    /// (`.mdkg/`, `aux/.mdkg/`), by alias.
+    pub folders: BTreeMap<String, String>,
+    /// The workspace instruction files outside the graph speak for: the
+    /// one at the graph's root.
+    pub home_ws: String,
     /// Nodes only other branches hold.
     pub foreign: Vec<ForeignNode>,
     /// The graph's workspace aliases (`root`).
@@ -111,6 +159,70 @@ pub struct Source {
     /// each MCP config, each skill mirror), which the config lists from
     /// now on.
     pub projections: Vec<&'static str>,
+    /// Where the work history goes.
+    pub history: History,
+    /// Nodes already on 0.7 that the plan doesn't hold but refs may name:
+    /// legacy id to id. Restoring history plans only the nodes it brings
+    /// back, and refs to the rest resolve to the ids they have.
+    pub known_ids: BTreeMap<String, String>,
+    /// Why the work history goes where it does, for the plan to say.
+    pub history_reason: String,
+    /// Against a migrated main ([`super::against`]): main's ids, by
+    /// `<workspace>:<legacy id>`, for the nodes it has; and by path, main's
+    /// content for each graph file this branch hasn't changed since it
+    /// forked (`None`: main has none there).
+    pub id_overrides: BTreeMap<String, String>,
+    pub adopt: BTreeMap<String, Option<String>>,
+    /// By path, the nodes main made after the fork, added as it has them.
+    pub added: BTreeMap<String, String>,
+    /// By `<workspace>:<legacy id>`, main's ids of the nodes in `added`.
+    pub added_ids: BTreeMap<String, String>,
+    /// The records main's migration made, planned again from the commit
+    /// it migrated, for a store that doesn't have them (a clone that never
+    /// ran it): imported with this branch's own, each once.
+    pub replayed: Vec<Record>,
+    /// By `<workspace>:<legacy id>`, this branch's nodes whose legacy id
+    /// main gave a different node after the fork, with main's id for it:
+    /// they leave the handle to main's (no `legacy_id`), and never share
+    /// its id.
+    pub collisions: BTreeMap<String, String>,
+    pub against: Option<super::against::Against>,
+    /// Warnings found while gathering it, said with the plan's own.
+    pub warnings: Vec<PlanWarning>,
+}
+
+impl Source {
+    /// The path a node's id is minted from (format 0.7, section 10.1): the
+    /// file's path relative to the graph's `.mdkg` folder. That's its path
+    /// inside it for the workspace there (`work/task-19-x.md`), and starts
+    /// `../` for any other (`../aux/.mdkg/work/task-19-x.md`), which no
+    /// file inside it can: two workspaces' `task-1` get different ids.
+    pub fn mint_path(&self, path: &str, ws: &str) -> String {
+        mint_path(
+            &self.folders,
+            &self.graph_prefix,
+            &self.mdkg_prefix,
+            path,
+            ws,
+        )
+    }
+}
+
+/// [`Source::mint_path`], from its parts.
+pub fn mint_path(
+    folders: &BTreeMap<String, String>,
+    graph_prefix: &str,
+    mdkg_prefix: &str,
+    path: &str,
+    ws: &str,
+) -> String {
+    let root = format!("{graph_prefix}.mdkg/");
+    match folders.get(ws) {
+        Some(folder) if *folder == root => path.strip_prefix(folder.as_str()).map(str::to_string),
+        Some(_) => path.strip_prefix(graph_prefix).map(|p| format!("../{p}")),
+        None => path.strip_prefix(mdkg_prefix).map(str::to_string),
+    }
+    .unwrap_or_else(|| path.to_string())
 }
 
 /// What happens to a file.
@@ -127,7 +239,8 @@ pub struct FileChange {
     /// Relative to the repository's top.
     pub path: String,
     pub action: Action,
-    /// sha256 of the file before and after.
+    /// sha256 of the file before (empty for a file the change makes) and
+    /// after.
     pub before: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub after: Option<String>,
@@ -151,6 +264,16 @@ pub struct NodeChange {
     pub record: Option<String>,
 }
 
+/// A workspace the migration converts: its config entry stays as it is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct PlanWorkspace {
+    pub alias: String,
+    /// Its folder, relative to the repository's top (`aux/.mdkg/`).
+    pub folder: String,
+    /// How many of its nodes the plan converts.
+    pub nodes: usize,
+}
+
 /// Something a reviewer should look at.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
 pub struct PlanWarning {
@@ -167,6 +290,19 @@ pub struct Plan {
     pub format: u32,
     pub base: String,
     pub graph_id: String,
+    /// Where the work history goes. Left out for `store`, so a plan 0.7.0
+    /// stored keeps its hash.
+    #[serde(default, skip_serializing_if = "History::is_store")]
+    pub history: History,
+    /// Why the work history goes there.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub history_reason: String,
+    /// Every enabled workspace the migration converts, in alias order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workspaces: Vec<PlanWorkspace>,
+    /// What the plan took from a migrated main it was made against.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub against: Option<super::against::Against>,
     pub nodes: Vec<NodeChange>,
     /// Changes inside the graph, made by `--apply`.
     pub files: Vec<FileChange>,
@@ -259,7 +395,7 @@ fn is_opaque_refs_key(key: &str, node_type: &str) -> bool {
 fn opaque_refs(value: &str, ids: &Ids<'_>) -> String {
     let one = |item: &str| {
         ids.local
-            .get(item)
+            .get(&ids.here(item))
             .cloned()
             .unwrap_or_else(|| item.to_string())
     };
@@ -364,6 +500,8 @@ fn list_items(value: &str) -> Option<Vec<&str>> {
 struct Read {
     file: NodeFile,
     legacy_id: String,
+    /// `<workspace>:<legacy id>`, which the id maps are keyed by.
+    key: String,
     node_type: String,
     status: Option<String>,
     title: String,
@@ -406,6 +544,7 @@ fn read(file: &NodeFile) -> Result<Read, PlanError> {
     let plane = classify(&node_type, status.as_deref());
     Ok(Read {
         file: file.clone(),
+        key: ws_key(&file.ws, &legacy_id),
         legacy_id,
         title: text("title").unwrap_or_default(),
         created: text("created").unwrap_or_default(),
@@ -445,7 +584,14 @@ enum Target {
     Unknown,
 }
 
-/// The graph's id map.
+/// A legacy id in a workspace, as the id maps key it: `<ws>:<id>`.
+fn ws_key(ws: &str, id: &str) -> String {
+    format!("{ws}:{id}")
+}
+
+/// The graph's id map. 0.6.0 ids are unique only in a workspace, so each
+/// is keyed by its workspace ([`ws_key`]); an unqualified ref names a node
+/// in the workspace of the node it's written in (`ws`), as 0.6.0 reads it.
 struct Ids<'a> {
     /// Legacy id to new id, for nodes that stay.
     local: BTreeMap<String, String>,
@@ -453,28 +599,46 @@ struct Ids<'a> {
     converted: BTreeSet<String>,
     /// Nodes only other branches hold: what refs to them become.
     foreign: BTreeMap<String, Target>,
+    /// The workspace of the text being rewritten.
+    ws: String,
     /// This graph's id, and what each of its UUIDs names (its own nodes',
     /// and other branches' nodes'), for `mdkg://<graph>/<uuid>` refs.
     graph_id: &'a str,
     by_uuid: BTreeMap<String, Target>,
     workspaces: &'a [String],
     subgraphs: &'a BTreeMap<String, Option<ChildGraph>>,
+    /// Legacy ids several workspaces hold, which an unqualified mention
+    /// outside the graph can't tell apart: [`Ids::text`] leaves those.
+    shared: BTreeSet<String>,
 }
 
 impl Ids<'_> {
+    /// The workspace an id written with `qualifier` is in: the text's own
+    /// for none, or the one it names; `None` for any other qualifier (a
+    /// subgraph's alias).
+    fn workspace<'q>(&'q self, qualifier: Option<&'q str>) -> Option<&'q str> {
+        match qualifier {
+            None => Some(self.ws.as_str()),
+            Some(q) if self.workspaces.iter().any(|w| w == q) => Some(q),
+            Some(_) => None,
+        }
+    }
+
+    /// An unqualified id's key, in the text's own workspace.
+    fn here(&self, id: &str) -> String {
+        ws_key(&self.ws, id)
+    }
+
     fn resolve(&self, qualifier: Option<&str>, id: &str) -> Target {
-        let local = match qualifier {
-            None => true,
-            Some(q) => self.workspaces.iter().any(|w| w == q),
-        };
-        if local {
-            if let Some(new) = self.local.get(id) {
+        if let Some(ws) = self.workspace(qualifier) {
+            let k = ws_key(ws, id);
+            if let Some(new) = self.local.get(&k) {
                 return Target::Node(new.clone());
             }
-            if self.converted.contains(id) {
-                return Target::Converted(id.to_string());
+            if self.converted.contains(&k) {
+                return Target::Converted(k);
             }
-            return self.foreign.get(id).cloned().unwrap_or(Target::Unknown);
+            return self.foreign.get(&k).cloned().unwrap_or(Target::Unknown);
         }
         match qualifier.and_then(|q| self.subgraphs.get(q)) {
             Some(Some(child)) => match child.ids.get(id) {
@@ -532,9 +696,18 @@ impl Ids<'_> {
             Some(_) => return None,
             None => (None, value),
         };
-        let known = self.local.contains_key(id)
-            || self.converted.contains(id)
-            || self.foreign.contains_key(id);
+        let known = match self.workspace(qualifier) {
+            Some(ws) => {
+                let k = ws_key(ws, id);
+                self.local.contains_key(&k)
+                    || self.converted.contains(&k)
+                    || self.foreign.contains_key(&k)
+            }
+            None => qualifier
+                .and_then(|q| self.subgraphs.get(q))
+                .and_then(Option::as_ref)
+                .is_some_and(|c| c.ids.contains_key(id)),
+        };
         if !(known || mdkg_format::ids::is_canonical_id(id)) {
             return None;
         }
@@ -562,7 +735,11 @@ impl Ids<'_> {
     /// Rewrites the id tokens in a frontmatter value to full ids; returns
     /// the text and the tokens nothing knew.
     fn text(&self, text: &str) -> (String, BTreeSet<String>) {
+        let ambiguous = |t: &Token<'_>| t.qualifier.is_none() && self.shared.contains(t.id);
         let (out, unknown) = rewrite::rewrite_tokens(text, |t: &Token<'_>| {
+            if ambiguous(t) {
+                return None;
+            }
             match self.resolve(t.qualifier, t.id) {
                 Target::Node(new) | Target::Elsewhere(new) => Some(new),
                 _ => None,
@@ -571,10 +748,11 @@ impl Ids<'_> {
         let unknown = unknown
             .into_iter()
             .filter(|t| {
-                !matches!(
-                    self.resolve(t.qualifier, t.id),
-                    Target::Converted(_) | Target::ElsewhereRecord
-                )
+                !ambiguous(t)
+                    && !matches!(
+                        self.resolve(t.qualifier, t.id),
+                        Target::Converted(_) | Target::ElsewhereRecord
+                    )
             })
             .map(|t| t.text.to_string())
             .collect::<BTreeSet<String>>();
@@ -591,10 +769,14 @@ fn foreign_target(source: &Source, f: &ForeignNode) -> Option<Target> {
     if let Some(id) = &f.id {
         return Some(Target::Elsewhere(id.clone()));
     }
-    if matches!(
-        classify(&f.node_type, f.status.as_deref()),
-        Plane::Checkpoint | Plane::CheckResult
-    ) {
+    // That branch's migration keeps its history where this one does: as
+    // nodes in git, or as records.
+    if source.history == History::Store
+        && matches!(
+            classify(&f.node_type, f.status.as_deref()),
+            Plane::Checkpoint | Plane::CheckResult
+        )
+    {
         return Some(Target::ElsewhereRecord);
     }
     let uuid = match &f.node_id {
@@ -623,13 +805,27 @@ fn warn(warnings: &mut Vec<PlanWarning>, code: &str, path: Option<&str>, message
     });
 }
 
+/// What a node's line says of a section the migration moved to the work
+/// log (a migration in store mode leaves it).
+pub const MOVED_SECTION: &str = "moved to the work log at migration";
+
 /// The node types a checkpoint's or test's summary line goes to first.
 const WORK_ITEMS: &[&str] = &["task", "bug", "feat", "spike", "test", "goal", "epic"];
 
 /// Plans the migration of `source`.
 pub fn plan(source: &Source) -> Result<Plan, PlanError> {
-    let mut warnings = Vec::new();
-    let reads: Vec<Read> = source.nodes.iter().map(read).collect::<Result<_, _>>()?;
+    let mut warnings = source.warnings.clone();
+    let mut reads: Vec<Read> = source.nodes.iter().map(read).collect::<Result<_, _>>()?;
+    // A graph that commits its work keeps its history there: checkpoints
+    // and finished tests stay nodes, minted and rewritten like any other.
+    let keep = source.history == History::Git;
+    if keep {
+        for r in &mut reads {
+            if matches!(r.plane, Plane::Checkpoint | Plane::CheckResult) {
+                r.plane = Plane::Knowledge;
+            }
+        }
+    }
 
     // Pass 1: ids. Every canonical id that stays gets a minted id; ids
     // 0.7.0 keeps (reserved and portable ids) stay as they are.
@@ -637,19 +833,55 @@ pub fn plan(source: &Source) -> Result<Plan, PlanError> {
         local: BTreeMap::new(),
         converted: BTreeSet::new(),
         foreign: BTreeMap::new(),
+        ws: source.home_ws.clone(),
         graph_id: &source.graph_id,
         by_uuid: BTreeMap::new(),
         workspaces: &source.workspaces,
         subgraphs: &source.subgraphs,
+        shared: BTreeSet::new(),
     };
+    ids.local.extend(source.known_ids.clone());
+    // Nodes taken from main: refs to them name them where this branch has
+    // no node of its own by that legacy id (one it has wins, below).
+    ids.local.extend(source.added_ids.clone());
     for r in &reads {
+        // A file main no longer has is gone here too: refs to it name the
+        // node main moved it to, or go as to a node that left git.
+        if source.adopt.get(&r.file.path) == Some(&None) {
+            match source.id_overrides.get(&r.key) {
+                Some(main) => {
+                    ids.local.insert(r.key.clone(), main.clone());
+                }
+                None => {
+                    ids.converted.insert(r.key.clone());
+                }
+            }
+            continue;
+        }
         match r.plane {
             Plane::Checkpoint | Plane::CheckResult => {
-                ids.converted.insert(r.legacy_id.clone());
+                ids.converted.insert(r.key.clone());
             }
             Plane::Knowledge | Plane::TierC => {
-                if let Some(new) = new_id(source, r, &mut warnings)? {
-                    ids.local.insert(r.legacy_id.clone(), new);
+                if let Some(main) = source.id_overrides.get(&r.key) {
+                    ids.local.insert(r.key.clone(), main.clone());
+                } else if let Some(mut new) = new_id(source, r, &mut warnings)? {
+                    // Made on both sides at the same path on the same day,
+                    // it would mint main's id: minted from this commit too.
+                    if source.collisions.get(&r.key) == Some(&new) {
+                        let path = format!(
+                            "{}@{}",
+                            source.mint_path(&r.file.path, &r.file.ws),
+                            source.base
+                        );
+                        if let Ok(uuid) =
+                            mint::node_uuid(&source.graph_id, &r.legacy_id, &r.created, &path)
+                        {
+                            let prefix = new.len().saturating_sub(36);
+                            new = format!("{}{uuid}", &new[..prefix]);
+                        }
+                    }
+                    ids.local.insert(r.key.clone(), new);
                 }
             }
         }
@@ -659,10 +891,22 @@ pub fn plan(source: &Source) -> Result<Plan, PlanError> {
     // nodes too: by their v2 node_id, or by the UUID in an id their branch
     // already migrated to. A UUID is one node, whatever legacy ids collide.
     if let Some(v2) = &source.v2 {
+        // The graph's other nodes, already on 0.7 (restoring history),
+        // keep their v2 UUID in their id.
+        for id in source.known_ids.values() {
+            if let Some(uuid) = id.get(id.len().saturating_sub(36)..)
+                && mdkg_format::ids::is_identity_uuid(uuid)
+            {
+                ids.by_uuid
+                    .entry(uuid.to_string())
+                    .or_insert_with(|| Target::Node(id.clone()));
+            }
+        }
         for r in &reads {
             if let Some(uuid) = v2.uuids.get(&r.file.path) {
-                ids.by_uuid
-                    .insert(uuid.clone(), ids.resolve(None, &r.legacy_id));
+                ids.ws = r.file.ws.clone();
+                let target = ids.resolve(None, &r.legacy_id);
+                ids.by_uuid.insert(uuid.clone(), target);
             }
         }
     }
@@ -702,24 +946,23 @@ pub fn plan(source: &Source) -> Result<Plan, PlanError> {
 
     // Nodes other branches hold get the ids their own migration gives
     // them; two different nodes with one legacy id resolve to neither.
-    let mut candidates: BTreeMap<&str, BTreeSet<Target>> = BTreeMap::new();
+    let mut candidates: BTreeMap<String, BTreeSet<Target>> = BTreeMap::new();
     for f in &source.foreign {
-        if ids.local.contains_key(&f.legacy_id) || ids.converted.contains(&f.legacy_id) {
+        let k = ws_key(&f.ws, &f.legacy_id);
+        if ids.local.contains_key(&k) || ids.converted.contains(&k) {
             continue;
         }
         let Some(candidate) = foreign_target(source, f) else {
             continue;
         };
-        candidates
-            .entry(&f.legacy_id)
-            .or_default()
-            .insert(candidate);
+        candidates.entry(k).or_default().insert(candidate);
     }
-    for (legacy, found) in candidates {
+    for (k, found) in candidates {
+        let legacy = k.split_once(':').map_or(k.as_str(), |(_, id)| id);
         match found.len() {
             1 => {
                 ids.foreign.insert(
-                    legacy.to_string(),
+                    k.clone(),
                     found.into_iter().next().unwrap_or(Target::Unknown),
                 );
             }
@@ -737,27 +980,35 @@ pub fn plan(source: &Source) -> Result<Plan, PlanError> {
     // Who points at each node that leaves git.
     let mut referenced_by: BTreeMap<&str, Vec<Value>> = BTreeMap::new();
     for r in &reads {
-        for (key, items) in &r.edges {
+        ids.ws = r.file.ws.clone();
+        for (field, items) in &r.edges {
             for item in items {
-                if let Some(Target::Converted(id)) = ids.resolve_ref(item)
-                    && let Some(target) = reads.iter().find(|x| x.legacy_id == id)
+                if let Some(Target::Converted(k)) = ids.resolve_ref(item)
+                    && let Some(target) = reads.iter().find(|x| x.key == k)
                 {
                     let by = ids
                         .local
-                        .get(&r.legacy_id)
+                        .get(&r.key)
                         .cloned()
                         .unwrap_or(r.legacy_id.clone());
                     referenced_by
-                        .entry(target.legacy_id.as_str())
+                        .entry(target.key.as_str())
                         .or_default()
-                        .push(json!({ "node": by, "field": key }));
+                        .push(json!({ "node": by, "field": field }));
                 }
             }
         }
     }
+    // A record names its workspace when the graph has several.
+    let several = reads
+        .iter()
+        .map(|r| &r.file.ws)
+        .collect::<BTreeSet<_>>()
+        .len()
+        > 1;
 
     // Pass 2: the nodes that leave git become records.
-    let by_id: BTreeMap<&str, &Read> = reads.iter().map(|r| (r.legacy_id.as_str(), r)).collect();
+    let by_id: BTreeMap<&str, &Read> = reads.iter().map(|r| (r.key.as_str(), r)).collect();
     let mut converted: Vec<Converted> = Vec::new();
     let mut records = Vec::new();
     for r in &reads {
@@ -766,6 +1017,11 @@ pub fn plan(source: &Source) -> Result<Plan, PlanError> {
             Plane::CheckResult => RecordKind::CheckResult,
             _ => continue,
         };
+        // Main's migration recorded what this branch shares with it.
+        if source.adopt.contains_key(&r.file.path) {
+            continue;
+        }
+        ids.ws = r.file.ws.clone();
         let targets = summary_targets(r, &ids, &by_id);
         if targets.is_empty() {
             warn(
@@ -787,7 +1043,7 @@ pub fn plan(source: &Source) -> Result<Plan, PlanError> {
                 _ => None,
             })
             .collect();
-        let body = json!({
+        let mut body = json!({
             "legacy_id": r.legacy_id,
             "type": r.node_type,
             "title": r.title,
@@ -797,8 +1053,11 @@ pub fn plan(source: &Source) -> Result<Plan, PlanError> {
             "path": r.file.path,
             "file": r.file.content,
             "refs": refs,
-            "referenced_by": referenced_by.get(r.legacy_id.as_str()).cloned().unwrap_or_default(),
+            "referenced_by": referenced_by.get(r.key.as_str()).cloned().unwrap_or_default(),
         });
+        if several {
+            body["workspace"] = json!(r.file.ws);
+        }
         let actor = r
             .owners
             .first()
@@ -862,10 +1121,7 @@ pub fn plan(source: &Source) -> Result<Plan, PlanError> {
                     r.legacy_id
                 ),
             );
-            converted_keys
-                .entry(&r.legacy_id)
-                .or_default()
-                .insert(k.clone());
+            converted_keys.entry(&r.key).or_default().insert(k.clone());
         }
     }
 
@@ -877,10 +1133,10 @@ pub fn plan(source: &Source) -> Result<Plan, PlanError> {
         .iter()
         .filter(|r| matches!(r.plane, Plane::Knowledge | Plane::TierC))
     {
-        let converted = converted_keys.get(r.legacy_id.as_str());
+        let converted = converted_keys.get(r.key.as_str());
         let mut names: BTreeMap<String, &str> = BTreeMap::new();
         // The legacy_id line rewrite_node writes beside a new id.
-        if ids.local.contains_key(&r.legacy_id) {
+        if ids.local.contains_key(&r.key) {
             names.insert("legacy_id".into(), "id");
         }
         for k in &r.keys {
@@ -911,11 +1167,25 @@ pub fn plan(source: &Source) -> Result<Plan, PlanError> {
     let mut nodes = Vec::new();
     let mut files = Vec::new();
     for r in &reads {
+        ids.ws = r.file.ws.clone();
+        // A file the branch hasn't changed comes out as main has it
+        // (below). Its records are main's migration's own
+        // (`Source::replayed`).
+        if source.adopt.contains_key(&r.file.path) {
+            nodes.push(NodeChange {
+                legacy_id: r.legacy_id.clone(),
+                id: ids.local.get(&r.key).cloned(),
+                path: r.file.path.clone(),
+                plane: plane_name(r.plane).into(),
+                record: None,
+            });
+            continue;
+        }
         match r.plane {
             Plane::Checkpoint | Plane::CheckResult => {
                 let c = converted
                     .iter()
-                    .find(|c| c.record.body["legacy_id"] == Value::String(r.legacy_id.clone()));
+                    .find(|c| c.record.body["path"] == Value::String(r.file.path.clone()));
                 nodes.push(NodeChange {
                     legacy_id: r.legacy_id.clone(),
                     id: None,
@@ -937,13 +1207,15 @@ pub fn plan(source: &Source) -> Result<Plan, PlanError> {
                 "migrate.tier_c_kept",
                 Some(&r.file.path),
                 format!(
-                    "{} is a {} node, which 0.7.0 keeps as a plain node without its 0.6.0 behaviour",
+                    "{} is a {} node, which format 0.7 keeps as a plain node without its 0.6 behaviour",
                     r.legacy_id, r.node_type
                 ),
             ),
             Plane::Knowledge => {}
         }
-        if r.node_type == "test" {
+        if r.node_type == "test"
+            && classify(&r.node_type, r.status.as_deref()) != Plane::CheckResult
+        {
             warn(
                 &mut warnings,
                 "migrate.open_test_kept",
@@ -954,7 +1226,7 @@ pub fn plan(source: &Source) -> Result<Plan, PlanError> {
                 ),
             );
         }
-        let new = ids.local.get(&r.legacy_id).cloned();
+        let new = ids.local.get(&r.key).cloned();
         let lines: Vec<&str> = converted
             .iter()
             .filter(|c| new.as_ref().is_some_and(|n| c.targets.contains(n)))
@@ -965,16 +1237,28 @@ pub fn plan(source: &Source) -> Result<Plan, PlanError> {
             new.as_deref(),
             &ids,
             &lines,
-            converted_keys.get(r.legacy_id.as_str()),
+            converted_keys.get(r.key.as_str()),
             source.v2.is_some(),
+            keep,
+            several,
             &mut warnings,
         )?;
+        let content = if source.collisions.contains_key(&r.key) {
+            drop_legacy_id(&content)
+        } else {
+            content
+        };
         records.append(&mut node_records);
         nodes.push(NodeChange {
             legacy_id: r.legacy_id.clone(),
             id: new,
             path: r.file.path.clone(),
-            plane: plane_name(r.plane).into(),
+            // A checkpoint or finished test kept in git says so.
+            plane: plane_name(match classify(&r.node_type, r.status.as_deref()) {
+                kept @ (Plane::Checkpoint | Plane::CheckResult) => kept,
+                _ => r.plane,
+            })
+            .into(),
             record: None,
         });
         if content != r.file.content {
@@ -988,8 +1272,14 @@ pub fn plan(source: &Source) -> Result<Plan, PlanError> {
         }
     }
 
-    // The event logs become legacy records, and leave git.
-    for f in &source.events {
+    // The event logs become legacy records, and leave git (or stay, as
+    // they are, with the rest of the work history).
+    for f in source
+        .events
+        .iter()
+        .filter(|f| !keep && !source.adopt.contains_key(&f.path))
+    {
+        ids.ws = f.ws.clone();
         let (mut evs, unparsed) =
             super::records::import_events(&f.path, &f.content, |r| match ids.resolve_ref(r)? {
                 Target::Node(new) => Some(new),
@@ -1046,12 +1336,12 @@ pub fn plan(source: &Source) -> Result<Plan, PlanError> {
         });
     }
 
-    // The core list names nodes by id, reserved ids too.
-    if let Some(core) = &source.core_list {
+    // Each core list names its workspace's nodes by id, reserved ids too.
+    for core in &source.core_lists {
         let mut out = String::with_capacity(core.content.len());
         for line in core.content.split_inclusive('\n') {
             let bare = line.trim_end_matches(['\n', '\r']);
-            match ids.local.get(bare.trim()) {
+            match ids.local.get(&ws_key(&core.ws, bare.trim())) {
                 Some(new) if !bare.trim_start().starts_with('#') => {
                     out.push_str(new);
                     out.push_str(&line[bare.len()..]);
@@ -1070,9 +1360,57 @@ pub fn plan(source: &Source) -> Result<Plan, PlanError> {
         }
     }
 
-    // The patch: instruction files outside the node folders.
+    // The patch: instruction files outside the node folders, read as the
+    // graph's root workspace's.
+    ids.ws = source.home_ws.clone();
+    // An id several workspaces hold names none of them for sure there: it
+    // stays as written (qualified ones still change).
+    let mut held: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for k in ids
+        .local
+        .keys()
+        .chain(&ids.converted)
+        .chain(ids.foreign.keys())
+    {
+        if let Some((ws, id)) = k.split_once(':') {
+            held.entry(id).or_default().insert(ws);
+        }
+    }
+    let shared: BTreeSet<String> = held
+        .into_iter()
+        .filter(|(_, ws)| ws.len() > 1)
+        .map(|(id, _)| id.to_string())
+        .collect();
+    ids.shared = shared;
     let mut patch = Vec::new();
     for f in &source.outside {
+        let named: Vec<&String> = ids
+            .shared
+            .iter()
+            .filter(|id| {
+                f.content.match_indices(id.as_str()).any(|(at, _)| {
+                    let before = |c: char| c.is_ascii_alphanumeric() || "-_.:".contains(c);
+                    let after = |c: char| c.is_ascii_alphanumeric() || "-_".contains(c);
+                    !f.content[..at].ends_with(before)
+                        && !f.content[at + id.len()..].starts_with(after)
+                })
+            })
+            .collect();
+        if !named.is_empty() {
+            let shown: Vec<&str> = named.iter().take(8).map(|s| s.as_str()).collect();
+            warn(
+                &mut warnings,
+                "migrate.ambiguous_ref",
+                Some(&f.path),
+                format!(
+                    "{} id(s) are in several workspaces, so where they're written without one \
+                     they stay as written: {}; write them as <workspace>:<id> to have them \
+                     rewritten",
+                    named.len(),
+                    shown.join(", ")
+                ),
+            );
+        }
         let examples = source.examples.contains(&f.path);
         let (content, unknown, kept) = rewrite_instructions(&f.content, &ids, examples);
         if kept > 0 {
@@ -1101,6 +1439,57 @@ pub fn plan(source: &Source) -> Result<Plan, PlanError> {
         }
     }
 
+    // Against a migrated main, each graph file this branch hasn't changed
+    // since it forked comes out as main has it, byte for byte.
+    if !source.adopt.is_empty() {
+        let mut current: BTreeMap<&str, &str> = BTreeMap::new();
+        current.insert(&source.config.path, &source.config.content);
+        for f in source.events.iter().chain(&source.core_lists) {
+            current.insert(&f.path, &f.content);
+        }
+        for n in &source.nodes {
+            current.insert(&n.path, &n.content);
+        }
+        // Only the files main's content stands in for; any other change
+        // the plan makes (an identity v2 manifest that goes) stays.
+        files.retain(|f| {
+            !(source.adopt.contains_key(&f.path) && current.contains_key(f.path.as_str()))
+        });
+        for (path, main) in &source.adopt {
+            let Some(now) = current.get(path.as_str()) else {
+                continue;
+            };
+            let before = Digest::of_bytes(now.as_bytes()).to_string();
+            match main {
+                Some(c) if c != now => files.push(FileChange {
+                    path: path.clone(),
+                    action: Action::Write,
+                    before,
+                    after: Some(Digest::of_bytes(c.as_bytes()).to_string()),
+                    content: Some(c.clone()),
+                }),
+                Some(_) => {}
+                None => files.push(FileChange {
+                    path: path.clone(),
+                    action: Action::Delete,
+                    before,
+                    after: None,
+                    content: None,
+                }),
+            }
+        }
+    }
+    for (path, main) in &source.added {
+        files.push(FileChange {
+            path: path.clone(),
+            action: Action::Write,
+            before: String::new(),
+            after: Some(Digest::of_bytes(main.as_bytes()).to_string()),
+            content: Some(main.clone()),
+        });
+    }
+
+    records.extend(source.replayed.iter().cloned());
     files.sort_by(|a, b| a.path.cmp(&b.path));
     patch.sort_by(|a, b| a.path.cmp(&b.path));
     warnings.sort();
@@ -1108,6 +1497,18 @@ pub fn plan(source: &Source) -> Result<Plan, PlanError> {
         format: PLAN_FORMAT,
         base: source.base.clone(),
         graph_id: source.graph_id.clone(),
+        history: source.history,
+        history_reason: source.history_reason.clone(),
+        against: source.against.clone(),
+        workspaces: source
+            .folders
+            .iter()
+            .map(|(alias, folder)| PlanWorkspace {
+                alias: alias.clone(),
+                folder: folder.clone(),
+                nodes: source.nodes.iter().filter(|n| &n.ws == alias).count(),
+            })
+            .collect(),
         nodes,
         files,
         patch,
@@ -1157,19 +1558,15 @@ fn new_id(
     if !type_ok {
         return Err(PlanError {
             path: r.file.path.clone(),
-            message: format!("{}'s type can't prefix a 0.7.0 id", r.legacy_id),
+            message: format!("{}'s type can't prefix a format 0.7 id", r.legacy_id),
         });
     }
     // An identity v2 node keeps its UUID.
     if let Some(uuid) = source.v2.as_ref().and_then(|v2| v2.uuids.get(&r.file.path)) {
         return Ok(Some(format!("{node_type}-{uuid}")));
     }
-    let path = r
-        .file
-        .path
-        .strip_prefix(&source.mdkg_prefix)
-        .unwrap_or(&r.file.path);
-    match mint::node_uuid(&source.graph_id, &r.legacy_id, &r.created, path) {
+    let path = source.mint_path(&r.file.path, &r.file.ws);
+    match mint::node_uuid(&source.graph_id, &r.legacy_id, &r.created, &path) {
         Ok(uuid) => Ok(Some(format!("{node_type}-{uuid}"))),
         Err(e) => Err(PlanError {
             path: r.file.path.clone(),
@@ -1215,8 +1612,11 @@ fn summary_targets(r: &Read, ids: &Ids<'_>, by_id: &BTreeMap<&str, &Read>) -> Ve
             .iter()
             .filter_map(|item| match ids.resolve_ref(item)? {
                 Target::Node(new) if !new.starts_with("mdkg://") => {
-                    let id = item.rsplit(':').next().unwrap_or(item);
-                    let t = by_id.get(id).map_or("", |x| x.node_type.as_str());
+                    let k = match item.split_once(':') {
+                        Some((q, id)) => ws_key(q, id),
+                        None => ids.here(item),
+                    };
+                    let t = by_id.get(k.as_str()).map_or("", |x| x.node_type.as_str());
                     Some((new, t))
                 }
                 _ => None,
@@ -1241,7 +1641,26 @@ fn summary_targets(r: &Read, ids: &Ids<'_>, by_id: &BTreeMap<&str, &Read>) -> Ve
     Vec::new()
 }
 
+/// `content` without its frontmatter's `legacy_id` line.
+fn drop_legacy_id(content: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    let mut in_front = false;
+    let mut dropped = false;
+    for (i, line) in content.split_inclusive('\n').enumerate() {
+        let bare = line.trim_end_matches(['\n', '\r']);
+        if bare == "---" {
+            in_front = i == 0;
+        } else if in_front && !dropped && bare.starts_with("legacy_id:") {
+            dropped = true;
+            continue;
+        }
+        out.push_str(line);
+    }
+    out
+}
+
 /// Rewrites one node that stays.
+#[allow(clippy::too_many_arguments)]
 fn rewrite_node(
     r: &Read,
     new: Option<&str>,
@@ -1249,6 +1668,8 @@ fn rewrite_node(
     summary: &[&str],
     to_extension: Option<&BTreeSet<String>>,
     v2: bool,
+    keep_sections: bool,
+    several: bool,
     warnings: &mut Vec<PlanWarning>,
 ) -> Result<(String, Vec<Record>), PlanError> {
     let path = &r.file.path;
@@ -1333,7 +1754,9 @@ fn rewrite_node(
                     warnings,
                     "migrate.extension_key_kept",
                     Some(path),
-                    format!("{key} has no 0.7.0 spelling (x-<namespace>.<field>), so it stays"),
+                    format!(
+                        "{key} has no format 0.7 spelling (x-<namespace>.<field>), so it stays"
+                    ),
                 );
                 key.to_string()
             }
@@ -1380,33 +1803,42 @@ fn rewrite_node(
     out.push_str("---");
     out.push_str(close_ending);
 
-    // The body: sections that move, gates, then ids.
+    // The body: sections that move (unless the history stays in git),
+    // gates, then ids.
     let mut moved = Vec::new();
     let subject = new.map_or(r.legacy_id.clone(), str::to_string);
-    let (body, _) = rewrite::split_sections(s.body, |section| {
-        let record = Record::new(
-            RecordKind::ReviewRecord,
-            r.updated.clone(),
-            LEGACY_ACTOR,
-            vec![subject.clone()],
-            json!({
+    let (body, _) = if keep_sections {
+        (s.body.to_string(), Vec::new())
+    } else {
+        rewrite::split_sections(s.body, |section| {
+            let mut body = json!({
                 "legacy_id": r.legacy_id,
                 "section": section.kind.as_str(),
                 "heading": section.heading,
                 "text": section.text,
-            }),
-        );
-        let what = match section.kind {
-            SectionKind::Progress => "Progress notes",
-            SectionKind::ReviewLedger => "The review ledger",
-        };
-        let line = format!(
-            "{what} moved to the work log at migration: review record, migration digest {}.",
-            record.digest
-        );
-        moved.push(record);
-        line
-    });
+            });
+            if several {
+                body["workspace"] = json!(r.file.ws);
+            }
+            let record = Record::new(
+                RecordKind::ReviewRecord,
+                r.updated.clone(),
+                LEGACY_ACTOR,
+                vec![subject.clone()],
+                body,
+            );
+            let what = match section.kind {
+                SectionKind::Progress => "Progress notes",
+                SectionKind::ReviewLedger => "The review ledger",
+            };
+            let line = format!(
+                "{what} {MOVED_SECTION}: review record, migration digest {}.",
+                record.digest
+            );
+            moved.push(record);
+            line
+        })
+    };
     let body = match rewrite::gate_sections(&body) {
         Some((gated, dropped)) => {
             if dropped {
@@ -1639,6 +2071,19 @@ fn upgrade_config(config: &str, graph_id: &str, projections: &[&str]) -> Option<
     }
     out.entry(mdkg_run::projection::KEY)
         .or_insert_with(|| json!(projections));
+    // Where work lives stays as it was, said in 0.7's words when the
+    // config left it implicit: in git (format 0.7, section 2.2).
+    match out.get_mut("work") {
+        Some(Value::Object(work)) => {
+            if !work.contains_key("location") && !work.contains_key("committed") {
+                work.insert("location".into(), json!("git"));
+            }
+        }
+        Some(_) => {}
+        None => {
+            out.insert("work".into(), json!({ "location": "git" }));
+        }
+    }
     // The file's own indentation: its first member's.
     let indent: String = config
         .split('\n')
@@ -1661,7 +2106,7 @@ fn upgrade_config(config: &str, graph_id: &str, projections: &[&str]) -> Option<
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     const G: &str = "0192f4c2-1b2a-7c3d-8e4f-0123456789ab";
@@ -1670,10 +2115,11 @@ mod tests {
         NodeFile {
             path: format!(".mdkg/work/{path}"),
             content: content.into(),
+            ws: "root".into(),
         }
     }
 
-    fn source(nodes: Vec<NodeFile>) -> Source {
+    pub(in crate::migrate) fn source(nodes: Vec<NodeFile>) -> Source {
         Source {
             base: "abc".into(),
             graph_id: G.into(),
@@ -1681,15 +2127,18 @@ mod tests {
             config: TextFile {
                 path: ".mdkg/config.json".into(),
                 content: "{\n  \"schema_version\": 1,\n  \"tool\": \"mdkg\"\n}\n".into(),
+                ws: "root".into(),
             },
             nodes,
             mdkg_prefix: ".mdkg/".into(),
+            folders: [("root".to_string(), ".mdkg/".to_string())].into(),
+            home_ws: "root".into(),
             workspaces: vec!["root".into()],
             ..Source::default()
         }
     }
 
-    fn task(n: u32, extra: &str, body: &str) -> NodeFile {
+    pub(in crate::migrate) fn task(n: u32, extra: &str, body: &str) -> NodeFile {
         node(
             &format!("task-{n}-t.md"),
             &format!(
@@ -1743,7 +2192,7 @@ mod tests {
         assert_eq!(
             cfg,
             format!(
-                "{{\n  \"schema_version\": 3,\n  \"format_version\": \"0.7\",\n  \"graph_id\": \"{G}\",\n  \"tool\": \"mdkg\",\n  \"projections\": []\n}}\n"
+                "{{\n  \"schema_version\": 3,\n  \"format_version\": \"0.7\",\n  \"graph_id\": \"{G}\",\n  \"tool\": \"mdkg\",\n  \"projections\": [],\n  \"work\": {{\n    \"location\": \"git\"\n  }}\n}}\n"
             )
         );
         // Deterministic: the same source, the same hash.
@@ -1835,6 +2284,219 @@ mod tests {
     }
 
     #[test]
+    fn a_graph_that_commits_its_work_keeps_its_history_in_git() {
+        let chk = node(
+            "chk-1-c.md",
+            "---\nid: chk-1\ntype: checkpoint\ntitle: Did it\nstatus: done\ncheckpoint_kind: implementation\nscope: [task-1]\nrelates: [task-1]\ncreated: 2026-10-23\nupdated: 2026-10-23\n---\nBody of chk-1, about task-1.\n",
+        );
+        let done_test = node(
+            "test-1-x.md",
+            "---\nid: test-1\ntype: test\ntitle: Proves it\nstatus: done\nrelates: [task-1]\ncreated: 2026-10-23\nupdated: 2026-10-23\n---\nEvidence.\n",
+        );
+        let mut src = source(vec![
+            task(
+                1,
+                "blocked_by: [test-1]\nrefs: [chk-1]\n",
+                "\n# Overview\n\nchk-1 did it.\n\n# Progress\n\n- step one\n",
+            ),
+            chk,
+            done_test,
+        ]);
+        src.events = vec![TextFile {
+            path: ".mdkg/work/events/events.jsonl".into(),
+            content: "{\"ts\":\"2026-10-23\",\"kind\":\"x\",\"refs\":[\"task-1\"]}\n".into(),
+            ws: "root".into(),
+        }];
+        let store = plan(&src).unwrap();
+        src.history = History::Git;
+        let p = plan(&src).unwrap();
+        // The mode is part of the plan, so of its hash.
+        assert_eq!(p.history, History::Git);
+        assert_ne!(p.hash(), store.hash());
+        // Nothing becomes a record, and nothing leaves git.
+        assert!(p.records.is_empty(), "{:?}", p.records);
+        assert!(
+            p.files.iter().all(|f| f.action == Action::Write),
+            "{:?}",
+            p.files
+        );
+        let id = |legacy: &str, ty: &str, path: &str| {
+            format!(
+                "{ty}-{}",
+                mint::node_uuid(G, legacy, "2026-10-23", path).unwrap()
+            )
+        };
+        let new_chk = id("chk-1", "checkpoint", "work/chk-1-c.md");
+        let new_test = id("test-1", "test", "work/test-1-x.md");
+        let new1 = format!(
+            "task-{}",
+            mint::node_uuid(G, "task-1", "2026-10-24", "work/task-1-t.md").unwrap()
+        );
+        // The checkpoint and the finished test are nodes with new ids, their
+        // refs and bodies rewritten like any other's.
+        let c = file(&p, "chk-1-c.md").content.clone().unwrap();
+        assert!(
+            c.contains(&format!("\nid: {new_chk}\nlegacy_id: chk-1\n")),
+            "{c}"
+        );
+        assert!(c.contains(&format!("\nscope: [{new1}]\n")), "{c}");
+        assert!(c.contains("\ncheckpoint_kind: implementation\n"), "{c}");
+        assert!(
+            c.contains(&format!(
+                "Body of [chk-1]({new_chk}), about [task-1]({new1})."
+            )),
+            "{c}"
+        );
+        let t = file(&p, "test-1-x.md").content.clone().unwrap();
+        assert!(t.contains(&format!("\nid: {new_test}\n")), "{t}");
+        assert!(t.contains("\nstatus: done\n"), "{t}");
+        // Refs to them stay; no summary lines; the progress section stays.
+        let t1 = file(&p, "task-1-t.md").content.clone().unwrap();
+        assert!(t1.contains(&format!("blocked_by: [{new_test}]\n")), "{t1}");
+        assert!(t1.contains(&format!("refs: [{new_chk}]\n")), "{t1}");
+        assert!(!t1.contains("# Migrated records"), "{t1}");
+        assert!(t1.contains("# Progress\n\n- step one\n"), "{t1}");
+        assert!(t1.contains(&format!("[chk-1]({new_chk}) did it.")), "{t1}");
+        let planes: Vec<(&str, &str)> = p
+            .nodes
+            .iter()
+            .map(|n| (n.legacy_id.as_str(), n.plane.as_str()))
+            .collect();
+        assert!(planes.contains(&("chk-1", "checkpoint")), "{planes:?}");
+        assert!(planes.contains(&("test-1", "check-result")), "{planes:?}");
+        assert!(p.nodes.iter().all(|n| n.id.is_some() && n.record.is_none()));
+        // A finished test isn't reported as an open one.
+        assert!(
+            !p.warnings
+                .iter()
+                .any(|w| w.code == "migrate.open_test_kept")
+        );
+    }
+
+    #[test]
+    fn two_workspaces_keep_their_ids_apart() {
+        let mut src = source(vec![
+            task(1, "relates: [aux:task-1]\n", "\n# Overview\n\nSee aux:task-1.\n"),
+            NodeFile {
+                path: "aux/.mdkg/work/task-1-a.md".into(),
+                content: "---\nid: task-1\ntype: task\ntitle: Aux\nstatus: todo\nrelates: [root:task-1, task-2]\ncreated: 2026-10-24\nupdated: 2026-10-24\n---\n# Progress\n\n- aux step\n".into(),
+                ws: "aux".into(),
+            },
+            NodeFile {
+                path: "aux/.mdkg/work/task-2-a.md".into(),
+                content: "---\nid: task-2\ntype: task\ntitle: Aux 2\nstatus: todo\ncreated: 2026-10-24\nupdated: 2026-10-24\n---\n".into(),
+                ws: "aux".into(),
+            },
+            NodeFile {
+                path: "aux/.mdkg/work/chk-1-a.md".into(),
+                content: "---\nid: chk-1\ntype: checkpoint\ntitle: Aux chk\nstatus: done\nscope: [task-1]\ncreated: 2026-10-24\nupdated: 2026-10-24\n---\n".into(),
+                ws: "aux".into(),
+            },
+        ]);
+        src.workspaces.push("aux".into());
+        src.folders.insert("aux".into(), "aux/.mdkg/".into());
+        let mint = |legacy: &str, path: &str| {
+            format!(
+                "task-{}",
+                mint::node_uuid(G, legacy, "2026-10-24", path).unwrap()
+            )
+        };
+        // The root workspace mints from inside its folder, the other from
+        // the graph's root: two task-1s, two ids.
+        let root1 = mint("task-1", "work/task-1-t.md");
+        let aux1 = mint("task-1", "../aux/.mdkg/work/task-1-a.md");
+        let aux2 = mint("task-2", "../aux/.mdkg/work/task-2-a.md");
+        assert_ne!(root1, aux1);
+        for history in [History::Store, History::Git] {
+            src.history = history;
+            let p = plan(&src).unwrap();
+            let names: Vec<(&str, &str)> = p
+                .workspaces
+                .iter()
+                .map(|w| (w.alias.as_str(), w.folder.as_str()))
+                .collect();
+            assert_eq!(names, [("aux", "aux/.mdkg/"), ("root", ".mdkg/")]);
+            let t1 = file(&p, ".mdkg/work/task-1-t.md").content.clone().unwrap();
+            assert!(t1.contains(&format!("\nrelates: [{aux1}]\n")), "{t1}");
+            assert!(t1.contains(&format!("See [aux:task-1]({aux1}).")), "{t1}");
+            let a1 = file(&p, "aux/.mdkg/work/task-1-a.md")
+                .content
+                .clone()
+                .unwrap();
+            assert!(a1.contains(&format!("\nid: {aux1}\n")), "{a1}");
+            // Unqualified, task-2 is aux's own.
+            assert!(
+                a1.contains(&format!("\nrelates: [{root1}, {aux2}]\n")),
+                "{a1}"
+            );
+            if history == History::Store {
+                // Records say which workspace's node they came from.
+                let chk = p
+                    .records
+                    .iter()
+                    .find(|r| r.kind == RecordKind::LegacyCheckpoint)
+                    .expect("record");
+                assert_eq!(chk.body["workspace"], "aux");
+                assert_eq!(chk.subject, std::slice::from_ref(&aux1));
+                let review = p
+                    .records
+                    .iter()
+                    .find(|r| r.kind == RecordKind::ReviewRecord)
+                    .expect("review");
+                assert_eq!(review.body["workspace"], "aux");
+            } else {
+                let c = file(&p, "aux/.mdkg/work/chk-1-a.md")
+                    .content
+                    .clone()
+                    .unwrap();
+                assert!(c.contains(&format!("\nscope: [{aux1}]\n")), "{c}");
+            }
+        }
+    }
+
+    #[test]
+    fn workspace_ids_outside_the_graph_and_mint_paths_stay_apart() {
+        let mut src = source(vec![
+            task(1, "", "\n# Overview\n\nx\n"),
+            NodeFile {
+                path: "aux/.mdkg/work/task-1-a.md".into(),
+                content: "---\nid: task-1\ntype: task\ntitle: Aux\nstatus: todo\ncreated: 2026-10-24\nupdated: 2026-10-24\n---\n".into(),
+                ws: "aux".into(),
+            },
+        ]);
+        src.workspaces.push("aux".into());
+        src.folders.insert("aux".into(), "aux/.mdkg/".into());
+        src.outside.push(TextFile {
+            path: "AGENTS.md".into(),
+            content: "Run `mdkg show task-1 --ws aux`, then `mdkg show aux:task-1`.\n".into(),
+            ws: String::new(),
+        });
+        let p = plan(&src).unwrap();
+        let aux1 = format!(
+            "task-{}",
+            mint::node_uuid(G, "task-1", "2026-10-24", "../aux/.mdkg/work/task-1-a.md").unwrap()
+        );
+        let agents = p.patch[0].content.clone().unwrap();
+        // Unqualified, task-1 could be either workspace's: it stays.
+        assert!(agents.contains("`mdkg show task-1 --ws aux`"), "{agents}");
+        assert!(agents.contains(&format!("`mdkg show {aux1}`")), "{agents}");
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.code == "migrate.ambiguous_ref" && w.message.contains("task-1")),
+            "{:?}",
+            p.warnings
+        );
+        // A root file can't mint from another workspace's path: those start
+        // `../`, and nothing inside `.mdkg/` does.
+        src.folders.insert("team".into(), "work/team/.mdkg/".into());
+        let root = src.mint_path(".mdkg/work/team/.mdkg/work/task-1.md", "root");
+        let team = src.mint_path("work/team/.mdkg/work/task-1.md", "team");
+        assert_eq!(root, "work/team/.mdkg/work/task-1.md");
+        assert_eq!(team, "../work/team/.mdkg/work/task-1.md");
+    }
+
+    #[test]
     fn sections_gates_extension_keys_and_tier_c() {
         let body = "\n# Overview\n\nx\n\n# Progress (2026-10-19)\n\n- step one\n\n# Test Plan\n\n- `mdkg capability search \"q\" --json`\n";
         let goal = node(
@@ -1880,7 +2542,8 @@ mod tests {
         src.events.push(TextFile {
             path: ".mdkg/work/events/events.jsonl".into(),
             content: "{\"ts\":\"2026-05-15T01:17:46.639Z\",\"kind\":\"NODE_CREATED\",\"refs\":[\"task-1\"]}\n".into(),
-        });
+                    ws: "root".into(),
+});
         let p = plan(&src).unwrap();
         let t1 = file(&p, "task-1-t.md").content.clone().unwrap();
         assert!(t1.contains("relates: [mdkg://g2/task-n7]\n"), "{t1}");
@@ -1908,7 +2571,8 @@ mod tests {
         src.outside.push(TextFile {
             path: "AGENTS.md".into(),
             content: "Run `mdkg task start task-1`, then `mdkg task done task-1 --checkpoint \"x\"`.\nGate: mdkg capability search \"q\" --json\n".into(),
-        });
+                    ws: "root".into(),
+});
         let p = plan(&src).unwrap();
         let new1 = format!(
             "task-{}",
@@ -1988,6 +2652,7 @@ mod tests {
                       `mdkg task update task-1`\n\
                       mdkg task update \"$TASK_ID\" --status progress\n"
                 .into(),
+            ws: "root".into(),
         });
         let p = plan(&src).unwrap();
         let new1 = format!(
@@ -2018,13 +2683,15 @@ mod tests {
     #[test]
     fn core_list_and_examples() {
         let mut src = source(vec![task(1, "", "")]);
-        src.core_list = Some(TextFile {
+        src.core_lists = vec![TextFile {
             path: ".mdkg/core/core.md".into(),
             content: "# core\ntask-1\ngone-2\n".into(),
-        });
+            ws: "root".into(),
+        }];
         src.outside.push(TextFile {
             path: ".mdkg/README.md".into(),
             content: "mdkg task start task-1\n".into(),
+            ws: "root".into(),
         });
         src.examples.push(".mdkg/README.md".into());
         let p = plan(&src).unwrap();
@@ -2114,6 +2781,7 @@ mod tests {
             manifest: TextFile {
                 path: ".mdkg/graph.json".into(),
                 content: "{}".into(),
+                ws: "root".into(),
             },
             uuids: [(".mdkg/work/task-1-t.md".to_string(), N1.to_string())].into(),
         });
@@ -2126,6 +2794,7 @@ mod tests {
             status: Some("todo".into()),
             created: "2026-10-24".into(),
             path: "work/task-9-x.md".into(),
+            ws: "root".into(),
         }];
         let p = plan(&s).expect("plan");
         let t = file(&p, ".mdkg/work/task-1-t.md")
@@ -2174,12 +2843,14 @@ mod tests {
             manifest: TextFile {
                 path: ".mdkg/graph.json".into(),
                 content: "{}".into(),
+                ws: "root".into(),
             },
             uuids: [(".mdkg/work/task-1-t.md".to_string(), N1.to_string())].into(),
         });
         s.outside = vec![TextFile {
             path: "AGENTS.md".into(),
             content: format!("Run `mdkg show {}`.\n", r(NB)),
+            ws: "root".into(),
         }];
         let foreign =
             |legacy: &str, id: Option<String>, node_id: Option<&str>, path: &str| ForeignNode {
@@ -2190,6 +2861,7 @@ mod tests {
                 status: Some("todo".into()),
                 created: "2026-10-24".into(),
                 path: path.into(),
+                ws: "root".into(),
             };
         s.foreign = vec![
             // Two branches' task-9s: their legacy id is ambiguous, their
@@ -2293,7 +2965,7 @@ mod tests {
         assert_eq!(
             upgrade_config("{}", G, &[]).unwrap(),
             format!(
-                "{{\n  \"schema_version\": 3,\n  \"format_version\": \"0.7\",\n  \"graph_id\": \"{G}\",\n  \"projections\": []\n}}"
+                "{{\n  \"schema_version\": 3,\n  \"format_version\": \"0.7\",\n  \"graph_id\": \"{G}\",\n  \"projections\": [],\n  \"work\": {{\n    \"location\": \"git\"\n  }}\n}}"
             )
         );
         assert_eq!(
@@ -2304,16 +2976,30 @@ mod tests {
             )
             .unwrap(),
             format!(
-                "{{\n    \"tool\": \"mdkg\",\n    \"schema_version\": 3,\n    \"format_version\": \"0.7\",\n    \"graph_id\": \"{G}\",\n    \"a\": [\n        1\n    ],\n    \"projections\": [\n        \"agents-md\",\n        \"mcp:claude\"\n    ]\n}}\n"
+                "{{\n    \"tool\": \"mdkg\",\n    \"schema_version\": 3,\n    \"format_version\": \"0.7\",\n    \"graph_id\": \"{G}\",\n    \"a\": [\n        1\n    ],\n    \"projections\": [\n        \"agents-md\",\n        \"mcp:claude\"\n    ],\n    \"work\": {{\n        \"location\": \"git\"\n    }}\n}}\n"
             )
         );
         // A list the config has already is kept as it is.
         assert_eq!(
             upgrade_config("{\"projections\": [\"agents-md\"]}", G, &["mcp:claude"]).unwrap(),
             format!(
-                "{{\n  \"schema_version\": 3,\n  \"format_version\": \"0.7\",\n  \"graph_id\": \"{G}\",\n  \"projections\": [\n    \"agents-md\"\n  ]\n}}"
+                "{{\n  \"schema_version\": 3,\n  \"format_version\": \"0.7\",\n  \"graph_id\": \"{G}\",\n  \"projections\": [\n    \"agents-md\"\n  ],\n  \"work\": {{\n    \"location\": \"git\"\n  }}\n}}"
             )
         );
+        // A storage setting the config has is kept as it is, either spelling.
+        for work in [
+            "{\"location\": \"git\"}",
+            "{\"committed\": \"definitions\"}",
+        ] {
+            let out = upgrade_config(&format!("{{\"work\": {work}}}"), G, &[]).unwrap();
+            let v: Value = serde_json::from_str(&out).unwrap();
+            let want: Value = serde_json::from_str(work).unwrap();
+            assert_eq!(v["work"], want, "{out}");
+        }
+        // An implicit one is said: work stays in git.
+        let out = upgrade_config("{\"work\": {\"priority_max\": 9}}", G, &[]).unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["work"], json!({"priority_max": 9, "location": "git"}));
         assert!(upgrade_config("[1]", G, &[]).is_none());
     }
 

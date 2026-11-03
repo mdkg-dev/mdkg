@@ -1,0 +1,186 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "mdkg.run.wrapper.v1",
+  "description": "Draft (mdkg API v1; see docs/api.md). May change until the release that first emits it. The turn spec mdkg writes (mode 0600) and passes as the wrapper's first argument after its own argv (A19).",
+  "x-mdkg-status": "draft",
+  "type": "object",
+  "properties": {
+    "schema": {
+      "const": "mdkg.run.wrapper.v1"
+    },
+    "turn_id": {
+      "type": "string"
+    },
+    "agent": {
+      "type": "string"
+    },
+    "harness": {
+      "type": "string",
+      "description": "A harness id. An open set: accept values not listed.",
+      "x-mdkg-open": true,
+      "examples": [
+        "claude",
+        "codex",
+        "opencode"
+      ]
+    },
+    "role": {
+      "type": "string",
+      "description": "The agent's role. An open set: accept values not listed.",
+      "x-mdkg-open": true,
+      "examples": [
+        "worker",
+        "reviewer"
+      ]
+    },
+    "mode": {
+      "type": "string",
+      "description": "The definition's `mode`."
+    },
+    "argv": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "The harness program and arguments, exactly as passed after `--`. The wrapper must run them unchanged."
+    },
+    "cwd": {
+      "type": "string"
+    },
+    "env_keys": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Names, never values, of the variables mdkg set."
+    },
+    "paths": {
+      "type": "object",
+      "properties": {
+        "worktree": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Path"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "git_common_dir": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Path"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "graph_checkout": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Path"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "run_dir": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Path"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "scratch_shared": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Path"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "scratch_actor": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Path"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "harness_config": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Path"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "worktree",
+        "git_common_dir",
+        "run_dir"
+      ]
+    },
+    "read_only": {
+      "type": "boolean",
+      "description": "True for reviewer turns."
+    },
+    "timeout_secs": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0,
+      "description": "The turn's timeout, or null."
+    }
+  },
+  "required": [
+    "schema",
+    "turn_id",
+    "agent",
+    "harness",
+    "role",
+    "argv",
+    "cwd",
+    "env_keys",
+    "paths",
+    "read_only",
+    "timeout_secs"
+  ],
+  "$defs": {
+    "Path": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "Absolute."
+        },
+        "access": {
+          "type": "string",
+          "description": "What the turn needs.",
+          "enum": [
+            "read",
+            "write"
+          ]
+        }
+      },
+      "required": [
+        "path",
+        "access"
+      ]
+    }
+  }
+}

@@ -16,8 +16,125 @@ use serde_json::Value;
 use crate::error::RunError;
 
 pub mod agent;
+pub mod runtime;
 
-/// A graph's `.mdkg/config.json`, parsed; `null` when there's none.
+/// Read one authority snapshot for the selected graph root. The graph may be
+/// nested inside its repository; carry the caller's request-scoped Git trust
+/// into the graph reader rather than inheriting a shared daemon's pins.
+pub fn authority(root: &Path) -> Result<mdkg_graph::graphref::Authority, RunError> {
+    graph_read(root, true, mdkg_graph::graphref::authority_in)
+}
+
+/// [`authority`], or `None` when the checkout positively has no graph: an
+/// unborn or unregistered checkout-mode HEAD that commits no graph config
+/// (dec-01a188da). Every other failure stays an error.
+pub(crate) fn authority_or_absent(
+    root: &Path,
+) -> Result<Option<mdkg_graph::graphref::Authority>, RunError> {
+    graph_read(root, true, mdkg_graph::graphref::lookup_in).map(|lookup| match lookup {
+        mdkg_graph::graphref::Lookup::Found(authority) => Some(authority),
+        mdkg_graph::graphref::Lookup::Absent(_) => None,
+    })
+}
+
+/// [`authority_or_absent`] reading only the committed config, for runtime
+/// settings: no agent definition is parsed, so a broken one doesn't
+/// refuse them (orchestrator, 2026-11-02, #15433).
+pub fn config_authority_or_absent(
+    root: &Path,
+) -> Result<Option<mdkg_graph::graphref::Authority>, RunError> {
+    graph_read(root, true, mdkg_graph::graphref::lookup_config_in).map(|lookup| match lookup {
+        mdkg_graph::graphref::Lookup::Found(authority) => Some(authority),
+        mdkg_graph::graphref::Lookup::Absent(_) => None,
+    })
+}
+
+/// [`config_authority_or_absent`] for a command that already checked
+/// `root`'s checkout freshly (`Repo::open`, a ref-mode bind): reuses that
+/// check ([`mdkg_git::checked_worktree`]; a fresh one when none is kept),
+/// so a command asks git for the repository's folders once (git_spawns).
+pub fn config_authority_or_absent_checked(
+    root: &Path,
+) -> Result<Option<mdkg_graph::graphref::Authority>, RunError> {
+    graph_read(root, false, mdkg_graph::graphref::lookup_config_in).map(|lookup| match lookup {
+        mdkg_graph::graphref::Lookup::Found(authority) => Some(authority),
+        mdkg_graph::graphref::Lookup::Absent(_) => None,
+    })
+}
+
+/// [`authority`] reading only the committed config (#15706): the ref-mode
+/// entry gate for coordination commands, which a broken agent definition
+/// must not refuse (#15433).
+pub fn config_authority(root: &Path) -> Result<mdkg_graph::graphref::Authority, RunError> {
+    config_authority_or_absent(root)?.ok_or_else(|| {
+        RunError::failure(
+            "graph.authority_invalid",
+            "this checkout commits no graph config",
+        )
+    })
+}
+
+fn graph_read<T>(
+    root: &Path,
+    fresh: bool,
+    read: impl FnOnce(&Path, &str) -> Result<T, mdkg_graph::graphref::Error>,
+) -> Result<T, RunError> {
+    let trust = mdkg_coord_sqlite::git::WorktreeTrust::current();
+    let root =
+        std::fs::canonicalize(root).map_err(|e| RunError::io("can't resolve the graph root", e))?;
+    // A fresh check unless the caller checked this command already:
+    // callers decide writes and admissions from what this reads
+    // (dec-01a18ee0 item 9; #13401).
+    let checked = if fresh {
+        mdkg_coord_sqlite::git::check_worktree_with_trust(&root, &trust)
+    } else {
+        mdkg_git::checked_worktree_with_trust(&root, &trust)
+    };
+    let checkout = checked.map_err(|e| {
+        RunError::failure(
+            "config.unreadable",
+            format!("can't check the graph's checkout: {e}"),
+        )
+    })?;
+    let relative = root.strip_prefix(&checkout.top).map_err(|_| {
+        RunError::failure(
+            "graph.authority_invalid",
+            "graph root is outside its checkout",
+        )
+    })?;
+    let mut parts = Vec::new();
+    for part in relative.components() {
+        let Component::Normal(part) = part else {
+            return Err(RunError::failure(
+                "graph.authority_invalid",
+                "invalid graph root",
+            ));
+        };
+        let part = part.to_str().ok_or_else(|| {
+            RunError::failure("graph.authority_invalid", "graph root is not UTF-8")
+        })?;
+        if part.contains('\\') {
+            return Err(RunError::failure(
+                "graph.authority_invalid",
+                "a graph-root component contains a backslash",
+            )
+            .with_hint("rename the graph-root folder to remove the backslash, then retry"));
+        }
+        parts.push(part);
+    }
+    let prefix = parts.join("/");
+    // Read with this check itself: the shared cache's entry for the top
+    // may be another thread's by now (#13510). The binding matches the top
+    // exactly, so `read` gets `checkout.top`, never `root`.
+    mdkg_graph::graphref::with_git_trust(trust.common, trust.worktree, || {
+        mdkg_git::with_checkout(&checkout, || read(&checkout.top, &prefix))
+    })
+    .map_err(|e| RunError::failure(e.code, e.message))
+}
+
+/// A checkout's prospective `.mdkg/config.json`, parsed; `null` when absent.
+/// Projection and installation planning use this before a graph is committed.
+/// Agent definitions and worktree identity must use the authority reader.
 pub fn load_config(root: &Path) -> Result<Value, RunError> {
     let path = root.join(".mdkg").join("config.json");
     match std::fs::read(&path) {
@@ -32,9 +149,7 @@ pub fn load_config(root: &Path) -> Result<Value, RunError> {
 /// Agent configuration with committed definition files overlaid on the
 /// legacy inline entries. Other config consumers do not read agent files.
 pub fn load_agent_config(root: &Path) -> Result<Value, RunError> {
-    let mut config = load_config(root)?;
-    agent::merge(root, &mut config)?;
-    Ok(config)
+    agent::authority_config(&authority(root)?)
 }
 
 /// The placeholder both patterns hold.
@@ -187,10 +302,9 @@ impl Names {
         )
     }
 
-    /// The names a graph's `.mdkg/config.json` sets, read from `root`; the
-    /// defaults when there's no config file.
+    /// The names committed by the graph authority selected for `root`.
     pub fn load(root: &Path) -> Result<Self, RunError> {
-        Self::from_config(&load_config(root)?)
+        Self::from_config(&authority(root)?.config)
     }
 
     /// The agent's own branch, as a short name.
@@ -220,6 +334,57 @@ impl Names {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_worktree_replaced_at_the_same_path_is_read_fresh() {
+        let dir = std::env::temp_dir().join(format!("mdkg-graph-read-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(dir.join("main")).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        let git = |at: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(at)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .args(["-c", "user.name=T", "-c", "user.email=t@example.invalid"])
+                .args(["-c", "core.hooksPath=/dev/null"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        let main = dir.join("main");
+        git(&main, &["init", "-q", "-b", "main"]);
+        let config = |branch: &str| {
+            serde_json::json!({
+                "schema_version": 3, "format_version": "0.7",
+                "graph_id": "0192f3a0-0000-7000-8000-000000000000",
+                "orchestration": {"branch": format!("{branch}/{{agent}}")}
+            })
+            .to_string()
+        };
+        std::fs::create_dir_all(main.join(".mdkg")).unwrap();
+        for branch in ["one", "two"] {
+            git(&main, &["checkout", "-q", "-B", branch]);
+            std::fs::write(main.join(".mdkg/config.json"), config(branch)).unwrap();
+            git(&main, &["add", "-A"]);
+            git(&main, &["commit", "-q", "-m", branch]);
+        }
+        git(&main, &["checkout", "-q", "-B", "main"]);
+        let (at, moved) = (dir.join("wt"), dir.join("moved"));
+        let wt = at.to_str().unwrap();
+        git(&main, &["worktree", "add", "-q", wt, "one"]);
+        assert_eq!(Names::load(&at).unwrap().branch_for("a"), "one/a");
+        // Within one process: the first worktree moves away, keeping its
+        // admin folder, and another branch is added at the same path.
+        git(&main, &["worktree", "move", wt, moved.to_str().unwrap()]);
+        git(&main, &["worktree", "add", "-q", wt, "two"]);
+        assert_eq!(Names::load(&at).unwrap().branch_for("a"), "two/a");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn the_defaults_are_edd_6s() {

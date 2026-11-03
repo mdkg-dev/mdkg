@@ -265,11 +265,209 @@ fn declared_config_parents_must_be_committed_directories() {
         let out = mdkg(&r.0, &["install"]);
         assert!(!out.status.success(), "{kind}: {out:?}");
         let text = String::from_utf8_lossy(&out.stdout);
+        let boundary = if kind == "gitlink" {
+            "submodule"
+        } else {
+            "directory"
+        };
         assert!(
-            text.contains("linked") && text.contains("directory"),
+            text.contains("linked") && text.contains(boundary),
             "{kind}: {text}"
         );
     }
+}
+
+fn declare_subgraph(root: &Path, source_path: &str) {
+    let path = root.join(".mdkg/config.json");
+    let mut config: Value =
+        serde_json::from_slice(&fs::read(&path).expect("config")).expect("JSON");
+    config["subgraphs"] = serde_json::json!({"child": {"source_path": source_path}});
+    fs::write(path, serde_json::to_vec(&config).expect("JSON")).expect("JSON");
+}
+
+#[test]
+fn install_skips_submodule_subgraphs_and_records_only_the_parent() {
+    for source_path in ["modules/child", "modules/child/nested"] {
+        let source = repo(true);
+        let r = repo(true);
+        git(
+            &r.0,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                source.0.to_str().unwrap(),
+                "modules/child",
+            ],
+        );
+        declare_subgraph(&r.0, source_path);
+        git(&r.0, &["add", ".mdkg", ".gitmodules", "modules"]);
+        git(&r.0, &["commit", "-qm", "declare submodule subgraph"]);
+        ok(&r.0, &["install"]);
+        let graph = r.0.join(".worktrees/graph");
+        assert_eq!(
+            git(&r.0, &["config", "--local", "--get-regexp", "^mdkg.graph."]),
+            format!("{} graph", identity_key(&r.0))
+        );
+        // The linked checkout contains no submodule graph files. Repair must
+        // still add only the root record, never traverse the populated source.
+        assert!(!graph.join("modules/child/.mdkg/config.json").exists());
+        git(
+            &r.0,
+            &["config", "--local", "--unset-all", &identity_key(&r.0)],
+        );
+        let repaired = doctor_identity(&r.0, true);
+        assert_eq!(repaired["status"], "ok", "{repaired}");
+        assert_eq!(
+            git(&r.0, &["config", "--local", "--get-regexp", "^mdkg.graph."]),
+            format!("{} graph", identity_key(&r.0))
+        );
+    }
+}
+
+#[test]
+fn subgraph_symlink_and_blob_parents_refuse_and_preserve_identity_records() {
+    for symlink in [true, false] {
+        let r = repo(true);
+        ok(&r.0, &["install"]);
+        let local = fs::read(r.0.join(".git/config")).expect("local config");
+        declare_subgraph(&r.0, "linked");
+        if symlink {
+            std::os::unix::fs::symlink(".", r.0.join("linked")).expect("symlink parent");
+        } else {
+            fs::write(r.0.join("linked"), "blob parent").expect("blob parent");
+        }
+        git(&r.0, &["add", ".mdkg/config.json", "linked"]);
+        git(&r.0, &["commit", "-qm", "declare non-directory subgraph"]);
+        let out = mdkg(&r.0, &["install"]);
+        assert!(!out.status.success(), "{symlink}: {out:?}");
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            text.contains("committed linked must be a directory"),
+            "{text}"
+        );
+        assert_eq!(
+            fs::read(r.0.join(".git/config")).expect("local config"),
+            local
+        );
+        let refused = doctor_identity(&r.0, true);
+        assert_eq!(refused["status"], "error", "{refused}");
+        assert!(
+            refused["summary"].as_str().unwrap().contains("directory"),
+            "{refused}"
+        );
+        assert_eq!(
+            fs::read(r.0.join(".git/config")).expect("local config"),
+            local
+        );
+    }
+}
+
+#[test]
+fn install_identity_refusal_reports_an_already_completed_fast_forward() {
+    let r = repo(true);
+    ok(&r.0, &["install"]);
+    let graph = r.0.join(".worktrees/graph");
+    let local = fs::read(r.0.join(".git/config")).expect("local config");
+    let old = git(&graph, &["rev-parse", "HEAD"]);
+    let path = r.0.join(".mdkg/config.json");
+    let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    config["graph_id"] = uuid::Uuid::now_v7().to_string().into();
+    fs::write(path, serde_json::to_vec(&config).unwrap()).unwrap();
+    git(&r.0, &["add", ".mdkg/config.json"]);
+    git(&r.0, &["commit", "-qm", "replace graph identity"]);
+    let target = git(&r.0, &["rev-parse", "HEAD"]);
+    let preview = mdkg(&r.0, &["install", "--dry-run"]);
+    assert!(!preview.status.success(), "{preview:?}");
+    let text = String::from_utf8_lossy(&preview.stdout);
+    assert!(
+        text.contains("does not identify this graph checkout"),
+        "{text}"
+    );
+    assert!(!text.contains("already updated"), "{text}");
+    assert_eq!(git(&graph, &["rev-parse", "HEAD"]), old);
+    assert_eq!(
+        fs::read(r.0.join(".git/config")).expect("local config"),
+        local
+    );
+    let out = mdkg(&r.0, &["install"]);
+    assert!(!out.status.success(), "{out:?}");
+    let body: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let diagnostic = &body["diagnostics"][0];
+    assert_eq!(diagnostic["code"], "install.unsupported_layout", "{body}");
+    let text = diagnostic["message"].as_str().unwrap();
+    assert!(
+        text.contains("does not identify this graph checkout"),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("already updated to {target}")),
+        "{text}"
+    );
+    assert_eq!(git(&graph, &["rev-parse", "HEAD"]), target);
+    assert_eq!(
+        fs::read(r.0.join(".git/config")).expect("local config"),
+        local
+    );
+}
+
+#[test]
+fn install_heals_a_refused_gitlink_workspace_after_correction_on_main() {
+    let r = repo(true);
+    let head = git(&r.0, &["rev-parse", "HEAD"]);
+    git(
+        &r.0,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{head},modules/child"),
+        ],
+    );
+    declare_workspace(&r.0, "child", "modules/child", ".mdkg");
+    // A duplicate subgraph declaration must not hide an invalid workspace.
+    declare_subgraph(&r.0, "modules/child");
+    git(&r.0, &["add", ".mdkg/config.json"]);
+    git(&r.0, &["commit", "-qm", "incorrect workspace declaration"]);
+    let refused = mdkg(&r.0, &["install"]);
+    assert!(!refused.status.success(), "{refused:?}");
+    assert!(String::from_utf8_lossy(&refused.stdout).contains("declared workspace"));
+    let graph = r.0.join(".worktrees/graph");
+    let old = git(&graph, &["rev-parse", "HEAD"]);
+    let path = r.0.join(".mdkg/config.json");
+    let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    config["workspaces"]
+        .as_object_mut()
+        .unwrap()
+        .remove("child");
+    fs::write(path, serde_json::to_vec(&config).unwrap()).unwrap();
+    git(&r.0, &["add", ".mdkg/config.json"]);
+    git(&r.0, &["commit", "-qm", "correct workspace to subgraph"]);
+    let target = git(&r.0, &["rev-parse", "HEAD"]);
+    assert_ne!(old, target);
+    let local = fs::read(r.0.join(".git/config")).expect("local config");
+    let preview = ok(&r.0, &["install", "--dry-run"]);
+    assert!(
+        preview.to_string().contains("would fast-forward"),
+        "{preview}"
+    );
+    assert_eq!(git(&graph, &["rev-parse", "HEAD"]), old);
+    assert_eq!(
+        fs::read(r.0.join(".git/config")).expect("local config"),
+        local
+    );
+    let installed = ok(&r.0, &["install"]);
+    assert!(
+        installed.to_string().contains("graph synced"),
+        "{installed}"
+    );
+    assert_eq!(git(&graph, &["rev-parse", "HEAD"]), target);
+    assert_eq!(
+        git(&r.0, &["config", "--local", "--get-regexp", "^mdkg.graph."]),
+        format!("{} graph", identity_key(&r.0))
+    );
 }
 
 #[test]
@@ -482,16 +680,119 @@ fn fast_forward_does_not_overwrite_ignored_local_content() {
 fn configured_main_branch_is_used_and_a_missing_main_is_explicit() {
     let r = repo(true);
     git(&r.0, &["branch", "-m", "trunk"]);
+    // Row 16: install needs no main. The graph checkout waits, and the
+    // note says why and what to do.
     let out = mdkg(&r.0, &["install", "--enable", "agents-md"]);
-    assert!(!out.status.success(), "{out:?}");
-    assert!(String::from_utf8_lossy(&out.stdout).contains("main branch main does not exist"));
-    assert!(!r.0.join("AGENTS.md").exists());
+    assert!(out.status.success(), "{out:?}");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("no main branch main"), "{text}");
+    // `--enable` left the graph's config uncommitted: the move would lose
+    // it, so it isn't offered (#14187).
+    assert!(!text.contains("install --setup local"), "{text}");
+    assert!(r.0.join("AGENTS.md").exists());
+    assert!(!r.0.join(".worktrees/graph").exists());
     git(&r.0, &["config", "mdkg.mainRef", "trunk"]);
     ok(&r.0, &["install"]);
     assert_eq!(
         git(&r.0.join(".worktrees/graph"), &["rev-parse", "HEAD"]),
         git(&r.0, &["rev-parse", "trunk"])
     );
+}
+
+/// #13333: main got a graph change the kept checkout never saw, then went:
+/// the note says it may be behind and doesn't offer the move to the graph
+/// ref, which would start from it. With `MDKG_MAIN_REF` set, it says that
+/// names the branch.
+#[test]
+fn a_kept_graph_checkout_with_main_gone_says_why_it_is_not_refreshed() {
+    let r = repo(true);
+    ok(&r.0, &["install"]);
+    let graph = r.0.join(".worktrees/graph");
+    let before = git(&graph, &["rev-parse", "HEAD"]);
+    fs::write(r.0.join(".mdkg/later.md"), "a graph change\n").expect("w");
+    git(&r.0, &["add", ".mdkg/later.md"]);
+    git(&r.0, &["commit", "-qm", "graph change on main"]);
+    git(&r.0, &["branch", "-m", "main", "trunk"]);
+    let out = mdkg(&r.0, &["install"]);
+    assert!(out.status.success(), "{out:?}");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("(kept, and it may be behind: there's no main branch main"),
+        "{text}"
+    );
+    assert!(!text.contains("install --setup local"), "{text}");
+    assert!(!text.contains("MDKG_MAIN_REF"), "{text}");
+    assert!(!text.contains("commit the initial graph"), "{text}");
+    assert_eq!(git(&graph, &["rev-parse", "HEAD"]), before);
+    let out = isolated(
+        Command::new(env!("CARGO_BIN_EXE_mdkg"))
+            .arg("--root")
+            .arg(&r.0)
+            .args(["install", "--json"]),
+    )
+    .env("MDKG_MAIN_REF", "main")
+    .output()
+    .expect("mdkg");
+    assert!(out.status.success(), "{out:?}");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("`MDKG_MAIN_REF` names it"), "{text}");
+}
+
+/// #14187: the move to the graph ref is offered only when it keeps the
+/// checkout's graph, since setup takes an existing mdkg-graph branch as
+/// the graph ref: not for a branch missing the checkout's graph changes,
+/// nor after a refresh that failed; yes for a checkout only behind the
+/// branch, and once the graph checkout is up to date. No main is read.
+#[test]
+fn the_move_to_the_graph_ref_is_offered_only_when_it_keeps_the_graph() {
+    let notes = |out: &Output| String::from_utf8_lossy(&out.stdout).into_owned();
+    // A branch, no checkout, then main moves on and goes.
+    let r = repo(true);
+    git(&r.0, &["branch", "mdkg-graph"]);
+    fs::write(r.0.join(".mdkg/later.md"), "a graph change\n").expect("w");
+    git(&r.0, &["add", ".mdkg/later.md"]);
+    git(&r.0, &["commit", "-qm", "graph change on main"]);
+    git(&r.0, &["branch", "-m", "main", "trunk"]);
+    let out = mdkg(&r.0, &["install", "--enable", "agents-md"]);
+    assert!(out.status.success(), "{out:?}");
+    let text = notes(&out);
+    assert!(text.contains("no main branch main"), "{text}");
+    assert!(!text.contains("install --setup local"), "{text}");
+    git(&r.0, &["commit", "-qam", "agents-md listed"]);
+    let e = mdkg(&r.0, &["install", "--setup", "local"]);
+    assert!(!e.status.success(), "{e:?}");
+    assert!(
+        String::from_utf8_lossy(&e.stdout).contains("graph.diverged"),
+        "{e:?}"
+    );
+    // Only behind the branch: the move is offered, and goes ahead.
+    git(&r.0, &["reset", "-q", "--hard", "mdkg-graph"]);
+    let out = mdkg(&r.0, &["install"]);
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        notes(&out).contains("install --setup local"),
+        "behind: {out:?}"
+    );
+    // A refresh that fails: the graph branch diverged from main.
+    let r = repo(true);
+    let out = mdkg(&r.0, &["install"]);
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        notes(&out).contains("install --setup local"),
+        "up to date: {out:?}"
+    );
+    let graph = r.0.join(".worktrees/graph");
+    fs::write(graph.join(".mdkg/mine.md"), "graph work\n").expect("w");
+    git(&graph, &["add", ".mdkg/mine.md"]);
+    git(&graph, &["commit", "-qm", "graph work"]);
+    fs::write(r.0.join(".mdkg/later.md"), "a graph change\n").expect("w");
+    git(&r.0, &["add", ".mdkg/later.md"]);
+    git(&r.0, &["commit", "-qm", "graph change on main"]);
+    let out = mdkg(&r.0, &["install"]);
+    assert!(out.status.success(), "{out:?}");
+    let text = notes(&out);
+    assert!(text.contains("graph not synced"), "{text}");
+    assert!(!text.contains("install --setup local"), "{text}");
 }
 
 #[test]
@@ -918,10 +1219,15 @@ fn identity_review_refuses_linked_common_config_before_record_use_or_publication
         for args in [vec!["install"], vec!["status"]] {
             let out = mdkg(&r.0, &args);
             assert!(!out.status.success(), "{symlink} {args:?}: {out:?}");
-            assert!(
-                String::from_utf8_lossy(&out.stdout).contains("local Git config"),
-                "{out:?}"
-            );
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            // Ref mode is decided first at main's gate (#10871, a'), so for
+            // `status` graphref refuses the linked config before install's
+            // review can; install skips that probe and gives its own.
+            let refused = stdout.contains("local Git config")
+                || (args[0] == "status"
+                    && stdout.contains("graph.config_invalid")
+                    && stdout.contains("exactly one link"));
+            assert!(refused, "{symlink} {args:?}: {out:?}");
         }
         assert_eq!(fs::read(&source).expect("source preserved"), original);
     }
@@ -1283,8 +1589,8 @@ fn install_without_committed_identity_explains_migration_before_reinstall() {
             ],
         );
         if migrated {
-            // The caller must pass the early config gate so install checks
-            // the damaged committed identity in the existing graph checkout.
+            // Main's correction must be previewed without moving the damaged
+            // graph checkout or publishing identity records.
             fs::write(&path, valid_config).expect("restore primary identity");
             git(&r.0, &["add", ".mdkg/config.json"]);
             git(&r.0, &["commit", "-qm", "restore primary identity"]);
@@ -1306,26 +1612,31 @@ fn install_without_committed_identity_explains_migration_before_reinstall() {
             .output()
             .expect("install preview");
             let body: Value = serde_json::from_slice(&out.stdout).expect("JSON");
-            assert_eq!(out.status.code(), Some(1), "{body}");
-            let diagnostic = &body["diagnostics"][0];
-            assert_eq!(diagnostic["code"], "install.unsupported_layout", "{body}");
-            assert_eq!(
-                diagnostic["message"],
-                "graph checkout identity needs repair: committed .mdkg/config.json has no valid 0.7 graph identity",
-                "{body}"
-            );
-            assert_eq!(
-                diagnostic["hint"],
-                format!(
-                    "If this graph is unmigrated, run {binary} migrate --dry-run from its primary \
+            if migrated {
+                assert!(out.status.success(), "{body}");
+                assert!(body.to_string().contains("would fast-forward"), "{body}");
+            } else {
+                assert_eq!(out.status.code(), Some(1), "{body}");
+                let diagnostic = &body["diagnostics"][0];
+                assert_eq!(diagnostic["code"], "install.unsupported_layout", "{body}");
+                assert_eq!(
+                    diagnostic["message"],
+                    "graph checkout identity needs repair: committed .mdkg/config.json has no valid 0.7 graph identity",
+                    "{body}"
+                );
+                assert_eq!(
+                    diagnostic["hint"],
+                    format!(
+                        "If this graph is unmigrated, run {binary} migrate --dry-run from its primary \
                      checkout, review the plan, then {binary} migrate --apply <plan-hash>. If it \
                      was already migrated, restore its valid committed graph identity. Ensure \
                      any existing graph checkout contains that valid identity commit before \
                      rerunning {binary} install from the primary checkout. No checkout or \
                      identity record is reset automatically."
-                ),
-                "{body}"
-            );
+                    ),
+                    "{body}"
+                );
+            }
             assert_eq!(fs::read(r.0.join(".git/config")).expect("config"), local);
             assert_eq!(git(&graph, &["rev-parse", "HEAD"]), head);
             assert_eq!(
@@ -1481,4 +1792,320 @@ fn repair_commands_use_the_invoked_binary_and_quote_checkout_paths() {
             "After verifying this record is incorrect or its graph was removed, remove only this key: git -C {graph_word} config --local --unset-all {key}; then run mdkg-next --root {word} install. No checkout or record is reset automatically."
         )
     );
+}
+
+fn doctor_identity(root: &Path, repair: bool) -> Value {
+    let args = if repair {
+        vec!["doctor", "--repair"]
+    } else {
+        vec!["doctor"]
+    };
+    let out = mdkg(root, &args);
+    let value: Value = serde_json::from_slice(&out.stdout).expect("doctor JSON");
+    common::conforms_envelope(&value);
+    value["data"]["checks"]
+        .as_array()
+        .expect("checks")
+        .iter()
+        .find(|c| c["name"] == "graph_identity")
+        .expect("identity check")
+        .clone()
+}
+
+fn bare_graph_checkout(root: &Path) -> PathBuf {
+    let graph = root.join(".worktrees/graph");
+    git(
+        root,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "mdkg-graph",
+            graph.to_str().expect("UTF-8 fixture graph path"),
+            "HEAD",
+        ],
+    );
+    graph
+}
+
+#[test]
+fn doctor_identity_repair_previews_only_identity_writes_and_is_idempotent() {
+    for from_graph in [false, true] {
+        let r = repo(true);
+        let graph = bare_graph_checkout(&r.0);
+        let root = if from_graph { &graph } else { &r.0 };
+        let key = identity_key(&graph);
+        let local_before = fs::read(r.0.join(".git/config")).unwrap();
+        let head_before = git(&graph, &["rev-parse", "HEAD"]);
+        let store_before = fs::read(r.0.join(".git/mdkg/coord.sqlite")).ok();
+        let status_before = git(
+            &graph,
+            &["status", "--porcelain=v1", "--untracked-files=all"],
+        );
+        let paths = [
+            ".mcp.json",
+            ".codex/config.toml",
+            "opencode.json",
+            "AGENTS.md",
+            ".claude/settings.json",
+            ".claude/settings.local.json",
+        ];
+        let projections_before: Vec<_> = [&r.0, &graph]
+            .into_iter()
+            .flat_map(|base| {
+                paths
+                    .iter()
+                    .map(move |path| (base.join(path), fs::read(base.join(path)).ok()))
+            })
+            .collect();
+        let preview = doctor_identity(root, false);
+        assert_eq!(preview["status"], "warning", "{preview}");
+        assert!(
+            preview["summary"].as_str().unwrap().contains(&key),
+            "{preview}"
+        );
+        assert!(
+            preview["summary"]
+                .as_str()
+                .unwrap()
+                .contains("git config --local --add"),
+            "{preview}"
+        );
+        assert_eq!(fs::read(r.0.join(".git/config")).unwrap(), local_before);
+
+        let repaired = doctor_identity(root, true);
+        assert_eq!(repaired["status"], "ok", "{repaired}");
+        assert!(
+            repaired["summary"].as_str().unwrap().starts_with("wrote: "),
+            "{repaired}"
+        );
+        assert_eq!(
+            git(&r.0, &["config", "--local", "--get-all", &key]),
+            "graph"
+        );
+        let local_after = fs::read(r.0.join(".git/config")).unwrap();
+        let repeated = doctor_identity(root, true);
+        assert_eq!(repeated["summary"], "no missing graph identity records");
+        assert_eq!(fs::read(r.0.join(".git/config")).unwrap(), local_after);
+        assert_eq!(git(&graph, &["rev-parse", "HEAD"]), head_before);
+        assert_eq!(
+            git(
+                &graph,
+                &["status", "--porcelain=v1", "--untracked-files=all"]
+            ),
+            status_before
+        );
+        assert_eq!(
+            fs::read(r.0.join(".git/mdkg/coord.sqlite")).ok(),
+            store_before
+        );
+        for (path, before) in projections_before {
+            assert_eq!(
+                fs::read(&path).ok(),
+                before,
+                "projection changed: {}",
+                path.display()
+            );
+        }
+    }
+}
+
+#[test]
+fn doctor_identity_repair_preserves_conflicts_and_dirty_checkouts() {
+    let r = repo(true);
+    let graph = bare_graph_checkout(&r.0);
+    let key = identity_key(&graph);
+    git(&r.0, &["config", "--local", "--add", &key, "wrong-admin"]);
+    let local = fs::read(r.0.join(".git/config")).unwrap();
+    let refused = doctor_identity(&r.0, true);
+    assert_eq!(refused["status"], "error", "{refused}");
+    assert_eq!(fs::read(r.0.join(".git/config")).unwrap(), local);
+    git(&r.0, &["config", "--local", "--unset-all", &key]);
+    let config = graph.join(".mdkg/config.json");
+    let dirty = format!("{}\n ", fs::read_to_string(&config).unwrap());
+    fs::write(&config, &dirty).unwrap();
+    let local = fs::read(r.0.join(".git/config")).unwrap();
+    let refused = doctor_identity(&graph, true);
+    assert_eq!(refused["status"], "error", "{refused}");
+    assert_eq!(fs::read(r.0.join(".git/config")).unwrap(), local);
+    assert_eq!(fs::read_to_string(config).unwrap(), dirty);
+}
+
+#[test]
+fn doctor_identity_repair_adds_only_missing_declared_ids_without_advancing_head() {
+    let r = repo(true);
+    let child = r.0.join("packages/child");
+    fs::create_dir_all(&child).unwrap();
+    ok(&child, &["init"]);
+    declare_workspace(&r.0, "child", "packages/child", ".mdkg");
+    git(&r.0, &["add", ".mdkg", "packages"]);
+    git(&r.0, &["commit", "-qm", "declare child"]);
+    let graph = bare_graph_checkout(&r.0);
+    let root_key = identity_key(&graph);
+    let child_key = identity_key(&graph.join("packages/child"));
+    git(&r.0, &["config", "--local", "--add", &root_key, "graph"]);
+    let graph_head = git(&graph, &["rev-parse", "HEAD"]);
+    fs::write(r.0.join("unrelated.txt"), "main moves independently").unwrap();
+    git(&r.0, &["add", "unrelated.txt"]);
+    git(&r.0, &["commit", "-qm", "unrelated main change"]);
+    let repaired = doctor_identity(&graph, true);
+    assert_eq!(repaired["status"], "ok", "{repaired}");
+    assert!(
+        repaired["summary"].as_str().unwrap().contains(&child_key),
+        "{repaired}"
+    );
+    assert!(
+        !repaired["summary"].as_str().unwrap().contains(&root_key),
+        "{repaired}"
+    );
+    for key in [&root_key, &child_key] {
+        assert_eq!(git(&r.0, &["config", "--local", "--get-all", key]), "graph");
+    }
+    assert_eq!(git(&graph, &["rev-parse", "HEAD"]), graph_head);
+    assert!(!graph.join("unrelated.txt").exists());
+}
+
+#[test]
+fn doctor_identity_repair_finds_moved_graph_from_an_ordinary_sibling() {
+    let r = repo(true);
+    let graph = bare_graph_checkout(&r.0);
+    let moved = r.0.join("renamed-graph");
+    git(
+        &r.0,
+        &[
+            "worktree",
+            "move",
+            graph.to_str().unwrap(),
+            moved.to_str().unwrap(),
+        ],
+    );
+    let sibling = r.0.join("worker");
+    git(
+        &r.0,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "worker",
+            sibling.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+    let repaired = doctor_identity(&sibling, true);
+    assert_eq!(repaired["status"], "ok", "{repaired}");
+    assert_eq!(
+        git(
+            &r.0,
+            &["config", "--local", "--get-all", &identity_key(&moved)]
+        ),
+        "graph"
+    );
+}
+
+#[test]
+fn concurrent_doctor_identity_repairs_do_not_duplicate_records() {
+    let r = repo(true);
+    let graph = bare_graph_checkout(&r.0);
+    let spawn = || {
+        isolated(
+            Command::new(env!("CARGO_BIN_EXE_mdkg"))
+                .arg("--root")
+                .arg(&r.0)
+                .args(["doctor", "--repair", "--json"]),
+        )
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap()
+    };
+    let a = spawn();
+    let b = spawn();
+    for child in [a, b] {
+        let out = child.wait_with_output().unwrap();
+        let value: Value = serde_json::from_slice(&out.stdout).unwrap();
+        let check = value["data"]["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "graph_identity")
+            .unwrap();
+        assert_eq!(check["status"], "ok", "{value}");
+    }
+    assert_eq!(
+        git(
+            &r.0,
+            &["config", "--local", "--get-all", &identity_key(&graph)]
+        ),
+        "graph"
+    );
+}
+
+#[test]
+fn doctor_identity_repair_explains_declared_submodule_workspace_boundary() {
+    let source = repo(true);
+    let r = repo(true);
+    git(
+        &r.0,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            source.0.to_str().unwrap(),
+            "modules/child",
+        ],
+    );
+    declare_workspace(&r.0, "child", "modules/child", ".mdkg");
+    git(&r.0, &["add", ".mdkg", ".gitmodules", "modules"]);
+    git(&r.0, &["commit", "-qm", "declare submodule graph"]);
+    let graph = bare_graph_checkout(&r.0);
+    let config = fs::read(r.0.join(".git/config")).unwrap();
+    let head = git(&graph, &["rev-parse", "HEAD"]);
+    for caller in [&r.0, &graph] {
+        let refused = doctor_identity(caller, true);
+        assert_eq!(refused["status"], "error", "{refused}");
+        assert!(
+            refused["summary"]
+                .as_str()
+                .unwrap()
+                .contains("crosses Git submodule modules/child"),
+            "{refused}"
+        );
+        assert!(
+            refused["hint"]
+                .as_str()
+                .unwrap()
+                .contains("subgraph with source_path instead of a workspace"),
+            "{refused}"
+        );
+        assert!(
+            !refused["hint"].as_str().unwrap().contains("--unset-all"),
+            "{refused}"
+        );
+    }
+    assert_eq!(fs::read(r.0.join(".git/config")).unwrap(), config);
+    assert_eq!(git(&graph, &["rev-parse", "HEAD"]), head);
+
+    // A submodule is its own Git repository: its own linked graph is repaired
+    // within that common directory, never through the parent graph's gitlink.
+    let child = r.0.join("modules/child");
+    let child_graph = bare_graph_checkout(&child);
+    let repaired = doctor_identity(&child, true);
+    assert_eq!(repaired["status"], "ok", "{repaired}");
+    assert_eq!(
+        git(
+            &child,
+            &[
+                "config",
+                "--local",
+                "--get-all",
+                &identity_key(&child_graph)
+            ]
+        ),
+        "graph"
+    );
+    assert_eq!(fs::read(r.0.join(".git/config")).unwrap(), config);
 }

@@ -11,7 +11,7 @@ use mdkg_graph::{GraphError, config, identity_v2};
 use serde_json::Value;
 
 use super::gitops;
-use super::plan::{self, ChildGraph, ForeignNode, NodeFile, Source, TextFile, V2Source};
+use super::plan::{self, ChildGraph, ForeignNode, History, NodeFile, Source, TextFile, V2Source};
 use crate::coord::{Repo, git_error};
 
 /// Files larger than this outside the graph are skipped by the patch.
@@ -60,7 +60,13 @@ fn is_instruction(path: &str, mdkg_dirs: &[String], mirrors: &[String]) -> bool 
 
 /// Collects the source for the graph at `root`. `subgraphs` says whether to
 /// plan the configured subgraphs too (a child is planned without its own).
-pub fn gather(root: &Path, subgraphs: bool) -> Result<(Repo, Source), GraphError> {
+/// `history` overrides where the work history goes; by default the config
+/// says (it stays in git for a graph that commits its work).
+pub fn gather(
+    root: &Path,
+    subgraphs: bool,
+    history: Option<History>,
+) -> Result<(Repo, Source), GraphError> {
     let repo = Repo::open(root)?;
     let top = repo.top.clone();
     let config_rel = format!("{}{}", repo.prefix, config::CONFIG_PATH);
@@ -75,7 +81,7 @@ pub fn gather(root: &Path, subgraphs: bool) -> Result<(Repo, Source), GraphError
     if raw.get("graph_id").is_some() {
         return Err(GraphError::conflict(
             Code::MigrateAlreadyMigrated,
-            "this graph's config has a graph_id: it's already on 0.7.0",
+            "this graph's config has a graph_id: it's already on format 0.7",
         )
         .with_hint("there's nothing to migrate; `migrate --status` shows the last migration"));
     }
@@ -109,16 +115,24 @@ pub fn gather(root: &Path, subgraphs: bool) -> Result<(Repo, Source), GraphError
     }
     // Every node, by graph-relative path and legacy id (the index refuses a
     // v2 graph, whose reader lists them instead).
-    let listed: Vec<(String, String)> = match &v2 {
+    // By graph-relative path, legacy id and workspace (a v2 graph has one
+    // workspace: migrate refuses it with more).
+    let home_alias = cfg
+        .workspaces
+        .iter()
+        .find(|w| w.enabled)
+        .map(|w| w.alias.clone())
+        .unwrap_or_else(|| "root".into());
+    let listed: Vec<(String, String, String)> = match &v2 {
         Some(g) => g
             .nodes
             .iter()
-            .map(|n| (n.path.clone(), n.legacy_id.clone()))
+            .map(|n| (n.path.clone(), n.legacy_id.clone(), home_alias.clone()))
             .collect(),
         None => mdkg_graph::index::build(root, &cfg)?
             .nodes
             .into_iter()
-            .map(|n| (n.path, n.id))
+            .map(|n| (n.path, n.id, n.ws))
             .collect(),
     };
     let base = gitops::head(&top).map_err(git_error)?;
@@ -150,6 +164,7 @@ pub fn gather(root: &Path, subgraphs: bool) -> Result<(Repo, Source), GraphError
                 manifest: TextFile {
                     content: read_text(&top, &manifest)?,
                     path: manifest,
+                    ws: String::new(),
                 },
                 uuids: g
                     .nodes
@@ -162,23 +177,25 @@ pub fn gather(root: &Path, subgraphs: bool) -> Result<(Repo, Source), GraphError
     };
 
     let mut nodes = Vec::new();
-    for (rel, _) in &listed {
+    for (rel, _, ws) in &listed {
         let path = format!("{}{rel}", repo.prefix);
         let content = read_text(&top, &path)?;
-        nodes.push(NodeFile { path, content });
+        nodes.push(NodeFile {
+            path,
+            content,
+            ws: ws.clone(),
+        });
     }
 
-    let mdkg_dirs: Vec<String> = cfg
-        .workspaces
-        .iter()
-        .filter(|w| w.enabled)
-        .map(|w| {
-            let p = Path::new(&w.path).join(&w.mdkg_dir);
-            let p = p.to_string_lossy().replace('\\', "/");
-            let p = p.trim_start_matches("./").to_string();
-            format!("{}{p}", repo.prefix)
-        })
-        .collect();
+    // Each enabled workspace's folder, from the repository's top.
+    let dirs: Vec<(String, String)> = workspace_folders(&cfg, &repo.prefix);
+    let mdkg_dirs: Vec<String> = dirs.iter().map(|(_, d)| d.clone()).collect();
+    let ws_of = |path: &str| {
+        dirs.iter()
+            .find(|(_, d)| path.starts_with(&format!("{d}/")))
+            .map(|(ws, _)| ws.clone())
+            .unwrap_or_default()
+    };
     let mirrors: Vec<String> = cfg
         .skill_mirror_targets
         .iter()
@@ -188,15 +205,16 @@ pub fn gather(root: &Path, subgraphs: bool) -> Result<(Repo, Source), GraphError
     let mut events = Vec::new();
     let mut outside = Vec::new();
     let mut examples = Vec::new();
-    let mut core_list = None;
+    let mut core_lists = Vec::new();
     for path in &tracked {
         if mdkg_dirs
             .iter()
             .any(|d| *path == format!("{d}/core/core.md"))
         {
-            core_list = Some(TextFile {
+            core_lists.push(TextFile {
                 path: path.clone(),
                 content: read_text(&top, path)?,
+                ws: ws_of(path),
             });
             continue;
         }
@@ -207,6 +225,7 @@ pub fn gather(root: &Path, subgraphs: bool) -> Result<(Repo, Source), GraphError
             events.push(TextFile {
                 path: path.clone(),
                 content: read_text(&top, path)?,
+                ws: ws_of(path),
             });
             continue;
         }
@@ -242,14 +261,105 @@ pub fn gather(root: &Path, subgraphs: bool) -> Result<(Repo, Source), GraphError
             outside.push(TextFile {
                 path: path.clone(),
                 content,
+                ws: String::new(),
             });
         }
     }
 
+    let children = subgraph_ids(root, &raw, subgraphs);
+
+    let local: std::collections::BTreeSet<String> = listed
+        .iter()
+        .map(|(_, id, ws)| format!("{ws}:{id}"))
+        .collect();
+    let folders: BTreeMap<String, String> = dirs
+        .iter()
+        .map(|(ws, d)| (ws.clone(), format!("{d}/")))
+        .collect();
+    // The first workspace's folder, in alias order.
+    let mdkg_prefix = folders.values().next().cloned().unwrap_or_default();
+    // The workspace at the graph's root, which instruction files speak for.
+    let root_folder = format!("{}.mdkg/", repo.prefix);
+    let home_ws = folders
+        .iter()
+        .find(|(_, d)| **d == root_folder)
+        .or_else(|| folders.iter().next())
+        .map(|(ws, _)| ws.clone())
+        .unwrap_or(home_alias);
+    let foreign =
+        foreign_nodes(&top, &folders, &repo.prefix, &mdkg_prefix, &local).map_err(git_error)?;
+    let source = Source {
+        base,
+        graph_id,
+        graph_id_minted: minted,
+        v2,
+        config: TextFile {
+            path: config_rel,
+            content: config_text,
+            ws: String::new(),
+        },
+        nodes,
+        events,
+        core_lists,
+        outside,
+        examples,
+        mdkg_prefix,
+        graph_prefix: repo.prefix.clone(),
+        folders,
+        home_ws,
+        foreign,
+        workspaces: cfg.workspaces.iter().map(|w| w.alias.clone()).collect(),
+        subgraphs: children,
+        // The graph's own root, which install and doctor read them from
+        // (review of 6af00f9): a nested graph has its own.
+        projections: mdkg_run::projection::upgraded(&top.join(&repo.prefix), &raw),
+        history: history.unwrap_or(match cfg.work_committed {
+            config::WorkCommitted::Definitions => History::Git,
+            config::WorkCommitted::None => History::Store,
+        }),
+        history_reason: match (history, cfg.work_committed) {
+            (Some(_), _) => "chosen with --work-history".into(),
+            (None, config::WorkCommitted::Definitions) => {
+                let said = raw
+                    .get("work")
+                    .and_then(|w| w.get("location").or_else(|| w.get("committed")))
+                    .is_some();
+                if said {
+                    "the graph commits its work (its config's work.location is git)".into()
+                } else {
+                    "the graph commits its work (its config doesn't say where work lives, \
+                     which is git)"
+                        .into()
+                }
+            }
+            (None, config::WorkCommitted::None) => {
+                "the graph keeps its work local (work.location local)".into()
+            }
+        },
+        known_ids: BTreeMap::new(),
+        id_overrides: BTreeMap::new(),
+        adopt: BTreeMap::new(),
+        added: BTreeMap::new(),
+        added_ids: BTreeMap::new(),
+        replayed: Vec::new(),
+        collisions: BTreeMap::new(),
+        against: None,
+        warnings: Vec::new(),
+    };
+    Ok((repo, source))
+}
+
+/// The config's subgraph aliases, each with the child's new ids when
+/// `plan_children` and the child can be read.
+pub fn subgraph_ids(
+    root: &Path,
+    raw: &Value,
+    plan_children: bool,
+) -> BTreeMap<String, Option<ChildGraph>> {
     let mut children = BTreeMap::new();
     if let Some(declared) = raw.get("subgraphs").and_then(Value::as_object) {
         for (alias, entry) in declared {
-            let child = if subgraphs {
+            let child = if plan_children {
                 entry
                     .get("source_path")
                     .and_then(Value::as_str)
@@ -260,42 +370,25 @@ pub fn gather(root: &Path, subgraphs: bool) -> Result<(Repo, Source), GraphError
             children.insert(alias.clone(), child);
         }
     }
+    children
+}
 
-    let local: std::collections::BTreeSet<String> =
-        listed.iter().map(|(_, id)| id.clone()).collect();
-    // The first workspace's folder, in alias order (spec section 10.1).
-    let mdkg_prefix = cfg
+/// Each enabled workspace's alias and folder, from the repository's top,
+/// with no trailing `/` (`.mdkg`, `aux/.mdkg`), in alias order.
+pub fn workspace_folders(cfg: &config::Config, prefix: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = cfg
         .workspaces
         .iter()
         .filter(|w| w.enabled)
-        .zip(&mdkg_dirs)
-        .min_by(|(a, _), (b, _)| a.alias.cmp(&b.alias))
-        .map(|(_, d)| format!("{d}/"))
-        .unwrap_or_default();
-    let foreign = foreign_nodes(&top, &mdkg_prefix, &local).map_err(git_error)?;
-    let source = Source {
-        base,
-        graph_id,
-        graph_id_minted: minted,
-        v2,
-        config: TextFile {
-            path: config_rel,
-            content: config_text,
-        },
-        nodes,
-        events,
-        core_list,
-        outside,
-        examples,
-        mdkg_prefix,
-        foreign,
-        workspaces: cfg.workspaces.iter().map(|w| w.alias.clone()).collect(),
-        subgraphs: children,
-        // The graph's own root, which install and doctor read them from
-        // (review of 6af00f9): a nested graph has its own.
-        projections: mdkg_run::projection::upgraded(&top.join(&repo.prefix), &raw),
-    };
-    Ok((repo, source))
+        .map(|w| {
+            let p = Path::new(&w.path).join(&w.mdkg_dir);
+            let p = p.to_string_lossy().replace('\\', "/");
+            let p = p.trim_start_matches("./").to_string();
+            (w.alias.clone(), format!("{prefix}{p}"))
+        })
+        .collect();
+    out.sort();
+    out
 }
 
 /// The nodes other local branches hold and this worktree doesn't, read
@@ -303,38 +396,45 @@ pub fn gather(root: &Path, subgraphs: bool) -> Result<(Repo, Source), GraphError
 /// branch resolves to the id that branch's own migration will give it.
 fn foreign_nodes(
     top: &Path,
+    ws_folders: &BTreeMap<String, String>,
+    graph_prefix: &str,
     mdkg_prefix: &str,
     local: &std::collections::BTreeSet<String>,
 ) -> std::io::Result<Vec<ForeignNode>> {
-    // Every (path, blob) a tip holds: the same bytes at two paths are two
-    // candidates, since a node's id derives from its path. Each commit is
-    // read once, however many branches point at it, and only its graph
-    // folders, however large the rest of the repository.
-    let folders: Vec<String> = ["core", "design", "work"]
-        .iter()
-        .map(|d| format!("{mdkg_prefix}{d}"))
+    // Every (workspace, path, blob) a tip holds: the same bytes at two
+    // paths are two candidates, since a node's id derives from its path.
+    // Each commit is read once, however many branches point at it, and only
+    // its graph folders, however large the rest of the repository.
+    let folders: Vec<String> = ws_folders
+        .values()
+        .flat_map(|f| ["core", "design", "work"].map(|d| format!("{f}{d}")))
         .collect();
     let tips: std::collections::BTreeSet<String> = gitops::branch_tips(top)?
         .into_iter()
         .map(|(_, tip)| tip)
         .collect();
-    let mut seen: std::collections::BTreeSet<(String, String)> = std::collections::BTreeSet::new();
+    let mut seen: std::collections::BTreeSet<(String, String, String)> =
+        std::collections::BTreeSet::new();
     for tip in tips {
         for (path, entry) in gitops::ls_tree_under(top, &tip, &folders)? {
-            let Some(rel) = path.strip_prefix(mdkg_prefix) else {
+            let Some((ws, rel)) = ws_folders
+                .iter()
+                .find_map(|(ws, f)| Some((ws, path.strip_prefix(f.as_str())?)))
+            else {
                 continue;
             };
             let in_docs = ["core/", "design/", "work/"]
                 .iter()
                 .any(|d| rel.starts_with(d));
             if entry.kind == "blob" && in_docs && rel.ends_with(".md") {
-                seen.insert((rel.to_string(), entry.oid));
+                let minted = plan::mint_path(ws_folders, graph_prefix, mdkg_prefix, &path, ws);
+                seen.insert((ws.clone(), minted, entry.oid));
             }
         }
     }
     let oids: Vec<String> = seen
         .iter()
-        .map(|(_, oid)| oid.clone())
+        .map(|(_, _, oid)| oid.clone())
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .collect();
@@ -344,7 +444,7 @@ fn foreign_nodes(
         .zip(gitops::read_blobs(top, &oids)?)
         .collect();
     let mut out = Vec::new();
-    for (path, oid) in seen {
+    for (ws, path, oid) in seen {
         let Some(text) = blobs.get(&oid).and_then(|b| std::str::from_utf8(b).ok()) else {
             continue;
         };
@@ -365,7 +465,7 @@ fn foreign_nodes(
         // A node this worktree has by legacy id is only another node when
         // it has a UUID of its own (a v2 node_id, or a migrated id): refs
         // by UUID still name it.
-        if local.contains(&legacy_id) && node_id.is_none() && id.is_none() {
+        if local.contains(&format!("{ws}:{legacy_id}")) && node_id.is_none() && id.is_none() {
             continue;
         }
         out.push(ForeignNode {
@@ -376,16 +476,17 @@ fn foreign_nodes(
             status: field("status"),
             created,
             path,
+            ws,
         });
     }
-    out.sort_by(|a, b| (&a.legacy_id, &a.path).cmp(&(&b.legacy_id, &b.path)));
+    out.sort_by(|a, b| (&a.ws, &a.legacy_id, &a.path).cmp(&(&b.ws, &b.legacy_id, &b.path)));
     out.dedup();
     Ok(out)
 }
 
 /// A node file's frontmatter as `key: value` lines (scalars as written),
 /// without the 0.6.0 key grammar; empty when it has none.
-fn frontmatter_lines(text: &str) -> BTreeMap<&str, &str> {
+pub fn frontmatter_lines(text: &str) -> BTreeMap<&str, &str> {
     let mut out = BTreeMap::new();
     let mut lines = text.lines();
     if lines.next().map(str::trim) != Some("---") {
@@ -414,7 +515,7 @@ fn child_ids(dir: &Path) -> Option<ChildGraph> {
     if let Some(graph_id) = raw.get("graph_id").and_then(Value::as_str) {
         return migrated_ids(dir, graph_id);
     }
-    let (_, source) = gather(dir, false).ok()?;
+    let (_, source) = gather(dir, false, None).ok()?;
     let p = plan::plan(&source).ok()?;
     Some(ChildGraph {
         graph_id: p.graph_id,
@@ -428,7 +529,7 @@ fn child_ids(dir: &Path) -> Option<ChildGraph> {
 
 /// A migrated graph's `legacy_id` to `id` map, from its node files'
 /// frontmatter (`.mdkg/{core,design,work}`).
-fn migrated_ids(dir: &Path, graph_id: &str) -> Option<ChildGraph> {
+pub fn migrated_ids(dir: &Path, graph_id: &str) -> Option<ChildGraph> {
     fn walk(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;

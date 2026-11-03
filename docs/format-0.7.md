@@ -133,8 +133,27 @@ enable/disable, hook installation and undo.
 
 The [settings engine](../crates/mdkg-format/src/settings/README.md), typed
 graph adapter, scoped file editor and `config show` command are implemented.
-The `config set` command and runtime/agent reader integration remain pending;
-their intended interface is distinguished below from the available display.
+`agents up` and `agents status` use captured effective agent and orchestration
+settings. The `config set` command remains pending; its intended interface is
+distinguished below from the available display.
+
+In 0.7.0, user and machine-local agent overrides apply only to named physical
+`.mdkg/agents/<name>.json` definitions. Optional `agents.defaults` and optional
+entries without a definition file are ignored; legacy inline and saved-only
+agents retain their existing behavior until migrated with `mdkg agents edit`.
+Definition management reads and writes project-authored values only. Status
+includes the effective file definition and its origins separately from saved
+execution fields. A new `agents up` invocation captures changed settings;
+an active watch keeps its prepared settings, including receiver policy.
+If a definition file is removed, its machine-local saved-only execution state
+can still retain the last effective overrides; separating those transient
+values from saved state is a 0.7.x follow-up.
+
+Projections stay project-only: optional layers cannot change which committed,
+shared repository files install, doctor, skills or hooks write. Optional-layer
+naming such as `orchestration.worktree` does not create an actor identity for
+an unsaved interactive checkout; identity still comes from authored and saved
+actor information.
 
 #### 2.2.1 Sources and precedence
 
@@ -173,8 +192,7 @@ merging, so a higher layer's `work.location` can override a lower layer's
 alias. Conflicting spellings within one source are refused. Per-file agent
 definitions can contribute project inputs after `.mdkg/config.json` and
 before the machine-local file, retaining each definition's path as its
-origin. `config show` uses this ordering; connecting runtime agent loading
-to it remains pending.
+origin. `config show` and runtime file-definition loading use this ordering.
 
 Every file must be a JSON object with unique keys. Unreadable files, final
 symlinks, special files, inputs over 1 MiB and nesting beyond 64 levels are
@@ -550,6 +568,69 @@ specification and ships with it. For each type it gives:
 - 0.6.0 files (section 10) are checked against their graph's templates, as
   0.6.0 checks them.
 
+### 3.6 Requirements in bodies
+
+Requirements are a body convention, not a frontmatter key or a change to
+the node schema. Durable requirements belong in `edd` and `prd` nodes;
+change requirements belong in `task`, `bug`, `feat` and `spike` nodes.
+In a `# Requirements` or `## Requirements` section, each top-level item is
+written as follows:
+
+```text
+- R1 (changes edd-<uuid>#R2): When a request arrives, the service shall respond. (verify: test name)
+```
+
+An `R` id has one to nine digits and starts with `1` to `9`, matching the
+ledger's entry ids. IDs are unique within the node and are not renumbered.
+An optional relation is `changes <node-id>#R<n>`, `adds <node-id>` (with an
+optional `#R<n>`), or `removes <node-id>#R<n>`; more than one relation can
+appear before the colon. A retired item keeps its id and begins with
+`(retired)` instead of relations. Indented continuation lines belong to the
+item. Headings and list items inside fenced code blocks are ignored, so the
+templates' fenced examples do not create live requirements.
+
+The check is a `(verify: ...)` that ends the whole item, continuation
+lines included: one followed by a continuation line is part of the
+statement, and the item has no check. If the item still ends in `)`,
+the parsing below applies to the whole item: a balanced `(verify: ...)`
+that ends the continuation is the check, and the earlier marker stays
+in the statement; otherwise the earliest marker starts the check, which
+then runs to the item's end, continuation included.
+
+For a trailing `(verify: ...)`, the parser first finds a balanced outer
+parenthesis by scanning backward. If no balanced verification suffix is
+found, it uses the earliest whitespace-delimited `(verify:` marker. Since
+both statement and check are free text, an earlier marker in the statement
+and unbalanced parentheses in the check can make that fallback ambiguous;
+balance parentheses in checks to keep the intended split clear.
+
+For an EARS `Where` or `While` condition, the classifier splits at the first
+comma followed by `While`, `When`, or `If` before the response's `shall`, if
+there is one; otherwise it uses the first comma. A condition that itself
+contains a comma followed by one of those keywords can therefore be split
+earlier than its author intended.
+
+In format 0.7 graphs, `validate` checks this convention with warnings only;
+it never refuses a node because a requirement is missing or malformed or
+because its sentence does not follow EARS. Spikes state questions ending in
+`?`. Other requirements use EARS's `shall` and may begin with `Where`,
+`While`, `When`, or `If ... then` clauses. The warnings also flag duplicate
+ids, vague statements without a number, and invalid design relations. A
+task, bug or spike with no requirement items warns unless its status is
+`done`. Markdown around the section that may change what parses, such as
+an unclosed fence or HTML that may hide the heading, warns as
+`req.bad_line` at its line. Design nodes (`edd` and `prd`) hold durable
+requirements, which carry no relation. Only those and the work items
+(`task`, `bug`, `feat` and `spike`) hold requirements; the lint leaves a
+`# Requirements` section in any other type, such as a rule's, alone.
+
+`mdkg req list <node> --json` reports the parsed lines, relations, EARS
+shape, verification text and one-based body line. It reports `unverified`
+when a readable coordinator has no entry for an active requirement. If the
+coordinator cannot be read, the state is null and the command warns; a
+retired requirement has no state. `pack --json` includes structured
+requirements for its included nodes; its markdown budget is unchanged.
+
 ## 4. Ids
 
 ### 4.1 Form
@@ -897,7 +978,7 @@ Each coordinator store keeps one chain of records. Every write that changes
 coordination state appends one record, in the same transaction as the
 change, so a crash or a failed write leaves both or neither. That covers
 claims, renewals, releases, expiries, status marks, `done`, `sync`,
-`abandon`, settlement, and message and room events, purges included. Two
+`abandon`, settlement, and message and channel events, purges included. Two
 writes add records that aren't one change each: an import (a marker and
 the imported records) and a checkpoint (section 9.5).
 
@@ -918,7 +999,7 @@ A record is a JSON object with exactly these eight keys:
 | `seq` | integer | 1 for the chain's first record, then +1 per record, with no gaps |
 | `prev` | string or `null` | The previous record's hash; `null` exactly when `seq` is 1 |
 | `ts` | string | When the event happened, as its writer says: the writer's clock for a live record, the original time for an imported one. RFC 3339 UTC to the millisecond, exactly `YYYY-MM-DDTHH:MM:SS.sssZ`. Records are ordered by `seq`, never by `ts` |
-| `actor` | string, not empty | Who acted: a coordination actor name, or `mdkg` for the system. A `human:<name>` appears only on the mail commands a human runs (acks, leaving a room) |
+| `actor` | string, not empty | Who acted: a coordination actor name, or `mdkg` for the system. A `human:<name>` appears only on the mail commands a human runs (acks, leaving a channel) |
 | `kind` | string | `<domain>.<verb>`: two or more `.`-separated segments of `[a-z0-9_]` (section 9.2) |
 | `subject` | array of strings | What the record is about, in the writer's order (below) |
 | `body` | object | Kind-specific (section 9.2) |
@@ -965,10 +1046,10 @@ A record is a JSON object with exactly these eight keys:
 | `log.checkpoint` | A compaction (section 9.5) | none | `{from, to, first, last, count, summary}` |
 | `log.import` | Before imported history (`migrate`) | none | `{import_id, count, skipped}`; the next `count` records are the import, each with its own `ts` and `actor`. An imported record whose body's `migrate_digest` the chain already holds isn't written again; `skipped` counts those |
 | `lease.claim`, `lease.renew`, `lease.release`, `lease.expire`, `lease.reconcile`, `leaf.register`, `changeset.commit`, `changeset.abandon`, `main.observe`, `request.prune`, `alias.issue`, `work.status` | One per coordinator journal entry: claims and refused claims, renewals, releases, expiries, offline leases reconciled, a node file first seen (`leaf.register`), `done` and `sync` commits, abandons, observations of main, expired claim keys dropped, a 0.6.0-compatible alias issued, status marks | The lease's node, its scope (`path:`, `role:`, `run:` or `node:`) and `lease:`; the changesets | `{journal, command, outcome}`. Only `journal`, the journal entry's number, is part of the format. `command` and `outcome` are that entry's command and outcome as the reference implementation writes them: opaque JSON a consumer MUST NOT rely on, which may change without a new record version |
-| `msg.send` | A message is stored (not a retry of the same send) | `msg:<id>`, and `room:<name>` for a room post | `{message_id, context_id, kind, sender, via, room, to, references, digest, size, retention}`. `digest` is the body's; the body never enters the log |
+| `msg.send` | A message is stored (not a retry of the same send) | `msg:<id>`, and `room:<name>` for a channel post | `{message_id, context_id, kind, sender, via, room, to, references, digest, size, retention}`. `digest` is the body's; the body never enters the log |
 | `msg.ack` | Deliveries change to acked, or acking purges a body | `msg:<id>` for each id the ack named, once each | `{acked: [{message_id, mailbox}], by, via, outcome_digest, purged}`: the deliveries this ack changed and the bodies it purged. An ack's outcome text enters only as a digest |
 | `msg.purge` | Bodies are purged under their retention (by whichever command finds them due) | `msg:<id>` for each | `{purged: [message_id], reason: "retention"}` |
-| `room.create`, `room.join`, `room.leave` | Room membership changes | `room:<name>` | `{room, by, members}`, `{room, by, added}`, `{room, by, removed}` |
+| `room.create`, `room.join`, `room.leave` | Channel membership changes | `room:<name>` | `{room, by, members}`, `{room, by, added}`, `{room, by, removed}` |
 | `legacy.*` | Written by `migrate` from 0.6.0 history | as imported | as imported |
 
 The actor is who ran the command (`--as`, `$MDKG_ACTOR`, or the worktree's
@@ -1026,7 +1107,7 @@ At a milestone (an anchor, so also a goal done and a release), the store
 appends a `log.checkpoint` summarizing every record since the last one:
 `from` and `to` are their seqs, `first` and `last` their hashes, `count`
 how many, and `summary` at most 150 words citing both hashes and naming
-the kinds and actors it has room for, the most frequent first. With
+the kinds and actors that fit, the most frequent first. With
 nothing since the last checkpoint, none is written. 0.7.0 prunes no records. Pruning the raw records a checkpoint covers would need a new
 bundle version, since a v1 bundle starts at the genesis.
 
@@ -1100,9 +1181,12 @@ way from a time and 10 derived bytes:
   file writes it;
 - `file` is the node file's path inside the graph's `.mdkg/` folder:
   `work/task-19-x.md` for `.mdkg/work/task-19-x.md`, and for
-  `projects/x/.mdkg/work/task-19-x.md` in a graph at `projects/x`.
-  `migrate` converts only a graph of one enabled workspace, `.mdkg` at
-  the graph's root, and refuses any other (`migrate.unsupported`).
+  `projects/x/.mdkg/work/task-19-x.md` in a graph at `projects/x`. A node
+  of any other workspace (its folder isn't the graph's `.mdkg`) uses its
+  path relative to that folder instead, which starts `../`:
+  `../aux/.mdkg/work/task-1.md` for the workspace at `aux`. No path inside
+  `.mdkg/` starts so, so its `task-1` and the root workspace's get
+  different UUIDs.
 - A node whose `created` or number breaks these rules isn't migrated: the
   plan reports it, and the graph is not migrated until it is fixed.
 
@@ -1180,6 +1264,14 @@ are in `conformance/v07/`, with the spec's expected codes, and
 | `edge.blocks_ancestor` | warning | A node is blocked by one of its own ancestors (section 5.2, rule 6) |
 | `edge.private_target` | error | With local work, a committed node names a private work node (section 5.2, rule 8) |
 | `edge.target_not_on_branch` | warning | With local work, a private work node names a node this branch doesn't have, or a goal's active node isn't in this checkout (section 5.2, rule 7) |
+| `req.missing` | warning | A task, bug or spike that isn't `done` has no requirement items |
+| `req.bad_line` | warning | A requirement item does not parse, or Markdown around it may change what parses |
+| `req.duplicate_id` | warning | Two requirement items share an id |
+| `req.not_ears` | warning | A non-spike requirement does not match an EARS form |
+| `req.vague` | warning | A requirement uses a listed vague term without a number |
+| `req.not_question` | warning | A spike requirement does not end in `?` |
+| `req.bad_relation` | warning | A relation's target doesn't resolve or isn't an `edd` or `prd`, or a `changes` names an id the target lacks; a `removes` is never warned for its id |
+| `req.relation_on_design` | warning | A requirement in an `edd` or `prd` carries a relation |
 
 The graph checks of section 5.2 keep 0.6.0's codes, all errors:
 `edge.missing_target`, `edge.prev_next_asymmetric`, `edge.cycle`,

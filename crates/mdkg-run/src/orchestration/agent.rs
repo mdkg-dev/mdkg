@@ -3,7 +3,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use mdkg_format::settings::{Input, Layer};
+use mdkg_format::settings::{self, Effective, Input, Layer, Origin};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -46,6 +46,16 @@ pub struct Definition {
     pub protect: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base: Option<String>,
+    /// How a worker follows the code base (mainRef). `notes`, the default:
+    /// in ref mode (`mdkg.graph.ref` set) with a mainRef this clone holds,
+    /// each turn `agents up` runs tells the worker how far its branch is
+    /// behind, when it is; checkout mode, a level branch or a mainRef not
+    /// here give no note. `merge` is accepted but acts as `notes` in 0.7.1:
+    /// nothing is merged, and the note says the launcher's automatic merge
+    /// comes in 0.7.2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "follow_field")]
+    pub follow: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -77,6 +87,14 @@ fn extends_field(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
     schemars::json_schema!({ "type": ["string", "null"], "minLength": 1 })
 }
 
+fn follow_field(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({ "type": "string", "enum": ["notes", "merge"] })
+}
+
+fn valid_follow(value: &Value) -> bool {
+    matches!(value.as_str(), Some("notes" | "merge"))
+}
+
 fn definition_schema(schema: &mut schemars::Schema) {
     schema.insert("anyOf".into(), json!([
         {"required": ["harness", "role"], "properties": {"harness": {"type":"string"}, "role": {"type":"string"}}},
@@ -87,6 +105,12 @@ fn definition_schema(schema: &mut schemars::Schema) {
 /// Validation shared by every execution path, including saved agents.
 pub fn check_execution(config: &Value, name: &str) -> Result<(), RunError> {
     let entry = config.get("agents").and_then(|a| a.get(name));
+    if entry
+        .and_then(|a| a.get("follow"))
+        .is_some_and(|v| !valid_follow(v))
+    {
+        return Err(bad(format!("agent {name}: follow must be notes or merge")));
+    }
     if entry
         .and_then(|a| a.get("extends"))
         .is_some_and(|v| !v.is_null())
@@ -133,6 +157,9 @@ pub fn check_name(name: &str) -> Result<(), RunError> {
 impl Definition {
     pub fn parse(name: &str, value: Value) -> Result<Self, RunError> {
         check_name(name)?;
+        if value.get("follow").is_some_and(|v| !valid_follow(v)) {
+            return Err(bad(format!("agent {name}: follow must be notes or merge")));
+        }
         let definition: Self =
             serde_json::from_value(value).map_err(|e| bad(format!("agent {name}: {e}")))?;
         if definition.schema != SCHEMA {
@@ -160,7 +187,7 @@ impl Definition {
                 error
             },
         )?;
-        state::check_name(&definition.reports_to)?;
+        state::check_reports_to(name, &definition.reports_to)?;
         if let (Some(harness), Some(role)) = (definition.harness, definition.role) {
             state::check_native(
                 harness,
@@ -195,11 +222,14 @@ pub fn directory(root: &Path) -> Result<PathBuf, RunError> {
     Ok(dir)
 }
 
+/// Locate an explicit filesystem candidate for definition editing. Active
+/// definitions are read from a pinned graph authority, never from this path.
 pub fn path(root: &Path, name: &str) -> Result<PathBuf, RunError> {
     check_name(name)?;
     Ok(directory(root)?.join(format!("{name}.json")))
 }
 
+/// Validate a filesystem edit candidate; this is not an authority read.
 pub fn read(path: &Path, name: &str) -> Result<Definition, RunError> {
     let meta = fs::symlink_metadata(path)
         .map_err(|e| RunError::io("can't inspect agent definition", e))?;
@@ -216,47 +246,102 @@ pub fn read(path: &Path, name: &str) -> Result<Definition, RunError> {
     Definition::parse(name, value)
 }
 
-fn definition_paths(root: &Path) -> Result<Vec<PathBuf>, RunError> {
-    let dir = directory(root)?;
-    let entries = match fs::read_dir(&dir) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(RunError::io("can't list agent definitions", e)),
-    };
-    let mut files = entries
-        .map(|e| e.map(|e| e.path()))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| RunError::io("can't list agent definitions", e))?;
-    files.sort();
-    files.retain(|path| {
-        path.extension().is_some_and(|e| e == "json")
-            && !path
-                .file_name()
-                .is_some_and(|n| n.to_string_lossy().starts_with('.'))
-    });
-    Ok(files)
+/// Definition patches at project priority. Operations that also need the
+/// config should pin one authority and use [`authority_layer_inputs`].
+pub fn layer_inputs(root: &Path) -> Result<Vec<Input>, RunError> {
+    authority_layer_inputs(&super::authority(root)?)
 }
 
-/// Raw definition patches at project priority. Retain authored values and
-/// source paths; serde defaults must not become falsely project-authored.
-/// Parsing is bounded and rejects duplicate keys and links. Typed validation
-/// belongs to the consumer after all layers have been merged.
-pub fn layer_inputs(root: &Path) -> Result<Vec<Input>, RunError> {
-    definition_paths(root)?
-        .into_iter()
-        .map(|path| {
-            let name = path
-                .file_stem()
-                .and_then(|n| n.to_str())
-                .ok_or_else(|| bad("agent definition filename must be UTF-8"))?;
+/// File-backed definition patches from the same pinned authority as the
+/// project configuration. Keep raw authored fields and their shared graph
+/// origin; typed execution validation is performed by runtime consumers.
+pub fn authority_layer_inputs(
+    authority: &mdkg_graph::graphref::Authority,
+) -> Result<Vec<Input>, RunError> {
+    authority
+        .definitions
+        .iter()
+        .filter(|(_, definition)| !definition.inline)
+        .map(|(name, definition)| {
             check_name(name)?;
-            let mut input = Input::read(Layer::Project, &path)
-                .map_err(|e| bad(e.to_string()))?
-                .ok_or_else(|| bad("agent definition disappeared while reading configuration"))?;
-            input.value = json!({"agents": {name: input.value}});
-            Input::new(input.origin, input.value).map_err(|e| bad(e.to_string()))
+            Input::new(
+                Origin::file(Layer::Project, &authority.source),
+                json!({"agents": {name: definition.value}}),
+            )
+            .map_err(|e| bad(e.to_string()))
         })
         .collect()
+}
+
+/// Refuse changes to graph-owned authority in one optional layer or flags,
+/// even if a later layer would mask them. Compare after applying each patch
+/// to the authored snapshot so replacing an enclosing object cannot bypass
+/// the check. Flags may still create an ad hoc agent absent from the graph.
+pub fn check_authority_override(authored: &Value, optional: &Input) -> Result<(), RunError> {
+    if !matches!(
+        optional.origin.layer,
+        Layer::User | Layer::Local | Layer::Flags
+    ) {
+        return Err(bad(
+            "authority override check expects an optional layer or flags",
+        ));
+    }
+    let defaults = settings::defaults().map_err(|e| bad(e.to_string()))?;
+    let project = Input::new(Origin::value(Layer::Project), authored.clone())
+        .map_err(|e| bad(e.to_string()))?;
+    let mut effective = Effective::new(&defaults).map_err(|e| bad(e.to_string()))?;
+    effective.apply(&project).map_err(|e| bad(e.to_string()))?;
+    let before = effective.values.clone();
+    effective.apply(optional).map_err(|e| bad(e.to_string()))?;
+    let after = &effective.values;
+    let refused = |field: &str| {
+        RunError::usage(
+            "run.authority_override",
+            format!(
+                "the {:?} layer changes committed {field}",
+                optional.origin.layer
+            ),
+        )
+    };
+    for field in ["branch", "worktree"] {
+        if before.get("orchestration").and_then(|v| v.get(field))
+            != after.get("orchestration").and_then(|v| v.get(field))
+        {
+            return Err(refused(field));
+        }
+    }
+    // Optional-only entries are never admitted as agents. They are not
+    // authority overrides of a graph-defined actor.
+    let names = authored
+        .get("agents")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|agents| agents.keys())
+        .filter(|name| name.as_str() != "defaults");
+    for name in names {
+        for field in [
+            "role",
+            "reports_to",
+            "protect",
+            "placement",
+            "follow",
+            "cwd",
+            "worktree",
+            "base",
+        ] {
+            let get = |value: &Value| {
+                value
+                    .get("agents")
+                    .and_then(|agents| agents.get(name))
+                    .and_then(|agent| agent.get(field))
+                    .cloned()
+            };
+            if get(&before) != get(after) {
+                return Err(refused(field));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Resolve raw file definitions using the same whole-entry replacement as
@@ -275,6 +360,18 @@ pub fn resolve_layers(
     replacement: Option<&Input>,
     flags: Option<&Value>,
 ) -> Result<mdkg_graph::config::layers::Resolved, mdkg_graph::GraphError> {
+    use mdkg_format::Code;
+    use mdkg_graph::GraphError;
+
+    let settings_error = |error: settings::Error| {
+        let code = match error.kind {
+            settings::ErrorKind::Invalid => Code::ConfigInvalid,
+            settings::ErrorKind::Read | settings::ErrorKind::TooLarge => Code::ConfigUnreadable,
+        };
+        let mut result = GraphError::failure(code, error.to_string());
+        result.diagnostic.path = error.origin.path.map(|p| p.to_string_lossy().into_owned());
+        result
+    };
     let mut input = replacement
         .filter(|candidate| candidate.origin.layer == Layer::Project)
         .unwrap_or_else(|| project.project_input())
@@ -288,25 +385,113 @@ pub fn resolve_layers(
             }
         }
     }
+    let defaults = settings::defaults().map_err(&settings_error)?;
+    let authored = settings::Layers {
+        user: None,
+        project: Some(input.clone()),
+        local: None,
+    }
+    .resolve(&defaults, definitions, None)
+    .map_err(&settings_error)?;
     let mut replacements = vec![input];
-    if let Some(replacement) = replacement.filter(|r| r.origin.layer != Layer::Project) {
+    for (layer, path) in [
+        (Layer::User, project.paths().user.as_deref()),
+        (Layer::Local, project.paths().local.as_deref()),
+    ] {
+        let Some(path) = path else { continue };
+        // Capture each optional source once. A missing source is represented
+        // by an empty patch so the resolver cannot reread it later.
+        let candidate = match replacement.filter(|r| r.origin.layer == layer) {
+            Some(candidate) => candidate.clone(),
+            None => match Input::read(layer, path).map_err(&settings_error)? {
+                Some(candidate) => candidate,
+                None => {
+                    Input::new(Origin::file(layer, path), json!({})).map_err(&settings_error)?
+                }
+            },
+        };
+        check_authority_override(&authored.values, &candidate).map_err(|error| {
+            GraphError::usage(
+                Code::parse(&error.code).unwrap_or(Code::ConfigInvalid),
+                error.message,
+            )
+        })?;
+        replacements.push(candidate);
+    }
+    if let Some(flags) = flags {
+        let flags =
+            Input::new(Origin::value(Layer::Flags), flags.clone()).map_err(&settings_error)?;
+        check_authority_override(&authored.values, &flags).map_err(|error| {
+            GraphError::usage(
+                Code::parse(&error.code).unwrap_or(Code::ConfigInvalid),
+                error.message,
+            )
+        })?;
+    }
+    if let Some(replacement) = replacement.filter(|r| {
+        !matches!(r.origin.layer, Layer::Project | Layer::User | Layer::Local)
+            || (r.origin.layer == Layer::User && project.paths().user.is_none())
+            || (r.origin.layer == Layer::Local && project.paths().local.is_none())
+    }) {
+        // Preserve the resolver's invalid-source refusal for other layers or
+        // optional sources that discovery did not select.
         replacements.push(replacement.clone());
     }
     project.resolve_replacements(&replacements, definitions, flags)
 }
 
-/// Overlay files on legacy inline entries. File definitions replace an
-/// entry whole; shared `agents.defaults` remains the policy fallback.
+/// Replace the value with one committed authority, including file-backed
+/// definitions over legacy inline entries.
 pub fn merge(root: &Path, config: &mut Value) -> Result<(), RunError> {
-    for path in definition_paths(root)? {
-        let name = path
-            .file_stem()
-            .and_then(|n| n.to_str())
-            .ok_or_else(|| bad("agent definition filename must be UTF-8"))?;
-        let definition = read(&path, name)?;
-        if config.is_null() {
-            *config = json!({});
+    *config = authority_config(&super::authority(root)?)?;
+    Ok(())
+}
+
+/// Validate the surviving committed definitions before optional layers can
+/// hide an invalid entry. File definitions replace inline entries whole.
+pub fn validate_authority(authority: &mdkg_graph::graphref::Authority) -> Result<(), RunError> {
+    for (name, entry) in &authority.definitions {
+        if !entry.inline {
+            Definition::parse(name, entry.value.clone())?;
+            continue;
         }
+        check_name(name)?;
+        let fields = entry
+            .value
+            .as_object()
+            .ok_or_else(|| bad(format!("agent {name}: definition must be an object")))?;
+        let cwd = match fields.get("cwd") {
+            None | Some(Value::Null) => false,
+            Some(Value::String(_)) => true,
+            Some(_) => return Err(bad(format!("agent {name}: cwd must be a string"))),
+        };
+        let worktree = match fields.get("worktree") {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(value)) => *value,
+            Some(_) => return Err(bad(format!("agent {name}: worktree must be a boolean"))),
+        };
+        if cwd && worktree {
+            return Err(bad(format!("agent {name}: use cwd or worktree, not both")));
+        }
+        check_execution(&authority.config, name)?;
+    }
+    Ok(())
+}
+
+/// Materialize the authored agent map from one pinned graph snapshot.
+/// File definitions replace legacy inline entries whole, just as in
+/// management reads; inline entries retain their authored values.
+pub fn authority_config(authority: &mdkg_graph::graphref::Authority) -> Result<Value, RunError> {
+    validate_authority(authority)?;
+    let mut config = authority.config.clone();
+    if !config.is_object() {
+        return Err(bad("agent configuration must be an object"));
+    }
+    for (name, entry) in &authority.definitions {
+        if entry.inline {
+            continue;
+        }
+        let definition = Definition::parse(name, entry.value.clone())?;
         let object = config
             .as_object_mut()
             .ok_or_else(|| bad("agent configuration must be an object"))?;
@@ -318,11 +503,38 @@ pub fn merge(root: &Path, config: &mut Value) -> Result<(), RunError> {
             .as_object_mut()
             .ok_or_else(|| bad("agents must be an object"))?
             .insert(
-                name.into(),
+                name.clone(),
                 serde_json::to_value(definition).map_err(|e| bad(e.to_string()))?,
             );
     }
-    Ok(())
+    Ok(config)
+}
+
+/// The `protect` list the graph authority gives `actor`, read from the
+/// graph ref in ref mode, never from a checkout's definition file (#11129).
+/// A positively absent checkout graph defines nobody, so it protects
+/// nothing extra; any other failure is an error, which a caller refuses on.
+pub fn committed_protect(root: &Path, actor: &str) -> Result<Vec<String>, RunError> {
+    let Some(authority) = crate::orchestration::authority_or_absent(root)? else {
+        return Ok(Vec::new());
+    };
+    let config = authority_config(&authority)?;
+    match config
+        .get("agents")
+        .and_then(|agents| agents.get(actor))
+        .and_then(|agent| agent.get("protect"))
+    {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(names)) => names
+            .iter()
+            .map(|name| {
+                name.as_str()
+                    .map(String::from)
+                    .ok_or_else(|| bad("an agent's protect list must hold branch names"))
+            })
+            .collect(),
+        Some(_) => Err(bad("an agent's protect list must be an array")),
+    }
 }
 
 /// Publish complete JSON atomically. Adding never overwrites a definition;
@@ -373,6 +585,259 @@ pub fn write(
 }
 
 #[cfg(test)]
+mod receipt_target_tests {
+    use super::*;
+
+    #[test]
+    fn committed_inline_definitions_are_validated_before_use() {
+        use mdkg_graph::graphref::{Authority, Def};
+
+        for harness in ["claude", "codex", "opencode"] {
+            let value = json!({"harness": harness, "role": "worker"});
+            let mut authority = Authority {
+                source: "graph:fixture".into(),
+                graph_ref: Some("refs/heads/mdkg-graph".into()),
+                commit: "fixture".into(),
+                graph_id: "fixture".into(),
+                config: json!({"agents": {"worker": value}}),
+                definitions: std::collections::BTreeMap::from([(
+                    "worker".into(),
+                    Def {
+                        blob: "fixture".into(),
+                        value: value.clone(),
+                        inline: true,
+                    },
+                )]),
+            };
+            validate_authority(&authority).unwrap();
+            for (field, invalid) in [
+                ("cwd", json!(42)),
+                ("worktree", json!("yes")),
+                ("follow", json!("always")),
+                ("extends", json!("elsewhere")),
+                ("mode", json!("manual")),
+                ("sandbox", json!(false)),
+                ("approvals", json!([])),
+            ] {
+                let mut invalid_value = value.clone();
+                invalid_value[field] = invalid;
+                authority.config["agents"]["worker"] = invalid_value.clone();
+                authority.definitions.get_mut("worker").unwrap().value = invalid_value;
+                assert!(validate_authority(&authority).is_err(), "{harness} {field}");
+            }
+            let both = json!({"cwd":"/worker", "worktree":true});
+            authority.config["agents"]["worker"] = both.clone();
+            authority.definitions.get_mut("worker").unwrap().value = both;
+            assert!(
+                validate_authority(&authority).is_err(),
+                "{harness} locations"
+            );
+
+            // A file replaces the invalid inline entry rather than layering
+            // it; only the surviving definition may govern the actor.
+            authority.definitions.insert(
+                "worker".into(),
+                Def {
+                    blob: "file".into(),
+                    value: json!({"schema":SCHEMA,"harness":harness,"role":"worker"}),
+                    inline: false,
+                },
+            );
+            let resolved = authority_config(&authority).unwrap();
+            assert_eq!(resolved["agents"]["worker"]["harness"], harness);
+            assert!(resolved["agents"]["worker"].get("cwd").is_none());
+        }
+    }
+
+    #[test]
+    fn optional_layers_cannot_change_or_remove_authority_fields() {
+        for harness in ["claude", "codex", "opencode"] {
+            let authored = json!({
+                "agents":{"worker":{
+                    "harness":harness,"role":"worker","reports_to":"lead",
+                    "protect":["main"],"placement":{"host":"one"},"follow":"notes",
+                    "cwd":"/original","worktree":false,"base":"main","model":"old"
+                }},
+                "orchestration":{"branch":"agent/{agent}","worktree":".worktrees/{agent}"}
+            });
+            for layer in [Layer::User, Layer::Local] {
+                for (field, changed) in [
+                    ("role", json!("reviewer")),
+                    ("reports_to", json!("other")),
+                    ("protect", json!([])),
+                    ("placement", json!({"host":"two"})),
+                    ("follow", json!("merge")),
+                    ("cwd", json!("/other")),
+                    ("worktree", json!(true)),
+                    ("base", json!("other")),
+                ] {
+                    let patch = Input::new(
+                        Origin::value(layer),
+                        json!({"agents":{"worker":{(field):changed}}}),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        check_authority_override(&authored, &patch)
+                            .unwrap_err()
+                            .code,
+                        "run.authority_override",
+                        "{harness} {layer:?} {field}"
+                    );
+                }
+                for field in ["branch", "worktree"] {
+                    let patch = Input::new(
+                        Origin::value(layer),
+                        json!({"orchestration":{(field):"other/{agent}"}}),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        check_authority_override(&authored, &patch)
+                            .unwrap_err()
+                            .code,
+                        "run.authority_override"
+                    );
+                }
+                for patch in [json!({"agents":null}), json!({"orchestration":null})] {
+                    let patch = Input::new(Origin::value(layer), patch).unwrap();
+                    assert_eq!(
+                        check_authority_override(&authored, &patch)
+                            .unwrap_err()
+                            .code,
+                        "run.authority_override"
+                    );
+                }
+                let allowed = Input::new(
+                    Origin::value(layer),
+                    json!({"agents":{"worker":{"role":"worker","model":"new"}}}),
+                )
+                .unwrap();
+                check_authority_override(&authored, &allowed).unwrap();
+                let inactive = Input::new(
+                    Origin::value(layer),
+                    json!({"agents":{"other":{"role":"reviewer","cwd":"/other"}}}),
+                )
+                .unwrap();
+                check_authority_override(&authored, &inactive).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn flags_cannot_change_a_committed_agent_but_can_create_an_ad_hoc_one() {
+        let authored = json!({"agents":{"worker":{"role":"worker","cwd":"/work"}}});
+        for patch in [
+            json!({"agents":{"worker":{"role":"reviewer"}}}),
+            json!({"agents":{"worker":{"cwd":"/other"}}}),
+            json!({"agents":null}),
+            json!({"orchestration":{"branch":"other/{agent}"}}),
+        ] {
+            let patch = Input::new(Origin::value(Layer::Flags), patch).unwrap();
+            assert_eq!(
+                check_authority_override(&authored, &patch)
+                    .unwrap_err()
+                    .code,
+                "run.authority_override"
+            );
+        }
+        for patch in [
+            json!({"agents":{"worker":{"role":"worker","model":"new"}}}),
+            json!({"agents":{"adhoc":{"role":"worker","cwd":"/adhoc"}}}),
+        ] {
+            let patch = Input::new(Origin::value(Layer::Flags), patch).unwrap();
+            check_authority_override(&authored, &patch).unwrap();
+        }
+    }
+
+    #[test]
+    fn follow_is_validated_for_each_harness() {
+        for harness in ["claude", "codex", "opencode"] {
+            let mut value = json!({"schema": SCHEMA, "harness": harness, "role": "worker"});
+            assert!(
+                Definition::parse("worker", value.clone())
+                    .unwrap()
+                    .follow
+                    .is_none()
+            );
+            for follow in ["notes", "merge"] {
+                value["follow"] = json!(follow);
+                assert_eq!(
+                    Definition::parse("worker", value.clone())
+                        .unwrap()
+                        .follow
+                        .as_deref(),
+                    Some(follow)
+                );
+                assert!(check_execution(&json!({"agents":{"worker":value}}), "worker").is_ok());
+            }
+            for invalid in [json!("always"), Value::Null, json!(true)] {
+                value["follow"] = invalid;
+                assert!(Definition::parse("worker", value.clone()).is_err());
+                assert!(check_execution(&json!({"agents":{"worker":value}}), "worker").is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn definitions_refuse_self_and_reserved_receipt_targets() {
+        let value = json!({"schema": SCHEMA, "harness": "codex", "role": "worker"});
+        assert_eq!(
+            Definition::parse("worker", value.clone())
+                .unwrap()
+                .reports_to,
+            "orchestrator"
+        );
+        assert!(
+            Definition::parse("orchestrator", value.clone()).is_err(),
+            "the omitted default must not report to itself"
+        );
+        for target in ["worker", "mdkg:receipts", "mdkg:other", "MDKG:receipts"] {
+            let mut invalid = value.clone();
+            invalid["reports_to"] = target.into();
+            assert!(Definition::parse("worker", invalid).is_err(), "{target}");
+        }
+        for name in ["mdkg:receipts", "MDKG:other"] {
+            assert!(Definition::parse(name, value.clone()).is_err());
+        }
+        let mut fixed = value;
+        fixed["reports_to"] = "lead".into();
+        assert_eq!(
+            Definition::parse("orchestrator", fixed).unwrap().reports_to,
+            "lead"
+        );
+    }
+
+    #[test]
+    fn stale_inline_receipt_targets_do_not_override_saved_state() {
+        let saved = state::resolve(
+            "worker",
+            None,
+            state::SpecFlags {
+                harness: Some(Harness::Codex),
+                role: Some(Role::Worker),
+                reports_to: Some("lead".into()),
+                ..Default::default()
+            },
+            Path::new("/repo/worker"),
+        )
+        .unwrap();
+        for target in [json!("worker"), json!("mdkg:receipts"), Value::Null] {
+            let config = json!({"agents": {"worker": {"reports_to": target}}});
+            // Legacy inline entries initialize new agents only. Execution
+            // validates the resolved spec, not these possibly stale fields.
+            check_execution(&config, "worker").unwrap();
+            let resolved = state::resolve(
+                "worker",
+                Some(saved.clone()),
+                state::SpecFlags::default(),
+                Path::new("/repo/worker"),
+            )
+            .unwrap();
+            assert_eq!(resolved.spec.reports_to, "lead");
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use mdkg_format::settings::{Environment, Origin};
@@ -386,12 +851,41 @@ mod tests {
                 std::env::temp_dir().join(format!("mdkg-agent-layers-{}", uuid::Uuid::now_v7()));
             fs::create_dir_all(&root).unwrap();
             let fixture = Self(fs::canonicalize(root).unwrap());
-            for dir in ["project/.git/objects", "project/.git/refs"] {
-                fs::create_dir_all(fixture.0.join(dir)).unwrap();
-            }
-            fixture.write("project/.git/HEAD", "ref: refs/heads/main\n");
-            fixture.write("project/.git/config", "[core]\n bare=false\n");
+            fs::create_dir_all(fixture.0.join("project")).unwrap();
+            fixture.git(&["init", "-q", "-b", "main"]);
             fixture
+        }
+        fn git(&self, args: &[&str]) {
+            let output = std::process::Command::new("git")
+                .current_dir(self.0.join("project"))
+                .env_clear()
+                .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+                .env("HOME", &self.0)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_ATTR_NOSYSTEM", "1")
+                .args([
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-c",
+                    "init.templateDir=",
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        fn commit_graph(&self) {
+            self.git(&["add", "--", ".mdkg"]);
+            self.git(&["commit", "-q", "-m", "fixture graph"]);
         }
         fn write(&self, path: &str, bytes: &str) -> PathBuf {
             let path = self.0.join(path);
@@ -404,6 +898,113 @@ mod tests {
         fn drop(&mut self) {
             fs::remove_dir_all(&self.0).unwrap();
         }
+    }
+
+    /// git.protect's list comes from the graph ref, whatever the agent's
+    /// checkout file says or whether it's there (#11129).
+    #[test]
+    fn the_protect_list_is_read_from_the_graph_ref_not_the_checkout_file() {
+        let f = Fixture::new();
+        let graph_id = "0192f3a0-0000-7000-8000-000000000000";
+        f.write(
+            "project/.mdkg/config.json",
+            &json!({"schema_version":3,"format_version":"0.7","graph_id":graph_id}).to_string(),
+        );
+        let file = f.write(
+            "project/.mdkg/agents/lane-a.json",
+            &json!({"schema":SCHEMA,"harness":"codex","role":"worker","protect":["release"]})
+                .to_string(),
+        );
+        f.commit_graph();
+        f.git(&["update-ref", "refs/heads/mdkg-graph", "HEAD"]);
+        f.git(&["config", "mdkg.graph.ref", "refs/heads/mdkg-graph"]);
+        f.git(&[
+            "config",
+            &format!("mdkg.graph.{graph_id}.ref"),
+            "refs/heads/mdkg-graph",
+        ]);
+        let root = f.0.join("project");
+        assert_eq!(committed_protect(&root, "lane-a").unwrap(), ["release"]);
+        // The agent empties its own uncommitted file, then deletes it.
+        fs::write(
+            &file,
+            json!({"schema":SCHEMA,"harness":"codex","role":"worker"}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(committed_protect(&root, "lane-a").unwrap(), ["release"]);
+        fs::remove_file(&file).unwrap();
+        assert_eq!(committed_protect(&root, "lane-a").unwrap(), ["release"]);
+        assert!(committed_protect(&root, "nobody").unwrap().is_empty());
+        // An unreadable graph ref is an error, never an empty list.
+        f.git(&["update-ref", "-d", "refs/heads/mdkg-graph"]);
+        assert!(committed_protect(&root, "lane-a").is_err());
+    }
+
+    #[test]
+    fn each_optional_authority_override_is_refused_before_layer_merging() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "project/.mdkg/config.json",
+            &json!({
+                "schema_version":3, "format_version":"0.7",
+                "graph_id":"0192f3a0-0000-7000-8000-000000000000",
+                "agents":{"worker":{"role":"worker","model":"project"}}
+            })
+            .to_string(),
+        );
+        let user = fixture.write(
+            "home/.config/mdkg/config.json",
+            &json!({"agents":{"worker":{"role":"reviewer"}}}).to_string(),
+        );
+        let local = fixture.write(
+            "project/.git/mdkg/config.local.json",
+            &json!({"agents":{"worker":{"role":"worker"}}}).to_string(),
+        );
+        let root = fixture.0.join("project");
+        let home = fixture.0.join("home");
+        fixture.commit_graph();
+        let authority = crate::orchestration::authority(&root).unwrap();
+        let project = Project::from_authority(
+            &authority,
+            &root,
+            Environment {
+                home: Some(&home),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            resolve_layers(&project, &[], None, None)
+                .unwrap_err()
+                .to_string()
+                .contains("User layer changes committed role")
+        );
+        fs::write(
+            user,
+            json!({"agents":{"worker":{"model":"user"}}}).to_string(),
+        )
+        .unwrap();
+        fs::write(
+            &local,
+            json!({"agents":{"worker":{"role":"reviewer"}}}).to_string(),
+        )
+        .unwrap();
+        assert!(
+            resolve_layers(&project, &[], None, None)
+                .unwrap_err()
+                .to_string()
+                .contains("Local layer changes committed role")
+        );
+        fs::write(
+            local,
+            json!({"agents":{"worker":{"model":"local"}}}).to_string(),
+        )
+        .unwrap();
+        let resolved = resolve_layers(&project, &[], None, None).unwrap();
+        assert_eq!(
+            resolved.effective.values["agents"]["worker"]["model"],
+            "local"
+        );
     }
 
     #[test]
@@ -442,7 +1043,11 @@ mod tests {
         );
         let root = fixture.0.join("project");
         let home = fixture.0.join("home");
-        let project = Project::capture(
+        fixture.commit_graph();
+        let authority = crate::orchestration::authority(&root).unwrap();
+        let source = PathBuf::from(&authority.source);
+        let project = Project::from_authority(
+            &authority,
             &root,
             Environment {
                 home: Some(&home),
@@ -450,7 +1055,7 @@ mod tests {
             },
         )
         .unwrap();
-        let definitions = layer_inputs(&root).unwrap();
+        let definitions = authority_layer_inputs(&authority).unwrap();
 
         // Management still sees authored file values, never optional overrides.
         let authored = crate::orchestration::load_agent_config(&root).unwrap();
@@ -483,7 +1088,7 @@ mod tests {
         );
         assert_eq!(
             out.origins["/agents/astra/harness"].path.as_ref(),
-            Some(&file_path)
+            Some(&source)
         );
         assert_eq!(
             out.origins["/agents/astra/model"].path.as_ref(),
@@ -496,7 +1101,7 @@ mod tests {
         for (layer, path, model) in [
             (Layer::User, &user_path, "candidate-user"),
             (Layer::Local, &local_path, "candidate-local"),
-            (Layer::Project, &project_path, "user-model"),
+            (Layer::Project, &source, "user-model"),
         ] {
             let value = if layer == Layer::Project {
                 let mut value = project_value.clone();

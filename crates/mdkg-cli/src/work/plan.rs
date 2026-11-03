@@ -167,7 +167,26 @@ pub fn validate(root: &Path) -> Result<(), GraphError> {
     Ok(())
 }
 
+/// `work localize` converts a checkout's shared work; in ref mode the
+/// graph is the graph ref, whose cache can't be swapped, so 0.7.1 refuses
+/// it there (orchestrator #6595; a known limit).
+pub fn refuse_ref_mode(repo: &Repo) -> Result<(), GraphError> {
+    if repo.mode.is_none() {
+        return Ok(());
+    }
+    Err(crate::coord::graph_git::graph_error(
+        "graph.unsupported",
+        "work localize doesn't run on a graph on the graph ref in 0.7.1",
+    )
+    .with_hint(format!(
+        "run it in checkout mode before `{} install` moves the clone to the graph ref; a new \
+         ref-mode graph already keeps work local",
+        crate::BIN
+    )))
+}
+
 pub fn build(repo: &Repo) -> Result<Plan, GraphError> {
+    refuse_ref_mode(repo)?;
     let root = fs::canonicalize(&repo.root)
         .map_err(|e| GraphError::failure(Code::IoReadFailed, e.to_string()))?;
     let cfg = config::load(&root)?;

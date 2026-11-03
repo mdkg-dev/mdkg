@@ -4,6 +4,7 @@
 #![allow(dead_code)]
 
 pub mod temp;
+pub mod template;
 
 use std::fs;
 use std::path::Path;
@@ -44,12 +45,13 @@ pub fn agent_turn_args(root: &Path, args: &[&str]) -> Vec<String> {
     if !watch {
         out.push("--once".into());
     }
-    let path = root.join(".mdkg/agents").join(format!("{name}.json"));
+    let graph = fixture_authority_root(root);
+    let path = graph.join(".mdkg/agents").join(format!("{name}.json"));
     let mut definition: Value = fs::read(&path)
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .or_else(|| {
-            fs::read(root.join(".mdkg/config.json"))
+            fs::read(graph.join(".mdkg/config.json"))
                 .ok()
                 .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
                 .and_then(|v| v.get("agents").and_then(|a| a.get(name)).cloned())
@@ -111,12 +113,98 @@ pub fn agent_turn_args(root: &Path, args: &[&str]) -> Vec<String> {
         fs::create_dir_all(path.parent().expect("definition parent"))
             .expect("fixture definition folder");
         fs::write(
-            path,
+            &path,
             serde_json::to_vec_pretty(&definition).expect("definition JSON"),
         )
         .expect("fixture definition");
+        commit_fixture_definition(&graph, &path);
     }
     out
+}
+
+/// A fixture's git, isolated from the caller's repository, config and hooks.
+fn fixture_git(dir: &Path, args: &[&str]) -> std::process::Output {
+    let mut command = Command::new("git");
+    for (name, _) in std::env::vars_os() {
+        if name.to_string_lossy().starts_with("GIT_") {
+            command.env_remove(name);
+        }
+    }
+    command
+        .arg("-C")
+        .arg(dir)
+        .args(["-c", "core.hooksPath=/dev/null", "-c", "user.name=Test"])
+        .args(["-c", "user.email=test@example.invalid"])
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .expect("git runs")
+}
+
+/// Where `root`'s graph authority is committed: the same folder in the
+/// repository's registered graph checkout (`mdkg.graph.<id>.worktree`, a
+/// linked worktree's name), else `root` itself.
+fn fixture_authority_root(root: &Path) -> std::path::PathBuf {
+    let text = |args: &[&str]| {
+        let out = fixture_git(root, args);
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+    };
+    let (Some(top), Some(common)) = (
+        text(&["rev-parse", "--show-toplevel"]),
+        text(&["rev-parse", "--path-format=absolute", "--git-common-dir"]),
+    ) else {
+        return root.to_path_buf();
+    };
+    let registered = text(&["config", "--get-regexp", r"^mdkg\.graph\..*\.worktree$"]);
+    // The linked worktree's `gitdir` names its `.git` file.
+    let checkout = registered
+        .as_deref()
+        .and_then(|lines| lines.lines().next())
+        .and_then(|line| line.split_once(' '))
+        .and_then(|(_, name)| {
+            fs::read_to_string(
+                Path::new(&common)
+                    .join("worktrees")
+                    .join(name)
+                    .join("gitdir"),
+            )
+            .ok()
+        })
+        .and_then(|gitdir| Path::new(gitdir.trim()).parent().map(Path::to_path_buf));
+    let (Some(checkout), Ok(top), Ok(real)) =
+        (checkout, fs::canonicalize(&top), fs::canonicalize(root))
+    else {
+        return root.to_path_buf();
+    };
+    match real.strip_prefix(&top) {
+        Ok(relative) if checkout.is_dir() => checkout.join(relative),
+        _ => root.to_path_buf(),
+    }
+}
+
+/// Agent definitions are read only from committed authority, so a fixture
+/// definition is committed like any other deliberate setup. Outside a Git
+/// checkout it stays a file, and the command reports that itself.
+fn commit_fixture_definition(root: &Path, path: &Path) {
+    let git = |args: &[&str]| fixture_git(root, args);
+    if !git(&["rev-parse", "--is-inside-work-tree"])
+        .status
+        .success()
+    {
+        return;
+    }
+    let path = path.to_str().expect("UTF-8 fixture path");
+    let added = git(&["add", "--", path]);
+    assert!(added.status.success(), "{added:?}");
+    // An unchanged definition has nothing to commit.
+    let staged = git(&["diff", "--cached", "--quiet", "--", path]);
+    if staged.status.code() == Some(1) {
+        let committed = git(&["commit", "-q", "-m", "fixture definition", "--", path]);
+        assert!(committed.status.success(), "{committed:?}");
+    }
 }
 
 /// Validate the actual event envelopes, then expose the one turn's data to
@@ -167,194 +255,15 @@ pub fn rerun_without_launcher_env(test: &str) -> bool {
     true
 }
 
-/// The keywords the generated schemas use. Anything else fails the check,
-/// so a schemars upgrade that emits new keywords can't pass unchecked.
-const KEYWORDS: &[&str] = &[
-    "type",
-    "properties",
-    "required",
-    "additionalProperties",
-    "items",
-    "enum",
-    "const",
-    "anyOf",
-    "oneOf",
-    "minimum",
-    "minLength",
-    "prefixItems",
-    "minItems",
-    "maxItems",
-    "$ref",
-    "description",
-    // Annotation only: an omitted input field's default value.
-    "default",
-    "format",
-    "title",
-    "$schema",
-    "$defs",
-    // An annotation: the lease-authority contract a build speaks.
-    "x-mdkg-lease-authority",
-];
+#[path = "../../../../conformance/api-v1/schema.rs"]
+pub mod api_schema;
+pub use api_schema::check;
 
 pub fn schema(command: &str) -> Value {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../schemas")
         .join(format!("mdkg.{command}.v1.json"));
     serde_json::from_slice(&fs::read(&path).expect("schema file")).expect("schema JSON")
-}
-
-/// Checks `value` against the subset of JSON Schema the generated schemas
-/// use: `type`, `properties`, `required`, `additionalProperties`, `items`,
-/// `prefixItems` (tuples), `minItems`, `maxItems`, `enum`, `const`, `anyOf`,
-/// `oneOf`, `minimum` and local `$ref`s. Pushes one line per violation.
-pub fn check(root: &Value, schema: &Value, value: &Value, at: &str, errors: &mut Vec<String>) {
-    let Some(rules) = schema.as_object() else {
-        if schema != &Value::Bool(true) {
-            errors.push(format!("{at}: schema isn't an object: {schema}"));
-        }
-        return;
-    };
-    for key in rules.keys() {
-        if !KEYWORDS.contains(&key.as_str()) {
-            errors.push(format!("{at}: unsupported schema keyword {key}"));
-        }
-    }
-    if let Some(r) = rules.get("$ref").and_then(Value::as_str) {
-        match r
-            .strip_prefix("#/$defs/")
-            .and_then(|name| root["$defs"].get(name))
-        {
-            Some(target) => check(root, target, value, at, errors),
-            None => errors.push(format!("{at}: unresolved $ref {r}")),
-        }
-        return;
-    }
-    if let Some(any) = rules.get("anyOf").and_then(Value::as_array) {
-        let fits = any.iter().any(|s| {
-            let mut e = Vec::new();
-            check(root, s, value, at, &mut e);
-            e.is_empty()
-        });
-        if !fits {
-            errors.push(format!("{at}: matches no anyOf branch"));
-        }
-    }
-    if let Some(one) = rules.get("oneOf").and_then(Value::as_array) {
-        let fitting = one
-            .iter()
-            .filter(|s| {
-                let mut e = Vec::new();
-                check(root, s, value, at, &mut e);
-                e.is_empty()
-            })
-            .count();
-        if fitting != 1 {
-            errors.push(format!(
-                "{at}: matches {fitting} oneOf branches, not exactly one"
-            ));
-        }
-    }
-    if let Some(t) = rules.get("type") {
-        let types: Vec<&str> = match t {
-            Value::String(s) => vec![s.as_str()],
-            Value::Array(a) => a.iter().filter_map(Value::as_str).collect(),
-            _ => Vec::new(),
-        };
-        let ok = types.iter().any(|t| match *t {
-            "object" => value.is_object(),
-            "array" => value.is_array(),
-            "string" => value.is_string(),
-            "boolean" => value.is_boolean(),
-            "null" => value.is_null(),
-            "integer" => value.is_i64() || value.is_u64(),
-            "number" => value.is_number(),
-            _ => false,
-        });
-        if !ok {
-            errors.push(format!("{at}: expected {types:?}, got {value}"));
-            return;
-        }
-    }
-    if let Some(c) = rules.get("const")
-        && c != value
-    {
-        errors.push(format!("{at}: expected {c}, got {value}"));
-    }
-    if let Some(e) = rules.get("enum").and_then(Value::as_array)
-        && !e.contains(value)
-    {
-        errors.push(format!("{at}: {value} isn't one of the enum values"));
-    }
-    if let (Some(min), Some(n)) = (rules.get("minimum").and_then(Value::as_f64), value.as_f64())
-        && n < min
-    {
-        errors.push(format!("{at}: {n} is below {min}"));
-    }
-    if let (Some(min), Some(text)) = (
-        rules.get("minLength").and_then(Value::as_u64),
-        value.as_str(),
-    ) && (text.chars().count() as u64) < min
-    {
-        errors.push(format!("{at}: shorter than minLength"));
-    }
-    if let Some(map) = value.as_object() {
-        for key in rules
-            .get("required")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-        {
-            if !map.contains_key(key) {
-                errors.push(format!("{at}: missing required {key}"));
-            }
-        }
-        let props = rules.get("properties").and_then(Value::as_object);
-        for (key, v) in map {
-            match props.and_then(|p| p.get(key)) {
-                Some(s) => check(root, s, v, &format!("{at}.{key}"), errors),
-                None => match rules.get("additionalProperties") {
-                    Some(Value::Bool(false)) => {
-                        errors.push(format!("{at}: unexpected property {key}"));
-                    }
-                    Some(s @ Value::Object(_)) => check(root, s, v, &format!("{at}.{key}"), errors),
-                    _ => {}
-                },
-            }
-        }
-    }
-    if let Some(list) = value.as_array() {
-        if let Some(tuple) = rules.get("prefixItems").and_then(Value::as_array) {
-            for (i, (s, v)) in tuple.iter().zip(list).enumerate() {
-                check(root, s, v, &format!("{at}[{i}]"), errors);
-            }
-        }
-        let len = list.len() as u64;
-        if rules
-            .get("minItems")
-            .and_then(Value::as_u64)
-            .is_some_and(|n| len < n)
-        {
-            errors.push(format!("{at}: fewer than minItems items"));
-        }
-        if rules
-            .get("maxItems")
-            .and_then(Value::as_u64)
-            .is_some_and(|n| len > n)
-        {
-            errors.push(format!("{at}: more than maxItems items"));
-        }
-    }
-    if let (Some(items), Some(list)) = (rules.get("items"), value.as_array()) {
-        // After a tuple's prefix, as JSON Schema 2020-12 has it.
-        let skip = rules
-            .get("prefixItems")
-            .and_then(Value::as_array)
-            .map_or(0, Vec::len);
-        for (i, v) in list.iter().enumerate().skip(skip) {
-            check(root, items, v, &format!("{at}[{i}]"), errors);
-        }
-    }
 }
 
 pub fn conforms(command: &str, envelope: &Value) {
