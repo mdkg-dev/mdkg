@@ -24,6 +24,17 @@ env:
      (command -v yum >/dev/null && yum install -y git) ||
      (command -v apk >/dev/null && apk add --no-cache git)) &&
     git config --global --add safe.directory '*'
+  # FIDO2 person keys (crates/mdkg-presence) build hidapi's hidraw backend
+  # against libudev, found by pkg-config, on Linux gnu. manylinux_2_28 is
+  # AlmaLinux 8, where systemd-devel carries libudev.pc; maturin's
+  # auditwheel repair copies libudev.so.1 into the wheel (it isn't on the
+  # manylinux allow-list). musllinux wheels leave FIDO2 out (no static
+  # libudev for musl), so they need neither.
+  LIBUDEV_IN_CONTAINER: >-
+    if command -v dnf >/dev/null; then dnf install -y systemd-devel pkgconf-pkg-config;
+    elif command -v yum >/dev/null; then yum install -y systemd-devel pkgconfig;
+    else apt-get update && apt-get install -y libudev-dev pkg-config; fi &&
+    pkg-config --exists libudev
 
 jobs:
   wheels:
@@ -34,8 +45,8 @@ jobs:
         include:
           - { runner: macos-14, target: aarch64-apple-darwin }
           - { runner: macos-15-intel, target: x86_64-apple-darwin }
-          - { runner: ubuntu-22.04, target: x86_64-unknown-linux-gnu, manylinux: "2_28" }
-          - { runner: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu, manylinux: "2_28" }
+          - { runner: ubuntu-22.04, target: x86_64-unknown-linux-gnu, manylinux: "2_28", libudev: true }
+          - { runner: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu, manylinux: "2_28", libudev: true }
           - { runner: ubuntu-22.04, target: x86_64-unknown-linux-musl, manylinux: musllinux_1_2 }
           - { runner: ubuntu-22.04-arm, target: aarch64-unknown-linux-musl, manylinux: musllinux_1_2 }
     runs-on: ${{ matrix.runner }}
@@ -47,7 +58,8 @@ jobs:
         with:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux || 'auto' }}
-          before-script-linux: ${{ env.GIT_IN_CONTAINER }}
+          before-script-linux: >-
+            ${{ env.GIT_IN_CONTAINER }}${{ matrix.libudev && format(' && {{ {0}; }}', env.LIBUDEV_IN_CONTAINER) || '' }}
           args: --release --locked --out dist
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

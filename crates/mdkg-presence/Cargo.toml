@@ -30,10 +30,11 @@ rustix = { workspace = true, features = ["process"] }
 # workspace's approved safe wrapper.
 nix.workspace = true
 
-# FIDO2 over USB HID on macOS and Linux (decided 2026-10-29). On Linux its
-# hidapi builds against libudev, found by pkg-config: building needs
-# pkg-config and libudev-dev.
-[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
+# FIDO2 over USB HID on macOS and Linux gnu (decided 2026-10-29). On Linux
+# its hidapi builds against libudev, found by pkg-config: building needs
+# pkg-config and libudev-dev. musl builds go without (no static libudev for
+# musl; decided 2026-11-03): their FIDO2 backend refuses with api.unsupported.
+[target.'cfg(any(target_os = "macos", all(target_os = "linux", not(target_env = "musl"))))'.dependencies]
 ctap-hid-fido2.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]

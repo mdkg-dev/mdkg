@@ -44,3 +44,10 @@ github-attestations = true
 # The dependencies' license notices go in every archive, beside LICENSE
 # (scripts/third-party-notices.py writes them).
 include = ["THIRD_PARTY_NOTICES.md"]
+
+# FIDO2 person keys (crates/mdkg-presence) build hidapi's hidraw backend
+# against libudev, found by pkg-config, on Linux gnu. musl builds leave
+# FIDO2 out (there's no static libudev for musl), so they need neither.
+# .github/build-setup.yml installs both non-interactively on the gnu
+# runners; `[dist.dependencies.apt]` would run apt-get install without -y.
+github-build-setup = "../build-setup.yml"

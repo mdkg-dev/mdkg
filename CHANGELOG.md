@@ -205,6 +205,9 @@
   still exceed ordinary mail limits. Full local receipts are limited to
   4 MiB; rendering above that cap fails before a local receipt is saved.
   See [agent operation](docs/agents.md) for behavior details.
+- Linux musl builds (the static binaries, and musllinux wheels) have no
+  FIDO2 person keys; use a gnu (glibc) build, Homebrew or the macOS build
+  for them.
 
 ### Not in 0.7.1
 

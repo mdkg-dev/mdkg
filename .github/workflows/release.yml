@@ -129,6 +129,12 @@ jobs:
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
             echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           fi
+      - name: "Install libudev and pkg-config (Linux gnu)"
+        if: "runner.os == 'Linux' && !contains(join(matrix.targets, ','), 'musl')"
+        run: "sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev pkg-config"
+      - name: "Install musl-tools (Linux musl)"
+        if: "runner.os == 'Linux' && contains(join(matrix.targets, ','), 'musl')"
+        run: "sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools"
       - name: Install dist
         run: cargo install cargo-dist --version 0.32.0 --locked
       # Get the dist-manifest

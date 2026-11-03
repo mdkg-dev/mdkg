@@ -146,11 +146,23 @@ impl fmt::Display for Fido2Error {
 
 impl std::error::Error for Fido2Error {}
 
+/// What to do instead on a build without a FIDO2 transport. A Linux musl
+/// build (the static binaries and musllinux wheels) has none: hidapi's
+/// hidraw backend needs libudev, which has no static build for musl.
+#[cfg(all(target_os = "linux", target_env = "musl"))]
+const UNSUPPORTED_HINT: &str = "this build has no FIDO2 support: musl builds can't use FIDO2 \
+     person keys; use a gnu (glibc) build, Homebrew or the macOS build, or a machine-grade \
+     file key with --allow-file-key";
+#[cfg(not(all(target_os = "linux", target_env = "musl")))]
+const UNSUPPORTED_HINT: &str =
+    "enrol a Secure Enclave key (macOS), or a machine-grade file key with --allow-file-key";
+
 /// The diagnostic for a FIDO2 error.
 pub fn diagnostic(e: &Fido2Error) -> Box<Diagnostic> {
     let d = match e {
-        Fido2Error::Unsupported => Diagnostic::error(Code::ApiUnsupported, e.to_string())
-            .with_hint("enrol a Secure Enclave key (macOS), or a machine-grade file key with --allow-file-key"),
+        Fido2Error::Unsupported => {
+            Diagnostic::error(Code::ApiUnsupported, e.to_string()).with_hint(UNSUPPORTED_HINT)
+        }
         Fido2Error::NoDevice | Fido2Error::MultipleDevices => {
             Diagnostic::error(Code::ApiPersonSignatureRequired, e.to_string())
                 .with_hint("plug in exactly one security key: the one you enrolled")
@@ -169,7 +181,10 @@ pub fn diagnostic(e: &Fido2Error) -> Box<Diagnostic> {
             Diagnostic::error(Code::ApiPersonSignatureRequired, e.to_string())
         }
         Fido2Error::NoCredential => Diagnostic::error(Code::ApiPersonUnknown, e.to_string())
-            .with_hint(format!("plug in the key you enrolled, or enrol this one with `{} person enroll`", mdkg_format::program::BIN)),
+            .with_hint(format!(
+                "plug in the key you enrolled, or enrol this one with `{} person enroll`",
+                mdkg_format::program::BIN
+            )),
         Fido2Error::Failed(_) => Diagnostic::error(Code::IoReadFailed, e.to_string()),
     };
     Box::new(d)
@@ -806,7 +821,13 @@ impl Signer for Fido2Key {
 
 /// How a request to the key verifies its user.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+#[cfg_attr(
+    not(any(
+        target_os = "macos",
+        all(target_os = "linux", not(target_env = "musl"))
+    )),
+    allow(dead_code)
+)]
 enum Verification<'a> {
     /// Presence only.
     Skip,
@@ -820,7 +841,13 @@ enum Verification<'a> {
 /// for its PIN on every operation (alwaysUv, or PIN-protected creation)
 /// refuses without it (Terra #8056 9). Without a PIN, `uv` asks the key
 /// for its built-in verification, and `up` asks for presence alone.
-#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+#[cfg_attr(
+    not(any(
+        target_os = "macos",
+        all(target_os = "linux", not(target_env = "musl"))
+    )),
+    allow(dead_code)
+)]
 fn verification(uv: bool, pin: Option<&str>) -> Verification<'_> {
     match (uv, pin) {
         (_, Some(pin)) => Verification::Pin(pin),
@@ -829,16 +856,19 @@ fn verification(uv: bool, pin: Option<&str>) -> Verification<'_> {
     }
 }
 
-/// The platform's FIDO2 transport: USB HID on macOS and Linux (where
+/// The platform's FIDO2 transport: USB HID on macOS and Linux gnu (where
 /// opening the key needs a udev rule or group access to its hidraw
-/// device), and [`Fido2Error::Unsupported`] elsewhere. `pin` is the key's
+/// device), and [`Fido2Error::Unsupported`] elsewhere, Linux musl included. `pin` is the key's
 /// PIN, for a `uv` policy on a key without a biometric; it is held in
 /// memory only.
 pub fn platform(pin: Option<String>) -> Box<dyn Fido2Backend> {
     Box::new(hid::Hid::new(pin))
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(
+    target_os = "macos",
+    all(target_os = "linux", not(target_env = "musl"))
+))]
 mod hid {
     use ctap_hid_fido2::fidokey::{
         CredentialSupportedKeyType, GetAssertionArgsBuilder, MakeCredentialArgsBuilder,
@@ -967,7 +997,10 @@ mod hid {
     }
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(
+    target_os = "macos",
+    all(target_os = "linux", not(target_env = "musl"))
+)))]
 mod hid {
     use super::{Assertion, Fido2Backend, Fido2Error, MadeCredential};
 
@@ -1358,6 +1391,27 @@ pub(crate) mod tests {
         assert_eq!(verification(true, Some("1234")), Verification::Pin("1234"));
         assert_eq!(verification(true, None), Verification::BuiltIn);
         assert_eq!(verification(false, None), Verification::Skip);
+    }
+
+    /// A musl build has no FIDO2 transport: the platform backend refuses
+    /// with the stable api.unsupported code and a hint naming the builds
+    /// that have one.
+    #[cfg(all(target_os = "linux", target_env = "musl"))]
+    #[test]
+    fn musl_build_refuses_fido2_with_a_hint() {
+        let hid = platform(None);
+        assert_eq!(
+            hid.make_credential(RP_ID, b"challenge", true),
+            Err(Fido2Error::Unsupported)
+        );
+        assert_eq!(
+            hid.get_assertion(RP_ID, b"challenge", b"credential", true),
+            Err(Fido2Error::Unsupported)
+        );
+        let d = diagnostic(&Fido2Error::Unsupported);
+        assert_eq!(d.code, Code::ApiUnsupported);
+        let hint = d.hint.as_deref().expect("hint");
+        assert!(hint.contains("musl") && hint.contains("gnu"), "{hint}");
     }
 
     #[test]

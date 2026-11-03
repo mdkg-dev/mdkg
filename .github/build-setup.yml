@@ -1,0 +1,13 @@
+# Extra steps dist splices into release.yml's build-local-artifacts job
+# (dist-workspace.toml's github-build-setup). FIDO2 person keys build
+# hidapi's hidraw backend against libudev, found by pkg-config, on Linux
+# gnu; musl builds leave FIDO2 out and need neither.
+- name: Install libudev and pkg-config (Linux gnu)
+  if: runner.os == 'Linux' && !contains(join(matrix.targets, ','), 'musl')
+  run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev pkg-config
+# dist's own musl-tools install (its packages_install) runs apt-get
+# install without -y; installing it here first leaves that step nothing
+# to ask about.
+- name: Install musl-tools (Linux musl)
+  if: runner.os == 'Linux' && contains(join(matrix.targets, ','), 'musl')
+  run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
