@@ -74,7 +74,7 @@ glibc and musl. Windows and the PowerShell installer are not built yet
      `CARGO_REGISTRY_TOKEN` secret, run `cargo logout` and revoke the
      local API tokens that can publish these crates.
 6. Optionally, protect `main` and require the CI workflow's checks
-   (`check (ubuntu-24.04)` and `check (macos-14)`). With that rule, a
+   (`check (ubuntu-24.04)` and `check (macos-15)`). With that rule, a
    commit reaches `main` only once both have passed on it; see "Updating
    public main".
 7. **The `gh` login** that pushes the release needs the `workflow`
@@ -247,7 +247,7 @@ would start a new graph, with a new identity, beside it.
    GitHub no-reply address).
 
 3. **Run CI on the branch.** With `main` protected, a commit reaches it
-   only after `check (ubuntu-24.04)` and `check (macos-14)` have passed
+   only after `check (ubuntu-24.04)` and `check (macos-15)` have passed
    on that commit. CI runs on pushes to `main` and on pull requests, so
    start it by hand on the branch. This is the release's Linux gate:
 

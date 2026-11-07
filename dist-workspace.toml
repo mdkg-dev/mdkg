@@ -51,3 +51,8 @@ include = ["THIRD_PARTY_NOTICES.md"]
 # .github/build-setup.yml installs both non-interactively on the gnu
 # runners; `[dist.dependencies.apt]` would run apt-get install without -y.
 github-build-setup = "../build-setup.yml"
+
+# GitHub retired the macos-14 runner, dist's default for aarch64-apple-darwin.
+# macos-15 is GitHub's arm64 macOS 15 image.
+[dist.github-custom-runners]
+aarch64-apple-darwin = "macos-15"
