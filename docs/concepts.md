@@ -265,7 +265,16 @@ A claim of a shared path succeeds beside the others' and warns
 `coord.lease_shared` with their names, so you can tell them what you
 change. Their edits then meet in git: two branches that add a line at
 the same spot (the end of a list, under the same heading) conflict, and
-whoever merges second resolves it. Sharing works only between shared
+whoever merges second resolves it. To see that coming, a claim of a
+shared path and `mdkg status` compare your branch head with each
+co-holder's (`git merge-tree`, committed work only; a co-holder is found
+by a worktree named after it) and warn `coord.merge_conflict` with the
+files that would conflict. It's advice, never a refusal, and it can miss
+or over-report: it reads no `.gitattributes`, so custom merge attributes
+aren't applied, and it doesn't run at all while git config defines a
+merge driver (`merge.<name>.driver`), so no configured command ever
+runs. `mdkg --read-only status` skips the check, since `git merge-tree`
+writes git objects; there, no warning doesn't mean a clean merge. Sharing works only between shared
 leases: a claim with `--exclusive` still keeps the path to one actor,
 and a lease on a folder around it (`docs` around a shared
 `docs/commands.md`) is exclusive, so it blocks the shared claims and
@@ -293,7 +302,21 @@ it lapses when its time is up. Claiming it again keeps it, and so does
 editing it before she renews: before she edits a file she committed
 earlier, she claims it again. Two branches can then both change a file
 one of them committed, and git settles it when the second one merges,
-as for shared paths. Node, role and turn leases renew as before. `mdkg status` marks a clean lease past that first quarter `idle`
+as for shared paths. Node, role and turn leases renew as before.
+
+A lease she has committed she can give up at once: `mdkg release
+--committed` releases each of her path leases whose path she committed
+herself since claiming it (a commit in her worktree, never a
+fast-forward, merge or pull) and that has nothing left uncommitted
+(ignored files, hidden index entries and submodules count as open work),
+with no wait for the first quarter. It lists each path lease it kept and
+why: `uncommitted`, `not_committed` (no commit of hers since the claim)
+or `unknown`. Nothing releases a lease at commit by itself. It runs only
+in her own worktree (her actor is its folder's name), on this
+repository's own store: a lease held through a lease authority keeps its
+term until she releases it by path. `mdkg status` and `mdkg
+holds` show each lease's age and whether its paths are clean (`clean`)
+and committed (`committed`). `mdkg status` marks a clean lease past that first quarter `idle`
 when no turn of its owner's (`run:<owner>`) is running, since nobody is
 working in it, and suggests `mdkg release <path>`. It looks for another
 owner's changes in the worktree named after that owner (an actor's

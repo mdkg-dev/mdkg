@@ -443,6 +443,16 @@ impl Stream {
         validate_event(&value);
         value
     }
+    /// The next frame other than the head event each stream sends when it
+    /// starts (and on each move).
+    fn next_but_head(&self) -> Value {
+        loop {
+            let value = self.next();
+            if value["type"] != "mdkg.graph.head_changed" {
+                return value;
+            }
+        }
+    }
     fn stop(&mut self, signal: rustix::process::Signal) -> i32 {
         let pid = rustix::process::Pid::from_raw(self.child.id() as i32).expect("fixture value");
         rustix::process::kill_process(pid, signal).expect("fixture value");
@@ -556,7 +566,10 @@ fn watch_store_absence_preserves_legacy_artifacts() {
         assert_eq!(diagnostic["code"], "coord.store_failed");
         let message = diagnostic["message"].as_str().expect("error message");
         assert!(message.contains("absent"), "{kind}: {message}");
-        assert!(message.contains("msg inbox"), "{message}");
+        assert!(!message.contains("msg inbox"), "{message}");
+        let hint = diagnostic["hint"].as_str().expect("a hint");
+        assert!(hint.contains("msg inbox"), "{kind}: {hint}");
+        assert!(hint.contains("--root "), "{kind}: {hint}");
         let after = store_files(&path);
         if kind == "header" {
             // Read-only SQLite can maintain WAL-index caches (contract B).
@@ -683,7 +696,13 @@ fn watch_store_hot_journal_errors_advise_writer_recovery() {
     assert_eq!(diagnostic["code"], "coord.store_failed");
     let message = diagnostic["message"].as_str().expect("error message");
     assert!(message.contains("journal recovery"), "{message}");
-    assert!(message.contains("msg inbox"), "{message}");
+    // The store's message names no command; the hint says what to run,
+    // with the --root it reads (#17360).
+    assert!(!message.contains("msg inbox"), "{message}");
+    let hint = diagnostic["hint"].as_str().expect("a hint");
+    assert!(hint.contains("msg inbox"), "{hint}");
+    assert!(hint.contains("--root "), "{hint}");
+    assert!(!hint.contains("--read-only"), "{hint}");
     assert_eq!(store_files(&path), before);
     drop(
         mdkg_coord_sqlite::Store::open_with(&path, 60_000, mdkg_coord_sqlite::Upgrade::Refuse)
@@ -839,6 +858,100 @@ fn a_second_signal_ends_a_watch_blocked_on_a_stalled_reader() {
     drop(stdout);
 }
 
+impl Fixture {
+    fn git_head(&self) -> String {
+        let out = self
+            .isolated(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&self.repo)
+                    .args(["rev-parse", "HEAD"]),
+            )
+            .output()
+            .expect("git");
+        String::from_utf8(out.stdout)
+            .expect("utf-8")
+            .trim()
+            .to_owned()
+    }
+}
+
+fn head_event(stream: &Stream, graph: &str) -> Value {
+    let event = stream
+        .lines
+        .recv_timeout(Duration::from_secs(60))
+        .expect("a head_changed event")
+        .expect("stream JSON");
+    validate_event(&event);
+    assert_eq!(event["type"], "mdkg.graph.head_changed", "{event}");
+    assert_eq!(event["durable"], false);
+    assert_eq!(event["data"]["graph"], graph);
+    assert_eq!(
+        event["subjects"],
+        json!([format!("/v1/graphs/{graph}")]),
+        "{event}"
+    );
+    event
+}
+
+/// The stream names the head it starts from, so a client that waits for
+/// it misses no move after; then each move is announced once (Terra
+/// #19918).
+#[test]
+fn a_watch_names_the_checkouts_head_at_its_start_and_each_move_once() {
+    let case = case("03-list-then-watch");
+    let fixture = Fixture::new(&case["fixture"]);
+    let graph = case["fixture"]["graph_id"]
+        .as_str()
+        .expect("graph id")
+        .to_owned();
+    let start = fixture.git_head();
+    let stream = fixture.watch(None, &["--types", "mdkg.graph.head_changed"]);
+    assert_eq!(head_event(&stream, &graph)["data"]["head"], start.as_str());
+    fixture.git(&["commit", "-q", "--allow-empty", "-m", "moved"]);
+    assert_eq!(
+        head_event(&stream, &graph)["data"]["head"],
+        fixture.git_head().as_str()
+    );
+    // Nothing moved since: no other one.
+    assert!(
+        stream
+            .lines
+            .recv_timeout(Duration::from_millis(1500))
+            .is_err(),
+        "announced once"
+    );
+}
+
+/// A checkout whose `HEAD` names no commit starts with `head` null, its
+/// first commit is announced, and so is a switch back to a branch with no
+/// commit (Terra #19918, #20083).
+#[test]
+fn a_watch_in_an_unborn_checkout_starts_null_and_announces_each_change() {
+    let case = case("03-list-then-watch");
+    let fixture = Fixture::new(&case["fixture"]);
+    let graph = case["fixture"]["graph_id"]
+        .as_str()
+        .expect("graph id")
+        .to_owned();
+    fixture.git(&["checkout", "-q", "--orphan", "fresh"]);
+    let stream = fixture.watch(None, &["--types", "mdkg.graph.head_changed"]);
+    assert_eq!(
+        head_event(&stream, &graph)["data"].get("head"),
+        Some(&Value::Null)
+    );
+    fixture.git(&["commit", "-q", "-m", "first"]);
+    assert_eq!(
+        head_event(&stream, &graph)["data"]["head"],
+        fixture.git_head().as_str()
+    );
+    fixture.git(&["checkout", "-q", "--orphan", "again"]);
+    assert_eq!(
+        head_event(&stream, &graph)["data"].get("head"),
+        Some(&Value::Null)
+    );
+}
+
 #[test]
 fn default_watch_includes_other_actors_mail_and_filters_are_explicit() {
     let case = case("03-list-then-watch");
@@ -916,7 +1029,7 @@ fn midstream_store_error_is_a_final_bare_event() {
         )
         .expect("fixture value");
     drop(connection);
-    let final_event = stream.next();
+    let final_event = stream.next_but_head();
     assert_eq!(final_event["type"], "mdkg.stream.error");
     assert!(
         !restore_overlap_failure(&final_event),
@@ -969,7 +1082,7 @@ fn a_restore_can_proceed_while_watching_and_ends_with_a_cursor_reset_frame() {
             Err(error) => panic!("fixture restore: {error}"),
         }
     }
-    let event = stream.next();
+    let event = stream.next_but_head();
     assert_eq!(event["type"], "mdkg.stream.error");
     let code = event["data"]["diagnostics"][0]["code"]
         .as_str()

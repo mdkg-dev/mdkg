@@ -3127,4 +3127,1148 @@ fn round_six_lease_regressions() {
         (0, &serde_json::json!(false)),
         "{out}"
     );
+    // The text names the scope and how to take it (e2e UX).
+    let text = run_text(&wa, Some("c"), 200, &["holds", T1]);
+    assert!(text.starts_with(&format!("not held: {T1}; ")), "{text}");
+    assert!(text.contains(&format!("claim {T1}")), "{text}");
+}
+
+/// Runs git in `dir` with its author and committer dates at `secs` (Unix
+/// seconds), so a commit falls where the test's clock puts it.
+fn git_dated(dir: &Path, secs: u64, args: &[&str]) {
+    let date = format!("@{secs} +0000");
+    let out = isolated(Command::new("git").arg("-C").arg(dir).args(args))
+        .env("GIT_AUTHOR_DATE", &date)
+        .env("GIT_COMMITTER_DATE", &date)
+        .output()
+        .expect("git runs");
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The active lease on `scope` in a `status` envelope.
+fn status_lease(out: &Value, scope: &str) -> Value {
+    out["data"]["leases"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|l| l["scope"] == scope)
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+/// `release --committed`: a path lease whose
+/// paths its holder committed since claiming them, with nothing left
+/// uncommitted, ends when the holder asks, though it was just claimed;
+/// nothing ends it by itself. `status` and `holds` show it clean and
+/// committed, with its age, and the command lists what it kept and why.
+#[test]
+fn release_committed_takes_a_committed_lease_and_keeps_the_rest() {
+    let (_dir, _repo, wa, wb) = worktrees_named("a", "b");
+    // Granted 100 ms before the second the commit is dated in.
+    let granted = 10_000_900;
+    let now = 10_001_050;
+    assert_eq!(run(&wa, "a", granted, &["claim", "src/lib.rs"]).0, 0);
+    assert_eq!(
+        run(&wa, "a", granted, &["claim", "--new", "src/new.rs"]).0,
+        0
+    );
+    edit(&wa, "src/lib.rs", "// lib", "// lib, edited");
+    git_dated(&wa, 10_001, &["commit", "-qam", "edit lib"]);
+
+    // a hasn't run a command since: b is still blocked, and sees why.
+    let (code, out) = run(&wb, "b", now, &["claim", "src/lib.rs"]);
+    assert_eq!(code, 5, "{out}");
+    let (_, out) = run(&wb, "b", now, &["status"]);
+    let lib = status_lease(&out, "src/lib.rs");
+    assert_eq!(lib["age_ms"], 150, "{out}");
+    assert_eq!(lib["clean"], true, "{out}");
+    assert_eq!(lib["committed"], true, "{out}");
+    let new = status_lease(&out, "src/new.rs");
+    assert_eq!(new["clean"], true, "{out}");
+    assert_eq!(new["committed"], false, "{out}");
+    let text = run_text(&wb, Some("b"), now, &["status"]);
+    assert!(
+        text.contains("src/lib.rs by a until")
+            && text.contains(
+                "; age 0 min, committed and clean: its owner's `release --committed` releases it"
+            ),
+        "{text}"
+    );
+    assert!(
+        text.contains("src/new.rs by a until") && text.contains("; age 0 min, clean"),
+        "{text}"
+    );
+
+    // `holds` says the same; an edit hook's check doesn't pay for it.
+    let (code, out) = run(&wa, "a", now, &["holds", "src/lib.rs"]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(out["data"]["holds"], true, "{out}");
+    assert_eq!(out["data"]["lease"]["age_ms"], 150, "{out}");
+    assert_eq!(out["data"]["lease"]["clean"], true, "{out}");
+    assert_eq!(out["data"]["lease"]["committed"], true, "{out}");
+    let text = run_text(&wa, Some("a"), now, &["holds", "src/lib.rs"]);
+    assert!(text.contains("age 0 min, committed and clean"), "{text}");
+
+    // An edit in it makes it dirty again: shown, and not released.
+    edit(&wa, "src/lib.rs", "edited", "edited again");
+    let (_, out) = run(&wa, "a", now, &["holds", "src/lib.rs"]);
+    assert_eq!(out["data"]["lease"]["clean"], false, "{out}");
+    assert_eq!(out["data"]["lease"]["committed"], false, "{out}");
+    let (code, out) = run(&wa, "a", now, &["release", "--committed"]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(out["data"]["released"], serde_json::json!([]), "{out}");
+    assert_eq!(
+        kept(&out),
+        [
+            ("src/lib.rs".into(), "uncommitted".into()),
+            ("src/new.rs".into(), "not_committed".into())
+        ],
+        "{out}"
+    );
+    sh(&wa, &["checkout", "--", "src/lib.rs"]);
+
+    // Nothing releases it by itself: a's other commands leave it held.
+    assert_eq!(run(&wb, "b", now, &["claim", "--new", "src/b.rs"]).0, 0);
+    assert_eq!(run(&wa, "a", now, &["claim", "src/b.rs"]).0, 5);
+    assert_eq!(run(&wa, "a", now, &["renew"]).0, 0);
+    assert_eq!(run(&wa, "a", now, &["release", "--clean"]).0, 0);
+    assert_eq!(run(&wb, "b", now, &["claim", "src/lib.rs"]).0, 5);
+
+    // a asks: the committed one goes; the one with no commit since its
+    // claim keeps its protection, and the output says why.
+    let text = run_text(&wa, Some("a"), now, &["release", "--committed"]);
+    assert!(text.contains("released src/lib.rs ("), "{text}");
+    assert!(
+        text.contains("kept src/new.rs (")
+            && text.contains("no commit of yours touched its paths since you claimed it"),
+        "{text}"
+    );
+    let (code, out) = run(&wb, "b", now + 10, &["claim", "src/lib.rs"]);
+    assert_eq!(code, 0, "{out}");
+    let (_, out) = run(&wb, "b", now + 10, &["status"]);
+    assert_eq!(status_lease(&out, "src/new.rs")["owner"], "a", "{out}");
+}
+
+/// What `release --committed` kept: each lease's scope and `why`.
+fn kept(out: &Value) -> Vec<(String, String)> {
+    let mut kept: Vec<(String, String)> = out["data"]["skipped"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|k| {
+            (
+                k["lease"]["scope"].as_str().unwrap_or_default().to_string(),
+                k["why"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect();
+    kept.sort();
+    kept
+}
+
+/// `release --committed` takes a committed lease though it was just
+/// claimed, and keeps one with no commit since its claim: one claimed
+/// again after its commit, one never committed, and one whose path only a
+/// merge brought in. `release --clean` takes none of them then.
+#[test]
+fn release_committed_keeps_uncommitted_claims() {
+    let (_dir, _repo, wa, wb) = worktrees_named("a", "b");
+    let granted = 10_000_900;
+    let now = 10_001_100;
+    let released = |out: &Value| -> Vec<String> {
+        out["data"]["released"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|l| l["scope"].as_str().unwrap_or_default().to_string())
+            .collect()
+    };
+    // b's branch changes src/lib.rs, dated inside a's claim.
+    edit(&wb, "src/lib.rs", "// lib", "// lib from b");
+    git_dated(&wb, 10_001, &["commit", "-qam", "b edits lib"]);
+    for args in [
+        &["claim", "src/lib.rs"][..],
+        &["claim", "--new", "src/c.rs"],
+        &["claim", "--new", "src/d.rs"],
+    ] {
+        assert_eq!(run(&wa, "a", granted, args).0, 0);
+    }
+    fs::write(wa.join("src/c.rs"), "// c\n").expect("c.rs");
+    sh(&wa, &["add", "src/c.rs"]);
+    git_dated(&wa, 10_001, &["commit", "-qm", "add c"]);
+    git_dated(
+        &wa,
+        10_001,
+        &["merge", "-q", "--no-ff", "-m", "merge b", "b"],
+    );
+
+    let (code, out) = run(&wa, "a", now, &["release", "--clean"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(released(&out).is_empty(), "just claimed: {out}");
+    let (code, out) = run(&wa, "a", now, &["release", "--committed"]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(released(&out), ["src/c.rs"], "{out}");
+    let not = |p: &str| (p.to_string(), "not_committed".to_string());
+    assert_eq!(kept(&out), [not("src/d.rs"), not("src/lib.rs")], "{out}");
+
+    // Claimed again after its commit: protected again.
+    assert_eq!(run(&wa, "a", now + 10, &["claim", "src/c.rs"]).0, 0);
+    let (code, out) = run(&wa, "a", now + 20, &["release", "--committed"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(released(&out).is_empty(), "{out}");
+    let (_, out) = run(&wa, "a", now + 20, &["status"]);
+    for scope in ["src/lib.rs", "src/c.rs", "src/d.rs"] {
+        assert_eq!(status_lease(&out, scope)["owner"], "a", "{scope}: {out}");
+    }
+    assert_eq!(
+        status_lease(&out, "src/lib.rs")["committed"],
+        false,
+        "{out}"
+    );
+}
+
+/// `claim` takes several targets: one lease
+/// each, all or none. One held by someone else refuses them all before any
+/// is granted; a renewal of your own is reported as one; one target keeps
+/// the single-target output.
+#[test]
+fn claim_takes_several_targets_all_or_none() {
+    let (_dir, _repo, wa, wb) = worktrees_named("a", "b");
+    let scopes = |out: &Value| -> Vec<String> {
+        out["data"]["claims"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|c| c["lease"]["scope"].as_str().unwrap_or_default().to_string())
+            .collect()
+    };
+    let held_by = |wt: &Path, actor: &str, now: u64| -> Vec<String> {
+        let (_, out) = run(wt, actor, now, &["status"]);
+        out["data"]["leases"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|l| l["owner"] == actor)
+            .map(|l| l["scope"].as_str().unwrap_or_default().to_string())
+            .collect()
+    };
+    // Untracked files: paths a worktree has (`--new` applies to every
+    // target, so it can't sit beside a node id).
+    for f in ["src/x.rs", "src/y.rs"] {
+        fs::write(wa.join(f), "// new\n").expect("write");
+    }
+    let (code, out) = run(&wb, "b", 0, &["claim", "src/held.rs", "--new"]);
+    assert_eq!(code, 0, "{out}");
+
+    // One of them held by b: nothing is claimed.
+    let (code, out) = run(
+        &wa,
+        "a",
+        10,
+        &["claim", "src/x.rs", "src/held.rs", "task-1"],
+    );
+    assert_eq!(code, 5, "{out}");
+    assert!(
+        codes(&out).contains(&"coord.lease_held".to_string()),
+        "{out}"
+    );
+    let d = &out["diagnostics"][0];
+    assert!(
+        d["message"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("src/held.rs: "),
+        "{out}"
+    );
+    assert!(
+        d["hint"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("none of the 3 targets was claimed"),
+        "{out}"
+    );
+    assert_eq!(d["holders"][0], "b", "{out}");
+    assert!(held_by(&wa, "a", 10).is_empty(), "nothing granted");
+
+    // All free: one lease each, in order, the first's at the top.
+    let (code, out) = run(&wa, "a", 20, &["claim", "src/x.rs", "src/lib.rs", "task-1"]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(scopes(&out), ["src/x.rs", "src/lib.rs", T1], "{out}");
+    assert_eq!(out["data"]["lease"]["scope"], "src/x.rs", "{out}");
+    assert_eq!(out["data"]["claims"][2]["target"], "task-1", "{out}");
+    let ids: std::collections::BTreeSet<&str> = out["data"]["claims"]
+        .as_array()
+        .expect("claims")
+        .iter()
+        .filter_map(|c| c["lease"]["id"].as_str())
+        .collect();
+    assert_eq!(ids.len(), 3, "one lease per target: {out}");
+    let text = run_text(&wa, Some("a"), 30, &["claim", "src/lib.rs", "task-1"]);
+    assert!(
+        text.contains("renewed src/lib.rs as a") && text.contains("renewed .mdkg/work/task-1"),
+        "{text}"
+    );
+
+    // A target that doesn't resolve: refused before anything is granted.
+    let (code, out) = run(&wa, "a", 35, &["claim", "src/y.rs", "no-such-node"]);
+    assert_ne!(code, 0, "{out}");
+    assert!(!held_by(&wa, "a", 35).contains(&"src/y.rs".to_string()));
+
+    // A refusal after a grant (a turn isn't re-entrant): the grant is
+    // undone, the renewal stays.
+    assert_eq!(run(&wa, "a", 40, &["claim", "run:a"]).0, 0);
+    let (code, out) = run(&wa, "a", 45, &["claim", "src/y.rs", "src/lib.rs", "run:a"]);
+    assert_eq!(code, 5, "{out}");
+    let d = &out["diagnostics"][0];
+    assert!(
+        d["message"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("run:a: "),
+        "{out}"
+    );
+    assert!(
+        d["hint"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("none of the 3 targets was claimed"),
+        "{out}"
+    );
+    let mine = held_by(&wa, "a", 45);
+    assert!(!mine.contains(&"src/y.rs".to_string()), "{mine:?}");
+    assert!(mine.contains(&"src/lib.rs".to_string()), "{mine:?}");
+
+    // One target: the output it always had, no `claims`.
+    let (code, out) = run(&wa, "a", 50, &["claim", "src/lib.rs"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out["data"].get("claims").is_none(), "{out}");
+    assert_eq!(out["data"]["renewed"], true, "{out}");
+}
+
+/// Only the holder's own commit counts (#16988): after a
+/// fast-forward or a pull that brings in someone else's commit to the
+/// leased path, dated after the claim, `release --committed` keeps it.
+#[test]
+fn a_fast_forward_or_a_pull_never_releases_a_lease() {
+    let (_dir, _repo, wa, wb) = worktrees_named("a", "b");
+    let granted = 10_000_900;
+    let now = 10_001_100;
+    assert_eq!(run(&wa, "a", granted, &["claim", "src/lib.rs"]).0, 0);
+    // b changes the file twice, after a's claim.
+    edit(&wb, "src/lib.rs", "// lib", "// lib from b");
+    git_dated(&wb, 10_001, &["commit", "-qam", "b edits lib"]);
+    git_dated(&wa, 10_001, &["merge", "-q", "--ff-only", "b"]);
+    let (code, out) = run(&wa, "a", now, &["release", "--committed"]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(
+        out["data"]["released"],
+        serde_json::json!([]),
+        "fast-forward: {out}"
+    );
+
+    edit(&wb, "src/lib.rs", "from b", "from b again");
+    git_dated(&wb, 10_001, &["commit", "-qam", "b edits lib again"]);
+    git_dated(
+        &wa,
+        10_001,
+        &["pull", "-q", "--ff-only", "--no-rebase", ".", "b"],
+    );
+    let (code, out) = run(&wa, "a", now + 10, &["release", "--committed"]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(
+        out["data"]["released"],
+        serde_json::json!([]),
+        "pull: {out}"
+    );
+    let (_, out) = run(&wa, "a", now + 10, &["holds", "src/lib.rs"]);
+    assert_eq!(out["data"]["lease"]["clean"], true, "{out}");
+    assert_eq!(out["data"]["lease"]["committed"], false, "{out}");
+
+    // a's own commit to it, after the claim, does count.
+    edit(&wa, "src/lib.rs", "again", "and a");
+    git_dated(&wa, 10_001, &["commit", "-qam", "a edits lib"]);
+    let (_, out) = run(&wa, "a", now + 20, &["release", "--committed"]);
+    let released: Vec<&str> = out["data"]["released"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|l| l["scope"].as_str())
+        .collect();
+    assert_eq!(released, ["src/lib.rs"], "{out}");
+}
+
+/// `release --committed` judges only the holder's own worktree (#16983,
+/// #17125): in a worktree another actor works in, as a lease authority's
+/// host is asked `--as` a client, it's refused, and nothing else releases
+/// the client's lease after a commit there.
+#[test]
+fn release_at_commit_never_judges_another_actors_worktree() {
+    let (_dir, _repo, host, _wb) = worktrees_named("host", "b");
+    let granted = 10_000_900;
+    let now = 10_001_100;
+    assert_eq!(run(&host, "a", granted, &["claim", "src/lib.rs"]).0, 0);
+    edit(&host, "src/lib.rs", "// lib", "// lib, host");
+    git_dated(&host, 10_001, &["commit", "-qam", "host edits lib"]);
+    for args in [
+        &["renew"][..],
+        &["claim", "--new", "src/other.rs"],
+        &["release", "src/other.rs"],
+    ] {
+        let (code, out) = run(&host, "a", now, args);
+        assert_eq!(code, 0, "{args:?}: {out}");
+    }
+    let (code, out) = run(&host, "a", now, &["release", "--committed"]);
+    assert_ne!(code, 0, "{out}");
+    assert_eq!(codes(&out), ["usage.invalid_arguments"], "{out}");
+    let (_, out) = run(&host, "a", now, &["status"]);
+    let lease = status_lease(&out, "src/lib.rs");
+    assert_eq!(lease["owner"], "a", "{out}");
+    // No promise of a release the command refuses (#18021).
+    assert_eq!(lease["clean"], true, "{out}");
+    assert_eq!(lease["committed"], false, "{out}");
+    let text = run_text(&host, Some("a"), now, &["status"]);
+    assert!(!text.contains("release --committed"), "{text}");
+    let (_, out) = run(&host, "a", now, &["holds", "src/lib.rs"]);
+    assert_eq!(out["data"]["lease"]["clean"], true, "{out}");
+    assert_eq!(out["data"]["lease"]["committed"], false, "holds too: {out}");
+    let (_, out) = run(&host, "a", now, &["release", "--clean"]);
+    assert!(
+        !out["data"]["released"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|l| l["scope"] == "src/lib.rs"),
+        "{out}"
+    );
+}
+
+/// `release --committed` needs the lease's paths strictly clean (#16983): an
+/// edit git status can't see (an assume-unchanged or skip-worktree file)
+/// or a moved submodule pointer keeps a folder lease, and status and
+/// holds don't call it clean.
+#[test]
+fn hidden_changes_keep_a_committed_folder_lease() {
+    let (dir, _repo, wa, _wb) = worktrees_named("a", "b");
+    let granted = 10_000_900;
+    let now = 10_001_100;
+    // Two more tracked files; the submodule comes after the hidden-file
+    // cases, so it can't mask them (#18265).
+    fs::write(wa.join("src/hidden.rs"), "// hidden\n").expect("hidden");
+    fs::write(wa.join("src/skipped.rs"), "// skipped\n").expect("skipped");
+    sh(&wa, &["add", "."]);
+    sh(&wa, &["commit", "-qm", "more files"]);
+
+    let committed = |out: &Value| out["data"]["lease"]["committed"].clone();
+    let kept_uncommitted = |out: &Value| {
+        out["data"]["released"] == serde_json::json!([])
+            && kept(out) == [("src".to_string(), "uncommitted".to_string())]
+    };
+    let commit_lib = |text: &str| {
+        edit(&wa, "src/lib.rs", "// lib", text);
+        git_dated(&wa, 10_001, &["commit", "-qm", text, "--", "src/lib.rs"]);
+    };
+    for (case, hide, unhide) in [
+        (
+            "assume-unchanged",
+            &["update-index", "--assume-unchanged", "src/hidden.rs"][..],
+            &["update-index", "--no-assume-unchanged", "src/hidden.rs"][..],
+        ),
+        (
+            "skip-worktree",
+            &["update-index", "--skip-worktree", "src/skipped.rs"],
+            &["update-index", "--no-skip-worktree", "src/skipped.rs"],
+        ),
+    ] {
+        assert_eq!(run(&wa, "a", granted, &["claim", "src/"]).0, 0, "{case}");
+        sh(&wa, hide);
+        let file = if case == "skip-worktree" {
+            "src/skipped.rs"
+        } else {
+            "src/hidden.rs"
+        };
+        fs::write(wa.join(file), "// edited, unseen\n").expect("edit");
+        commit_lib(&format!("// lib {case}"));
+        let (_, out) = run(&wa, "a", now, &["holds", "src/"]);
+        assert_eq!(out["data"]["lease"]["clean"], false, "{case}: {out}");
+        assert_eq!(committed(&out), false, "{case}: {out}");
+        let (_, out) = run(&wa, "a", now, &["release", "--committed"]);
+        assert!(kept_uncommitted(&out), "{case}: {out}");
+        sh(&wa, unhide);
+        sh(&wa, &["checkout", "--", file]);
+        // Only the hidden entry kept it.
+        let (_, out) = run(&wa, "a", now, &["holds", "src/"]);
+        assert_eq!(out["data"]["lease"]["clean"], true, "{case}: {out}");
+        assert_eq!(run(&wa, "a", now, &["release", "src/"]).0, 0, "{case}");
+    }
+
+    // A skipped file above a `--new` lease isn't work under it (#18265):
+    // a sparse checkout lacks `src/skipped.rs`, and a lease on a path
+    // beneath it is clean.
+    sh(&wa, &["update-index", "--skip-worktree", "src/skipped.rs"]);
+    fs::remove_file(wa.join("src/skipped.rs")).expect("rm");
+    let leaf = "src/skipped.rs/intro.md";
+    assert_eq!(run(&wa, "a", granted, &["claim", "--new", leaf]).0, 0);
+    let (_, out) = run(&wa, "a", now, &["holds", leaf]);
+    assert_eq!(out["data"]["lease"]["clean"], true, "{out}");
+    assert_eq!(run(&wa, "a", now, &["release", leaf]).0, 0);
+    sh(
+        &wa,
+        &["update-index", "--no-skip-worktree", "src/skipped.rs"],
+    );
+    sh(&wa, &["checkout", "--", "src/skipped.rs"]);
+
+    // A submodule under src.
+    let sub = dir.0.join("sub");
+    fs::create_dir_all(&sub).expect("sub");
+    sh(&sub, &["init", "-q", "-b", "main"]);
+    fs::write(sub.join("s.txt"), "s\n").expect("s");
+    sh(&sub, &["add", "."]);
+    sh(&sub, &["commit", "-qm", "s"]);
+    let url = sub.to_str().expect("utf-8");
+    sh(
+        &wa,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            url,
+            "src/sub",
+        ],
+    );
+    sh(&wa, &["commit", "-qm", "submodule"]);
+
+    // A moved submodule pointer.
+    assert_eq!(run(&wa, "a", granted, &["claim", "src/"]).0, 0);
+    let inner = wa.join("src/sub");
+    fs::write(inner.join("s.txt"), "s2\n").expect("s2");
+    sh(&inner, &["commit", "-qam", "s2"]);
+    commit_lib("// lib with sub moved");
+    let (_, out) = run(&wa, "a", now, &["holds", "src/"]);
+    assert_eq!(out["data"]["lease"]["clean"], false, "submodule: {out}");
+    let (_, out) = run(&wa, "a", now, &["release", "--committed"]);
+    assert!(kept_uncommitted(&out), "submodule: {out}");
+    assert_eq!(run(&wa, "a", now, &["release", "src/"]).0, 0);
+
+    // A lease inside the submodule (#18319): this index can't see an edit
+    // there, so the submodule around it keeps it.
+    let inside = "src/sub/s.txt";
+    let (code, out) = run(&wa, "a", granted, &["claim", inside]);
+    assert_eq!(code, 0, "{out}");
+    fs::write(inner.join("s.txt"), "s3, uncommitted\n").expect("s3");
+    let (_, out) = run(&wa, "a", now, &["holds", inside]);
+    assert_eq!(out["data"]["lease"]["clean"], false, "inside: {out}");
+    let (_, out) = run(&wa, "a", now, &["release", "--committed"]);
+    assert_eq!(
+        out["data"]["released"],
+        serde_json::json!([]),
+        "inside: {out}"
+    );
+    assert_eq!(
+        kept(&out),
+        [(inside.to_string(), "uncommitted".to_string())],
+        "inside: {out}"
+    );
+}
+
+/// A `release --committed` whose store write fails is reported (#16983):
+/// it lists the lease under `failed`, read back from the store, and
+/// fails, and the lease stays held until a retry works.
+#[test]
+fn a_failed_release_at_commit_is_reported() {
+    let (_dir, repo, wa, _wb) = worktrees_named("a", "b");
+    let granted = 10_000_900;
+    let now = 10_001_100;
+    let (_, out) = run(&wa, "a", granted, &["claim", "src/lib.rs"]);
+    let id = out["data"]["lease"]["id"].as_str().expect("id").to_string();
+    edit(&wa, "src/lib.rs", "// lib", "// lib, a");
+    git_dated(&wa, 10_001, &["commit", "-qam", "a edits lib"]);
+    let store = repo.join(".git/mdkg/coord.sqlite");
+    rusqlite::Connection::open(&store)
+        .expect("store")
+        .execute_batch(&format!(
+            "CREATE TRIGGER fail_one BEFORE INSERT ON journal
+             WHEN NEW.command LIKE '%elease%' AND NEW.command LIKE '%\"{id}\"%'
+             BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;"
+        ))
+        .expect("trigger");
+
+    let (code, out) = run(&wa, "a", now, &["release", "--committed"]);
+    assert_ne!(code, 0, "{out}");
+    assert_eq!(out["ok"], false, "{out}");
+    let failed = out["data"]["failed"].as_array().expect("failed");
+    assert_eq!(failed.len(), 1, "{out}");
+    assert_eq!(failed[0]["lease"]["scope"], "src/lib.rs", "{out}");
+    // Read back from the store: the write never landed, so it's held.
+    assert_eq!(failed[0]["why"], "failed", "{out}");
+    assert_eq!(failed[0]["lease"]["status"], "active", "{out}");
+    assert!(
+        failed[0]["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("injected write failure")),
+        "{out}"
+    );
+    let (_, out) = run(&wa, "a", now, &["status"]);
+    assert_eq!(
+        status_lease(&out, "src/lib.rs")["owner"],
+        "a",
+        "still held: {out}"
+    );
+
+    rusqlite::Connection::open(&store)
+        .expect("store")
+        .execute_batch("DROP TRIGGER fail_one;")
+        .expect("drop trigger");
+    let (code, out) = run(&wa, "a", now, &["release", "--committed"]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(out["data"]["released"][0]["scope"], "src/lib.rs", "{out}");
+}
+
+/// The shared-lease merge advisory (#16942): under a shared lease,
+/// a co-holder's branch whose committed work conflicts with yours is
+/// named at your claim (`coord.merge_conflict`, advisory) and in your
+/// status; work that merges cleanly isn't.
+#[test]
+fn a_shared_lease_names_a_co_holder_whose_branch_conflicts() {
+    let (_dir, _repo, wa, wb) = worktrees_named("a", "b");
+    let policy = serde_json::json!({"paths": [{"glob": "src/**", "mode": "shared"}]});
+    lease_policy(&wa, policy.clone());
+    lease_policy(&wb, policy);
+    let conflict_of = |out: &Value| {
+        out["diagnostics"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|d| d["code"] == "coord.merge_conflict")
+            .cloned()
+    };
+    assert_eq!(run(&wa, "a", 0, &["claim", "src/lib.rs"]).0, 0);
+    let (code, out) = run(&wb, "b", 1, &["claim", "src/lib.rs"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(conflict_of(&out).is_none(), "nothing committed yet: {out}");
+
+    // Both change the same line; a also adds a file b never touches.
+    edit(&wa, "src/lib.rs", "// lib", "// lib, a's way");
+    sh(&wa, &["commit", "-qam", "a's lib"]);
+    edit(&wb, "src/lib.rs", "// lib", "// lib, b's way");
+    sh(&wb, &["commit", "-qam", "b's lib"]);
+
+    // `--read-only status` skips the check (#18694): `git merge-tree
+    // --write-tree` writes objects, and a read-only command changes
+    // nothing in git. Before any other command runs the check, so its
+    // objects aren't already there.
+    let objects = |dir: &Path| {
+        let out = Command::new("git")
+            .current_dir(dir)
+            .args(["count-objects", "-v"])
+            .output()
+            .expect("git count-objects");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let before = objects(&wa);
+    let (code, out) = run(&wa, "a", 2, &["--read-only", "status"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(
+        status_lease(&out, "src/lib.rs")
+            .get("merge_conflicts")
+            .is_none(),
+        "{out}"
+    );
+    assert_eq!(objects(&wa), before, "no git objects written");
+
+    let (code, out) = run(&wb, "b", 2, &["claim", "src/lib.rs"]);
+    assert_eq!(code, 0, "advisory, never refused: {out}");
+    let d = conflict_of(&out).unwrap_or_else(|| panic!("no conflict: {out}"));
+    assert_eq!(d["severity"], "warning", "{out}");
+    assert_eq!(d["path"], "src/lib.rs", "{out}");
+    assert_eq!(d["holders"], serde_json::json!(["a"]), "{out}");
+
+    let (_, out) = run(&wa, "a", 3, &["status"]);
+    assert_eq!(
+        status_lease(&out, "src/lib.rs")["merge_conflicts"],
+        serde_json::json!([{"owner": "b", "paths": ["src/lib.rs"]}]),
+        "{out}"
+    );
+    let text = run_text(&wa, Some("a"), 3, &["status"]);
+    assert!(
+        text.contains("  conflicts at merge with b's branch: src/lib.rs"),
+        "{text}"
+    );
+
+    // b takes a's version: their branches merge cleanly again.
+    sh(&wb, &["checkout", "a", "--", "src/lib.rs"]);
+    sh(&wb, &["commit", "-qam", "b takes a's lib"]);
+    let (_, out) = run(&wa, "a", 4, &["status"]);
+    assert!(
+        status_lease(&out, "src/lib.rs")
+            .get("merge_conflicts")
+            .is_none(),
+        "{out}"
+    );
+}
+
+/// A failed claim of several never ends a lease you held before it
+/// (#17023): a committed lease a later target names keeps its id, and
+/// the rolled-back transaction undoes only what the call did.
+#[test]
+fn a_failed_claim_of_several_keeps_the_leases_you_held() {
+    let (_dir, _repo, wa, _wb) = worktrees_named("a", "b");
+    let granted = 10_000_900;
+    let now = 10_001_100;
+    let (_, out) = run(&wa, "a", granted, &["claim", "src/lib.rs"]);
+    let id = out["data"]["lease"]["id"].clone();
+    edit(&wa, "src/lib.rs", "// lib", "// lib, a");
+    git_dated(&wa, 10_001, &["commit", "-qam", "a edits lib"]);
+    assert_eq!(run(&wa, "a", granted, &["claim", "run:a"]).0, 0);
+    fs::write(wa.join("src/x.rs"), "// x\n").expect("x");
+
+    let (code, out) = run(&wa, "a", now, &["claim", "src/x.rs", "src/lib.rs", "run:a"]);
+    assert_eq!(code, 5, "{out}");
+    // The coordinator's refusal of a later target, explained as `claim`
+    // explains it.
+    let d = &out["diagnostics"][0];
+    assert!(
+        d["message"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("run:a: "),
+        "{out}"
+    );
+    assert!(
+        d["hint"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("a turn isn't re-entrant"),
+        "{out}"
+    );
+    let (_, out) = run(&wa, "a", now, &["status"]);
+    assert_eq!(
+        status_lease(&out, "src/lib.rs")["id"],
+        id,
+        "the same lease: {out}"
+    );
+    assert!(status_lease(&out, "src/x.rs").is_null(), "{out}");
+}
+
+/// A claim of several grants every target in one store transaction: a
+/// write that fails after the first grant leaves nothing held, with no
+/// release needed to undo it (a crash there runs none), and a renewal in
+/// the same call is undone with it.
+#[test]
+fn a_claim_of_several_that_fails_after_its_first_grant_holds_nothing() {
+    let (_dir, repo, wa, _wb) = worktrees_named("a", "b");
+    for f in ["src/one.rs", "src/two.rs"] {
+        fs::write(wa.join(f), "// new\n").expect("write");
+    }
+    let (_, out) = run(&wa, "a", 0, &["claim", "src/lib.rs"]);
+    let lib = out["data"]["lease"].clone();
+    // A file and the folder around it, in either order: refused up front,
+    // naming no lease, and nothing is kept.
+    for targets in [["src/one.rs", "src/"], ["src/", "src/one.rs"]] {
+        let mut args = vec!["claim"];
+        args.extend(targets);
+        let (code, out) = run(&wa, "a", 5, &args);
+        assert_ne!(code, 0, "{out}");
+        assert_eq!(codes(&out), ["usage.invalid_arguments"], "{out}");
+        let d = &out["diagnostics"][0];
+        assert_eq!(d["message"], "src/one.rs is inside src/", "{out}");
+        assert!(
+            d["hint"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("none of the 2 targets was claimed"),
+            "{out}"
+        );
+    }
+    // A later target the checks refuse inside the transaction (a folder
+    // over src/lib.rs, held before this call): the first target's grant
+    // is rolled back with it.
+    fs::write(wa.join("top.rs"), "// top\n").expect("top");
+    let (code, out) = run(&wa, "a", 5, &["claim", "top.rs", "src/"]);
+    assert_eq!(code, 5, "{out}");
+    let d = &out["diagnostics"][0];
+    assert!(
+        d["message"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("src/: you hold "),
+        "{out}"
+    );
+    assert!(
+        d["hint"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("none of the 2 targets was claimed"),
+        "{out}"
+    );
+    let (_, out) = run(&wa, "a", 5, &["status"]);
+    assert!(status_lease(&out, "src/one.rs").is_null(), "{out}");
+    assert!(status_lease(&out, "top.rs").is_null(), "{out}");
+    assert!(status_lease(&out, "src").is_null(), "{out}");
+    let store = repo.join(".git/mdkg/coord.sqlite");
+    // The second grant's write fails, and so would any release: only one
+    // transaction for the whole claim leaves nothing behind.
+    rusqlite::Connection::open(&store)
+        .expect("store")
+        .execute_batch(
+            "CREATE TRIGGER fail_two BEFORE INSERT ON journal
+             WHEN NEW.command LIKE '%src/two.rs%' OR NEW.command LIKE '%elease%'
+             BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;",
+        )
+        .expect("trigger");
+
+    let (code, out) = run(
+        &wa,
+        "a",
+        10,
+        &["claim", "src/one.rs", "src/lib.rs", "src/two.rs"],
+    );
+    assert_ne!(code, 0, "{out}");
+    let (_, out) = run(&wa, "a", 20, &["status"]);
+    assert!(status_lease(&out, "src/one.rs").is_null(), "{out}");
+    assert!(status_lease(&out, "src/two.rs").is_null(), "{out}");
+    let held = status_lease(&out, "src/lib.rs");
+    assert_eq!(held["id"], lib["id"], "{out}");
+    assert_eq!(held["until"], lib["until"], "the renewal is undone: {out}");
+}
+
+/// A claim of several that names one lease twice is refused up front, and
+/// one that reaches the lease cap partway is refused whole.
+#[test]
+fn a_claim_of_several_is_refused_whole_on_a_repeat_or_at_the_cap() {
+    let (_dir, _repo, wa, _wb) = worktrees_named("a", "b");
+    let (code, out) = run(&wa, "a", 0, &["claim", "src/lib.rs", "run:a", "run:a"]);
+    assert_ne!(code, 0, "{out}");
+    assert_eq!(codes(&out), ["usage.invalid_arguments"], "{out}");
+    assert!(
+        out["diagnostics"][0]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("name the same lease"),
+        "{out}"
+    );
+    let (_, out) = run(&wa, "a", 0, &["status"]);
+    assert!(status_lease(&out, "src/lib.rs").is_null(), "{out}");
+    assert!(status_lease(&out, "run:a").is_null(), "{out}");
+
+    // 30 of the cap's 32 held: a third new target refuses all three.
+    let mut held: Vec<String> = (0..30).map(|i| format!("src/f{i}.rs")).collect();
+    held.insert(0, "--new".to_string());
+    let args: Vec<&str> = std::iter::once("claim")
+        .chain(held.iter().map(String::as_str))
+        .collect();
+    let (code, out) = run(&wa, "a", 10, &args);
+    assert_eq!(code, 0, "{out}");
+    let (code, out) = run(
+        &wa,
+        "a",
+        20,
+        &["claim", "--new", "src/n1.rs", "src/n2.rs", "src/n3.rs"],
+    );
+    assert_eq!(code, 5, "{out}");
+    assert_eq!(codes(&out), ["coord.lease_limit"], "{out}");
+    let d = &out["diagnostics"][0];
+    assert!(
+        d["message"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("src/n3.rs: "),
+        "{out}"
+    );
+    let (_, out) = run(&wa, "a", 20, &["status"]);
+    for f in ["src/n1.rs", "src/n2.rs", "src/n3.rs"] {
+        assert!(status_lease(&out, f).is_null(), "{f}: {out}");
+    }
+}
+
+/// The turn-end `release --clean` applies the strict test too (#17073):
+/// past its first quarter, a lease with an ignored draft under it, or an
+/// edit git status can't see, stays; once both are gone it goes.
+#[test]
+fn release_clean_keeps_a_lease_with_hidden_or_ignored_work() {
+    let (_dir, _repo, wa, _wb) = worktrees_named("a", "b");
+    fs::write(wa.join(".gitignore"), "*.draft\n").expect("ignore");
+    fs::write(wa.join("src/hidden.rs"), "// hidden\n").expect("hidden");
+    sh(&wa, &["add", "."]);
+    sh(&wa, &["commit", "-qm", "ignore drafts"]);
+    let scopes = |out: &Value| -> Vec<String> {
+        out["data"]["released"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|l| l["scope"].as_str().unwrap_or_default().to_string())
+            .collect()
+    };
+    // Past the first quarter (TTL 1000): the ordinary pass would take it.
+    assert_eq!(run(&wa, "a", 0, &["claim", "src/"]).0, 0);
+    fs::write(wa.join("src/wip.draft"), "draft\n").expect("draft");
+    let (_, out) = run(&wa, "a", 300, &["holds", "src/"]);
+    assert_eq!(out["data"]["lease"]["clean"], false, "ignored draft: {out}");
+    let (code, out) = run(&wa, "a", 300, &["release", "--clean"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(scopes(&out).is_empty(), "ignored draft keeps it: {out}");
+    // Status and renew judge it the same way (#17125): not idle.
+    let (_, out) = run(&wa, "a", 300, &["status"]);
+    assert_eq!(status_lease(&out, "src")["idle"], false, "{out}");
+    fs::remove_file(wa.join("src/wip.draft")).expect("rm");
+
+    sh(
+        &wa,
+        &["update-index", "--assume-unchanged", "src/hidden.rs"],
+    );
+    fs::write(wa.join("src/hidden.rs"), "// edited, unseen\n").expect("edit");
+    let (_, out) = run(&wa, "a", 310, &["release", "--clean"]);
+    assert!(scopes(&out).is_empty(), "hidden edit keeps it: {out}");
+    let (_, out) = run(&wa, "a", 310, &["renew"]);
+    assert_eq!(out["data"]["renewed"][0]["scope"], "src", "renewed: {out}");
+    sh(
+        &wa,
+        &["update-index", "--no-assume-unchanged", "src/hidden.rs"],
+    );
+    sh(&wa, &["checkout", "--", "src/hidden.rs"]);
+
+    // Past the renewed term's first quarter.
+    let (_, out) = run(&wa, "a", 600, &["release", "--clean"]);
+    assert_eq!(scopes(&out), ["src"], "{out}");
+}
+
+/// `release --committed` releases each lease in its own transaction: one
+/// failed write leaves the others released, and the output names them all.
+#[test]
+fn release_committed_reports_each_lease_when_one_fails() {
+    let (_dir, repo, wa, _wb) = worktrees_named("a", "b");
+    let granted = 10_000_900;
+    let now = 10_001_100;
+    for f in ["src/one.rs", "src/two.rs", "src/three.rs"] {
+        assert_eq!(run(&wa, "a", granted, &["claim", "--new", f]).0, 0);
+        fs::write(wa.join(f), "// new\n").expect("write");
+    }
+    sh(&wa, &["add", "src"]);
+    git_dated(&wa, 10_001, &["commit", "-qm", "three files"]);
+    let (_, out) = run(&wa, "a", granted, &["holds", "src/three.rs"]);
+    let id = out["data"]["lease"]["id"].as_str().expect("id").to_string();
+    let store = repo.join(".git/mdkg/coord.sqlite");
+    rusqlite::Connection::open(&store)
+        .expect("store")
+        .execute_batch(&format!(
+            "CREATE TRIGGER fail_one BEFORE INSERT ON journal
+             WHEN NEW.command LIKE '%elease%' AND NEW.command LIKE '%\"{id}\"%'
+             BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;"
+        ))
+        .expect("trigger");
+
+    let (code, out) = run(&wa, "a", now, &["release", "--committed"]);
+    assert_ne!(code, 0, "{out}");
+    let mut released: Vec<&str> = out["data"]["released"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|l| l["scope"].as_str())
+        .collect();
+    released.sort();
+    assert_eq!(released, ["src/one.rs", "src/two.rs"], "{out}");
+    assert_eq!(
+        out["data"]["failed"][0]["lease"]["scope"], "src/three.rs",
+        "{out}"
+    );
+    assert_eq!(out["data"]["failed"][0]["why"], "failed", "{out}");
+}
+
+/// Every reflog entry in the lease's window counts, in any order (#17074):
+/// a backdated commit recorded after the holder's commit to the leased
+/// path doesn't hide it.
+#[test]
+fn a_backdated_commit_never_hides_the_holders_commit() {
+    let (_dir, _repo, wa, _wb) = worktrees_named("a", "b");
+    let granted = 10_000_900;
+    let now = 10_001_100;
+    assert_eq!(run(&wa, "a", granted, &["claim", "src/lib.rs"]).0, 0);
+    edit(&wa, "src/lib.rs", "// lib", "// lib, a");
+    git_dated(&wa, 10_001, &["commit", "-qam", "a edits lib"]);
+    fs::write(wa.join("src/old.rs"), "// old\n").expect("old");
+    sh(&wa, &["add", "src/old.rs"]);
+    git_dated(&wa, 9_000, &["commit", "-qm", "backdated"]);
+    let (code, out) = run(&wa, "a", now, &["release", "--committed"]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(out["data"]["released"][0]["scope"], "src/lib.rs", "{out}");
+}
+
+/// The merge-tree advisory never runs a configured merge driver
+/// (#17101): with one defined, claim and status skip the
+/// check, so the driver's command never runs.
+#[test]
+fn the_merge_conflict_check_never_runs_a_merge_driver() {
+    let (dir, repo, wa, wb) = worktrees_named("a", "b");
+    let policy = serde_json::json!({"paths": [{"glob": "src/**", "mode": "shared"}]});
+    lease_policy(&wa, policy.clone());
+    lease_policy(&wb, policy);
+    let marker = dir.0.join("driver-ran");
+    let driver = format!("touch {}", marker.display());
+    sh(&repo, &["config", "merge.boom.driver", &driver]);
+    sh(&repo, &["config", "merge.default", "boom"]);
+    assert_eq!(run(&wa, "a", 0, &["claim", "src/lib.rs"]).0, 0);
+    assert_eq!(run(&wb, "b", 1, &["claim", "src/lib.rs"]).0, 0);
+    edit(&wa, "src/lib.rs", "// lib", "// lib, a's way");
+    sh(&wa, &["commit", "-qam", "a's lib"]);
+    edit(&wb, "src/lib.rs", "// lib", "// lib, b's way");
+    sh(&wb, &["commit", "-qam", "b's lib"]);
+    let (code, out) = run(&wb, "b", 2, &["claim", "src/lib.rs"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(
+        !codes(&out).contains(&"coord.merge_conflict".to_string()),
+        "{out}"
+    );
+    let (_, out) = run(&wa, "a", 3, &["status"]);
+    assert!(
+        status_lease(&out, "src/lib.rs")
+            .get("merge_conflicts")
+            .is_none(),
+        "{out}"
+    );
+    assert!(!marker.exists(), "the merge driver ran");
+}
+
+/// A commit to a file is no commit to a path beneath it (#17128): a lease
+/// on a file about to replace that file with a folder isn't committed by
+/// it, so `release --committed` keeps it.
+#[test]
+fn a_commit_to_an_ancestor_file_never_counts_for_a_path_beneath_it() {
+    let (_dir, _repo, wa, _wb) = worktrees_named("a", "b");
+    let granted = 10_000_900;
+    let now = 10_001_100;
+    let (code, out) = run(
+        &wa,
+        "a",
+        granted,
+        &["claim", "--new", "src/lib.rs/intro.md"],
+    );
+    assert_eq!(code, 0, "{out}");
+    edit(&wa, "src/lib.rs", "// lib", "// lib, last edit as a file");
+    git_dated(&wa, 10_001, &["commit", "-qam", "edit lib"]);
+    let (code, out) = run(&wa, "a", now, &["release", "--committed"]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(out["data"]["released"], serde_json::json!([]), "{out}");
+    assert_eq!(
+        kept(&out),
+        [(
+            "src/lib.rs/intro.md".to_string(),
+            "not_committed".to_string()
+        )],
+        "{out}"
+    );
+}
+
+/// A missing leased path under an ignored folder isn't dirty (#17125):
+/// git status names the ignored folder around it, which isn't work under
+/// the lease; once the path is there, it is.
+#[test]
+fn an_ignored_folder_around_a_missing_path_is_no_open_work() {
+    let (_dir, _repo, wa, _wb) = worktrees_named("a", "b");
+    fs::write(wa.join(".gitignore"), "build/\n").expect("ignore");
+    sh(&wa, &["add", ".gitignore"]);
+    sh(&wa, &["commit", "-qm", "ignore build"]);
+    fs::create_dir_all(wa.join("build")).expect("build");
+    fs::write(wa.join("build/other.o"), "o\n").expect("other");
+    assert_eq!(run(&wa, "a", 0, &["claim", "--new", "build/new.rs"]).0, 0);
+    let (_, out) = run(&wa, "a", 10, &["holds", "build/new.rs"]);
+    assert_eq!(out["data"]["lease"]["clean"], true, "{out}");
+    fs::write(wa.join("build/new.rs"), "// new\n").expect("new");
+    let (_, out) = run(&wa, "a", 10, &["holds", "build/new.rs"]);
+    assert_eq!(out["data"]["lease"]["clean"], false, "{out}");
+}
+
+/// An untracked folder around a missing leased path isn't open work under
+/// the lease either (#18021): `?? scratch/` names a sibling's folder.
+#[test]
+fn an_untracked_folder_around_a_missing_path_is_no_open_work() {
+    let (_dir, _repo, wa, _wb) = worktrees_named("a", "b");
+    fs::create_dir_all(wa.join("scratch")).expect("scratch");
+    fs::write(wa.join("scratch/other.txt"), "other\n").expect("other");
+    assert_eq!(
+        run(&wa, "a", 0, &["claim", "--new", "scratch/new.txt"]).0,
+        0
+    );
+    let (_, out) = run(&wa, "a", 10, &["holds", "scratch/new.txt"]);
+    assert_eq!(out["data"]["lease"]["clean"], true, "{out}");
+    fs::write(wa.join("scratch/new.txt"), "new\n").expect("new");
+    let (_, out) = run(&wa, "a", 10, &["holds", "scratch/new.txt"]);
+    assert_eq!(out["data"]["lease"]["clean"], false, "{out}");
+}
+
+/// A draft spelled in another letter case under an ignored folder is open
+/// work under the lease (#18021): scopes match in any case, so on a
+/// case-sensitive filesystem `build/draft.md` keeps a lease on
+/// `build/Draft.md`, and `release --clean` and `--committed` keep it.
+#[test]
+fn an_ignored_draft_in_another_case_keeps_its_lease() {
+    let (_dir, _repo, wa, _wb) = worktrees_named("a", "b");
+    fs::write(wa.join(".gitignore"), "build/\n").expect("ignore");
+    sh(&wa, &["add", ".gitignore"]);
+    sh(&wa, &["commit", "-qm", "ignore build"]);
+    // Case variants, git's icase pathspec doesn't match them all
+    // (#18144): Scope alone does. A scope is ASCII, but a file's name may
+    // not be: the Kelvin sign lowercases to `k`, as Scope compares.
+    for (leased, draft) in [
+        ("build/Draft.md", "build/draft.md"),
+        ("build/DrafT.md", "build/draft.md"),
+        ("build/key.md", "build/\u{212a}EY.md"),
+    ] {
+        let (code, out) = run(&wa, "a", 0, &["claim", "--new", leased]);
+        assert_eq!(code, 0, "{out}");
+        fs::create_dir_all(wa.join("build")).expect("build");
+        fs::write(wa.join(draft), "draft\n").expect("draft");
+        let (_, out) = run(&wa, "a", 300, &["holds", leased]);
+        assert_eq!(out["data"]["lease"]["clean"], false, "{leased}: {out}");
+        let (code, out) = run(&wa, "a", 300, &["release", "--clean"]);
+        assert_eq!(code, 0, "{out}");
+        assert_eq!(
+            out["data"]["released"],
+            serde_json::json!([]),
+            "{leased}: {out}"
+        );
+        fs::remove_file(wa.join(draft)).expect("rm");
+        assert_eq!(run(&wa, "a", 300, &["release", leased]).0, 0);
+    }
+}
+
+/// `release --committed` keeps a committed folder lease while a draft in
+/// another letter case sits under it (#18144): the commit qualifies, and
+/// the draft alone is why it stays.
+#[test]
+fn a_committed_lease_with_a_draft_in_another_case_stays() {
+    let (_dir, _repo, wa, _wb) = worktrees_named("a", "b");
+    fs::write(wa.join(".gitignore"), "*.draft\n").expect("ignore");
+    fs::create_dir_all(wa.join("docs/Notes")).expect("docs");
+    fs::write(wa.join("docs/Notes/a.md"), "a\n").expect("a");
+    sh(&wa, &["add", "."]);
+    sh(&wa, &["commit", "-qm", "docs"]);
+    let granted = 10_000_900;
+    let now = 10_001_100;
+    let (code, out) = run(&wa, "a", granted, &["claim", "docs/Notes"]);
+    assert_eq!(code, 0, "{out}");
+    edit(&wa, "docs/Notes/a.md", "a", "a, edited");
+    git_dated(&wa, 10_001, &["commit", "-qam", "edit a"]);
+    let (_, out) = run(&wa, "a", now, &["holds", "docs/Notes"]);
+    assert_eq!(out["data"]["lease"]["committed"], true, "{out}");
+    // On a case-sensitive filesystem a second folder; on a case-insensitive
+    // one the same folder. Either way it's under the lease.
+    fs::create_dir_all(wa.join("docs/notes")).expect("variant");
+    fs::write(wa.join("docs/notes/x.draft"), "draft\n").expect("draft");
+    let (_, out) = run(&wa, "a", now, &["holds", "docs/Notes"]);
+    assert_eq!(out["data"]["lease"]["clean"], false, "{out}");
+    let (code, out) = run(&wa, "a", now, &["release", "--committed"]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(out["data"]["released"], serde_json::json!([]), "{out}");
+    let why: Vec<String> = kept(&out).into_iter().map(|(_, w)| w).collect();
+    assert_eq!(why, ["uncommitted"], "{out}");
+    // Without the draft, the same commit releases it.
+    fs::remove_file(wa.join("docs/notes/x.draft")).expect("rm");
+    let (code, out) = run(&wa, "a", now, &["release", "--committed"]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(out["data"]["released"][0]["scope"], "docs/Notes", "{out}");
 }

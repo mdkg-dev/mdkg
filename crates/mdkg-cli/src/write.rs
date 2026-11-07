@@ -1170,6 +1170,11 @@ pub(crate) fn node_value(repo: &Repo, id: &str) -> Result<(Value, Vec<Diagnostic
 pub struct NewData {
     #[schemars(with = "NodeRecord")]
     pub node: Value,
+    /// Whether the node's file is in the store's work folder, for the text
+    /// only (not part of the JSON).
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub local: bool,
 }
 
 pub fn new_node(root: &Path, actor: Option<String>, spec: NewSpec, json: bool) -> u8 {
@@ -1182,17 +1187,33 @@ pub fn new_node(root: &Path, actor: Option<String>, spec: NewSpec, json: bool) -
         repo.observe(&mut store, now)?;
         let (id, _) = create(&repo, &mut store, &actor, &spec, now)?;
         let (node, warnings) = node_value(&repo, &id)?;
-        Ok(Report::ok(NewData { node }).with(warnings))
+        // Local work by where it is, the store's work folder, not by how
+        // its path reads: a separate git dir inside the checkout gives a
+        // relative one (Terra #17973).
+        let local = node["path"].as_str().is_some_and(|p| {
+            let file = repo.root.join(p);
+            mdkg_graph::store_work::work_dir(&repo.root)
+                .ok()
+                .flatten()
+                .is_some_and(|w| {
+                    let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or(p.to_path_buf());
+                    canonical(&file).starts_with(canonical(&w))
+                })
+        });
+        Ok(Report::ok(NewData { node, local }).with(warnings))
     })()
     .unwrap_or_else(Report::failed);
     output::emit("new", json, report, |d| {
-        // The path is the repository's own text (SEC2): escaped.
+        // The path is the repository's own text (SEC2): escaped. Local
+        // work lives outside the checkout, in the store's work folder, so
+        // its path is labelled as such (e2e UX).
+        let path = d.node["path"].as_str().unwrap_or("-");
+        let label = if d.local { "local work at " } else { "" };
         println!(
             "{}",
             output::shown_path(&format!(
-                "created {} ({})",
+                "created {} ({label}{path})",
                 d.node["id"].as_str().unwrap_or("-"),
-                d.node["path"].as_str().unwrap_or("-")
             ))
         );
     })

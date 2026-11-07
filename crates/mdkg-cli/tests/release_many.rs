@@ -264,6 +264,9 @@ fn release_takes_a_target_or_all_never_both() {
         &["release"],
         &["release", "task-1", "--clean"],
         &["release", "--all", "--clean"],
+        &["release", "task-1", "notes", "--all"],
+        &["release", "task-1", "notes", "--committed"],
+        &["release", "--scope", "lib.txt", "notes"],
     ] {
         let (code, out) = run(&wt, "a", args);
         assert_eq!(code, 1, "{args:?}: {out}");
@@ -343,6 +346,118 @@ fn beside_a_lease_authority_only_local_leases_go_and_it_says_so() {
         .any(|d| d["code"] == "coord.authority_remote" && d["severity"] == "warning");
     assert!(warned, "{out}");
     assert!(!calls.exists(), "the authority was never called");
+
+    // Several targets beside an authority: refused, one at a time.
+    ok(&wt, "a", &["claim", "role:reviewer"]);
+    let out = isolated(&mut Command::new(env!("CARGO_BIN_EXE_mdkg")))
+        .arg("--root")
+        .arg(&wt)
+        .args(["--as", "a", "release", "role:reviewer", "lib.txt", "--json"])
+        .env("XDG_CONFIG_HOME", &config)
+        .output()
+        .expect("run mdkg");
+    assert_eq!(out.status.code(), Some(1));
+    let out: Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(
+        out["diagnostics"][0]["code"], "usage.invalid_arguments",
+        "{out}"
+    );
+    assert_eq!(held(&wt, "a"), vec!["role:reviewer".to_string()], "{out}");
+    assert!(!calls.exists(), "the authority was never called");
+}
+
+/// `release a b c`: every target in one call,
+/// all or none, with each target's lease listed.
+#[test]
+fn release_takes_several_targets_all_or_none() {
+    let dir = scratch();
+    let (repo, wt) = setup(&dir);
+    ok(&wt, "a", &["claim", "task-1"]);
+    ok(&wt, "a", &["claim", "notes"]);
+    ok(&wt, "a", &["claim", "lib.txt"]);
+    let out = ok(&wt, "a", &["release", "task-1", "notes", "lib.txt"]);
+    assert_eq!(out["schema"], "mdkg.release.v1");
+    let releases = out["data"]["releases"].as_array().expect("releases");
+    let got: Vec<(&str, &str, &str)> = releases
+        .iter()
+        .map(|r| {
+            (
+                r["target"].as_str().expect("target"),
+                r["lease"]["scope"].as_str().expect("scope"),
+                r["lease"]["status"].as_str().expect("status"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        got,
+        [
+            ("task-1", T1, "released"),
+            ("notes", "notes", "released"),
+            ("lib.txt", "lib.txt", "released"),
+        ],
+        "{out}"
+    );
+    assert_eq!(out["data"]["lease"], releases[0]["lease"], "{out}");
+    assert!(held(&wt, "a").is_empty());
+
+    // One target with no lease of yours refuses them all: nothing goes.
+    ok(&wt, "a", &["claim", "notes"]);
+    ok(&wt, "a", &["claim", "lib.txt"]);
+    let (code, out) = run(&wt, "a", &["release", "notes", "lib.txt", "role:other"]);
+    assert_ne!(code, 0, "{out}");
+    assert_eq!(out["diagnostics"][0]["code"], "coord.no_lease", "{out}");
+    let message = out["diagnostics"][0]["message"].as_str().expect("message");
+    assert!(message.starts_with("role:other: "), "{out}");
+    let hint = out["diagnostics"][0]["hint"].as_str().expect("hint");
+    assert!(hint.contains("none of the 3 targets was released"), "{out}");
+    assert_eq!(
+        held(&wt, "a"),
+        vec!["lib.txt".to_string(), "notes".into()],
+        "{out}"
+    );
+    // Another actor's lease, by id, refuses them all too.
+    let b = ok(&repo, "b", &["claim", "task-1"]);
+    let b_id = b["data"]["lease"]["id"].as_str().expect("id");
+    let (code, out) = run(&wt, "a", &["release", "notes", b_id]);
+    assert_ne!(code, 0, "{out}");
+    // The store refuses it after `notes` in the same transaction, which
+    // rolls back whole.
+    assert_eq!(out["diagnostics"][0]["code"], "coord.not_owner", "{out}");
+    let hint = out["diagnostics"][0]["hint"].as_str().expect("hint");
+    assert!(hint.contains("none of the 2 targets was released"), "{out}");
+    assert_eq!(
+        held(&wt, "a"),
+        vec!["lib.txt".to_string(), "notes".into()],
+        "{out}"
+    );
+    assert_eq!(held(&repo, "b"), vec![T1.to_string()], "b's stays");
+
+    // The same lease twice, and one already ended, are fine; text lists
+    // each target's lease.
+    let ended = ok(&wt, "a", &["claim", "role:reviewer"]);
+    let ended_id = ended["data"]["lease"]["id"].as_str().expect("id");
+    ok(&wt, "a", &["release", "role:reviewer"]);
+    let text = mdkg(
+        &wt,
+        "a",
+        &["release", "notes", "notes/", ended_id, "lib.txt"],
+    );
+    assert!(text.status.success(), "{text:?}");
+    let lines: Vec<String> = String::from_utf8_lossy(&text.stdout)
+        .lines()
+        .map(|l| l.split(" (").next().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            "released notes",
+            "released notes",
+            "released role:reviewer",
+            "released lib.txt"
+        ],
+        "{text:?}"
+    );
+    assert!(held(&wt, "a").is_empty());
 }
 
 #[test]
@@ -458,4 +573,98 @@ fn release_clean_frees_only_clean_path_leases_past_their_first_30_minutes() {
         "{out}"
     );
     assert_eq!(held(&wt, "a"), vec![T1.to_string(), "role:reviewer".into()]);
+}
+
+/// A target that is both a lease id and a file here refuses the whole
+/// batch, as it refuses `release <target>` (#18223): never the lease
+/// that id names elsewhere.
+#[test]
+fn an_ambiguous_lease_id_refuses_the_whole_batch() {
+    let dir = scratch();
+    let (_repo, wt) = setup(&dir);
+    let first = ok(&wt, "a", &["claim", "task-1"]);
+    let id = first["data"]["lease"]["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    fs::write(wt.join(&id), "a file named like a lease id\n").expect("file");
+    ok(&wt, "a", &["claim", &format!("./{id}")]);
+    ok(&wt, "a", &["claim", "notes"]);
+    let before = held(&wt, "a");
+    assert_eq!(before, vec![T1.to_string(), id.clone(), "notes".into()]);
+    for args in [&["release", &id][..], &["release", &id, "notes"]] {
+        let (code, out) = run(&wt, "a", args);
+        assert_eq!(code, 1, "{args:?}: {out}");
+        assert_eq!(
+            out["diagnostics"][0]["code"], "usage.invalid_arguments",
+            "{out}"
+        );
+        assert_eq!(held(&wt, "a"), before, "{args:?}: nothing released");
+    }
+    let (code, out) = run(&wt, "a", &["release", &id, "notes"]);
+    assert_eq!(code, 1, "{out}");
+    let hint = out["diagnostics"][0]["hint"].as_str().expect("hint");
+    assert!(hint.contains("none of the 2 targets was released"), "{out}");
+}
+
+/// A failed journal write inside `release a b` rolls the whole batch
+/// back (#18223): reopened, the store holds both leases, and the same
+/// command then releases both.
+#[test]
+fn a_failed_write_in_a_batch_release_releases_none() {
+    let dir = scratch();
+    let (repo, wt) = setup(&dir);
+    ok(&wt, "a", &["claim", "notes"]);
+    let lib = ok(&wt, "a", &["claim", "lib.txt"]);
+    let id = lib["data"]["lease"]["id"].as_str().expect("id").to_string();
+    // The second release's journal write fails, as a full disk would.
+    let store = repo.join(".git/mdkg/coord.sqlite");
+    rusqlite::Connection::open(&store)
+        .expect("store")
+        .execute_batch(&format!(
+            "CREATE TRIGGER fail_one BEFORE INSERT ON journal
+             WHEN NEW.command LIKE '%elease%' AND NEW.command LIKE '%\"{id}\"%'
+             BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;"
+        ))
+        .expect("trigger");
+    let (code, out) = run(&wt, "a", &["release", "notes", "lib.txt"]);
+    assert_ne!(code, 0, "{out}");
+    assert_eq!(out["ok"], false, "{out}");
+    assert_eq!(
+        held(&wt, "a"),
+        vec!["lib.txt".to_string(), "notes".into()],
+        "neither is released: {out}"
+    );
+    rusqlite::Connection::open(&store)
+        .expect("store")
+        .execute_batch("DROP TRIGGER fail_one;")
+        .expect("drop trigger");
+    let out = ok(&wt, "a", &["release", "notes", "lib.txt"]);
+    let released: Vec<&str> = out["data"]["releases"]
+        .as_array()
+        .expect("releases")
+        .iter()
+        .map(|r| r["lease"]["status"].as_str().expect("status"))
+        .collect();
+    assert_eq!(released, ["released", "released"], "{out}");
+    assert!(held(&wt, "a").is_empty());
+}
+
+/// A handle naming several nodes refuses the whole batch (#18292), even
+/// when a lease of yours sits on a path spelled like it: never that path.
+#[test]
+fn an_ambiguous_handle_refuses_the_whole_batch() {
+    let dir = scratch();
+    let (_repo, wt) = setup(&dir);
+    // "task" is in both nodes' titles; `./task` is a path not yet written.
+    ok(&wt, "a", &["claim", "--new", "./task"]);
+    ok(&wt, "a", &["claim", "notes"]);
+    let before = held(&wt, "a");
+    assert_eq!(before, vec!["notes".to_string(), "task".into()]);
+    let (code, out) = run(&wt, "a", &["release", "task", "notes"]);
+    assert_eq!(code, 7, "{out}");
+    assert_eq!(out["diagnostics"][0]["code"], "node.ambiguous", "{out}");
+    let hint = out["diagnostics"][0]["hint"].as_str().unwrap_or_default();
+    assert!(hint.contains("none of the 2 targets was released"), "{out}");
+    assert_eq!(held(&wt, "a"), before, "nothing released");
 }

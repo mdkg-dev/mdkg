@@ -584,7 +584,7 @@ impl Owner {
     /// 6090d38); a `ps` that can't be asked never does.
     pub fn gone(&self) -> bool {
         if self.started.is_empty() {
-            return self.host == crate::turn::this_host()
+            return crate::turn::this_host().is_some_and(|h| h == self.host)
                 && matches!(crate::turn::started(self.pid), Ok(None));
         }
         crate::turn::holder_gone(&crate::state::LeaseRecord {

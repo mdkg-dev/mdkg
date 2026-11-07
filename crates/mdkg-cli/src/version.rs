@@ -28,11 +28,13 @@ const fn same(a: &str, b: &str) -> bool {
 }
 
 /// `mdkg --version`'s line: the crate version, the commit, whether the
-/// tree was dirty, and the build date.
-pub const LINE: &str = if HERE {
-    env!("MDKG_BUILD_VERSION")
-} else {
-    env!("MDKG_BUILD_VERSION_ELSEWHERE")
+/// tree was dirty, and the build date; a build with no FIDO2 backend
+/// (as mdkg-presence resolved its feature) says so.
+pub const LINE: &str = match (HERE, mdkg_serve::FIDO2) {
+    (true, true) => env!("MDKG_BUILD_VERSION"),
+    (false, true) => env!("MDKG_BUILD_VERSION_ELSEWHERE"),
+    (true, false) => env!("MDKG_BUILD_VERSION_NO_FIDO2"),
+    (false, false) => env!("MDKG_BUILD_VERSION_ELSEWHERE_NO_FIDO2"),
 };
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -64,6 +66,7 @@ pub fn data() -> VersionData {
         // ship with the stream's signal ending (A18); `serve.local` with
         // `mdkg serve`'s socket (its start envelope names the same).
         capabilities: Some(vec![
+            "agents.delivery.digest".into(),
             "channels".into(),
             "events".into(),
             "msg.watch".into(),

@@ -573,6 +573,52 @@ fn an_anchor_whose_publish_failed_is_published_by_the_next_command() {
     );
 }
 
+/// A recorded anchor whose file the graph then changed (a valid anchor,
+/// as another clone's would be) is stale; a fresh `anchor` still
+/// publishes, and the stale intent is kept (Terra #18107). Here the fresh
+/// command observes the changed tip, a new record, so its seq and request
+/// id are new; the same-seq retry (g-launcher #13274) is graph_git.rs's
+/// a_stale_anchor_intent_at_the_same_seq_retries_with_the_tip.
+#[test]
+fn a_stale_anchor_intent_does_not_block_the_next_anchor() {
+    let s = Scratch::new();
+    with_task(&s);
+    let (code, out) = s.mdkg_with(&["anchor", "--json"], &[("MDKG_FAIL_AFTER", "recorded")]);
+    assert_ne!(code, 0, "{out}");
+    let common = s.repo().join(".git");
+    let journal = mdkg_graph::intent::Journal::open(&common).expect("journal");
+    let pending = journal.pending().expect("pending");
+    assert_eq!(pending.len(), 1, "{pending:?}");
+    let first = pending[0].id().to_owned();
+    let prepared = pending[0].prepared.commit.clone();
+    let rel = s.git(&[
+        "diff-tree",
+        "--no-commit-id",
+        "--name-only",
+        "-r",
+        &prepared,
+        "--",
+        ".mdkg/anchors",
+    ]);
+    assert!(rel.starts_with(".mdkg/anchors/"), "{rel}");
+    // The same anchor at another time: canonical, valid, and a change,
+    // as another clone's anchor would be.
+    let text = s.git(&["show", &format!("{prepared}:{rel}")]);
+    let mut value: Value = serde_json::from_str(&text).expect("anchor");
+    value["ts"] = "2026-01-01T00:00:00.000Z".into();
+    put_on_graph(
+        &s,
+        &rel,
+        &format!("{}\n", serde_json::to_string(&value).expect("json")),
+    );
+    let tip = s.git(&["rev-parse", GRAPH]);
+    let (code, out) = s.mdkg(&["anchor", "--json"]);
+    assert_eq!(code, 0, "{out}");
+    assert_ne!(s.git(&["rev-parse", GRAPH]), tip, "{out}");
+    // The stale intent is kept for recovery, as before.
+    assert!(journal.load(&first).expect("load").is_some(), "{out}");
+}
+
 #[test]
 fn status_reports_a_pending_intent_without_replay_beside_a_writer() {
     let s = Scratch::new();
@@ -621,6 +667,49 @@ fn status_reports_a_pending_intent_without_replay_beside_a_writer() {
     assert_eq!(s.mdkg(&["renew", "--json"]).0, 0, "a writer still recovers");
     assert!(journal.pending().unwrap().is_empty());
     assert_ne!(s.git(&["rev-parse", GRAPH]), before);
+}
+
+/// `msg list` binds no graph: a pending intent stays pending, the graph
+/// ref doesn't move and the store's bytes don't change (edd-01a1a1f1 L3;
+/// Terra #17776 finding 1). Only an empty WAL may appear.
+#[test]
+fn msg_list_leaves_a_pending_intent_and_the_store_untouched() {
+    let s = Scratch::new();
+    with_task(&s);
+    let before = s.git(&["rev-parse", GRAPH]);
+    let (code, out) = s.mdkg_with(&["anchor", "--json"], &[("MDKG_FAIL_AFTER", "recorded")]);
+    assert_ne!(code, 0, "{out}");
+    let common = s.repo().join(".git");
+    let journal = mdkg_graph::intent::Journal::open(&common).unwrap();
+    let pending = journal.pending().unwrap();
+    assert_eq!(pending.len(), 1);
+    let store = |common: &std::path::Path| -> Vec<(String, Vec<u8>)> {
+        ["coord.sqlite", "coord.sqlite-wal"]
+            .iter()
+            .filter_map(|name| {
+                let bytes = fs::read(common.join("mdkg").join(name)).ok()?;
+                (!bytes.is_empty()).then(|| (name.to_string(), bytes))
+            })
+            .collect()
+    };
+    let bytes = store(&common);
+    assert!(!bytes.is_empty(), "the store exists");
+    let (code, listed) = s.mdkg(&["--as", "human:nick", "msg", "list", "--json"]);
+    assert_eq!(code, 0, "{listed}");
+    assert_eq!(listed["schema"], "mdkg.msg.list.v1");
+    assert_eq!(
+        journal.pending().unwrap(),
+        pending,
+        "msg list must not replay"
+    );
+    assert_eq!(
+        s.git(&["rev-parse", GRAPH]),
+        before,
+        "msg list must not publish"
+    );
+    assert!(store(&common) == bytes, "msg list must not write the store");
+    assert_eq!(s.mdkg(&["renew", "--json"]).0, 0, "a writer still recovers");
+    assert!(journal.pending().unwrap().is_empty());
 }
 
 #[test]
@@ -1124,7 +1213,8 @@ fn node_save_from_stdin_needs_its_preimage_and_refuses_a_stale_one() {
         ],
         format!("{body}\nLater.\n").as_bytes(),
     );
-    assert_ne!(code, 0, "{out}");
+    // A conflict to re-read and retry (exit 5), not a failure (4).
+    assert_eq!(code, 5, "{out}");
     assert!(out.to_string().contains("graph.write_stale"), "{out}");
     assert_eq!(s.git(&["rev-parse", GRAPH]), tip);
 }
@@ -1153,6 +1243,106 @@ fn node_edit_is_for_ref_mode_only() {
             "{verb}: {out}"
         );
     }
+}
+
+/// The e2e's N2 steps through the binary (#16893): ref-mode `init` keeps
+/// work local, so `new task` writes it under `.git/mdkg/work`; `node edit`
+/// and `node save` refuse it as a usage error (exit 1) naming its file, and
+/// leave no lease behind.
+#[test]
+fn node_edit_refuses_a_local_work_node_and_leaves_no_lease() {
+    let s = Scratch::new();
+    s.ref_mode(true);
+    let (code, out) = s.mdkg(&["init", "--json"]);
+    assert_eq!(code, 0, "{out}");
+    let (code, new) = s.mdkg(&[
+        "--as",
+        "carol",
+        "new",
+        "task",
+        "Leak check",
+        "--status",
+        "todo",
+        "--json",
+    ]);
+    assert_eq!(code, 0, "{new}");
+    let id = new["data"]["node"]["id"]
+        .as_str()
+        .or_else(|| new["data"]["id"].as_str())
+        .expect("id")
+        .to_owned();
+    let tip = s.git(&["rev-parse", GRAPH]);
+    for verb in ["edit", "save"] {
+        let (code, out) = s.mdkg(&["--as", "carol", "node", verb, "Leak check", "--json"]);
+        assert_eq!(code, 1, "{verb}: {out}");
+        let d = &out["diagnostics"][0];
+        assert!(
+            d["message"]
+                .as_str()
+                .expect("message")
+                .contains("local work"),
+            "{verb}: {out}"
+        );
+        let hint = d["hint"].as_str().expect("hint");
+        assert!(
+            hint.contains(".git/mdkg/work/") && hint.contains(&id),
+            "{verb}: the hint names the local file: {out}"
+        );
+    }
+    let (code, status) = s.mdkg(&["--as", "carol", "status", "--json"]);
+    assert_eq!(code, 0, "{status}");
+    let leases = status["data"]["leases"].as_array().expect("leases");
+    assert!(leases.is_empty(), "no lease is left: {status}");
+    // Another actor can claim it at once.
+    let (code, out) = s.mdkg(&["--as", "dave", "claim", "Leak check", "--json"]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(
+        s.git(&["rev-parse", GRAPH]),
+        tip,
+        "the graph ref is untouched"
+    );
+    assert!(!s.repo().join(".mdkg-edit").exists(), "no copy folder");
+}
+
+/// #16701 item 1: in ref mode the lease policy is the committed config's on
+/// the graph ref (coord's `committed_lease_policy` via
+/// `msg::committed_config`), so a policy published there shares a path at
+/// once.
+#[test]
+fn a_lease_policy_committed_to_the_graph_ref_takes_effect() {
+    let s = Scratch::new();
+    with_task(&s);
+    let (code, out) = s.mdkg(&["--as", "carol", "claim", "code.rs", "--json"]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(out["data"]["lease"]["mode"], "exclusive", "{out}");
+    let (code, out) = s.mdkg(&["--as", "dave", "claim", "code.rs", "--json"]);
+    assert_eq!(code, 5, "the default policy is exclusive: {out}");
+    let mut config: Value =
+        serde_json::from_str(&s.git(&["show", &format!("{GRAPH}:.mdkg/config.json")]))
+            .expect("config");
+    config["coordination"]["leases"] = serde_json::json!({
+        "paths": [{"glob": "code.rs", "mode": "shared"}]
+    });
+    put_on_graph(
+        &s,
+        ".mdkg/config.json",
+        &format!("{}\n", serde_json::to_string_pretty(&config).expect("json")),
+    );
+    let (code, out) = s.mdkg(&["--as", "carol", "release", "code.rs", "--json"]);
+    assert_eq!(code, 0, "{out}");
+    let (code, out) = s.mdkg(&["--as", "carol", "claim", "code.rs", "--json"]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(out["data"]["lease"]["mode"], "shared", "{out}");
+    let (code, out) = s.mdkg(&["--as", "dave", "claim", "code.rs", "--json"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(
+        out["diagnostics"]
+            .as_array()
+            .expect("diagnostics")
+            .iter()
+            .any(|d| d["code"] == "coord.lease_shared"),
+        "{out}"
+    );
 }
 
 #[test]
@@ -1676,4 +1866,625 @@ fn hand_edit_reported_by_status() {
         s.git(&["show", &format!("{GRAPH}:.mdkg/work/{task}.md")])
             .contains("a hand edit")
     );
+}
+
+/// A clone with code on its branch and no graph, not in ref mode yet:
+/// `init --setup` takes it there.
+fn plain_clone(s: &Scratch, identity: bool) {
+    s.git(&["init", "-q", "-b", "trunk"]);
+    if identity {
+        s.git(&["config", "user.name", "Graph Test"]);
+        s.git(&["config", "user.email", "graph@example.invalid"]);
+    }
+    fs::write(s.repo().join("code.rs"), "fn main() {}\n").expect("code");
+    s.git(&["add", "code.rs"]);
+    s.git(&[
+        "-c",
+        "user.name=Graph Test",
+        "-c",
+        "user.email=graph@example.invalid",
+        "commit",
+        "-q",
+        "-m",
+        "code",
+    ]);
+}
+
+fn mdkg_keys(s: &Scratch) -> String {
+    s.try_git(&["config", "--get-regexp", "^mdkg\\."])
+        .unwrap_or_default()
+}
+
+/// Omni #20236 item 3: `init --setup` starts the graph on the graph ref,
+/// in ref mode, with no commit on the checked-out branch and nothing
+/// written into the checkout; a dry run writes nothing at all.
+#[test]
+fn init_setup_starts_the_graph_on_the_graph_ref_without_a_branch_commit() {
+    let s = Scratch::new();
+    plain_clone(&s, true);
+    let head = s.git(&["rev-parse", "HEAD"]);
+    let (code, dry) = s.mdkg(&["init", "--setup", "local", "--dry-run", "--json"]);
+    assert_eq!(code, 0, "{dry}");
+    assert_eq!(dry["data"]["dry_run"], true, "{dry}");
+    assert_eq!(dry["data"]["setup"], "local", "{dry}");
+    assert!(
+        s.try_git(&["rev-parse", "-q", "--verify", GRAPH]).is_none(),
+        "{dry}"
+    );
+    assert_eq!(mdkg_keys(&s), "", "a dry run writes no key");
+    assert!(
+        dry.to_string()
+            .contains("identity for that commit is checked"),
+        "the preview says what it doesn't check: {dry}"
+    );
+    let (code, out) = s.mdkg(&["init", "--setup", "local", "--work", "shared", "--json"]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(out["data"]["setup"], "local", "{out}");
+    assert_eq!(out["data"]["graph_ref"], GRAPH, "{out}");
+    assert_eq!(
+        s.git(&["rev-parse", "HEAD"]),
+        head,
+        "no commit on the branch"
+    );
+    assert_eq!(
+        s.git(&["status", "--porcelain"]),
+        "",
+        "the checkout is unchanged"
+    );
+    assert!(!s.repo().join(".mdkg").exists());
+    assert_eq!(s.git(&["config", "mdkg.graph.ref"]), GRAPH);
+    assert!(s.try_git(&["config", "mdkg.graph.remote"]).is_none());
+    let graph_id = out["data"]["graph_id"].as_str().expect("id");
+    assert_eq!(
+        s.git(&["config", &format!("mdkg.graph.{graph_id}.ref")]),
+        GRAPH
+    );
+    assert!(
+        !out.to_string().contains("there's no graph yet"),
+        "no stale note: {out}"
+    );
+    let (code, status) = s.mdkg(&["status", "--json"]);
+    assert_eq!(code, 0, "{status}");
+    let (code, new) = s.mdkg(&["new", "task", "First", "--status", "todo", "--json"]);
+    assert_eq!(code, 0, "{new}");
+    assert_eq!(
+        s.git(&["rev-parse", "HEAD"]),
+        head,
+        "still no branch commit"
+    );
+    // A second init --setup has nothing to choose.
+    let (code, again) = s.mdkg(&["init", "--setup", "local", "--json"]);
+    assert_eq!(code, 1, "{again}");
+    assert_eq!(again["diagnostics"][0]["code"], "init.conflict", "{again}");
+    let hint = again["diagnostics"][0]["hint"].as_str().expect("hint");
+    assert!(
+        hint.contains("init` (without --setup, and with the same --work"),
+        "{again}"
+    );
+}
+
+/// Each refusal comes before anything is written: a checkout that has a
+/// graph, an existing graph ref, a professional setup without its remote,
+/// --in-checkout alongside it, and a failure before the graph ref is
+/// published, which puts the keys back.
+#[test]
+fn init_setup_refuses_before_writing_and_rolls_back_a_failed_creation() {
+    // A professional setup needs --graph-remote; install's own refusal.
+    let s = Scratch::new();
+    plain_clone(&s, true);
+    let (code, out) = s.mdkg(&["init", "--setup", "professional", "--json"]);
+    assert_ne!(code, 0, "{out}");
+    assert_eq!(mdkg_keys(&s), "", "{out}");
+    assert!(s.try_git(&["rev-parse", "-q", "--verify", GRAPH]).is_none());
+    // --in-checkout says the opposite.
+    let (code, out) = s.mdkg(&["init", "--setup", "local", "--in-checkout", "--json"]);
+    assert_eq!(code, 1, "{out}");
+    // An existing graph ref is install's to adopt.
+    s.git(&["branch", "mdkg-graph"]);
+    let (code, out) = s.mdkg(&["init", "--setup", "local", "--json"]);
+    assert_eq!(code, 1, "{out}");
+    assert_eq!(out["diagnostics"][0]["code"], "init.exists", "{out}");
+    assert!(
+        out["diagnostics"][0]["hint"]
+            .as_str()
+            .is_some_and(|h| h.contains("install --setup local")),
+        "{out}"
+    );
+    s.git(&["branch", "-D", "mdkg-graph"]);
+    assert_eq!(mdkg_keys(&s), "");
+    // A checkout with a graph (checkout mode's init) is moved by install.
+    let (code, out) = s.mdkg(&["init", "--json"]);
+    assert_eq!(code, 0, "{out}");
+    let (code, out) = s.mdkg(&["init", "--setup", "personal", "--json"]);
+    assert_eq!(code, 1, "{out}");
+    assert_eq!(out["diagnostics"][0]["code"], "init.exists", "{out}");
+    assert!(
+        out["diagnostics"][0]["hint"]
+            .as_str()
+            .is_some_and(|h| h.contains("install --setup personal")),
+        "{out}"
+    );
+    assert!(s.try_git(&["config", "mdkg.graph.ref"]).is_none(), "{out}");
+
+    // No git identity: the commit fails before the graph ref exists, so
+    // the clone is back in checkout mode with no key left.
+    let t = Scratch::named("setup-rollback");
+    plain_clone(&t, false);
+    let (code, out) = t.mdkg(&["init", "--setup", "local", "--json"]);
+    assert_ne!(code, 0, "{out}");
+    assert_eq!(
+        out["diagnostics"][0]["code"], "graph.identity_unset",
+        "{out}"
+    );
+    assert_eq!(mdkg_keys(&t), "", "keys put back: {out}");
+    assert!(t.try_git(&["rev-parse", "-q", "--verify", GRAPH]).is_none());
+    // With an identity, the same command then succeeds.
+    t.git(&["config", "user.name", "Graph Test"]);
+    t.git(&["config", "user.email", "graph@example.invalid"]);
+    let (code, out) = t.mdkg(&["init", "--setup", "local", "--json"]);
+    assert_eq!(code, 0, "{out}");
+}
+
+/// init at a graph checkout made by hand is refused as before, and the
+/// hint now names `init --setup`.
+#[test]
+fn init_at_a_hand_made_graph_worktree_names_init_setup() {
+    let s = Scratch::new();
+    plain_clone(&s, true);
+    let view = s.repo().join(".worktrees/graph");
+    s.git(&[
+        "worktree",
+        "add",
+        "-q",
+        "--orphan",
+        "-b",
+        "mdkg-graph",
+        view.to_str().expect("utf-8"),
+    ]);
+    let (code, out) = s.mdkg(&["init", "--root", view.to_str().expect("utf-8"), "--json"]);
+    assert_ne!(code, 0, "{out}");
+    assert_eq!(
+        out["diagnostics"][0]["code"], "install.unsupported_layout",
+        "{out}"
+    );
+    let hint = out["diagnostics"][0]["hint"].as_str().expect("hint");
+    assert!(hint.contains("init --setup"), "{out}");
+}
+
+/// A graph fetched from the setup's own graph remote is install's to
+/// adopt: init --setup refuses it, with --new-graph too, and starts no
+/// graph (#20348).
+#[test]
+fn init_setup_refuses_a_graph_on_its_own_graph_remote_even_with_new_graph() {
+    let s = Scratch::new();
+    plain_clone(&s, true);
+    let (code, out) = s.mdkg(&["init", "--setup", "local", "--json"]);
+    assert_eq!(code, 0, "{out}");
+    // A clone of it has origin/mdkg-graph and no graph of its own.
+    let t = Scratch::named("second");
+    fs::remove_dir(t.repo()).expect("empty");
+    s.git(&[
+        "clone",
+        "-q",
+        s.repo().to_str().expect("utf-8"),
+        t.repo().to_str().expect("utf-8"),
+    ]);
+    t.git(&["config", "user.name", "Graph Test"]);
+    t.git(&["config", "user.email", "graph@example.invalid"]);
+    assert!(
+        t.try_git(&[
+            "rev-parse",
+            "-q",
+            "--verify",
+            "refs/remotes/origin/mdkg-graph"
+        ])
+        .is_some()
+    );
+    for extra in [
+        &[][..],
+        &["--new-graph"][..],
+        &["--new-graph", "--dry-run"][..],
+    ] {
+        let mut args = vec!["init", "--setup", "personal"];
+        args.extend_from_slice(extra);
+        args.push("--json");
+        let (code, out) = t.mdkg(&args);
+        assert_eq!(code, 1, "{extra:?}: {out}");
+        assert_eq!(
+            out["diagnostics"][0]["code"], "init.graph_fetched",
+            "{extra:?}: {out}"
+        );
+        assert_eq!(mdkg_keys(&t), "", "{extra:?}: no key");
+        assert!(t.try_git(&["rev-parse", "-q", "--verify", GRAPH]).is_none());
+    }
+    let (_, out) = t.mdkg(&["init", "--setup", "personal", "--new-graph", "--json"]);
+    assert!(
+        out["diagnostics"][0]["hint"]
+            .as_str()
+            .is_some_and(|h| h.contains("install --setup personal")),
+        "{out}"
+    );
+}
+
+/// A nested checkout-mode graph is refused: ref mode is clone-wide, so
+/// `sub` would read the new root graph (Terra #20413).
+#[test]
+fn init_setup_refuses_a_nested_checkout_graph() {
+    let s = Scratch::new();
+    plain_clone(&s, true);
+    let sub = s.repo().join("sub");
+    fs::create_dir_all(&sub).expect("sub");
+    let (code, out) = s.mdkg(&["init", "--root", sub.to_str().expect("utf-8"), "--json"]);
+    assert_eq!(code, 0, "{out}");
+    let (code, out) = s.mdkg(&["init", "--setup", "local", "--json"]);
+    assert_eq!(code, 1, "{out}");
+    assert_eq!(out["diagnostics"][0]["code"], "init.exists", "{out}");
+    assert!(
+        out["diagnostics"][0]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("sub/.mdkg/config.json")),
+        "{out}"
+    );
+    assert!(
+        out["diagnostics"][0]["hint"]
+            .as_str()
+            .is_some_and(|h| h.contains("move only a root") && !h.contains("moves the checkout")),
+        "{out}"
+    );
+    assert_eq!(mdkg_keys(&s), "", "{out}");
+    assert!(s.try_git(&["rev-parse", "-q", "--verify", GRAPH]).is_none());
+    // Ignored, it's still found (Terra #20453).
+    fs::write(s.repo().join(".gitignore"), "sub/.mdkg/\n").expect("ignore");
+    let (code, out) = s.mdkg(&["init", "--setup", "local", "--json"]);
+    assert_eq!(code, 1, "{out}");
+    assert_eq!(out["diagnostics"][0]["code"], "init.exists", "{out}");
+    // Committed, then its removal staged: HEAD still has it.
+    fs::remove_file(s.repo().join(".gitignore")).expect("unignore");
+    s.git(&["add", "sub/.mdkg/config.json"]);
+    s.git(&["commit", "-q", "-m", "nested graph"]);
+    s.git(&["rm", "-q", "--cached", "sub/.mdkg/config.json"]);
+    fs::rename(sub.join(".mdkg"), s.repo().join("moved-aside")).expect("aside");
+    let (code, out) = s.mdkg(&["init", "--setup", "local", "--json"]);
+    assert_eq!(code, 1, "{out}");
+    assert_eq!(out["diagnostics"][0]["code"], "init.exists", "{out}");
+    assert_eq!(mdkg_keys(&s), "", "{out}");
+}
+
+/// A root graph only in the index (staged, then removed from disk) is
+/// on neither disk nor HEAD, and is still refused (Opus #20627).
+#[test]
+fn init_setup_refuses_a_root_graph_only_in_the_index() {
+    let s = Scratch::new();
+    plain_clone(&s, true);
+    let (code, out) = s.mdkg(&["init", "--in-checkout", "--json"]);
+    assert_eq!(code, 0, "{out}");
+    // A deleted name that is also a glob matching the README (Terra
+    // #20738).
+    let glob = s.repo().join(".mdkg/READM[E].md");
+    fs::write(&glob, "glob-named\n").expect("glob file");
+    s.git(&["add", ".mdkg"]);
+    fs::remove_file(&glob).expect("remove glob file");
+    // An unstaged edit beside the deleted config survives the hint's
+    // recovery (Terra #20704).
+    let readme = s.repo().join(".mdkg/README.md");
+    let edited = format!(
+        "{}\nlocal edit\n",
+        fs::read_to_string(&readme).expect("readme")
+    );
+    fs::write(&readme, &edited).expect("edit");
+    fs::remove_file(s.repo().join(".mdkg/config.json")).expect("remove");
+    let (code, out) = s.mdkg(&["init", "--setup", "local", "--json"]);
+    assert_eq!(code, 1, "{out}");
+    assert_eq!(out["diagnostics"][0]["code"], "init.exists", "{out}");
+    assert!(
+        out["diagnostics"][0]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("staged but missing")),
+        "{out}"
+    );
+    assert_eq!(mdkg_keys(&s), "", "{out}");
+    assert!(s.try_git(&["rev-parse", "-q", "--verify", GRAPH]).is_none());
+    // The hint's recovery works: restore, commit, install --setup moves
+    // it (Terra #20666).
+    let hint = out["diagnostics"][0]["hint"].as_str().expect("hint");
+    assert!(!hint.contains("rm -r"), "{out}");
+    let restore = hint
+        .split('`')
+        .find(|part| part.starts_with("git ls-files -d"))
+        .expect("restore command");
+    let ran = Command::new("sh")
+        .arg("-c")
+        .arg(restore)
+        .current_dir(s.repo())
+        .output()
+        .expect("sh runs");
+    assert!(
+        ran.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ran.stderr)
+    );
+    assert!(s.repo().join(".mdkg/config.json").is_file());
+    assert_eq!(
+        fs::read_to_string(&glob).expect("glob file"),
+        "glob-named\n"
+    );
+    assert_eq!(fs::read_to_string(&readme).expect("readme"), edited);
+    s.git(&["add", ".mdkg"]);
+    s.git(&["commit", "-q", "-m", "graph"]);
+    let (code, out) = s.mdkg(&["install", "--setup", "local", "--json"]);
+    assert_eq!(code, 0, "{out}");
+}
+
+/// A root config that isn't a readable file (a dangling link), untracked
+/// or staged, is refused as that, not as a staged graph (Terra #20666,
+/// Opus #20759).
+#[cfg(unix)]
+#[test]
+fn init_setup_names_a_dangling_root_config_link() {
+    let s = Scratch::new();
+    plain_clone(&s, true);
+    fs::create_dir_all(s.repo().join(".mdkg")).expect("folder");
+    std::os::unix::fs::symlink("missing.json", s.repo().join(".mdkg/config.json")).expect("link");
+    let (code, out) = s.mdkg(&["init", "--setup", "local", "--json"]);
+    assert_eq!(code, 1, "{out}");
+    assert_eq!(out["diagnostics"][0]["code"], "init.exists", "{out}");
+    let message = out["diagnostics"][0]["message"].as_str().expect("message");
+    assert!(message.contains("isn't a readable file"), "{out}");
+    assert!(!message.contains("staged"), "{out}");
+    assert_eq!(mdkg_keys(&s), "", "{out}");
+    // Staged: the index has it, and lstat still finds the link.
+    s.git(&["add", ".mdkg/config.json"]);
+    let (code, out) = s.mdkg(&["init", "--setup", "local", "--json"]);
+    assert_eq!(code, 1, "{out}");
+    let message = out["diagnostics"][0]["message"].as_str().expect("message");
+    assert!(message.contains("isn't a readable file"), "{out}");
+    assert_eq!(mdkg_keys(&s), "", "{out}");
+    // The hint's recovery: remove and unstage, then init --setup runs
+    // (Terra #20882).
+    let hint = out["diagnostics"][0]["hint"].as_str().expect("hint");
+    assert!(
+        hint.contains("git rm -q --cached .mdkg/config.json"),
+        "{out}"
+    );
+    fs::remove_file(s.repo().join(".mdkg/config.json")).expect("remove link");
+    s.git(&["rm", "-q", "--cached", ".mdkg/config.json"]);
+    // A staged regular config whose working copy became a dangling link
+    // is restored, never unstaged (Terra #20897).
+    let t = Scratch::named("staged-regular");
+    plain_clone(&t, true);
+    let (code, out) = t.mdkg(&["init", "--in-checkout", "--json"]);
+    assert_eq!(code, 0, "{out}");
+    t.git(&["add", ".mdkg/config.json"]);
+    let staged = t.git(&["show", ":.mdkg/config.json"]);
+    fs::remove_file(t.repo().join(".mdkg/config.json")).expect("remove config");
+    std::os::unix::fs::symlink("missing.json", t.repo().join(".mdkg/config.json")).expect("link");
+    let (code, out) = t.mdkg(&["init", "--setup", "local", "--json"]);
+    assert_eq!(code, 1, "{out}");
+    let hint = out["diagnostics"][0]["hint"].as_str().expect("hint");
+    assert!(!hint.contains("rm -q --cached"), "{out}");
+    assert!(hint.contains("git restore -- .mdkg/config.json"), "{out}");
+    t.git(&["restore", "--", ".mdkg/config.json"]);
+    assert_eq!(
+        fs::read_to_string(t.repo().join(".mdkg/config.json")).expect("restored"),
+        format!("{staged}\n")
+    );
+    let (code, out) = t.mdkg(&["init", "--setup", "local", "--json"]);
+    assert_eq!(code, 1, "{out}");
+    assert_eq!(out["diagnostics"][0]["code"], "init.exists", "{out}");
+    let (code, out) = s.mdkg(&["init", "--setup", "local", "--json"]);
+    assert_eq!(code, 0, "{out}");
+}
+
+/// The setup's own destination follows a hand-set mdkg.graph.remoteRef:
+/// a fetched origin/team-graph is refused, --new-graph too (Terra #20413).
+#[test]
+fn init_setup_refuses_a_fetched_branch_at_its_configured_remote_ref() {
+    let s = Scratch::new();
+    plain_clone(&s, true);
+    s.git(&["branch", "team-graph"]);
+    let t = Scratch::named("second");
+    fs::remove_dir(t.repo()).expect("empty");
+    s.git(&[
+        "clone",
+        "-q",
+        s.repo().to_str().expect("utf-8"),
+        t.repo().to_str().expect("utf-8"),
+    ]);
+    t.git(&["config", "user.name", "Graph Test"]);
+    t.git(&["config", "user.email", "graph@example.invalid"]);
+    t.git(&["config", "mdkg.graph.remoteRef", "refs/heads/team-graph"]);
+    let (code, out) = t.mdkg(&["init", "--setup", "personal", "--new-graph", "--json"]);
+    assert_eq!(code, 1, "{out}");
+    assert_eq!(out["diagnostics"][0]["code"], "init.graph_fetched", "{out}");
+    assert!(
+        out["diagnostics"][0]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("refs/remotes/origin/team-graph")),
+        "{out}"
+    );
+    assert!(t.try_git(&["rev-parse", "-q", "--verify", GRAPH]).is_none());
+    assert!(t.try_git(&["config", "mdkg.graph.ref"]).is_none(), "{out}");
+    // The hint doesn't promise an adoption install wouldn't do.
+    let hint = out["diagnostics"][0]["hint"].as_str().expect("hint");
+    assert!(hint.contains("doesn't adopt from checkout mode"), "{out}");
+    assert!(!hint.contains("adopts it"), "{out}");
+}
+
+/// A linked worktree under an ignored `.worktrees/` holds no graph, and
+/// init --setup isn't refused for it (Terra #20565).
+#[test]
+fn init_setup_ignores_an_ignored_linked_worktree_without_a_graph() {
+    let s = Scratch::new();
+    plain_clone(&s, true);
+    fs::write(s.repo().join(".gitignore"), ".worktrees/\n").expect("ignore");
+    s.git(&["add", ".gitignore"]);
+    s.git(&["commit", "-q", "-m", "ignore worktrees"]);
+    let lane = s.repo().join(".worktrees/lane");
+    s.git(&[
+        "worktree",
+        "add",
+        "-q",
+        "-b",
+        "lane",
+        lane.to_str().expect("utf-8"),
+    ]);
+    let (code, out) = s.mdkg(&["init", "--setup", "local", "--json"]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(out["data"]["setup"], "local", "{out}");
+}
+
+/// A linked worktree, ignored or outside the checkout, whose branch has a
+/// checkout-mode graph refuses init --setup: the config it changes is
+/// shared (Terra #20633).
+#[test]
+fn init_setup_refuses_a_linked_worktree_with_a_graph() {
+    let s = Scratch::new();
+    plain_clone(&s, true);
+    fs::write(s.repo().join(".gitignore"), ".worktrees/\n").expect("ignore");
+    s.git(&["add", ".gitignore"]);
+    s.git(&["commit", "-q", "-m", "ignore worktrees"]);
+    let lane = s.repo().join(".worktrees/lane");
+    s.git(&[
+        "worktree",
+        "add",
+        "-q",
+        "-b",
+        "lane",
+        lane.to_str().expect("utf-8"),
+    ]);
+    // On disk only (not committed in the lane).
+    let (code, out) = s.mdkg(&[
+        "init",
+        "--in-checkout",
+        "--root",
+        lane.to_str().expect("utf-8"),
+        "--json",
+    ]);
+    assert_eq!(code, 0, "{out}");
+    let refused = |s: &Scratch| {
+        let (code, out) = s.mdkg(&["init", "--setup", "local", "--json"]);
+        assert_eq!(code, 1, "{out}");
+        assert_eq!(out["diagnostics"][0]["code"], "init.exists", "{out}");
+        assert!(
+            out["diagnostics"][0]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("linked worktree") && m.contains("lane")),
+            "{out}"
+        );
+        assert_eq!(mdkg_keys(s), "", "{out}");
+        assert!(s.try_git(&["rev-parse", "-q", "--verify", GRAPH]).is_none());
+    };
+    refused(&s);
+    // Committed on the lane branch, then removed from its disk: its HEAD
+    // still has it.
+    let lane_git = |args: &[&str]| {
+        let mut all = vec!["-C", lane.to_str().expect("utf-8")];
+        all.extend_from_slice(args);
+        s.git(&all);
+    };
+    lane_git(&["add", ".mdkg"]);
+    lane_git(&["commit", "-q", "-m", "lane graph"]);
+    fs::rename(lane.join(".mdkg"), s.repo().join("lane-graph-aside")).expect("aside");
+    refused(&s);
+}
+
+/// A linked worktree outside the checkout gets the same scan as the
+/// checkout: a nested graph, and a root graph only in its index, refuse
+/// init --setup, and the hint warns before `git worktree remove` (Terra
+/// #20691).
+#[test]
+fn init_setup_scans_an_outside_linked_worktree_like_the_checkout() {
+    let s = Scratch::new();
+    plain_clone(&s, true);
+    let outside = Scratch::named("outside");
+    fs::remove_dir(outside.repo()).expect("empty");
+    let wt = outside.repo();
+    s.git(&[
+        "worktree",
+        "add",
+        "-q",
+        "-b",
+        "svc",
+        wt.to_str().expect("utf-8"),
+    ]);
+    let wt_git = |args: &[&str]| {
+        let mut all = vec!["-C", wt.to_str().expect("utf-8")];
+        all.extend_from_slice(args);
+        s.git(&all);
+    };
+    let refused = |s: &Scratch, needle: &str| {
+        let (code, out) = s.mdkg(&["init", "--setup", "local", "--json"]);
+        assert_eq!(code, 1, "{out}");
+        assert_eq!(out["diagnostics"][0]["code"], "init.exists", "{out}");
+        let message = out["diagnostics"][0]["message"].as_str().expect("message");
+        assert!(
+            message.contains("linked worktree") && message.contains(needle),
+            "{out}"
+        );
+        let hint = out["diagnostics"][0]["hint"].as_str().expect("hint");
+        assert!(
+            hint.contains("somewhere safe") && hint.contains("deletes them"),
+            "{out}"
+        );
+        assert_eq!(mdkg_keys(s), "", "{out}");
+        assert!(s.try_git(&["rev-parse", "-q", "--verify", GRAPH]).is_none());
+    };
+    // Nested, untracked.
+    let api = wt.join("services/api");
+    fs::create_dir_all(&api).expect("api");
+    let (code, out) = s.mdkg(&["init", "--root", api.to_str().expect("utf-8"), "--json"]);
+    assert_eq!(code, 0, "{out}");
+    refused(&s, "services/api/.mdkg/config.json");
+    // A root graph only in the worktree's index.
+    fs::remove_dir_all(wt.join("services")).expect("clear");
+    let (code, out) = s.mdkg(&[
+        "init",
+        "--in-checkout",
+        "--root",
+        wt.to_str().expect("utf-8"),
+        "--json",
+    ]);
+    assert_eq!(code, 0, "{out}");
+    wt_git(&["add", ".mdkg"]);
+    fs::remove_dir_all(wt.join(".mdkg")).expect("remove");
+    refused(&s, ".mdkg/config.json");
+}
+
+/// Run from a linked worktree, a graph in the main checkout is named as
+/// the main checkout's, with no `git worktree remove` hint (Terra #20691).
+#[test]
+fn init_setup_from_a_linked_worktree_names_the_main_checkouts_graph() {
+    let s = Scratch::new();
+    plain_clone(&s, true);
+    let (code, out) = s.mdkg(&["init", "--in-checkout", "--json"]);
+    assert_eq!(code, 0, "{out}");
+    s.git(&["add", ".mdkg"]);
+    s.git(&["commit", "-q", "-m", "graph"]);
+    let other = Scratch::named("lane");
+    fs::remove_dir(other.repo()).expect("empty");
+    let wt = other.repo();
+    s.git(&[
+        "worktree",
+        "add",
+        "-q",
+        "-b",
+        "lane",
+        wt.to_str().expect("utf-8"),
+    ]);
+    // The lane's own branch drops the graph, so only the main checkout has it.
+    let wt_git = |args: &[&str]| {
+        let mut all = vec!["-C", wt.to_str().expect("utf-8")];
+        all.extend_from_slice(args);
+        s.git(&all);
+    };
+    wt_git(&["rm", "-q", "-r", ".mdkg"]);
+    wt_git(&["commit", "-q", "-m", "no graph here"]);
+    let (code, out) = other.mdkg(&["init", "--setup", "local", "--json"]);
+    assert_eq!(code, 1, "{out}");
+    assert_eq!(out["diagnostics"][0]["code"], "init.exists", "{out}");
+    let message = out["diagnostics"][0]["message"].as_str().expect("message");
+    assert!(message.contains("main checkout"), "{out}");
+    let hint = out["diagnostics"][0]["hint"].as_str().expect("hint");
+    assert!(!hint.contains("worktree remove"), "{out}");
+    assert!(s.try_git(&["config", "mdkg.graph.ref"]).is_none(), "{out}");
 }

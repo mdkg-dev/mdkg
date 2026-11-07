@@ -6,8 +6,10 @@ definitions, designs and shared work — from git objects at one commit. In
 branch, usually `main`. Since 0.7.1 the graph can live on a **graph ref** of
 its own, so a repository doesn't need a code branch, or `main`, to carry it.
 
-This page describes what 0.7.1 does. Commands that arrive later are marked
-where they'd change the picture; they aren't available yet.
+This page describes what 0.7.1 does, plus graph sync (`mdkg graph remote
+approve`, `graph sync`, `graph conflicts`, `graph resolve`), new in 0.7.2.
+Other commands that arrive later are marked where they'd change the
+picture; they aren't available yet.
 
 ## The two modes
 
@@ -82,6 +84,27 @@ Install keeps an existing graph ref, adopts an already fetched
 `refs/remotes/<remote>/<graph-branch>`, or creates an orphan graph-only
 commit from this checkout's committed graph. It fetches nothing. With no
 graph yet it records the setup; `mdkg init` then creates the graph there.
+`mdkg init --setup <personal|professional|local>` (with `--graph-remote` for
+professional) does both in one step for a repository with no graph: it
+checks install's setup rules and records the same keys, then commits the
+graph to a new `refs/heads/mdkg-graph`, with no commit on any branch and
+nothing written into the checkout. It refuses, before writing anything, a
+checkout that already has a graph at its root (`install --setup` moves it)
+or nested below it (which stays in checkout mode, or moves to the root
+first: neither command moves a nested graph), a graph anywhere in another
+worktree of the clone (the config it changes is shared: a linked worktree's
+graph must leave it first, and one in the main checkout is that checkout's
+to set up), a fetched branch at the setup's own graph
+destination (its remote's `mdkg-graph`, or `mdkg.graph.remoteRef` when set,
+even with `--new-graph`), an existing
+graph ref (install adopts it), a clone already in ref mode, and a fetched
+graph of this repository (`--new-graph` lifts that one only for a graph on
+another remote; one on the setup's own graph remote is always install's to
+adopt). If the graph's first commit
+fails before the ref exists, the keys are put back and the clone stays in
+checkout mode (if a key can't be put back, the error names the `git config`
+command to run); a stop after the keys are written is finished by `mdkg init`
+with the same `--work` and `--graph-only` options.
 A professional setup refuses an existing graph ref whose tree holds code
 alongside the graph. The clone's graph identity is recorded when the graph
 is kept, adopted or created.
@@ -128,9 +151,9 @@ edits alone. The view is read-only by convention and is never authority:
 linked worktree with a detached HEAD, a code checkout made with `git
 worktree add --detach` included, so run it from the primary checkout or a
 linked worktree on a branch.
-It needs an existing graph ref. With no graph yet, run `mdkg install
---setup local`, then `mdkg init`, then `mdkg install --view` in that order
-(choose personal or professional instead when appropriate). Asking for
+It needs an existing graph ref. With no graph yet, run `mdkg init --setup
+local` (or `install --setup local`, then `mdkg init`), then `mdkg install
+--view` (choose personal or professional instead when appropriate). Asking for
 `--view` before init fails after setup has already recorded the mode key.
 
 `mdkg install --checkout-mode` unsets `mdkg.graph.ref` and keeps the graph
@@ -168,18 +191,20 @@ can't read stays, with a `doctor --repair` note) and, when no `.worktree`
 record remains and
 the graph ref is the default `refs/heads/mdkg-graph`, makes and registers
 a new graph checkout through install's own path, which records every graph
-again. A custom graph ref is refused up front (`graph.ref_invalid`),
-still in ref mode with no mode or registration changed (binding the graph
-may first complete an earlier interrupted graph write, as every graph
-command does), since install's graph checkout is
-made on `mdkg-graph` only: move the graph to `refs/heads/mdkg-graph`
-(`git branch -m -- <name> mdkg-graph` for a branch, `git update-ref
-refs/heads/mdkg-graph '<ref>^{commit}' ''` for a ref outside `refs/heads/`,
-which peels an annotated tag and, with the empty old value, refuses if
-`mdkg-graph` already exists: inspect that branch and keep or merge its
-commits first) and set
-`mdkg.graph.ref` and each `mdkg.graph.<id>.ref` record naming the old ref
-to `refs/heads/mdkg-graph` first, or
+again. A custom graph ref (0.7.2) is moved first, since install's graph
+checkout is made on `mdkg-graph` only: `refs/heads/mdkg-graph` is created
+at its tip (create-only), the custom ref is kept and no longer moves, and
+each `mdkg.graph.<id>.ref` record naming it is set to
+`refs/heads/mdkg-graph`; the rest runs as for the default ref. The switch
+refuses before changing anything (`graph.ref_invalid`) when `mdkg-graph`
+already holds another commit (inspect it and keep or merge its commits;
+the hint gives the compare-and-swap `git update-ref` that points it at the
+graph, after freeing it in any worktree that has it checked out), when
+`mdkg-graph` is checked out in a worktree other than the view or a
+registered graph checkout, or when branches under `mdkg-graph/` keep git
+from creating it. Running the switch again finishes one that stopped
+part way: records still naming the custom ref are retargeted and a
+detached view at the tip is reattached. To keep using the custom ref,
 stay in ref mode. A record it kept (such as a nested graph's no longer
 declared) leaves the checkout unregistered; checkout-mode reads then
 refuse with an identity diagnostic such as `graph.ref_missing` or
@@ -206,8 +231,9 @@ Preserve the view's edits throughout. This switch is separate from
 a branch or a worktree.
 
 Install pins no destination and prints that a person must approve it before
-anything is pushed. The approval command and graph sync arrive in 0.7.2;
-there is no approval command to run in 0.7.1.
+anything is pushed. Since 0.7.2 that's `mdkg graph remote approve`, then
+`mdkg graph sync` (see [Syncing with graph.remote](#syncing-with-graphremote)).
+Install itself never contacts a remote.
 
 ### Ref mode
 
@@ -328,94 +354,84 @@ authority is read. `mdkg config show` names that commit in its project
 layer's source, and warns when a user or machine-local layer sets
 `coordination`, which changes nothing at run time.
 
-- **Checkout mode:** edit `.mdkg/config.json` and commit it. With a graph
-  checkout registered, commit it there (`.worktrees/graph`), because a
-  commit on another branch isn't read.
-- **Ref mode:** no checkout has a copy, and `node edit` takes only nodes.
-  A person changes the config through git. An agent can't: with the git
-  hooks installed, its commit to a graph file is refused
-  (`git.graph_path`).
-
-  This recipe covers the graph at the repository root only; resolving a
-  nested graph's target is planned for 0.7.2.
-
-  1. Let mdkg name the target. In ref mode, `mdkg config show` reports
-     the graph its settings came from, resolved exactly as every command
-     resolves it (`graph:` in its text output, `data.graph` with
-     `--json`): the repository's common git folder, the graph ref, the
-     commit read, and the config's path in the ref's tree. Don't work
-     these out with `git config` or `rev-parse`: git reads scopes and
-     environment variables (such as `GIT_DIR` or `GIT_COMMON_DIR`) that
-     mdkg ignores, so it can name another ref or repository. Clear those
-     variables for the whole sequence, then set the target's values
-     (the first four commands of the example below). If `config show`
-     itself refuses because the committed config or an agent definition
-     is broken, this recipe can't find its target; 0.7.2's `mdkg config
-     set` covers that case.
-  2. Check that no worktree has the graph branch checked out (`git
-     --git-dir="$common" worktree list`). `update-ref` would move that
-     worktree's branch without updating its files, and a later commit
-     there could undo the change. Commit or save any edits there, then
-     detach it (`git -C <worktree> switch --detach`).
-  3. Make the change in a detached worktree of that commit, and move the
-     ref with a compare-and-swap against it:
+Change it with `mdkg config set` and `mdkg config unset`, in either mode:
 
 ```console
-$ unset GIT_DIR GIT_COMMON_DIR GIT_WORK_TREE GIT_INDEX_FILE \
-    GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
-$ graph="$(mdkg config show --json | jq -c .data.graph)"
-$ common="$(jq -r .common_dir <<<"$graph")"; ref="$(jq -r .ref <<<"$graph")"
-$ old="$(jq -r .commit <<<"$graph")"; path="$(jq -r .config_path <<<"$graph")"
-$ git --git-dir="$common" worktree add --detach /tmp/mdkg-config "$old"
-$ $EDITOR "/tmp/mdkg-config/$path"
-$ git -C /tmp/mdkg-config commit -am "config: purge acked mail at the ack"
-$ git --git-dir="$common" update-ref "$ref" \
-    "$(git -C /tmp/mdkg-config rev-parse HEAD)" "$old" \
-  && git --git-dir="$common" worktree remove /tmp/mdkg-config && mdkg doctor
+$ mdkg config set coordination.messages.ack_grace_days 0 --dry-run
+$ mdkg config set coordination.messages.ack_grace_days 0
+$ mdkg config unset coordination.messages.ack_grace_days
 ```
 
-  The worktree is removed only when `update-ref` succeeds. If another write
-  moved the ref since `config show` read it, `update-ref` refuses, the ref
-  is unchanged, and the worktree still holds your commit. Retry with the
-  block below, never by repeating the `update-ref` alone: it reads the new
-  tip first, rebases onto that exact commit, and swaps only when the
-  rebase succeeded and your commit sits on that tip, so the swap can't
-  replace a newer graph with your older commit:
+The key is a dotted path or a JSON pointer
+(`/coordination/messages/ack_grace_days`), and the value is JSON. A bare
+word, such as `shared`, is taken as a string; quote a string that looks
+like a number. The command refuses a key this build doesn't know (one
+that isn't in the committed config, the built-in defaults or a section
+mdkg reads), the graph's identity keys (`schema_version`, `format_version`,
+`graph_id`), `work.location` and its `work.committed` alias (including a
+whole `work` set or unset that would change them: `mdkg work localize`
+moves work out of git together with its nodes), and any change after which the config would fail the
+checks `validate` and `doctor` make, such as an `ack_grace_days` outside
+0 to 3650. A refused change writes nothing. `--dry-run` prints the
+change as a diff without claiming, writing or committing anything.
+`--json` gives the key, its old and new values (credential-like values
+hidden, as `config show` hides them), the diff, the commit it read
+(`base`), the commit it made (`commit`), and in ref mode the graph ref.
 
-```console
-$ old="$(git --git-dir="$common" rev-parse "$ref")"
-$ git -C /tmp/mdkg-config rebase "$old" \
-  && git -C /tmp/mdkg-config merge-base --is-ancestor "$old" HEAD \
-  && new="$(git -C /tmp/mdkg-config rev-parse HEAD)" \
-  && [ "$new" != "$old" ] \
-  && git --git-dir="$common" update-ref "$ref" "$new" "$old" \
-  && git --git-dir="$common" worktree remove /tmp/mdkg-config && mdkg doctor
-```
+The change holds an exclusive lease on `.mdkg/config.json` while it
+runs. The command takes the lease and releases it. If you already hold
+one, it uses that one: a change it commits uses the lease up, as `done`
+does, and a change that changes nothing leaves it held.
 
-  If any step fails (a refused or conflicted rebase, or the ref moved
-  again), the ref is unchanged. Finish or abort the rebase (`git -C
-  /tmp/mdkg-config rebase --continue` or `--abort`), and run the block
-  again.
-  Afterwards, `mdkg doctor` checks the committed config of the graph at
-  the repository root, in `.mdkg` (`dir` above; in ref mode every command
-  reads the root graph there until 0.7.2, so doctor, `config show`, every
-  command and `install --setup` refuse an `mdkg.graph.<id>.dir` naming
-  another folder for it), including mail
-  settings that would refuse every send and ack. Run `mdkg config
-  show` after it too: check the project layer's value and source (the
-  commit you made), since its effective view can show a user or
-  machine-local `coordination` setting that it warns about and that
-  changes nothing at run time.
+- **Ref mode:** the change is published on the graph ref through mdkg's
+  own graph writer, as `new` and `node save` publish. It is recorded as
+  a pending intent first. The ref is moved by compare-and-swap, and
+  rebuilt on a newer tip when another write moved the ref but left the
+  config alone. A crash is replayed by a later graph command. If another
+  write changed the config meanwhile, the change is reported stale and
+  never published over it. No checkout is touched.
+- **Checkout mode:** the change is committed in the checkout the
+  committed config is read from. With a graph checkout registered, run
+  it there (`.worktrees/graph`); elsewhere it refuses, because a commit
+  on another branch isn't read. An uncommitted edit to the config refuses
+  it too, so the commit never includes that edit.
 
-  With mdkg's git hooks installed, the commit is checked against the
-  graph's current config. If that config is itself what's broken (an
-  invalid lease policy, say), the hook refuses the correcting commit and
-  names `mdkg doctor`. A person can then commit with `git -C
-  /tmp/mdkg-config commit --no-verify -am "..."`, which skips git's hooks
-  for that one commit; agents can't.
+A change takes effect for commands that start after it. `agents up`
+keeps the settings it started with until it is restarted. This changes
+only the local ref or branch. Publishing it is the same push as any
+graph change, and it needs the same approval for the destination.
 
-  This changes only the local ref. Publishing it is the same push as any
-  graph change, and it needs the same approval for the destination.
+#### By hand, for recovery
+
+`config set` reads the committed config with the same parser every
+command uses. If a hand edit has left a config that parser refuses (an
+invalid lease policy, say), `config set` refuses it as well, and a person
+repairs it through git. In ref mode:
+
+1. Take the target from `mdkg config show --json` (`data.graph`: the
+   common git folder, the graph ref, the commit and the config's path),
+   with `GIT_DIR`, `GIT_COMMON_DIR` and the other `GIT_*` location
+   variables unset. If `config show` refuses too, take the ref from the
+   repository's own `git config mdkg.graph.ref` and its tip from
+   `git rev-parse`.
+2. Check that no worktree has the graph branch checked out (`git
+   --git-dir="$common" worktree list`).
+3. Fix the file in a detached worktree of that commit (`git worktree add
+   --detach`). Commit it there, with `--no-verify` if mdkg's hooks refuse
+   because the current config is the broken one. Then move the ref by
+   compare-and-swap against the commit you started from: `git update-ref
+   "$ref" <new> <old>`. If the swap is refused, the ref moved: rebase
+   onto the new tip and swap again. Never force it.
+4. Run `mdkg doctor`, then `mdkg config show`.
+
+Agents can't commit to graph files by hand: with the git hooks
+installed, that commit is refused (`git.graph_path`). An agent can run
+`mdkg config set` and `config unset`, as it can run `agents edit`: the
+change goes through mdkg's own writer and takes effect at once.
+0.7.3 is planned to refuse writes to authority fields (env, sandbox,
+approvals) from inside an agent's turn, through `config set`, `config
+unset` and `agents edit`. The one exception is the orchestrator role,
+and only under an explicit delegation the person records.
 
 ## How work settles
 
@@ -539,9 +555,12 @@ guidance. Where the clone has no `.mdkg` at all, mdkg's hooks still apply
 In ref mode, doctor's `code_base` check reports a missing code base without
 requiring main. `graph.ref` checks the ref and committed graph identity;
 `graph.shape` checks graph-only versus full-repository shape; `graph.remote`
-checks the configured remote, protected code refs and approval state. No
-approval is reported as `ok`, saying nothing is pushed: no 0.7.1 command
-approves a graph remote, so it isn't a warning and `doctor --strict` passes. The remaining checks are
+checks the configured remote, protected code refs, approval and the last
+sync (see **Doctor** under [Syncing with graph.remote](#syncing-with-graphremote)). In
+0.7.2 a never approved remote is a warning, so `doctor --strict` fails until a
+person runs `mdkg graph remote approve`. `graph.secret_scan` says whether
+the scanner graph pushes need can run. (In 0.7.1, with no approve
+command, an unapproved remote is `ok`.) The remaining checks are
 `graph.migrating`, when a migration marker exists; `graph.intents`,
 `graph.cache`, `graph.view`, `graph.hand_edits`, `graph.design_drift` and
 `graph.exclude`. The last checks for `/.mdkg-edit/` in common `info/exclude`.
@@ -569,9 +588,19 @@ and leaving that record in place.
 ## Credentials and privacy
 
 `mdkg.graph.remote` names an existing git remote; it never creates or edits
-one. At 0.7.1 the key is read and shown by `status`, and `graph.remoteRef`
-(the remote's ref, default the graph ref's own name) must be a branch, but
-nothing contacts the remote. Sync is 0.7.2.
+one. `graph.remoteRef` (the remote's ref, default the graph ref's own name)
+must be a branch. Sync uses your own git setup for the network (credential
+helpers, `insteadOf`, `core.sshCommand`, your `pre-push` hooks) and never
+reads, stores or prints a credential: a URL's userinfo is shown as `***@`.
+Nothing can prompt: git and ssh run with prompts off and a time limit, so a
+remote that needs a typed password fails as `graph.remote_auth` instead.
+The limits, as built: each network git command may run for 120 seconds,
+then its process group is stopped; git doesn't get a session of its own,
+so a `GIT_SSH_COMMAND` or `core.sshCommand` of yours without
+`BatchMode=yes`, or a signing passphrase prompt (`push.gpgSign`), can hold
+a sync (and the launcher's sync thread) for those 120 seconds. With no ssh
+command of yours set, mdkg's own ssh default sets `BatchMode=yes` and a
+15-second connect timeout.
 
 The graph ref holds the graph: config, definitions, design and shared work. A
 graph-only ref carries no code history; a ref in 0.7.0's full shape (a
@@ -580,16 +609,226 @@ clone's identity records live in its common git config, never in a commit.
 Secrets are part of what the graph holds: with `hooks:git` the scanner
 refuses a commit or push that carries one before it leaves.
 
-<!-- L2 (0.7.2): graph.remote is pushed and pulled on a cadence (pushDelay 120 s, pullInterval 900 s); background pushes go only to a destination a person pinned with `mdkg graph remote approve`, and run the clone's own pre-push hooks. -->
+## Syncing with graph.remote
+
+Since 0.7.2 the graph ref syncs with `mdkg.graph.remote`: the code's own
+remote in the personal setup, or a private repository of your own in the
+professional one. Only `remoteRef` crosses, through one explicit refspec:
+no tags, no other branch, no store, mail, leases or local work. mdkg never
+pushes a code branch.
+
+**Approve first.** Configuration alone never pushes. A person, in their own
+terminal and outside any agent turn, runs:
+
+```sh
+mdkg graph remote approve --dry-run   # shows the remote, remoteRef, and where fetches and pushes go
+mdkg graph remote approve             # pins them in <git common dir>/mdkg/graph/remote.json
+```
+
+The pin holds each URL's exact endpoint, with `insteadOf` and
+`pushInsteadOf` applied: local paths (plain or `file://`) resolved against
+the checkout and made canonical, and only what can't name another
+repository folded (the scheme's and host's case, a default port; a
+password is never kept). A user and every byte of the path stay, so
+`alice@host:g` and `bob@host:g`, or `repo` and `repo.git`, are different
+destinations. An https (or any non-ssh) URL's user can be an access token,
+so it's kept only as a digest (`~<hex>@`): a changed user still reads as a
+changed destination, and the token is never stored or printed. A `file://`
+URL's path is percent-decoded, as git opens it; one naming a host other
+than `localhost` is refused (`graph.remote_invalid`). A graph remote has one destination: its fetch and push URLs
+must name one repository (`graph.remote_invalid` otherwise), since sync
+pushes against the tip it fetched. The pin also holds the git setup a
+push runs with that an agent could change: the system, global, local and
+worktree values (every scope git reads but the command line's `-c` and
+`GIT_CONFIG_*`) of `core.sshCommand`, `core.hooksPath`,
+`remote.<name>.receivepack` and `uploadpack`, `credential.*`, `hook.*` and
+`include.*`/`includeIf.*`, each as a digest (never the value), plus one
+digest of all of them in git's order (git reads the order: an empty
+`credential.helper` resets the helpers before it, and a key with no value
+differs from an empty one), and the `pre-push` hook git would run: its
+content and whether git would run it, by the same `access(X_OK)` check git
+makes, so a mode, owner or ACL change that turns it on or off counts. A
+hooks path git can't expand is refused. If the remote's URL, push URL,
+name, `remoteRef` or that setup changes later, every sync stops with
+`graph.remote_changed`, naming what changed (a URL inside a key only by
+its digest), until a person approves again. A hook script that runs other
+files is pinned by its own content only. Approval
+is refused inside an agent's turn (`graph.remote_unapproved`); until person
+keys arrive, "a person" means the same outside-a-turn check delegated
+decisions use (no launcher turn mark, no live launcher turn in this clone,
+not a descendant of one).
+
+Approval and every push refuse a destination that is code:
+
+- `remoteRef` must not be `main`, `master`, `mainRef`'s branch, a branch in
+  a definition's `protect` list or GitHub's protection cache, or the
+  remote's default branch (`graph.remote_is_code`);
+- a graph remote other than the code's must not share a destination with
+  any other remote, so a company remote is never pushed to by another name.
+  This check compares loosely (scheme, user, a trailing `.git` and slashes
+  dropped, local paths canonical), so an alias of a code repository is
+  still caught; a remote counts as the code's only where the code remote
+  itself pushes;
+- an existing remote graph ref that shares history with `mainRef` is
+  refused, except the personal full-shape graph on the code's own remote;
+- a remote other than the code's receives graph-only history: every
+  outgoing commit may hold only graph folders (`graph.shape`).
+
+Network git runs from the checkout you run mdkg in, with that checkout's
+own git folder, so your relative hooks (`core.hooksPath`), a linked
+worktree's `config.worktree` and `includeIf.onbranch`, and relative local
+remote paths apply as they do for your own `git push` there. The
+destination checks and the approval read the remote's URLs in that same
+checkout, so a `pushurl` set only in a worktree is seen. The fetch
+writes only its one ref (`--refmap=`, `--no-prune`): a remote's configured
+fetch refspecs move nothing else. It runs in a process group of its own,
+not a new session, so it keeps your terminal: nothing can prompt
+(`GIT_TERMINAL_PROMPT=0`, no askpass, and ssh in batch mode unless you set
+an ssh command of your own), a read of the
+terminal stops it, and its time limit ends it.
+
+**Sync by hand.** `mdkg graph sync` fetches `remoteRef`, takes a
+fast-forward or merges, checks the result strictly, moves the local graph
+ref, and pushes with a lease (a compare-and-swap on the remote, never a
+force). Unapproved, it neither pulls nor pushes and says how to approve:
+an unapproved remote could hold definitions or protect lists an agent
+seeded, so nothing is read from it. `--no-push` pulls only. It's refused inside an agent's turn (`graph.sync_in_turn`).
+
+**Background sync.** `agents up` pulls when it starts, before it lets any
+turn begin, and every
+`mdkg.graph.sync.pullInterval` (900 s) after the last successful pull
+from the approved destination (`0` means only the first; a newly approved
+destination is due a pull at once, after any backoff below), and pushes
+`mdkg.graph.sync.pushDelay` (120 s) after the last local graph change,
+coalescing changes in that window into one push. Never per turn, and never
+inline after a write: writes publish locally and return. A due pull only pulls;
+one that leaves the graph ahead (after a merge) starts the push delay. The
+settings are read again every second, so a changed delay, interval or
+remote applies without a restart. The timers keep running until every turn
+has finished; when `agents up` stops, a push still waiting for its delay is
+dropped: your `mdkg graph sync` sends it, or the next `agents up`, whose
+first pull finds the graph ahead and starts the push delay. Before
+a sync moves the local graph, any graph write a crash left pending is
+replayed first. Background sync goes only to an approved, unchanged
+destination: for an unapproved or changed one the launcher neither pulls nor
+pushes. A failed or refused sync counts as no pull (`sync.json` records
+most failures; an unapproved or changed destination is refused before
+anything is recorded): the launcher waits 30 s, doubling up to 15 minutes,
+and tries again (a push stays due). Changing the
+interval applies it to the last successful pull. `agents up --once` runs no
+timers, and an `agents up` started inside an agent's turn runs without sync
+and says so once: sync starts only after the outside-turn check `mdkg graph
+sync` makes. Bad agent names fail before the first pull. A graph remote
+configured while `agents up` runs is picked up on the next tick, and
+pulled from once a person approves it. Another device sees a change about
+2 minutes plus up to one pull interval later.
+
+Each sync, approval and resolution holds `<git common dir>/mdkg/graph/sync.lock`
+while it reads and writes `sync.json`, `conflicts.json` and `remote.json`,
+so a background sync and yours take turns. A pulled remote tip is recorded
+as accepted before the local graph ref moves, so a crash between the two
+still treats a later reset of the remote as a rewrite. An adopted rewrite
+is the exception: it's accepted only after the local graph moves, so a
+crash or a failed backup leaves the rewrite refused until you accept it
+again.
+
+**Before every push** the outgoing commits pass the destination checks
+above, a 64 MiB cap (`graph.push_large`), and the secret scan, the same
+`secret.scan` git's hooks run, over every commit the remote doesn't have,
+so an overwritten or deleted secret in history is found too. When the
+graph remote is the code's own (the personal setup), commits the
+destination already holds (its branches, as `ls-remote` reports them at
+push time, never a local tracking ref) don't count as outgoing:
+they aren't sized or scanned again, so a first push doesn't walk all of
+the code's history. A branch deleted from the destination between that
+read and the push is a window this accepts: its commits were on that same
+destination when it was read. A finding
+refuses the push (`graph.secret`) and names the commit and path, never the
+match; a scan that can't run, or a blob too large to read, refuses it too
+(`graph.secret_scan_unavailable`). While `refs/replace/*` or a grafts file
+exists, pushes are refused the same way, since either could make git show
+the scan something other than what's sent. Remove the string from the graph's
+history, and rotate the credential if it was ever real.
+
+**Hooks.** Network commands run your `pre-push` hooks. A hook's refusal is
+reported (`graph.push_refused`) and never retried around: background sync
+stops until a person runs `mdkg graph sync`. Before each push, sync writes a
+latch to `sync.json`; any push that fails, however git reports it, keeps
+the latch (`graph.push_unrecorded` when the outcome is unknown), so a
+refusal is never lost to a crash or a misread error.
+
+**Conflicts.** When both sides changed a path, the remote's version wins,
+deletions included (G12). The local version is kept in history as the
+merge's first parent (for an adopted rewrite, in the backup ref instead) and named in an `Mdkg-Conflict: <path> local=<blob>
+remote=<blob>` trailer. Each conflict is recorded in `<git common
+dir>/mdkg/graph/conflicts.json`; `mdkg graph conflicts` lists them and
+`status` counts them. `mdkg graph resolve <path>... --take local|remote`
+publishes your choice for each path in one commit on the graph ref and
+clears their entries in one write. A path with a hidden character (a
+zero-width joiner, say) is listed with it escaped (`\u{200d}`), and
+resolve takes it in that form too, as the sync's note suggests; a
+recorded path that matches as typed always wins. A path with more than one open conflict
+needs `--merge <commit>` (at least 7 hex digits of the merge `graph
+conflicts` lists); without it, resolve lists them and settles nothing, so
+repeating a resolution whose outcome was uncertain never settles an older
+conflict in place of the one you chose. The result passes the same strict validation a
+sync's merge does: one that would break the graph (two nodes with one
+id, say) is refused (`graph.sync_invalid`), nothing is published and the
+conflicts stay open; take the remote's version, or settle the paths that
+belong together in one call. A conflict that differs only in a file's
+mode is listed, but `--take local` restores its content, not its mode. A merged tip
+that fails validation takes the remote's version of every path both sides
+changed; if that fails too (a rename on one side and an edit on the other
+can leave one id twice), it takes the remote's tree as it is, recording
+each path the local side changed as a conflict; if even that fails,
+nothing is taken (`graph.sync_invalid`).
+
+**A rewritten remote** (its graph ref no longer descends from the tip this
+clone last accepted) is refused, across restarts, with
+`graph.remote_rewritten`. After checking it, a person runs `mdkg graph sync
+--accept-rewrite`, which adopts it: the local graph is kept under
+`refs/mdkg/backup/<remote>/<time>`, and only your changes since the last
+accepted tip are re-applied on the rewritten one, in a commit whose only
+parent is the remote's, so nothing the rewrite removed is pushed again.
+It waits while sync conflicts are open (`graph.sync_conflict`): settle
+them first, since adopting would leave the merges that record them.
+An adoption is recognized from the history itself: once the local graph
+holds the adopted tip, later syncs (a retry after another device pushed,
+or one after a crash that lost `sync.json`'s update) go on from it and
+never adopt again.
+A deleted remote graph ref has no tip to adopt, and pushing would
+recreate it with all the history the deletion removed, so it's refused
+too, `--accept-rewrite` included. To publish the local graph there again,
+a person runs `mdkg graph remote approve`; the next sync may then create
+the ref. If the ref is back by then, at any tip, that permission ends and
+the rewrite check applies to it as before.
+
+**Offline.** An unreachable remote or a refused login is a warning
+(`graph.remote_unreachable`, `graph.remote_auth`), recorded with the time
+and the number of failures in a row in `sync.json`. `status` and `doctor`
+show it; the next pull retries. A push that fails partway keeps the push
+latch, though, so background sync stops until a person runs `mdkg graph
+sync`. Local writes never wait for the network.
+
+**Doctor.** With a graph remote, `doctor`'s `graph.remote` row runs the
+destination checks and reports, most serious first: a code destination or
+a changed one (error); never approved (a warning with the approve hint:
+nothing is pulled or pushed); the push latch; a deleted remote graph ref
+(a later failure of another kind first, naming the deletion; then
+whether it waits for approval or for the push that recreates it); the
+last failure; open
+conflicts; approved but never synced; and how many graph commits are not
+pushed or not pulled. `graph.secret_scan`
+says whether the scanner can run.
 
 ## A graph ref is not a shared ledger yet
 
 Leases, mail and the settlement log live in each clone's store; pushing the
 graph ref would share committed content only. So two clones of one graph can
 each hold a lease on the same node and each settle it, neither seeing the
-other, and nothing at 0.7.1 reconciles them. The intended guard,
-`graph.settled_elsewhere`, is defined but nothing raises it; it lands with
-sync, which is what lets a clone notice another's write.
+other, and nothing reconciles them. The intended guard,
+`graph.settled_elsewhere`, is defined but nothing raises it yet; 0.7.2's
+sync shares the graph's commits, not the ledgers.
 
 Until then, keep one clone writing a graph ref. `mdkg status` and the leases
 it lists describe that clone, not the graph.
@@ -610,11 +849,12 @@ the sync commands.
 
 ## Limits at 0.7.1
 
-- No sync, import, split, recover, `publish-design`, or remote approval. `mdkg
-  graph` is the query group it was in 0.7.0 (`refs`, `backrefs`, `ready`,
-  `critical-path`); `graph.remote` is configuration only.
-- `mdkg.graph.sync.pushDelay` and `pullInterval` are read (defaults 120 and
-  900 seconds) but nothing uses them yet.
+- No sync, import, split, recover, `publish-design`, or remote approval.
+  `mdkg graph` is the query group it was in 0.7.0 (`refs`, `backrefs`,
+  `ready`, `critical-path`); `graph.remote` is configuration only. 0.7.2
+  adds `graph remote approve`, `graph sync`, `graph conflicts` and `graph
+  resolve`, and `agents up` uses `pushDelay` and `pullInterval`; import,
+  split, recover and `publish-design` are still to come.
 - A graph ref checked out on a branch cannot be used for ref-mode writes;
   authority reads still use the pinned ref.
 - A `.worktrees/graph` view kept through the move isn't refreshed by graph

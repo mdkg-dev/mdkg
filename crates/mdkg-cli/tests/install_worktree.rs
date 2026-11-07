@@ -648,6 +648,56 @@ fn dirty_and_diverged_graphs_are_reported_and_preserved() {
     assert_eq!(git(&graph, &["rev-parse", "HEAD"]), before);
 }
 
+/// Doctor warns when a squash merge left the graph checkout diverged for
+/// good, and stays quiet while the graph branch only has work main lacks
+/// (e2e UX: only install said so).
+#[test]
+fn doctor_warns_about_a_graph_branch_main_squash_merged() {
+    let graph_check = |root: &Path| {
+        let v = ok(root, &["doctor"]);
+        v["data"]["checks"]
+            .as_array()
+            .expect("checks")
+            .iter()
+            .find(|c| c["name"] == "graph_worktree")
+            .cloned()
+            .expect("graph_worktree check")
+    };
+    let r = repo(true);
+    ok(&r.0, &["install"]);
+    let graph = r.0.join(".worktrees/graph");
+    fs::write(graph.join("graph-work"), "agent definition").expect("file");
+    git(&graph, &["add", "graph-work"]);
+    git(&graph, &["commit", "-qm", "graph work"]);
+    advance_main(&r.0);
+    // Diverged, but with work main doesn't have: the normal state.
+    let c = graph_check(&r.0);
+    assert_eq!(c["status"], "ok", "{c}");
+    git(&r.0, &["merge", "-q", "--squash", "mdkg-graph"]);
+    git(&r.0, &["commit", "-qm", "squash the graph branch"]);
+    let c = graph_check(&r.0);
+    assert_eq!(c["status"], "warning", "{c}");
+    assert!(
+        c["summary"]
+            .as_str()
+            .expect("summary")
+            .contains("diverged from main"),
+        "{c}"
+    );
+    assert!(
+        c["hint"]
+            .as_str()
+            .expect("hint")
+            .contains("reset --keep main"),
+        "{c}"
+    );
+    // Moving the branch to main, as the hint says, clears it, and the
+    // graph follows main again.
+    git(&graph, &["reset", "-q", "--keep", "main"]);
+    assert_eq!(graph_check(&r.0)["status"], "ok");
+    assert!(sync(&graph, true).reason.is_none());
+}
+
 #[test]
 fn fast_forward_does_not_overwrite_ignored_local_content() {
     let r = repo(true);

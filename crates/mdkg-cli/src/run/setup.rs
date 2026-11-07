@@ -67,6 +67,8 @@ pub(crate) struct Done {
     /// The graph ref exists (kept, adopted or created): projections sync
     /// from its tip.
     pub graph: bool,
+    /// The fetched ref the graph ref is (or would be) adopted from.
+    pub adopts: Option<String>,
 }
 
 fn refused(code: &'static str, message: impl Into<String>) -> GraphError {
@@ -307,7 +309,7 @@ fn code_base(top: &Path, setup: Setup) -> Option<String> {
 }
 
 /// The setup a ref-mode clone already has.
-fn inferred(top: &Path, graph: Option<&GraphRef>) -> Setup {
+pub(crate) fn inferred(top: &Path, graph: Option<&GraphRef>) -> Setup {
     match graph.and_then(|g| g.remote.as_ref()) {
         Some(r) if r.name == "origin" => Setup::Personal,
         Some(_) => Setup::Professional,
@@ -452,15 +454,79 @@ impl ProjectionSource {
 /// Unreadable trees or paths refuse classification rather than proving
 /// a graph-only shape. Doctor uses the same proof (#14632).
 pub(crate) fn full_shape(top: &Path, tip: &str, paths: &[String]) -> Result<bool, GraphError> {
+    full_shape_within(top, tip, paths, entry_limit())
+}
+
+fn full_shape_within(
+    top: &Path,
+    tip: &str,
+    paths: &[String],
+    entries: usize,
+) -> Result<bool, GraphError> {
     let objects = mdkg_git::ObjectReader::open(top)
         .map_err(|e| refused("graph.shape", format!("can't read the graph tree: {e}")))?;
-    ShapeWalk {
-        objects,
-        paths,
-        bytes: 0,
-        entries: 0,
+    ShapeWalk::new(objects, paths, entries).tree(&format!("{tip}^{{tree}}"), "", 0)
+}
+
+/// How many tree entries a shape walk visits at most, reused subtrees
+/// included. This is what ships.
+pub(crate) const SHAPE_ENTRIES: usize = 100_000;
+
+/// The walk's entry limit: [`SHAPE_ENTRIES`]. Debug builds also read
+/// `MDKG_SHAPE_ENTRY_LIMIT`, and only a smaller number counts, so a test
+/// trips the limit in seconds rather than walking 100,000 entries (F140).
+/// Release builds never read it.
+fn entry_limit() -> usize {
+    if !cfg!(debug_assertions) {
+        return SHAPE_ENTRIES;
     }
-    .tree(&format!("{tip}^{{tree}}"), "", 0)
+    lowered_limit(std::env::var("MDKG_SHAPE_ENTRY_LIMIT").ok().as_deref())
+}
+
+/// The override's value, if it's a number below [`SHAPE_ENTRIES`];
+/// anything else leaves the shipped limit.
+fn lowered_limit(value: Option<&str>) -> usize {
+    value
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n < SHAPE_ENTRIES)
+        .unwrap_or(SHAPE_ENTRIES)
+}
+
+/// A tip's shape as doctor reports it.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Shape {
+    GraphOnly,
+    Full,
+    /// Full, found before the walk ran out of its budget: the rest of the
+    /// tree wasn't checked (the message says which limit). A personal
+    /// graph keeps a full shape, so that's a warning there, not an error
+    /// (Terra #14932).
+    FullUnchecked(String),
+}
+
+/// [`full_shape`], telling a full shape found before a budget limit apart
+/// from one that couldn't be classified. Paths found invalid still fail.
+pub(crate) fn shape(top: &Path, tip: &str, paths: &[String]) -> Result<Shape, GraphError> {
+    shape_within(top, tip, paths, entry_limit())
+}
+
+fn shape_within(
+    top: &Path,
+    tip: &str,
+    paths: &[String],
+    entries: usize,
+) -> Result<Shape, GraphError> {
+    let objects = mdkg_git::ObjectReader::open(top)
+        .map_err(|e| refused("graph.shape", format!("can't read the graph tree: {e}")))?;
+    let mut walk = ShapeWalk::new(objects, paths, entries);
+    match walk.tree(&format!("{tip}^{{tree}}"), "", 0) {
+        Ok(true) => Ok(Shape::Full),
+        Ok(false) => Ok(Shape::GraphOnly),
+        Err(e) if walk.full_seen && walk.over_budget => {
+            Ok(Shape::FullUnchecked(e.diagnostic.message))
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Read tree objects individually, never an expanded `ls-tree -r` stream
@@ -472,20 +538,42 @@ struct ShapeWalk<'a> {
     paths: &'a [String],
     bytes: u64,
     entries: usize,
+    /// At most this many entries ([`entry_limit`]).
+    entry_limit: usize,
+    /// An entry outside the graph folders was found: the shape is full.
+    full_seen: bool,
+    /// The walk stopped at a depth, size or entry limit, not at a path it
+    /// found invalid.
+    over_budget: bool,
 }
 
-impl ShapeWalk<'_> {
+impl<'a> ShapeWalk<'a> {
+    fn new(objects: mdkg_git::ObjectReader, paths: &'a [String], entry_limit: usize) -> Self {
+        Self {
+            objects,
+            paths,
+            bytes: 0,
+            entries: 0,
+            entry_limit,
+            full_seen: false,
+            over_budget: false,
+        }
+    }
+
+    /// A budget limit's refusal, marked as one.
+    fn limit(&mut self, message: &'static str) -> GraphError {
+        self.over_budget = true;
+        refused("graph.shape", message)
+    }
+
     fn tree(&mut self, oid: &str, prefix: &str, depth: usize) -> Result<bool, GraphError> {
         const TREE_BYTES: u64 = 4 * 1024 * 1024;
         const TOTAL_BYTES: u64 = 16 * 1024 * 1024;
-        const ENTRIES: usize = 100_000;
         const DEPTH: usize = 128;
         const PATH_BYTES: usize = 4096;
         let bad = |message| refused("graph.shape", message);
         if depth > DEPTH {
-            return Err(bad(
-                "the graph tree exceeds the shape traversal depth limit",
-            ));
+            return Err(self.limit("the graph tree exceeds the shape traversal depth limit"));
         }
         let cap = TREE_BYTES.min(TOTAL_BYTES - self.bytes);
         if self
@@ -499,6 +587,13 @@ impl ShapeWalk<'_> {
             })?
             .is_none_or(|info| info.kind != "tree" || info.size > cap)
         {
+            // A tree over the per-tree cap or what's left of the total:
+            // a budget limit, which a full shape found already turns into
+            // "unchecked" (Terra #18260). Missing or not a tree is invalid.
+            let header = self.objects.info(oid).ok().flatten();
+            if header.is_some_and(|i| i.kind == "tree" && i.size > cap) {
+                return Err(self.limit("the graph tree exceeds the shape traversal size limit"));
+            }
             return Err(bad(
                 "the graph tree header is missing, invalid or exceeds the size limit",
             ));
@@ -509,11 +604,16 @@ impl ShapeWalk<'_> {
             .map_err(|e| refused("graph.shape", format!("can't read the graph tree: {e}")))?
             .ok_or_else(|| bad("the graph tree can't be found"))?;
         self.bytes += info.size;
-        self.entries = self
+        match self
             .entries
             .checked_add(entries.len())
-            .filter(|n| *n <= ENTRIES)
-            .ok_or_else(|| bad("the graph tree exceeds the shape traversal entry limit"))?;
+            .filter(|n| *n <= self.entry_limit)
+        {
+            Some(n) => self.entries = n,
+            None => {
+                return Err(self.limit("the graph tree exceeds the shape traversal entry limit"));
+            }
+        }
         let mut full = false;
         for entry in entries {
             let name = std::str::from_utf8(&entry.name)
@@ -555,6 +655,7 @@ impl ShapeWalk<'_> {
                 });
             if !owned && !ancestor {
                 full = true;
+                self.full_seen = true;
             }
             // A full shape still needs every later path checked, including
             // unowned subtrees: G20 doesn't permit unreadable paths (#14806).
@@ -1488,6 +1589,10 @@ pub(crate) fn setup(
             urls(&common, r).join(", ")
         ));
     }
+    let adopts = match &src {
+        Source::Adopt { from, .. } => Some(from.clone()),
+        _ => None,
+    };
     if choice.dry_run {
         let mut dry: Vec<String> = notes.into_iter().map(|n| format!("dry run: {n}")).collect();
         dry.push(format!(
@@ -1498,6 +1603,7 @@ pub(crate) fn setup(
             setup,
             notes: dry,
             graph: false,
+            adopts,
         });
     }
     let _lock = mdkg_graph::refwrite::GraphLock::exclusive(
@@ -1567,6 +1673,7 @@ pub(crate) fn setup(
         setup,
         notes,
         graph: graph_id.is_some(),
+        adopts,
     })
 }
 
@@ -1635,7 +1742,7 @@ pub(crate) fn checkout_mode(top: &Path, dry_run: bool) -> Result<Vec<String>, Gr
     // interrupted rollback the one its identity records name.
     let graph = match &name {
         Some(n) => n.clone(),
-        None => recorded_ref(&common)
+        None => recorded_ref(top, &common)
             .map(full)
             .transpose()?
             .unwrap_or_else(|| GRAPH.to_owned()),
@@ -1645,47 +1752,79 @@ pub(crate) fn checkout_mode(top: &Path, dry_run: bool) -> Result<Vec<String>, Gr
     let Some(name) = name else {
         notes.insert(0, "already in checkout mode".into());
         // A clone that never used a graph ref has nothing to finish.
-        if gone.is_empty() && recorded_ref(&common).is_none() {
+        if gone.is_empty() && recorded_ref(top, &common).is_none() {
             return Ok(notes);
+        }
+        // A move from a custom ref interrupted before its records named
+        // mdkg-graph: `mdkg-graph` is at the custom ref's commit.
+        let graph = if graph != GRAPH
+            && commit_of(top, &graph).is_some()
+            && commit_of(top, &graph) == commit_of(top, GRAPH)
+        {
+            if dry_run {
+                notes.push(format!(
+                    "dry run: each mdkg.graph.<id>.ref naming {graph} would name {GRAPH}"
+                ));
+            } else {
+                let _lock = mdkg_graph::refwrite::GraphLock::exclusive(
+                    &common_dir,
+                    mdkg_graph::refwrite::LockMode::Local,
+                )
+                .map_err(|e| graph_error(e.code(), e.to_string()))?;
+                retarget_records(&common, &graph, &mut notes)?;
+            }
+            GRAPH.to_owned()
+        } else {
+            graph
+        };
+        if graph == GRAPH {
+            // A rollback interrupted before its view's switch: the view
+            // still sits detached at the graph's tip.
+            let view = slot(top)?;
+            occupied(top, &common, &common_dir, &view)?;
+            reattach(
+                top,
+                &common_dir,
+                &view,
+                commit_of(top, GRAPH),
+                dry_run,
+                &mut notes,
+            )?;
         }
         return finish(top, &common, &common_dir, &graph, &gone, dry_run, notes);
     };
     // Install's graph checkout is made on mdkg-graph only, so a custom
-    // graph ref would be left with no graph checkout: refused here, in ref
-    // mode, before the rollback changes anything (#16358). Binding the
-    // graph above may still complete an earlier interrupted graph write;
-    // that is the designed crash recovery, not part of the rollback (#16562).
-    if name != GRAPH {
-        let short = name.strip_prefix("refs/heads/").unwrap_or(&name);
-        return Err(refused(
-            "graph.ref_invalid",
-            format!(
-                "checkout mode's graph checkout is made on {GRAPH} only, and this clone's graph \
-                 ref is {name}; the rollback changed no mode or registration (an earlier \
-                 interrupted graph write may have been completed), and ref mode keeps working"
-            ),
-        )
-        .with_hint(format!(
-            "stay in ref mode, or rename the graph ref first: `git branch -m -- {} mdkg-graph`, \
-             then `git config mdkg.graph.ref {GRAPH}` and set each `mdkg.graph.<id>.ref` \
-             record that names it to {GRAPH}, then run `{BIN} install --checkout-mode` again",
-            shell_word(short)
-        )));
-    }
+    // graph ref moves there first (#16358; 0.7.2): `mdkg-graph` is created
+    // at its tip, and the custom ref is kept where it is. An existing
+    // `mdkg-graph` at another commit is refused before anything changes.
+    let custom = (name != GRAPH).then(|| name.clone());
+    let created = match &custom {
+        Some(custom) => graph_branch_for(top, custom)?,
+        None => None,
+    };
+    // The graph's tip, read from the ref being rolled back: in a dry run
+    // `mdkg-graph` may not exist yet.
+    let tip = commit_of(top, custom.as_deref().unwrap_or(GRAPH));
     let view = slot(top)?;
-    let branch = name.strip_prefix("refs/heads/").unwrap_or(&name).to_owned();
-    let reattach = view.join(".git").exists()
-        && git_some(&view, &["symbolic-ref", "-q", "HEAD"]).is_none()
-        && commit_of(&view, "HEAD") == commit_of(top, &name);
+    // Before any mode change: a switch or a new graph checkout on an
+    // mdkg-graph checked out elsewhere would fail after it.
+    occupied(top, &common, &common_dir, &view)?;
     if dry_run {
-        notes.push("dry run: mdkg.graph.ref would be unset".into());
-        if reattach {
+        if let Some(custom) = &custom {
+            if let Some(tip) = &created {
+                notes.push(format!(
+                    "dry run: {GRAPH} would be created at {custom}'s tip {}",
+                    short(tip)
+                ));
+            }
             notes.push(format!(
-                "dry run: {} would switch to {branch}",
-                view.display()
+                "dry run: each mdkg.graph.<id>.ref naming {custom} would name {GRAPH}"
             ));
         }
-        return finish(top, &common, &common_dir, &graph, &gone, true, notes);
+        notes.push("dry run: mdkg.graph.ref would be unset".into());
+        reattach(top, &common_dir, &view, tip, true, &mut notes)?;
+        // The real run goes on with mdkg-graph, custom ref or not.
+        return finish(top, &common, &common_dir, GRAPH, &gone, true, notes);
     }
     {
         let _lock = mdkg_graph::refwrite::GraphLock::exclusive(
@@ -1693,6 +1832,15 @@ pub(crate) fn checkout_mode(top: &Path, dry_run: bool) -> Result<Vec<String>, Gr
             mdkg_graph::refwrite::LockMode::Local,
         )
         .map_err(|e| graph_error(e.code(), e.to_string()))?;
+        if let (Some(custom), Some(tip)) = (&custom, &created) {
+            // Create-only: an `mdkg-graph` made since the check is never
+            // moved.
+            git_ok(top, &["update-ref", GRAPH, tip, ""])?;
+            notes.push(format!(
+                "{GRAPH} created at {custom}'s tip {}: checkout mode's graph branch",
+                short(tip)
+            ));
+        }
         // The records first: a rerun in checkout mode finds what's left.
         for key in &gone {
             common.unset(key)?;
@@ -1701,18 +1849,259 @@ pub(crate) fn checkout_mode(top: &Path, dry_run: bool) -> Result<Vec<String>, Gr
             ));
         }
         common.unset("mdkg.graph.ref")?;
+        match &custom {
+            Some(custom) => {
+                notes.push(format!(
+                    "mdkg.graph.ref unset: back in checkout mode on {GRAPH}; {custom} is kept \
+                     and no longer moves"
+                ));
+                retarget_records(&common, custom, &mut notes)?;
+            }
+            None => notes.push(format!(
+                "mdkg.graph.ref unset: back in checkout mode; {GRAPH} is kept"
+            )),
+        }
+        // Last: a rerun in checkout mode makes this switch if it didn't
+        // happen.
+        reattach(top, &common_dir, &view, tip, false, &mut notes)?;
+    }
+    finish(top, &common, &common_dir, GRAPH, &[], false, notes)
+}
+
+/// Switches the managed view, a linked worktree of this repository
+/// detached at the graph's commit `tip`, to mdkg-graph, so install
+/// registers it as the graph checkout. Anything else (another clone in the
+/// slot, a branch elsewhere: #18056 major 1) is left as it is. In a dry
+/// run mdkg-graph may not exist yet; a real run's sits at `tip`.
+fn reattach(
+    top: &Path,
+    common_dir: &Path,
+    view: &Path,
+    tip: Option<String>,
+    dry_run: bool,
+    notes: &mut Vec<String>,
+) -> Result<(), GraphError> {
+    let branch = GRAPH.strip_prefix("refs/heads/").unwrap_or(GRAPH);
+    // The slot itself, never a link to another worktree (#18506 major 2).
+    let linked =
+        |p: &Path| std::fs::symlink_metadata(p).map_or(true, |m| m.file_type().is_symlink());
+    if std::fs::symlink_metadata(view).is_err() {
+        return Ok(());
+    }
+    // The link itself: the slot, or the folder holding it (#18724).
+    let link = if linked(view) {
+        Some(view)
+    } else {
+        view.parent().filter(|p| linked(p))
+    };
+    if let Some(link) = link {
+        // Left alone, and install refuses a link there too: say how to
+        // clear it (#18535), naming the link, so `rm` removes only it.
         notes.push(format!(
-            "mdkg.graph.ref unset: back in checkout mode; {name} is kept"
+            "{} is a symlink, so {} isn't the managed view: it was left alone and no graph \
+             checkout is made there; remove the link itself (`rm {}`, which keeps what it \
+             points to) and run `{BIN} install --checkout-mode` again",
+            link.display(),
+            view.display(),
+            shell_word(&link.to_string_lossy())
         ));
-        if reattach {
-            git_ok(&view, &["switch", "-q", &branch])?;
-            notes.push(format!(
-                "{} is on {branch} again; `{BIN} install` registers it as the graph checkout",
-                view.display()
-            ));
+        return Ok(());
+    }
+    let detached_at_tip = tip.is_some()
+        && admin_name(common_dir, view).is_some()
+        && git_some(view, &["symbolic-ref", "-q", "HEAD"]).is_none()
+        && commit_of(view, "HEAD") == tip
+        && (dry_run || commit_of(top, GRAPH) == tip);
+    if !detached_at_tip {
+        return Ok(());
+    }
+    // The view is detached, so a checkout of mdkg-graph is elsewhere:
+    // occupied() let it through as a registered graph checkout, which is
+    // the graph checkout, and the view stays detached (#18506 major 1).
+    if let Some(at) = checked_out(top, branch) {
+        notes.push(format!(
+            "{} stays detached: {branch} is checked out in the registered graph checkout {at}",
+            view.display()
+        ));
+        return Ok(());
+    }
+    if dry_run {
+        notes.push(format!(
+            "dry run: {} would switch to {branch}",
+            view.display()
+        ));
+    } else {
+        git_ok(view, &["switch", "-q", branch])?;
+        notes.push(format!(
+            "{} is on {branch} again; `{BIN} install` registers it as the graph checkout",
+            view.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Refuses, changing nothing, when mdkg-graph is checked out somewhere
+/// other than the managed view or a registered graph checkout: checkout
+/// mode's view switch, or install's new graph checkout, needs the branch.
+fn occupied(top: &Path, common: &Common, common_dir: &Path, view: &Path) -> Result<(), GraphError> {
+    let branch = GRAPH.strip_prefix("refs/heads/").unwrap_or(GRAPH);
+    let Some(at) = checked_out(top, branch) else {
+        return Ok(());
+    };
+    let same = matches!(
+        (std::fs::canonicalize(view), std::fs::canonicalize(&at)),
+        (Ok(a), Ok(b)) if a == b
+    );
+    // A `.worktree` record holds the checkout's admin name, not its path,
+    // so a registered checkout moved with `git worktree move` still
+    // matches (#18056 major 3).
+    let registered = admin_name(common_dir, Path::new(&at))
+        .is_some_and(|name| worktree_keys(common).iter().any(|(_, a)| *a == name));
+    if same || registered {
+        return Ok(());
+    }
+    Err(refused(
+        "graph.ref_invalid",
+        format!(
+            "checkout mode's graph branch {GRAPH} is checked out at {at}, which isn't the graph \
+             checkout; the rollback changed no mode or registration"
+        ),
+    )
+    .with_hint(format!(
+        "keep or commit the work in {at}, then free the branch there (`git -C {} switch \
+         --detach`, or remove that worktree) and run `{BIN} install --checkout-mode` again",
+        shell_word(&at)
+    )))
+}
+
+/// The admin name (`<common>/worktrees/<name>`) of the linked worktree of
+/// this repository whose top folder is `path`, or `None` for anything else:
+/// another clone, the primary checkout, a plain folder.
+fn admin_name(common_dir: &Path, path: &Path) -> Option<String> {
+    let out = git_some(
+        path,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--show-toplevel",
+            "--git-common-dir",
+            "--git-dir",
+        ],
+    )?;
+    let mut lines = out.lines();
+    let (top, common, dir) = (lines.next()?, lines.next()?, lines.next()?);
+    let canon = |p: &str| std::fs::canonicalize(p).ok();
+    if canon(top)? != std::fs::canonicalize(path).ok()?
+        || canon(common)? != std::fs::canonicalize(common_dir).ok()?
+    {
+        return None;
+    }
+    let dir = canon(dir)?;
+    if dir.parent()? != canon(common)?.join("worktrees") {
+        return None;
+    }
+    Some(dir.file_name()?.to_str()?.to_owned())
+}
+
+/// The commit `mdkg-graph` must be created at for the custom graph ref
+/// `custom` (its tip), or `None` when `mdkg-graph` is already there (a
+/// rerun). Refuses, changing nothing, when `mdkg-graph` holds another
+/// commit: its commits are someone's to keep or merge.
+fn graph_branch_for(top: &Path, custom: &str) -> Result<Option<String>, GraphError> {
+    let tip = commit_of(top, custom).ok_or_else(|| {
+        refused(
+            "graph.ref_missing",
+            format!("the graph ref {custom} names no commit; the rollback changed nothing"),
+        )
+    })?;
+    match commit_of(top, GRAPH) {
+        None => {
+            // Branches under `mdkg-graph/` (the custom ref among them)
+            // keep git's files backend from making `mdkg-graph`.
+            let under = git_some(
+                top,
+                &["for-each-ref", "--format=%(refname)", &format!("{GRAPH}/")],
+            )
+            .unwrap_or_default();
+            match under.lines().next() {
+                None => Ok(Some(tip)),
+                Some(first) => Err(refused(
+                    "graph.ref_invalid",
+                    format!(
+                        "checkout mode's graph branch is {GRAPH}, which git can't create while \
+                         {first} exists under it; the rollback changed nothing"
+                    ),
+                )
+                .with_hint(format!(
+                    "rename the branches under {GRAPH}/ (`git branch -m`); if one is this \
+                     clone's graph ref {custom}, set `mdkg.graph.ref` and each \
+                     `mdkg.graph.<id>.ref` naming it to the new name, then run `{BIN} install \
+                     --checkout-mode` again; or stay in ref mode"
+                ))),
+            }
+        }
+        Some(at) if at == tip => Ok(None),
+        Some(at) => {
+            // Moving a branch checked out in a worktree leaves its index
+            // and files at the old commit, so a later commit there could
+            // revert the graph (#17890 major 3): free it first.
+            let branch = GRAPH.strip_prefix("refs/heads/").unwrap_or(GRAPH);
+            let free = checked_out(top, branch)
+                .map(|wt| {
+                    format!(
+                        "{GRAPH} is checked out at {wt}: keep or commit its work there, then free \
+                         the branch (`git -C {} switch --detach`) before moving it; ",
+                        shell_word(&wt)
+                    )
+                })
+                .unwrap_or_default();
+            Err(refused(
+            "graph.ref_invalid",
+            format!(
+                "checkout mode's graph branch is {GRAPH}, which already exists at {} while this \
+                 clone's graph ref {custom} is at {}; the rollback changed no mode or \
+                 registration, and ref mode keeps working",
+                short(&at),
+                short(&tip)
+            ),
+        )
+        .with_hint(format!(
+            "{free}inspect mdkg-graph (`git log --oneline {tip}..{GRAPH}`) and keep or merge its \
+             commits; once nothing on it is wanted, `git update-ref {GRAPH} {tip} {at}` points \
+             it at the graph (refusing if it moved since), and `{BIN} install --checkout-mode` \
+             runs again; or stay in ref mode"
+        )))
         }
     }
-    finish(top, &common, &common_dir, &graph, &[], false, notes)
+}
+
+/// Points each `mdkg.graph.<id>.ref` record naming `custom` at
+/// `mdkg-graph`, as the moved graph's.
+fn retarget_records(
+    common: &Common,
+    custom: &str,
+    notes: &mut Vec<String>,
+) -> Result<(), GraphError> {
+    let Some(list) = git_some(
+        &common.top,
+        &[
+            "config",
+            "--file",
+            &common.file,
+            "--get-regexp",
+            r"^mdkg\.graph\..*\.ref$",
+        ],
+    ) else {
+        return Ok(());
+    };
+    for (key, value) in list.lines().filter_map(|l| l.split_once(' ')) {
+        let full = graphref::graph_ref_name(value).ok();
+        if full.as_deref() == Some(custom) {
+            common.set(key, GRAPH)?;
+            notes.push(format!("{key} now names {GRAPH}"));
+        }
+    }
+    Ok(())
 }
 
 /// The rest of a rollback whose view is gone: unset `gone` (an
@@ -1805,7 +2194,10 @@ fn slot(top: &Path) -> Result<PathBuf, GraphError> {
 }
 
 /// A `mdkg.graph.<id>.ref` record's value: the graph ref the clone used.
-fn recorded_ref(common: &Common) -> Option<String> {
+/// One naming a ref other than mdkg-graph comes first, so a move from a
+/// custom ref whose retarget stopped part way (some records on mdkg-graph
+/// already) is still found and finished (#17890 major 2).
+fn recorded_ref(top: &Path, common: &Common) -> Option<String> {
     let list = git_some(
         &common.top,
         &[
@@ -1816,8 +2208,35 @@ fn recorded_ref(common: &Common) -> Option<String> {
             r"^mdkg\.graph\..*\.ref$",
         ],
     )?;
-    list.lines()
-        .find_map(|l| l.split_once(' ').map(|(_, v)| v.to_owned()))
+    let records: Vec<(&str, &str)> = list
+        .lines()
+        .filter_map(|l| {
+            let (key, value) = l.split_once(' ')?;
+            let id = key.strip_prefix("mdkg.graph.")?.strip_suffix(".ref")?;
+            Some((id, value))
+        })
+        .collect();
+    let at = commit_of(top, GRAPH);
+    // The moved graph's own identity (committed on mdkg-graph) naming a
+    // custom ref at mdkg-graph's commit; another graph's record naming an
+    // old ref is never taken for it (#18056 major 2).
+    let ids = match &at {
+        Some(_) => mdkg_run::install::worktree::graph_ids_on(top, GRAPH).unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let moved = records.iter().find(|(id, value)| {
+        let full = graphref::graph_ref_name(value).ok();
+        full.as_deref() != Some(GRAPH)
+            && ids.iter().any(|i| i == id)
+            && full.is_some_and(|f| at.is_some() && commit_of(top, &f) == at)
+    });
+    let default = records
+        .iter()
+        .find(|(_, v)| graphref::graph_ref_name(v).ok().as_deref() == Some(GRAPH));
+    moved
+        .or(default)
+        .or(records.first())
+        .map(|(_, v)| (*v).to_owned())
 }
 
 /// Every `mdkg.graph.<id>.worktree` record, key and value exactly as
@@ -1941,7 +2360,10 @@ fn gone_records(
 
 #[cfg(test)]
 mod tests {
-    use super::{destination, full_shape};
+    use super::{
+        SHAPE_ENTRIES, Shape, destination, entry_limit, full_shape, full_shape_within,
+        lowered_limit, shape, shape_within,
+    };
 
     fn shape_fixture() -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("mdkg-shape-{}", uuid::Uuid::now_v7()));
@@ -1969,6 +2391,26 @@ mod tests {
             .to_owned()
     }
 
+    /// A small entry limit for the walk tests, so each trips it in seconds
+    /// (F140); the shipped limit is [`SHAPE_ENTRIES`].
+    const TEST_ENTRIES: usize = 1_000;
+
+    /// The limit that ships, and that the debug-only override can only
+    /// lower it: without the variable, or with a larger number, the walk
+    /// uses the shipped limit.
+    #[test]
+    fn the_shipped_shape_entry_limit_is_100_000() {
+        assert_eq!(SHAPE_ENTRIES, 100_000);
+        assert_eq!(lowered_limit(None), SHAPE_ENTRIES);
+        assert_eq!(lowered_limit(Some("500")), 500);
+        assert_eq!(lowered_limit(Some("100000")), SHAPE_ENTRIES);
+        assert_eq!(lowered_limit(Some("5000000")), SHAPE_ENTRIES);
+        assert_eq!(lowered_limit(Some("lots")), SHAPE_ENTRIES);
+        if std::env::var_os("MDKG_SHAPE_ENTRY_LIMIT").is_none() {
+            assert_eq!(entry_limit(), SHAPE_ENTRIES);
+        }
+    }
+
     #[test]
     fn a_compact_tree_dag_is_refused_before_expanding_all_paths() {
         let dir = shape_fixture();
@@ -1979,7 +2421,9 @@ mod tests {
             format!("100644 blob {blob}\tleaf\0").as_bytes(),
         );
         // Only 18 tiny tree objects, but a recursive listing expands to
-        // 65,536 leaves and more than 100,000 visited entries.
+        // 65,536 leaves and more than 100,000 visited entries. The walk
+        // runs with a 1,000-entry limit (TEST_ENTRIES) so it trips in
+        // seconds; the shipped limit is checked on its own.
         for _ in 0..16 {
             tree = object(
                 &dir,
@@ -1996,10 +2440,87 @@ mod tests {
             &["mktree", "-z"],
             format!("040000 tree {tree}\t.mdkg\0").as_bytes(),
         );
-        let err = full_shape(&dir, &root, &[".mdkg".into()])
+        let err = full_shape_within(&dir, &root, &[".mdkg".into()], TEST_ENTRIES)
             .expect_err("repeated paths must consume the traversal budget");
         assert_eq!(err.diagnostic.code.as_str(), "graph.shape");
         assert!(err.diagnostic.message.contains("limit"), "{err:?}");
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    /// A full shape found before the budget runs out is a full shape the
+    /// rest of which wasn't checked, not an unclassifiable tree; one that
+    /// runs out before anything outside the graph folders stays an error,
+    /// and `full_shape` keeps refusing both (Terra #14932).
+    #[test]
+    fn a_full_shape_past_the_budget_is_full_unchecked() {
+        let dir = shape_fixture();
+        let blob = object(&dir, &["hash-object", "-w", "--stdin"], b"x");
+        let mut tree = object(
+            &dir,
+            &["mktree", "-z"],
+            format!("100644 blob {blob}\tleaf\0").as_bytes(),
+        );
+        for _ in 0..16 {
+            tree = object(
+                &dir,
+                &["mktree", "-z"],
+                format!("040000 tree {tree}\ta\0040000 tree {tree}\tb\0").as_bytes(),
+            );
+        }
+        let graph = object(
+            &dir,
+            &["mktree", "-z"],
+            format!("100644 blob {blob}\tconfig.json\0").as_bytes(),
+        );
+        // `.mdkg` and `README` sort before `src`: the shape is full before
+        // the walk reaches the big subtree.
+        let full = object(
+            &dir,
+            &["mktree", "-z"],
+            format!(
+                "040000 tree {graph}\t.mdkg\0100644 blob {blob}\tREADME\0040000 tree {tree}\tsrc\0"
+            )
+            .as_bytes(),
+        );
+        let paths = [".mdkg".to_string()];
+        match shape_within(&dir, &full, &paths, TEST_ENTRIES).expect("classified") {
+            Shape::FullUnchecked(why) => assert!(why.contains("limit"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        full_shape_within(&dir, &full, &paths, TEST_ENTRIES).expect_err("full_shape still refuses");
+        // The big subtree inside the graph folder: nothing outside it seen.
+        let inside = object(
+            &dir,
+            &["mktree", "-z"],
+            format!("040000 tree {tree}\t.mdkg\0").as_bytes(),
+        );
+        shape_within(&dir, &inside, &paths, TEST_ENTRIES).expect_err("graph-only can't be proved");
+        // One tree over the 4 MiB per-tree cap after a full shape is found:
+        // unchecked as well, not invalid (Terra #18260).
+        let mut wide = Vec::new();
+        for i in 0..60_000 {
+            wide.extend_from_slice(format!("100644 blob {blob}\t{i:0>50}\0").as_bytes());
+        }
+        let wide = object(&dir, &["mktree", "-z"], &wide);
+        let full_wide = object(
+            &dir,
+            &["mktree", "-z"],
+            format!(
+                "040000 tree {graph}\t.mdkg\0100644 blob {blob}\tREADME\0040000 tree {wide}\tsrc\0"
+            )
+            .as_bytes(),
+        );
+        match shape(&dir, &full_wide, &paths).expect("classified") {
+            Shape::FullUnchecked(why) => assert!(why.contains("size limit"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        // A small full shape is just full.
+        let small = object(
+            &dir,
+            &["mktree", "-z"],
+            format!("040000 tree {graph}\t.mdkg\0100644 blob {blob}\tREADME\0").as_bytes(),
+        );
+        assert_eq!(shape(&dir, &small, &paths).expect("full"), Shape::Full);
         std::fs::remove_dir_all(dir).expect("cleanup");
     }
 

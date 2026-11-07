@@ -1707,3 +1707,109 @@ fn an_empty_kind_list_hides_only_receipts_and_keeps_unknown_kinds() {
         vec![("b".to_string(), 2)]
     );
 }
+
+/// The store file and its WAL as they are now, byte for byte. A missing
+/// WAL reads as an empty one: SQLite's read-only open of a WAL store may
+/// create an empty WAL file, which holds nothing.
+fn store_bytes(path: &std::path::Path) -> (Vec<u8>, Vec<u8>) {
+    let mut wal = path.as_os_str().to_owned();
+    wal.push("-wal");
+    (
+        std::fs::read(path).expect("store file"),
+        std::fs::read(wal).unwrap_or_default(),
+    )
+}
+
+/// Bodies still held in the store, read without writing.
+fn bodies(path: &std::path::Path) -> i64 {
+    Store::open_raw_read_only(path)
+        .expect("read-only open")
+        .expect("a store")
+        .query_row("SELECT COUNT(*) FROM msg_bodies", [], |r| r.get(0))
+        .expect("body count")
+}
+
+/// Which listed messages still show their body.
+fn with_body(messages: &[mdkg_coord_sqlite::mail::Message]) -> Vec<(String, bool)> {
+    messages
+        .iter()
+        .map(|m| (m.message_id.clone(), m.parts.is_some()))
+        .collect()
+}
+
+/// Pure reads (a read-only open, or `set_pure_reads`) purge nothing and
+/// append no log record, yet show a body due for purging as purged, by
+/// the same rule the purge deletes by: past its TTL, past its ack grace,
+/// or once a human's hold is over (Omni's read audit; d-mailread L3, L10).
+#[test]
+fn pure_reads_purge_nothing_and_show_due_bodies_as_purged() {
+    let dir = Scratch::new("pure");
+    let path = dir.0.join("mdkg").join("coord.sqlite");
+    let day = 24 * 60 * 60 * 1000;
+    let to_b = || To::Mailboxes(vec!["b".into()]);
+    {
+        let mut s = dir.store();
+        s.set_ack_grace_days(3);
+        s.send(&post("p", "a", to_b(), "grace", 0)).unwrap();
+        let mut ttl = post("t", "a", to_b(), "ttl", 0);
+        ttl.retention = Retention::Ttl(1);
+        s.send(&ttl).unwrap();
+        s.send(&post(
+            "h",
+            "a",
+            To::Mailboxes(vec!["b".into(), "human:nick".into()]),
+            "hold",
+            0,
+        ))
+        .unwrap();
+        s.send(&post("u", "a", to_b(), "unacked", 0)).unwrap();
+        show(&mut s, "b", 1);
+        s.ack(&["p".into(), "h".into()], &["b".into()], "b", None, None, 1)
+            .unwrap();
+    }
+    let now = 7 * day;
+    let query = InboxQuery {
+        mailboxes: vec!["b".into()],
+        all: true,
+        now_ms: now,
+        ..InboxQuery::default()
+    };
+    let expected = vec![
+        ("p".to_string(), false),
+        ("t".to_string(), false),
+        ("h".to_string(), false),
+        ("u".to_string(), true),
+    ];
+    let bytes = store_bytes(&path);
+    let head = mdkg_coord_sqlite::events::head(&path).unwrap();
+    assert_eq!(bodies(&path), 4);
+
+    // A read-only open reads purely from the start.
+    let mut reader = Store::open_read_only(&path).unwrap().unwrap();
+    assert_eq!(with_body(&reader.inbox(&query).unwrap().messages), expected);
+    let (_, thread, _) = reader
+        .thread_with_cursor("t", Page::default(), now)
+        .unwrap();
+    assert_eq!(with_body(&thread), vec![("t".to_string(), false)]);
+    assert!(reader.message("p", now).unwrap().parts.is_none());
+    assert!(reader.message("u", now).unwrap().parts.is_some());
+    assert!(reader.message("p", 3 * day).unwrap().parts.is_some());
+    drop(reader);
+    assert!(store_bytes(&path) == bytes, "the store is byte-identical");
+
+    // A writable store asked for pure reads: the same, and still no purge
+    // and no record (opening it for writing may write, so no byte check).
+    let mut pure = dir.store();
+    pure.set_pure_reads();
+    assert_eq!(with_body(&pure.inbox(&query).unwrap().messages), expected);
+    drop(pure);
+    assert_eq!(bodies(&path), 4, "no body was purged");
+    assert_eq!(mdkg_coord_sqlite::events::head(&path).unwrap(), head);
+
+    // A plain read purges them, and lists exactly what the pure ones did.
+    let mut writer = dir.store();
+    assert_eq!(with_body(&writer.inbox(&query).unwrap().messages), expected);
+    drop(writer);
+    assert_eq!(bodies(&path), 1);
+    assert_ne!(mdkg_coord_sqlite::events::head(&path).unwrap(), head);
+}

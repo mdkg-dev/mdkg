@@ -93,6 +93,16 @@ pub(super) fn grant(
     )
     .map_err(refused)?;
     let delegate = grants.delegates.get(sender).ok_or_else(|| {
+        if let Some(why) = grants.withheld.get(sender) {
+            // Granted, then withheld locally: say that first, not "none".
+            return refused(format!(
+                "the user settings file delegates to the decision sender, but {why}"
+            ))
+            .with_hint(
+                "a person removes that revocation (or fixes the file) to restore the grant; \
+                 until then, relay the answer as --kind resolution --reply-to <id>",
+            );
+        }
         refused("decision sender has no delegation in the user settings file; project and machine-local delegations are ignored")
             .with_hint(delegation_hint(sender, home.as_deref(), xdg.as_deref(), &grants.warnings))
     })?;

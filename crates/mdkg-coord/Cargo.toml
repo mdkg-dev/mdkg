@@ -1,6 +1,6 @@
 [package]
 name = "mdkg-coord"
-version = "0.7.1"
+version = "0.7.2"
 description = "Sans-IO coordinator: leases, claims, settlement through git, idempotent requests, sequencing and readable aliases. Internal to mdkg, no stable API; depend on the mdkg binary"
 edition.workspace = true
 license.workspace = true
@@ -10,8 +10,8 @@ homepage.workspace = true
 readme = "README.md"
 
 [dependencies]
-mdkg-format = { path = "../mdkg-format", version = "0.7.1" }
-mdkg-log = { path = "../mdkg-log", version = "0.7.1" }
+mdkg-format = { path = "../mdkg-format", version = "0.7.2" }
+mdkg-log = { path = "../mdkg-log", version = "0.7.2" }
 serde.workspace = true
 
 [dev-dependencies]

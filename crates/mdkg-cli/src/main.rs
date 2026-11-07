@@ -59,6 +59,7 @@ mod schema;
 mod scratch;
 mod search;
 mod serve_cli;
+mod signals;
 mod skills;
 mod verify;
 mod version;
@@ -95,6 +96,15 @@ struct Cli {
         help_heading = "Global options"
     )]
     allow_store_upgrade: bool,
+    /// Never write the coordinator store.
+    ///
+    /// The store is opened read-only: never created, upgraded, recovered or
+    /// checkpointed. Only `status`, which doesn't record its observation,
+    /// and `msg inbox`, `msg wait` and `msg thread`, which read as with
+    /// `--no-mark`, run with it. Every other command is refused with
+    /// `store.read_only` (exit 1) before it runs.
+    #[arg(long = "read-only", global = true, help_heading = "Global options")]
+    read_only: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -447,11 +457,20 @@ enum Command {
     ///
     /// A role is `role:<name>` (its mailbox), a turn `run:<name>`. Claiming
     /// again renews your lease, except a turn, which `renew` extends.
-    #[command(after_help = examples!("claim <id>", "claim --new src/new_module.rs", "claim role:reviewer"))]
+    #[command(after_help = examples!("claim <id>", "claim src/a.rs src/b.rs", "claim --new src/new_module.rs", "claim role:reviewer"))]
     Claim {
         /// Node id, file or folder path, `role:<name>` or `run:<name>`
         /// (names: lowercase a-z, 0-9, `.`, `_`, `-` and `:`, up to 120).
+        /// More targets may follow: all are claimed or none, one lease
+        /// each, and the options apply to every one. Beside a lease
+        /// authority, several targets in one call are refused (claim each
+        /// on its own); one target then is still fine.
         target: String,
+        /// The targets after the first. Hidden, so the served HTTP
+        /// operation (derived from these arguments) still takes one
+        /// target, and its refusal of turns and roles still sees it.
+        #[arg(hide = true, num_args = 0..)]
+        more: Vec<String>,
         /// A path you're about to create: lease it as a path, without the
         /// missing-file warning.
         ///
@@ -508,33 +527,52 @@ enum Command {
     /// `--all` releases every active lease you hold: run it once your head
     /// has merged and you've committed everything. Each lease is released
     /// on its own, so running it again finishes a run that stopped part
-    /// way. `--clean` releases only the path leases `renew` lets lapse:
-    /// nothing uncommitted in their paths, and not just claimed. The
-    /// launcher runs it as each agent after every turn.
+    /// way. `--clean` releases only the path leases with nothing
+    /// uncommitted in their paths (ignored files, hidden index entries and
+    /// submodules count as open work) that weren't just claimed. The
+    /// launcher runs it as each agent after every turn. `--committed`
+    /// releases, right away, the path leases you've committed to since
+    /// claiming them and left with nothing uncommitted, and lists the ones
+    /// it kept and why: run it after a commit to let others in.
     #[command(after_help = examples!(
         "release <id>",
         "release src/lib.rs",
         "release --all",
-        "release --clean"
+        "release --clean",
+        "release --committed"
     ))]
     Release {
         /// Node id, file or folder path, `role:<name>`, `run:<name>`, or
-        /// lease id.
-        #[arg(required_unless_present_any = ["scope", "all", "clean"])]
+        /// lease id. More targets may follow: all are released or none, in
+        /// one transaction. Beside a lease authority, several targets in
+        /// one call are refused (release each on its own).
+        #[arg(required_unless_present_any = ["scope", "all", "clean", "committed"])]
         target: Option<String>,
+        /// The targets after the first. Hidden, so the served HTTP
+        /// operation (derived from these arguments) still takes one target.
+        #[arg(hide = true, num_args = 0.., requires = "target")]
+        more: Vec<String>,
         /// For a lease authority's host: release your lease on this
         /// canonical scope (relative to the repository's top) instead.
         #[arg(long, hide = true, conflicts_with = "target")]
         scope: Option<String>,
         /// Release every active lease you hold.
-        #[arg(long, conflicts_with_all = ["target", "scope", "clean"])]
+        #[arg(long, conflicts_with_all = ["target", "scope", "clean", "committed"])]
         all: bool,
         /// Release your path leases whose paths have no uncommitted or
         /// staged changes in this worktree and that you didn't claim in the
         /// last 30 minutes: the leases `renew` lets lapse. Never a node,
         /// role or turn lease.
-        #[arg(long, conflicts_with_all = ["target", "scope"])]
+        #[arg(long, conflicts_with_all = ["target", "scope", "committed"])]
         clean: bool,
+        /// Release your path leases whose paths have no uncommitted,
+        /// staged or ignored changes in this worktree and that a commit of
+        /// yours here touched since you claimed them, with no 30-minute
+        /// wait. Lists each path lease it kept, and why. Only in your own
+        /// worktree, and only this repository's leases (not a lease
+        /// authority's).
+        #[arg(long, conflicts_with_all = ["target", "scope"])]
+        committed: bool,
         /// Print JSON.
         #[arg(long)]
         json: bool,
@@ -552,6 +590,10 @@ enum Command {
         /// List only your own active leases (text; JSON lists everyone's).
         #[arg(long)]
         mine: bool,
+        /// Don't record what main holds: write nothing to the store (a
+        /// live view's poll). Settlement shown is still current.
+        #[arg(long)]
+        no_observe: bool,
         /// Print JSON.
         #[arg(long)]
         json: bool,
@@ -755,6 +797,9 @@ impl Command {
     /// Doctor --repair only writes clone-local Git identity, so it stays out
     /// of this set and can repair the missing identity diagnosed by the gate.
     fn writes_graph(&self) -> bool {
+        if let Self::Config(c) = self {
+            return c.writes_graph();
+        }
         matches!(
             self,
             Self::New(_)
@@ -914,6 +959,21 @@ impl Command {
 }
 
 /// Reports an error that happened before a command could run.
+/// The commands `--read-only` runs: reads whose store open is read-only
+/// (`status`, and the mail reads that mark nothing under it).
+fn read_only_allowed(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Status { .. }
+            | Command::Msg(
+                msg::MsgCommand::Inbox(_)
+                    | msg::MsgCommand::Digest(_)
+                    | msg::MsgCommand::Wait(_)
+                    | msg::MsgCommand::Thread(_)
+            )
+    )
+}
+
 fn early_failure(command: &str, json: bool, d: Diagnostic, exit: u8) -> ExitCode {
     // `agents up --json` prints one envelope per line, its failures too.
     if command == "agents.up" && json {
@@ -948,7 +1008,7 @@ fn run(cli: Cli, root: &Path, gate: Option<mdkg_graph::graphref::Authority>) -> 
         } => read::show(root, &id, ws.as_deref(), meta, fields.as_deref(), json),
         Command::Search(a) => search::run(root, &a),
         Command::Index(c) => derived::run(root, &c),
-        Command::Graph(c) => graph::run(root, &c),
+        Command::Graph(c) => graph::run(root, &c, actor),
         Command::Pack(a) => pack::run(root, &a),
         Command::Validate {
             json,
@@ -1010,16 +1070,14 @@ fn run(cli: Cli, root: &Path, gate: Option<mdkg_graph::graphref::Authority>) -> 
         Command::Task(t) => compat::task(root, actor, t),
         Command::Claim {
             target,
+            more,
             new,
             exclusive,
             mode,
             node,
             json,
-        } => coord::claim(
-            root,
-            actor,
-            &target,
-            coord::ClaimOptions {
+        } => {
+            let opts = coord::ClaimOptions {
                 new,
                 exclusive,
                 mode: mode.map(|m| {
@@ -1031,9 +1089,14 @@ fn run(cli: Cli, root: &Path, gate: Option<mdkg_graph::graphref::Authority>) -> 
                 }),
                 node,
                 exact: false,
-            },
-            json,
-        ),
+            };
+            if more.is_empty() {
+                coord::claim(root, actor, &target, opts, json)
+            } else {
+                let targets: Vec<String> = std::iter::once(target).chain(more).collect();
+                coord::claim_many(root, actor, &targets, opts, json)
+            }
+        }
         Command::Holds { scope, node, json } => {
             coord::holds(root, actor, &scope, node.as_deref(), json)
         }
@@ -1042,10 +1105,24 @@ fn run(cli: Cli, root: &Path, gate: Option<mdkg_graph::graphref::Authority>) -> 
         }
         Command::Release {
             all: true, json, ..
-        } => coord::release_all(root, actor, false, json),
+        } => coord::release_all(root, actor, coord::ReleaseSelection::All, json),
         Command::Release {
             clean: true, json, ..
-        } => coord::release_all(root, actor, true, json),
+        } => coord::release_all(root, actor, coord::ReleaseSelection::Clean, json),
+        Command::Release {
+            committed: true,
+            json,
+            ..
+        } => coord::release_all(root, actor, coord::ReleaseSelection::Committed, json),
+        Command::Release {
+            target: Some(target),
+            more,
+            json,
+            ..
+        } if !more.is_empty() => {
+            let targets: Vec<String> = std::iter::once(target).chain(more).collect();
+            coord::release_many(root, actor, &targets, json)
+        }
         Command::Release {
             target,
             scope,
@@ -1059,7 +1136,12 @@ fn run(cli: Cli, root: &Path, gate: Option<mdkg_graph::graphref::Authority>) -> 
             };
             coord::release(root, actor, which, json)
         }
-        Command::Status { all, mine, json } => coord::status(root, actor, all, mine, json),
+        Command::Status {
+            all,
+            mine,
+            no_observe,
+            json,
+        } => coord::status(root, actor, all, mine, !no_observe, json),
         Command::Sync { target, json } => coord::sync(root, actor, target.as_deref(), json),
         Command::Abandon {
             changeset,
@@ -1098,7 +1180,7 @@ fn run(cli: Cli, root: &Path, gate: Option<mdkg_graph::graphref::Authority>) -> 
             Some(b) => verify::bundle(&b, anchor.as_deref(), json),
             None => verify::store(root, anchor.as_deref(), json),
         },
-        Command::Skills(s) => skills::run(root, &s),
+        Command::Skills(s) => skills::run(root, actor, &s),
         Command::Init(_) | Command::Doctor(_) => {
             unreachable!("init and doctor run without a graph")
         }
@@ -1334,11 +1416,43 @@ fn main() -> ExitCode {
             return early_failure(command, json, d, 1);
         }
     };
+    // `--read-only` is an allowlist (#17282): only these reads run under it,
+    // so no other command, server or subprocess can write the store, the
+    // graph or git with the flag set.
+    if cli.read_only && !read_only_allowed(&cli.command) {
+        let d = Diagnostic::error(
+            Code::StoreReadOnly,
+            format!(
+                "`{}` doesn't run with --read-only, which only `status`, `msg inbox`, `msg \
+                 wait` and `msg thread` take; nothing ran",
+                cli.command.name().replace('.', " ")
+            ),
+        )
+        .with_hint("run it without --read-only");
+        return early_failure(cli.command.name(), cli.command.json(), d, 1);
+    }
+    // SIGTERM and SIGINT reach the git this process started, except a
+    // signal the command takes over for a drain of its own.
+    match &cli.command {
+        Command::ReceiverQueueGuard { .. }
+        | Command::Agents(agents::AgentsCommand::Logs(_))
+        | Command::Msg(msg::MsgCommand::Watch(_))
+        | Command::Serve(serve_cli::ServeCommand::Serve(_)) => {}
+        // A continuous supervisor drains on SIGTERM; `--once` doesn't.
+        Command::Agents(agents::AgentsCommand::Up(a)) if !a.once => {
+            signals::forward_to_git(signals::Forwarded::InterruptOnly);
+            agents::register_term();
+        }
+        _ => signals::forward_to_git(signals::Forwarded::Both),
+    }
     if let Command::ReceiverQueueGuard { spec, owner } = &cli.command {
         return ExitCode::from(mdkg_run::receiver::guard::run(spec, *owner));
     }
     if cli.allow_store_upgrade {
         mdkg_coord_sqlite::allow_store_upgrades();
+    }
+    if cli.read_only {
+        mdkg_coord_sqlite::forbid_store_writes();
     }
     if let Command::Schema { command, out } = &cli.command {
         return ExitCode::from(schema::run(command.as_deref(), out.as_deref()));
@@ -1394,6 +1508,11 @@ fn main() -> ExitCode {
             }
         })
     {
+        // A hand-made graph checkout: init also names `init --setup`.
+        let e = match &cli.command {
+            Command::Init(a) => init::layout_hint(&root, a, e),
+            _ => e,
+        };
         let exit = e.exit_code();
         return early_failure(cli.command.name(), cli.command.json(), *e.diagnostic, exit);
     }
@@ -1436,7 +1555,14 @@ fn main() -> ExitCode {
     };
     // Setup commands run where there's no graph yet, or a broken one.
     match &cli.command {
-        Command::Config(c) => return ExitCode::from(config_cmd::run(&root, c)),
+        Command::Config(c) => {
+            return ExitCode::from(config_cmd::run(&root, cli.actor.clone(), c));
+        }
+        // `agents list` reads what `config show` reads, so it runs where
+        // that does: past no checkout config gate, and with no project.
+        Command::Agents(c @ agents::AgentsCommand::List { .. }) => {
+            return ExitCode::from(agents::run(&root, cli.actor.clone(), c));
+        }
         Command::Init(a) => return ExitCode::from(init::run(&root, a)),
         // Ref mode, or a move to or from it: the graph is the graph ref, or
         // about to be, so the checkout's config gate doesn't apply.
@@ -1449,7 +1575,10 @@ fn main() -> ExitCode {
             return ExitCode::from(run::install(&root, named, a));
         }
         Command::Doctor(a) => {
-            let root = if cli.root.is_some() {
+            // The store check reads the store of the repository git finds
+            // here, never one an ancestor's config points at (a nested
+            // repository under a parent graph; review of fad81967).
+            let root = if cli.root.is_some() || a.only == Some(doctor::Only::Store) {
                 root.clone()
             } else {
                 doctor::find_root(&root)
@@ -1572,10 +1701,13 @@ fn main() -> ExitCode {
     // checkout's `.mdkg` (edd-01a18867). Setup, launcher and store commands
     // keep the checkout, as do the servers: their served calls run the CLI,
     // which binds the graph itself, and git, the store and the machine-local
-    // config are found from the checkout, never the cache.
+    // config are found from the checkout, never the cache. `msg list`
+    // reads only the store, read-only, and never the graph: a bind could
+    // replay a pending graph intent, which writes (edd-01a1a1f1 L3).
     let root = if matches!(
         &cli.command,
         Command::Install { .. }
+            | Command::Msg(msg::MsgCommand::List(_))
             | Command::Mcp
             | Command::Serve(_)
             | Command::Agents(_)
@@ -1652,8 +1784,10 @@ fn main() -> ExitCode {
     // and leaves rooms (orchestrator, 2026-10-21); those commands check it
     // themselves. A person also makes ledger ops and runs `done
     // --residual` (edd-01a1878e, A27 rule 4 and A29; the orchestrator on
-    // #11043), which are refused inside a turn where they're judged.
-    // Nothing else runs as a human.
+    // #11043), which are refused inside a turn where they're judged, and
+    // sends mail unsigned, outside a turn, while no person is enforced
+    // (DECISION 39, 2026-11-04; `msg send` checks both). Nothing else runs
+    // as a human.
     let human = named
         .as_deref()
         .is_some_and(|a| a.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("human:")));
@@ -1670,9 +1804,11 @@ fn main() -> ExitCode {
         Command::Msg(
             msg::MsgCommand::Ack(_)
                 | msg::MsgCommand::Inbox(_)
+                | msg::MsgCommand::Digest(_)
                 | msg::MsgCommand::Wait(_)
                 | msg::MsgCommand::Thread(_)
                 | msg::MsgCommand::Watch(_)
+                | msg::MsgCommand::List(_)
         ) | Command::Room(msg::RoomCommand::Leave(_))
             | Command::Channel(msg::RoomCommand::Leave(_))
     ) && human)
@@ -1683,7 +1819,8 @@ fn main() -> ExitCode {
                     residual: Some(_),
                     ..
                 }
-        ) && person);
+        ) && person)
+        || (matches!(&cli.command, Command::Msg(msg::MsgCommand::Send(_))) && person);
     if !human_ack
         && let Some(actor) = &actor
         && let Err(e) = msg::check_actor(actor)

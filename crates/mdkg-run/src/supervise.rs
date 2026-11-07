@@ -33,12 +33,13 @@ pub mod registry;
 pub mod reload;
 pub mod stop;
 mod watch;
+pub(crate) use control::note_end;
 pub use control::{
-    Control, Progress, drain_requested, load_progress, pause, save_progress, stop_requested,
+    Control, End, Progress, drain_requested, load_progress, pause, save_progress, stop_requested,
     supervisor_id, wait_secs,
 };
 #[cfg(test)]
-pub(crate) use control::{bounded_test, with_control};
+pub(crate) use control::{bounded_test, with_agent, with_control};
 #[cfg(test)]
 pub(crate) use files::Scratch;
 pub use files::timestamp;
@@ -436,6 +437,24 @@ fn drained(
     saved: Option<&mut progress::Locked>,
     on: &(dyn Fn(&str, Event<'_>) + Sync),
 ) -> Result<(), RunError> {
+    // Recorded under the progress lock, before it's released, naming its
+    // watch (#20977). Best effort: a warning.
+    if let Some(supervisor) = control.supervisor()
+        && let Some(held) = saved.as_deref()
+        && let Err(e) = registry::record_exit(
+            supervisor.run_dir(),
+            &supervisor.id(),
+            held,
+            registry::ExitReason::Drained,
+            None,
+        )
+    {
+        eprintln!(
+            "warning: can't record that {} was drained: {}",
+            crate::digest::terminal_safe(name),
+            crate::digest::terminal_safe(&e.message)
+        );
+    }
     if let Some(saved) = saved {
         saved.release()?;
     }
@@ -468,6 +487,7 @@ fn supervise(
     let name = a.name.as_str();
     if a.policy.trigger == Trigger::Manual {
         on(name, Event::Manual);
+        note_end(End::Manual);
         return Ok(0);
     }
     if let Some(root) = a.opts.graph_root.as_deref() {
@@ -497,6 +517,10 @@ fn supervise(
     let mut capacity = Capacity::load(dir, name);
     let opts = TurnOptions {
         limit: a.policy.batch_max(),
+        digest_budget: match a.policy.shape {
+            crate::policy::Shape::Digest { budget } => Some(budget),
+            _ => None,
+        },
         timeout: a.policy.timeout.or(a.opts.timeout),
         ..a.opts.clone()
     };
@@ -513,6 +537,7 @@ fn supervise(
             return Ok(ran);
         }
         if how.max_turns.is_some_and(|m| ran >= m) {
+            note_end(End::Cap);
             return Ok(ran);
         }
         let agent = match state::load(dir, name) {
@@ -525,6 +550,7 @@ fn supervise(
                         format!("no agent named {name}"),
                     )),
                 );
+                note_end(End::UnknownAgent);
                 return Ok(ran);
             }
             Err(e) => {
@@ -545,7 +571,7 @@ fn supervise(
             .loop_guard
             .and_then(|g| guard.next_cooldown(&g, now));
         if check_inbox {
-            let inbox = match turn::peek(mail, name, &paused) {
+            let inbox = match turn::peek_for(mail, name, &paused, opts.digest_budget.is_some()) {
                 Ok(i) => i,
                 Err(e) => {
                     on(name, Event::Trouble(&e));
@@ -653,7 +679,12 @@ fn supervise(
         }
         let after = agent.cursor.max(seen);
         let wait = cooldown.map_or(how.wait_secs, |c| how.wait_secs.min(c.as_secs().max(1)));
-        match mail.wait(name, after, wait_secs(wait)) {
+        let waited = if opts.digest_budget.is_some() {
+            mail.wait_digest(name, after, wait_secs(wait))
+        } else {
+            mail.wait(name, after, wait_secs(wait))
+        };
+        match waited {
             Ok(Some(_)) => check_inbox = true,
             // Timed out: a cooled-down thread may run now.
             Ok(None) => check_inbox = cooldown.is_some(),
@@ -982,6 +1013,9 @@ mod tests {
                         via: None,
                         room: None,
                         sent_at: None,
+                        digest: String::new(),
+                        nodes: Vec::new(),
+                        supersedes: Vec::new(),
                         parts: vec![],
                     }],
                     cursor: Some(1),

@@ -33,6 +33,7 @@ use crate::store::{Store, StoreError};
 mod fault;
 pub use fault::{
     CLEAR_RECORD, FAULT_SCHEMA, FAULT_SENDER, FaultCleared, FaultOut, FaultSent, FaultTally,
+    fault_rows_read,
 };
 
 /// The mail tables' own version, in `meta` as `msg_schema`. "2" added
@@ -572,20 +573,26 @@ fn sql_ms(v: u64) -> i64 {
     i64::try_from(v).unwrap_or(i64::MAX)
 }
 
-/// Deletes bodies whose time is up.
+/// Whether message `m`'s body is due for purging at `?1` (now, in ms): a
+/// `ttl` body at its time; a `purge_on_ack` body past its ack grace, or
+/// held for a human once its hold is over and every other delivery is
+/// acked. [`purge_due`] deletes by it, and [`mask_due`] and `msg list`
+/// (`mail_list`) hide by it, so a read that purges and one that doesn't
+/// return the same thing.
+pub(crate) const DUE: &str = "m.purge_after_ms IS NOT NULL AND m.purge_after_ms <= ?1
+       AND (m.retention != 'purge_on_ack' OR NOT EXISTS (
+           SELECT 1 FROM msg_deliveries d
+           WHERE d.seq = m.seq AND d.state != 'acked'
+             AND substr(d.mailbox, 1, 6) != 'human:'))";
+
+/// Deletes bodies whose time is up ([`DUE`]).
 fn purge_due(tx: &Transaction<'_>, now_ms: u64) -> Result<(), MailError> {
-    // A `ttl` body at its time; a `purge_on_ack` body held for a human
-    // once its hold is over and every other delivery is acked.
     let due: Vec<(i64, String)> = {
-        let mut stmt = tx.prepare(
+        let mut stmt = tx.prepare(&format!(
             "SELECT m.seq, m.message_id FROM msg_messages m JOIN msg_bodies b ON b.seq = m.seq
-             WHERE m.purge_after_ms IS NOT NULL AND m.purge_after_ms <= ?1
-               AND (m.retention != 'purge_on_ack' OR NOT EXISTS (
-                   SELECT 1 FROM msg_deliveries d
-                   WHERE d.seq = m.seq AND d.state != 'acked'
-                     AND substr(d.mailbox, 1, 6) != 'human:'))
-             ORDER BY m.seq",
-        )?;
+             WHERE {DUE}
+             ORDER BY m.seq"
+        ))?;
         let rows = stmt.query_map(params![sql_ms(now_ms)], |r| Ok((r.get(0)?, r.get(1)?)))?;
         rows.collect::<Result<_, _>>()?
     };
@@ -605,6 +612,22 @@ fn purge_due(tx: &Transaction<'_>, now_ms: u64) -> Result<(), MailError> {
         ids.iter().map(|id| format!("msg:{id}")).collect(),
         serde_json::json!({"purged": ids, "reason": "retention"}),
     )?;
+    Ok(())
+}
+
+/// For a read that writes nothing: shows each listed body that
+/// [`purge_due`] would delete now as purged (no parts), so the read returns
+/// what it would have returned had a purge run first. The body stays in
+/// the store for a writing command to purge.
+fn mask_due(conn: &Connection, messages: &mut [Message], now_ms: u64) -> Result<(), MailError> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT 1 FROM msg_messages m WHERE m.seq = ?2 AND {DUE}"
+    ))?;
+    for m in messages.iter_mut().filter(|m| m.parts.is_some()) {
+        if stmt.exists(params![sql_ms(now_ms), sql_ms(m.seq)])? {
+            m.parts = None;
+        }
+    }
     Ok(())
 }
 
@@ -1226,6 +1249,12 @@ fn send_in(
     if !flow.nodes.is_empty() {
         body["nodes"] = flow.nodes.iter().map(|n| n.id.clone()).collect();
     }
+    // A person's own send names its proof, none while sends are unsigned,
+    // so an unsigned person send can be told apart later (DECISION 39,
+    // 2026-11-04).
+    if out.via.is_none() && out.sender.starts_with("human:") {
+        body["person_proof"] = Value::Null;
+    }
     crate::log::append_mail(
         tx,
         out.via.as_deref().unwrap_or(&out.sender),
@@ -1337,6 +1366,47 @@ impl Store {
     /// their own times; 0, the default, purges at the ack.
     pub fn set_ack_grace_days(&mut self, days: u32) {
         self.ack_grace_ms = u64::from(days) * DAY_MS;
+    }
+
+    /// Mail reads after this write nothing: no purge and no log record.
+    /// Bodies due for purging read as purged ([`mask_due`]) and stay for a
+    /// writing command to delete. Marking (`mark_shown`) and acks still
+    /// write; callers that must not write don't call them. A store opened
+    /// read-only reads this way from the start.
+    pub fn set_pure_reads(&mut self) {
+        self.pure_reads = true;
+    }
+
+    /// A read's transaction: with pure reads a deferred one that takes no
+    /// write lock and commits nothing, else the writer's ([`Self::mail_tx`]).
+    fn read_tx(&mut self) -> Result<Transaction<'_>, MailError> {
+        if !self.pure_reads {
+            return self.mail_tx();
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        // Its first read takes the snapshot, so a clock read after this
+        // returns is read within it, as it is under the writer's lock.
+        crate::store::check_mail_schema(&tx)?;
+        Ok(tx)
+    }
+
+    /// Before a read: purges what's due, unless reads are pure.
+    fn purge_before_read(tx: &Transaction<'_>, pure: bool, now_ms: u64) -> Result<(), MailError> {
+        if pure { Ok(()) } else { purge_due(tx, now_ms) }
+    }
+
+    /// After a read: with pure reads, hides what a purge would have taken.
+    fn mask_after_read(
+        tx: &Transaction<'_>,
+        pure: bool,
+        messages: &mut [Message],
+        now_ms: u64,
+    ) -> Result<(), MailError> {
+        if pure {
+            mask_due(tx, messages, now_ms)
+        } else {
+            Ok(())
+        }
     }
 
     fn mail_tx(&mut self) -> Result<Transaction<'_>, MailError> {
@@ -1480,7 +1550,8 @@ impl Store {
         clock: impl FnOnce() -> u64,
     ) -> Result<(Inbox, Vec<String>), MailError> {
         let ttl = self.ttl;
-        let tx = self.mail_tx()?;
+        let pure = self.pure_reads;
+        let tx = self.read_tx()?;
         let mut q = q.clone();
         // The lock may have waited past a role deadline. Bind time only once
         // the snapshot is acquired, never to the caller's earlier attempt.
@@ -1488,7 +1559,7 @@ impl Store {
         if let Some((actor, mailbox)) = reader {
             q.mailboxes = read_mailboxes_on(&tx, ttl, actor, mailbox, q.now_ms)?;
         }
-        purge_due(&tx, q.now_ms)?;
+        Self::purge_before_read(&tx, pure, q.now_ms)?;
         let after = q.after.unwrap_or(0);
         let mut seqs: Vec<u64> = Vec::new();
         {
@@ -1540,6 +1611,7 @@ impl Store {
                 messages.push(message_from_row(&tx, r)?);
             }
         }
+        Self::mask_after_read(&tx, pure, &mut messages, q.now_ms)?;
         let event_cursor = crate::events::head_in(&tx)?.encode();
         tx.commit()?;
         let cursor = seqs.last().copied().unwrap_or(after);
@@ -1756,10 +1828,12 @@ impl Store {
 
     /// One message by id, with its deliveries.
     pub fn message(&mut self, id: &str, now_ms: u64) -> Result<Message, MailError> {
-        let tx = self.mail_tx()?;
-        purge_due(&tx, now_ms)?;
-        let message =
+        let pure = self.pure_reads;
+        let tx = self.read_tx()?;
+        Self::purge_before_read(&tx, pure, now_ms)?;
+        let mut message =
             message_by_id(&tx, id)?.ok_or_else(|| MailError::UnknownMessage(id.into()))?;
+        Self::mask_after_read(&tx, pure, std::slice::from_mut(&mut message), now_ms)?;
         tx.commit()?;
         Ok(message)
     }
@@ -1796,9 +1870,10 @@ impl Store {
         page: Page,
         clock: impl FnOnce() -> u64,
     ) -> Result<(String, Vec<Message>, String), MailError> {
-        let tx = self.mail_tx()?;
+        let pure = self.pure_reads;
+        let tx = self.read_tx()?;
         let now_ms = clock();
-        purge_due(&tx, now_ms)?;
+        Self::purge_before_read(&tx, pure, now_ms)?;
         let resolved = match number {
             Some((seq, forced)) => {
                 let (by_seq, is_id, is_context) = handle_ids_on(&tx, Some(seq), typed)?;
@@ -1826,7 +1901,8 @@ impl Store {
         {
             return Err(MailError::UnknownContext(id_or_context.to_string()));
         }
-        let messages = page_of(&tx, "context_id", &context, page)?;
+        let mut messages = page_of(&tx, "context_id", &context, page)?;
+        Self::mask_after_read(&tx, pure, &mut messages, now_ms)?;
         let cursor = crate::events::head_in(&tx)?.encode();
         tx.commit()?;
         Ok((context, messages, cursor))
@@ -1861,13 +1937,15 @@ impl Store {
         page: Page,
         clock: impl FnOnce() -> u64,
     ) -> Result<(Vec<Message>, String), MailError> {
-        let tx = self.mail_tx()?;
+        let pure = self.pure_reads;
+        let tx = self.read_tx()?;
         let now_ms = clock();
-        purge_due(&tx, now_ms)?;
+        Self::purge_before_read(&tx, pure, now_ms)?;
         if !room_exists(&tx, room)? {
             return Err(MailError::UnknownRoom(room.to_string()));
         }
-        let messages = page_of(&tx, "room", room, page)?;
+        let mut messages = page_of(&tx, "room", room, page)?;
+        Self::mask_after_read(&tx, pure, &mut messages, now_ms)?;
         let cursor = crate::events::head_in(&tx)?.encode();
         tx.commit()?;
         Ok((messages, cursor))
@@ -1896,7 +1974,8 @@ impl Store {
         page: Page,
         now_ms: u64,
     ) -> Result<(Vec<Message>, String), MailError> {
-        let tx = self.mail_tx()?;
+        let pure = self.pure_reads;
+        let tx = self.read_tx()?;
         let member =
             room_exists(&tx, room)? && members_of(&tx, room)?.iter().any(|m| mailboxes.contains(m));
         if !member {
@@ -1905,8 +1984,9 @@ impl Store {
                 actor: mailboxes.first().cloned().unwrap_or_default(),
             });
         }
-        purge_due(&tx, now_ms)?;
-        let messages = page_of(&tx, "room", room, page)?;
+        Self::purge_before_read(&tx, pure, now_ms)?;
+        let mut messages = page_of(&tx, "room", room, page)?;
+        Self::mask_after_read(&tx, pure, &mut messages, now_ms)?;
         let cursor = crate::events::head_in(&tx)?.encode();
         tx.commit()?;
         Ok((messages, cursor))
@@ -1921,7 +2001,8 @@ impl Store {
         clock: impl FnOnce() -> u64,
     ) -> Result<(Vec<Message>, String), MailError> {
         let ttl = self.ttl;
-        let tx = self.mail_tx()?;
+        let pure = self.pure_reads;
+        let tx = self.read_tx()?;
         let now_ms = clock();
         let mailboxes = own_mailboxes_on(&tx, ttl, actor, now_ms)?;
         let member =
@@ -1932,8 +2013,9 @@ impl Store {
                 actor: mailboxes.first().cloned().unwrap_or_default(),
             });
         }
-        purge_due(&tx, now_ms)?;
-        let messages = page_of(&tx, "room", room, page)?;
+        Self::purge_before_read(&tx, pure, now_ms)?;
+        let mut messages = page_of(&tx, "room", room, page)?;
+        Self::mask_after_read(&tx, pure, &mut messages, now_ms)?;
         let cursor = crate::events::head_in(&tx)?.encode();
         tx.commit()?;
         Ok((messages, cursor))

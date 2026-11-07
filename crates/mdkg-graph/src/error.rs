@@ -42,8 +42,8 @@ impl ErrorKind {
         match self {
             ErrorKind::Usage => "Bad arguments: an unknown command or flag, a missing or bad value",
             ErrorKind::Validation => {
-                "A check found errors: `validate`, `verify`, `doctor`, `skills validate` or \
-                 `export`'s anchor check, or a write refused because the graph it would leave \
+                "A check found errors: `validate`, `verify`, `doctor`, `skills validate`, \
+                 `entry gate` or `export`'s anchor check, or a write refused because the graph it would leave \
                  doesn't validate"
             }
             ErrorKind::NotFound => {

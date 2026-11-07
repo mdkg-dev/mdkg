@@ -1,6 +1,6 @@
 [package]
 name = "mdkg-graph"
-version = "0.7.1"
+version = "0.7.2"
 description = "Load, index, query and validate mdkg graphs. Internal to mdkg, no stable API; depend on the mdkg binary"
 edition.workspace = true
 license.workspace = true
@@ -11,9 +11,11 @@ readme = "README.md"
 
 [dependencies]
 # Read immutable graph objects through the shared hardened Git boundary.
-mdkg-git = { path = "../mdkg-git", version = "0.7.1" }
-mdkg-format = { path = "../mdkg-format", version = "0.7.1", features = ["settings-fs"] }
+mdkg-git = { path = "../mdkg-git", version = "0.7.2" }
+mdkg-format = { path = "../mdkg-format", version = "0.7.2", features = ["settings-fs"] }
 serde_json.workspace = true
+# Graph sync pins git setup as digests, never values (Terra #18946).
+sha2.workspace = true
 # Review of 13b3e6e: templates are read through folder handles opened from
 # the repository root, never through a second path lookup.
 rustix = { workspace = true, features = ["process"] }

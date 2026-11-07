@@ -65,16 +65,27 @@ pub struct Remote {
     /// The full ref on the remote (`mdkg.graph.remoteRef`, default the
     /// graph ref's name).
     pub remote_ref: String,
-    /// The destination install pinned (`<common>/mdkg/graph/remote.json`),
+    /// The destination a person approved (`<common>/mdkg/graph/remote.json`),
     /// `None` until pinned.
     pub pinned: Option<Destination>,
 }
 
-/// A remote's normalized effective destinations, as pinned.
+/// A remote's normalized effective destinations, as pinned, with the
+/// remote's name and `remoteRef` they were pinned for (G23): a renamed
+/// remote or another `remoteRef` is a changed destination.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Destination {
+    /// The remote's name; empty in a pin that doesn't name it, which
+    /// matches no remote.
+    pub remote: String,
+    /// The full `remoteRef`; empty as `remote` is.
+    pub remote_ref: String,
     pub fetch: Vec<String>,
     pub push: Vec<String>,
+    /// The agent-writable git setup a push runs with
+    /// ([`crate::sync::guard::setup`], DECISION 10): empty in a pin made
+    /// before it was pinned, which matches no current setup.
+    pub setup: BTreeMap<String, String>,
 }
 
 /// The clone's graph-ref settings. `None` from [`resolve`] is checkout mode.
@@ -1039,10 +1050,14 @@ fn valid_ref(name: &str) -> bool {
 }
 
 /// The pinned destination, `<common>/mdkg/graph/remote.json`
-/// (`{"fetch": [...], "push": [...]}`), if install wrote one.
+/// (`{"remote", "remote_ref", "fetch": [...], "push": [...]}`), if
+/// `mdkg graph remote approve` wrote one.
+/// The largest `remote.json` read or written.
+const PIN_CAP: usize = 64 * 1024;
+
 fn pinned(common: &Path) -> Result<Option<Destination>, Error> {
     let path = common.join("mdkg").join("graph").join("remote.json");
-    let bytes = match mdkg_git::read_capped(&path, 64 * 1024) {
+    let bytes = match mdkg_git::read_capped(&path, PIN_CAP as u64) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
@@ -1062,21 +1077,71 @@ fn pinned(common: &Path) -> Result<Option<Destination>, Error> {
             })
             .collect()
     };
+    let text = |key: &str| -> Result<String, Error> {
+        match value.get(key) {
+            None | Some(Value::Null) => Ok(String::new()),
+            Some(Value::String(s)) => Ok(s.clone()),
+            Some(_) => Err(Error::new(
+                "graph.remote_invalid",
+                format!("remote.json's {key} must be a string"),
+            )),
+        }
+    };
+    let setup = match value.get("setup") {
+        None | Some(Value::Null) => BTreeMap::new(),
+        Some(Value::Object(o)) => o
+            .iter()
+            .map(|(k, v)| {
+                v.as_str()
+                    .map(|v| (k.clone(), v.to_owned()))
+                    .ok_or_else(|| {
+                        Error::new(
+                            "graph.remote_invalid",
+                            "remote.json's setup values must be strings",
+                        )
+                    })
+            })
+            .collect::<Result<_, _>>()?,
+        Some(_) => {
+            return Err(Error::new(
+                "graph.remote_invalid",
+                "remote.json's setup must be an object",
+            ));
+        }
+    };
     Ok(Some(Destination {
+        remote: text("remote")?,
+        remote_ref: text("remote_ref")?,
         fetch: list("fetch")?,
         push: list("push")?,
+        setup,
     }))
 }
 
 /// Writes the pinned destination, atomically and fsynced.
 pub fn pin_destination(common: &Path, destination: &Destination) -> Result<(), Error> {
     let dir = refwrite::graph_dir(common)?;
-    let value = serde_json::json!({"fetch": destination.fetch, "push": destination.push});
-    crate::intent::write_durably(
-        &dir,
-        "remote.json",
-        &serde_json::to_vec_pretty(&value).map_err(|e| Error::new("graph.io", e.to_string()))?,
-    )?;
+    let value = serde_json::json!({
+        "remote": destination.remote,
+        "remote_ref": destination.remote_ref,
+        "fetch": destination.fetch,
+        "push": destination.push,
+        "setup": destination.setup,
+    });
+    let bytes =
+        serde_json::to_vec_pretty(&value).map_err(|e| Error::new("graph.io", e.to_string()))?;
+    // The reader's cap (Terra #18946): a pin it couldn't read back is
+    // refused, and the existing one stays.
+    if bytes.len() > PIN_CAP {
+        return Err(Error::new(
+            "graph.remote_invalid",
+            format!(
+                "the destination to pin is {} bytes, over remote.json's {PIN_CAP}-byte cap",
+                bytes.len()
+            ),
+        ));
+    }
+    crate::intent::write_durably(&dir, "remote.json", &bytes)?;
     Ok(())
 }
 
@@ -1347,8 +1412,15 @@ fn head_entry(repo: &Path, head: &str, path: &str) -> Result<Option<String>, Err
 }
 
 /// The graph ref's tip, refusing a missing or symbolic ref
-/// (`graph.ref_missing`, `graph.ref_invalid`).
+/// (`graph.ref_missing`, `graph.ref_invalid`). A tip read once is kept
+/// for the process while the ref's files are unchanged
+/// ([`mdkg_git::cached_ref`], e-gitcache): a command resolves it on several
+/// paths (the entry gate, the graph binding, the config authority).
 pub fn tip(repo: &Path, graph: &GraphRef) -> Result<String, Error> {
+    mdkg_git::cached_ref(repo, &graph.name, "graph-tip", || fresh_tip(repo, graph))
+}
+
+fn fresh_tip(repo: &Path, graph: &GraphRef) -> Result<String, Error> {
     let symbolic = mdkg_git::command(repo)
         .args(["symbolic-ref", "-q", &graph.name])
         .run(None)?;

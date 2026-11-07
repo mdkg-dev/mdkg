@@ -10,7 +10,9 @@
 //! Until a-flow's P2 moves it onto the `fault:<agent>:<code>` slot, the
 //! dedupe is a direct lookup: in the send's transaction, the open faults
 //! with the same agent and code are acked, at every mailbox, with `via:
-//! "supersede"`.
+//! "supersede"`. The lookups pick those faults out in SQL, by the agent
+//! and code in their data part, and decode only them (e-gitcache, 0.7.2):
+//! a send or clear no longer reads every fault the store ever held.
 
 use rusqlite::{Transaction, params};
 use serde_json::Value;
@@ -32,6 +34,27 @@ pub const CLEAR_RECORD: &str = "fault.clear";
 
 /// The actor of every system ack.
 const MDKG: &str = "mdkg";
+
+thread_local! {
+    /// Stored faults this thread's dedupe and clear lookups read whole.
+    static ROWS_READ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many stored fault messages the lookups of this thread's
+/// [`Store::send_fault`] and [`Store::clear_faults`] calls have read whole
+/// (to find what to supersede, whether a copy was replaced, and what to
+/// clear), so tests can bound them as the store grows. The copy a send
+/// stores and returns is not counted.
+#[doc(hidden)]
+pub fn fault_rows_read() -> u64 {
+    ROWS_READ.with(std::cell::Cell::get)
+}
+
+/// A fault message read whole, counted for [`fault_rows_read`].
+fn read_fault(tx: &Transaction<'_>, id: &str) -> Result<Option<Message>, MailError> {
+    ROWS_READ.with(|n| n.set(n.get() + 1));
+    message_by_id(tx, id)
+}
 
 /// One fault to send: what the store needs to number, route and dedupe it.
 #[derive(Debug, Clone)]
@@ -113,29 +136,126 @@ fn stored(message: Message) -> Option<Stored> {
     })
 }
 
-/// Every fault message from mdkg, oldest first; with `open`, only those
-/// with an unacked delivery.
-fn faults(tx: &Transaction<'_>, open: bool) -> Result<Vec<Stored>, MailError> {
-    let sql = if open {
-        "SELECT DISTINCT m.message_id, m.seq FROM msg_messages m
-         JOIN msg_deliveries d ON d.seq = m.seq
-         WHERE m.sender = ?1 AND m.kind = 'fault' AND d.state = 'delivered' ORDER BY m.seq"
-    } else {
-        "SELECT message_id, seq FROM msg_messages
-         WHERE sender = ?1 AND kind = 'fault' ORDER BY seq"
-    };
-    let ids: Vec<String> = tx
-        .prepare(sql)?
-        .query_map(params![FAULT_SENDER], |r| r.get::<_, String>(0))?
-        .collect::<Result<_, _>>()?;
+/// The fault messages from mdkg that `candidates` (a condition on
+/// `msg_messages m`) keeps, each with the first part `stored` would take as
+/// its data part (a JSON object text, or NULL). The candidates are picked
+/// first, so the bodies are read in SQL only for them, and a lookup
+/// decodes only the messages it matches. A body that isn't a JSON array
+/// has no such part, as `stored` reads it; every `json_*` call sees only
+/// valid JSON, whatever order SQLite evaluates the terms in. `?1` is the
+/// sender and `?2` the schema.
+fn fault_parts(candidates: &str) -> String {
+    format!(
+        "WITH c AS MATERIALIZED (
+           SELECT m.seq, m.message_id FROM msg_messages m
+           WHERE m.sender = ?1 AND m.kind = 'fault' AND ({candidates}))
+         SELECT c.seq, c.message_id,
+           (SELECT p.value FROM json_each(
+                CASE WHEN json_valid(b.parts)
+                     THEN CASE WHEN json_type(b.parts) = 'array' THEN b.parts ELSE '[]' END
+                     ELSE '[]' END) p
+             WHERE CASE WHEN p.type = 'object'
+                        THEN json_type(p.value, '$.data') = 'object'
+                             AND json_extract(p.value, '$.data.schema') = ?2
+                        ELSE 0 END
+             ORDER BY p.id LIMIT 1) AS part
+         FROM c JOIN msg_bodies b ON b.seq = c.seq"
+    )
+}
+
+/// Decodes the fault messages `ids` names, keeping those `keep` accepts.
+fn decode(
+    tx: &Transaction<'_>,
+    ids: Vec<String>,
+    keep: impl Fn(&Stored) -> bool,
+) -> Result<Vec<Stored>, MailError> {
     let mut out = Vec::new();
     for id in ids {
-        if let Some(m) = message_by_id(tx, &id)?
+        if let Some(m) = read_fault(tx, &id)?
             && let Some(s) = stored(m)
+            && keep(&s)
         {
             out.push(s);
         }
     }
+    Ok(out)
+}
+
+/// The open fault messages of `agent` and `code`, oldest first: those with
+/// an unacked delivery. Only they are read.
+fn open_faults(tx: &Transaction<'_>, agent: &str, code: &str) -> Result<Vec<Stored>, MailError> {
+    let sql = format!(
+        "SELECT message_id FROM ({})
+         WHERE json_extract(part, '$.data.agent') = ?3
+           AND json_extract(part, '$.data.code') = ?4
+         ORDER BY seq",
+        fault_parts(
+            "EXISTS (SELECT 1 FROM msg_deliveries d WHERE d.seq = m.seq AND d.state = 'delivered')"
+        )
+    );
+    let ids = tx
+        .prepare(&sql)?
+        .query_map(params![FAULT_SENDER, FAULT_SCHEMA, agent, code], |r| {
+            r.get::<_, String>(0)
+        })?
+        .collect::<Result<_, _>>()?;
+    decode(tx, ids, |s| s.agent == agent && s.code == code)
+}
+
+/// Whether a fault of `agent` and `code` other than `fault_id` was stored
+/// after message `after`. Only messages stored after it are read.
+fn replaced_after(
+    tx: &Transaction<'_>,
+    agent: &str,
+    code: &str,
+    fault_id: &str,
+    after: u64,
+) -> Result<bool, MailError> {
+    let sql = format!(
+        "SELECT message_id FROM ({})
+         WHERE json_extract(part, '$.data.agent') = ?3
+           AND json_extract(part, '$.data.code') = ?4
+         ORDER BY seq",
+        fault_parts("m.seq > ?5")
+    );
+    let ids = tx
+        .prepare(&sql)?
+        .query_map(
+            params![FAULT_SENDER, FAULT_SCHEMA, agent, code, sql_ms(after)],
+            |r| r.get::<_, String>(0),
+        )?
+        .collect::<Result<_, _>>()?;
+    Ok(!decode(tx, ids, |s| {
+        s.agent == agent && s.code == code && s.fault_id != fault_id
+    })?
+    .is_empty())
+}
+
+/// The latest fault message of each of `agent`'s codes, by code; only
+/// those are decoded. A message whose data part lacks a text `fault_id`,
+/// `agent` or `code` is no fault (`stored` skips it), so it is never the
+/// latest.
+fn latest_of_each_code(tx: &Transaction<'_>, agent: &str) -> Result<Vec<Stored>, MailError> {
+    let sql = format!(
+        "SELECT message_id FROM (
+           SELECT message_id, seq, ROW_NUMBER() OVER (
+               PARTITION BY json_extract(part, '$.data.code') ORDER BY seq DESC) AS nth
+           FROM ({})
+           WHERE json_extract(part, '$.data.agent') = ?3
+             AND json_type(part, '$.data.agent') = 'text'
+             AND json_type(part, '$.data.code') = 'text'
+             AND json_type(part, '$.data.fault_id') = 'text')
+         WHERE nth = 1 ORDER BY seq",
+        fault_parts("1")
+    );
+    let ids = tx
+        .prepare(&sql)?
+        .query_map(params![FAULT_SENDER, FAULT_SCHEMA, agent], |r| {
+            r.get::<_, String>(0)
+        })?
+        .collect::<Result<_, _>>()?;
+    let mut out = decode(tx, ids, |s| s.agent == agent)?;
+    out.sort_by(|a, b| a.code.cmp(&b.code));
     Ok(out)
 }
 
@@ -152,8 +272,7 @@ fn copies(tx: &Transaction<'_>, fault_id: &str) -> Result<Vec<(u64, Message)>, M
         .collect::<Result<_, _>>()?;
     let mut out = Vec::new();
     for id in ids {
-        let message =
-            message_by_id(tx, &id)?.ok_or_else(|| MailError::UnknownMessage(id.clone()))?;
+        let message = read_fault(tx, &id)?.ok_or_else(|| MailError::UnknownMessage(id.clone()))?;
         let suffix = &id[prefix.len()..];
         let k = suffix
             .parse::<u64>()
@@ -264,10 +383,7 @@ fn send_fault_in(
     if !held.is_empty() && cleared(tx, f.fault_id, &messages)? {
         return Ok(FaultSent::Cleared);
     }
-    let open: Vec<Stored> = faults(tx, true)?
-        .into_iter()
-        .filter(|s| s.agent == f.agent && s.code == f.code)
-        .collect();
+    let open = open_faults(tx, f.agent, f.code)?;
     let tally = if let Some((_, latest)) = held.last() {
         // A resend stops at the store's copy, whatever its body: the latest
         // copy already went to every recipient.
@@ -276,12 +392,7 @@ fn send_fault_in(
                 .all(|to| latest.deliveries.iter().any(|d| &d.mailbox == to));
         // Only the active occurrence follows a changed recipient: one a
         // later fault of the same agent and code replaced stays where it is.
-        let replaced = faults(tx, false)?.into_iter().any(|s| {
-            s.agent == f.agent
-                && s.code == f.code
-                && s.fault_id != f.fault_id
-                && s.message.seq > latest.seq
-        });
+        let replaced = replaced_after(tx, f.agent, f.code, f.fault_id, latest.seq)?;
         if reached || replaced {
             return Ok(FaultSent::Stood(latest.clone()));
         }
@@ -360,28 +471,14 @@ fn clear_in(
     condition: &str,
     now_ms: u64,
 ) -> Result<Vec<FaultCleared>, MailError> {
-    let all = faults(tx, false)?;
-    let mut codes: Vec<&str> = all
-        .iter()
-        .filter(|s| s.agent == agent && s.clears.as_deref() == Some(condition))
-        .map(|s| s.code.as_str())
-        .collect();
-    codes.sort_unstable();
-    codes.dedup();
     let mut out = Vec::new();
-    for code in codes {
-        // The latest occurrence is the one whose condition is reported:
-        // earlier ones were superseded by it, or cleared before it.
-        let Some(latest) = all
-            .iter()
-            .rev()
-            .find(|s| s.agent == agent && s.code == code)
-        else {
-            continue;
-        };
+    // The latest occurrence of each code is the one whose condition is
+    // reported: earlier ones were superseded by it, or cleared before it.
+    for latest in latest_of_each_code(tx, agent)? {
         if latest.clears.as_deref() != Some(condition) {
             continue;
         }
+        let code = latest.code.as_str();
         let fault_id = latest.fault_id.clone();
         let held: Vec<Message> = copies(tx, &fault_id)?.into_iter().map(|(_, m)| m).collect();
         if cleared(tx, &fault_id, &held)? {

@@ -48,6 +48,11 @@ use mdkg_graph::refwrite::{self, GraphLock, LockKind, LockMode, Prepared, Receip
 pub(crate) fn graph_error(code: &'static str, message: impl Into<String>) -> GraphError {
     let message = message.into();
     match Code::parse(code) {
+        // The graph moved under the write: a coordination conflict (exit
+        // 5, re-read and retry), not a failure (orchestrator on #17713).
+        Some(c @ (Code::GraphWriteStale | Code::GraphWriteContended)) => {
+            GraphError::conflict(c, message)
+        }
         Some(c) => GraphError::failure(c, message),
         None => GraphError::failure(Code::IoGitFailed, format!("{code}: {message}")),
     }
@@ -274,7 +279,7 @@ fn bind_with(checkout: &Path, status: bool) -> Result<Option<PathBuf>, GraphErro
     }
     let top = raw::toplevel(checkout).map_err(io_error)?;
     let tip = graphref::tip(&top, &graph).map_err(from_ref)?;
-    // 0.7.1 binds the root graph at `.mdkg` only (#16095).
+    // Ref mode keeps the root graph at `.mdkg` (#16095, orchestrator #19410).
     crate::config_cmd::root_graph_folder(&top, &graph, Some(&tip))?;
     // Only the config and graph id are used here: an agent definition is
     // checked by the entry gate's full read where a command needs it, and
@@ -514,7 +519,8 @@ fn catch_up(
         // through a reader, even while a real writer owns the WAL lock.
         let path = raw::store_path(&mode.checkout).map_err(io_error)?;
         crate::coord::unreachable_store(&path)?;
-        let store = Store::open_read_only(&path).map_err(crate::coord::store_error)?;
+        let store = Store::open_read_only(&path)
+            .map_err(|e| crate::coord::store_error_in(e, Some(&mode.checkout)))?;
         let mut reserved = 0;
         for intent in &pending {
             let recorded = match &store {
@@ -629,6 +635,44 @@ fn recorded(store: &Store, intent: &Intent) -> Result<bool, GraphError> {
     Ok(state
         .changesets()
         .any(|c| c.source.as_ref().is_some_and(|s| &s.commit == commit)))
+}
+
+/// Replays this clone's pending graph write intents under `lock` (R13),
+/// for graph sync before it moves the local graph (Terra #18237), as a
+/// command's catch-up does: the store is opened only when an intent is
+/// pending, and what each replay did is reported.
+pub(crate) fn replay_intents(
+    checkout: &Path,
+    writer: &RefWriter,
+    lock: &GraphLock,
+) -> Result<(), GraphError> {
+    let journal = Journal::open(writer.common()).map_err(io_error)?;
+    if journal.pending().map_err(io_error)?.is_empty() {
+        return Ok(());
+    }
+    let store = Store::open_for_repo(checkout, crate::coord::ttl_ms())
+        .map_err(crate::coord::store_error)?;
+    let replayed = journal
+        .replay(writer, lock, |intent| recorded(&store, intent))
+        .map_err(from_write)?;
+    let failed = replayed
+        .iter()
+        .filter(|r| matches!(r, Replayed::Failed { .. }))
+        .count();
+    for r in &replayed {
+        report_replay(&journal, r);
+    }
+    // A write that couldn't be replayed now is tried again before the
+    // graph moves, never left behind a sync's move (Terra #18984).
+    if failed > 0 {
+        return Err(graph_error(
+            "graph.intents",
+            format!(
+                "{failed} pending graph write(s) couldn't be replayed; the sync waits for them"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn stale_intent_hint(journal: &Journal, id: &str) -> String {
@@ -1203,6 +1247,372 @@ pub(crate) fn next_request_id() -> String {
 }
 
 /// What an op's edits come to, for prepare and record.
+/// What [`record_graph_file`] did: the caller's value, the published
+/// commit and its changesets (`None` when nothing changed), and the
+/// authority-hold release note.
+pub(crate) type RecordedFile<T> = (T, Made, Option<Diagnostic>);
+
+/// A recorded write's commit and changesets, `None` when nothing changed.
+pub(crate) type Made = Option<(String, Vec<String>)>;
+
+/// One graph file changed under an exact exclusive lease on it, as
+/// `agents add` and `config set` change theirs: the lease is taken when the
+/// actor holds none (and released again when nothing changed, or the write
+/// fails), and `decide` reads the file and returns the bytes to write
+/// (`None`: leave it) with its own value. In ref mode (`root` is the bound
+/// cache root) the file is read in the cache at the tip under the exclusive
+/// graph lock and published on the graph ref; in a checkout-mode git
+/// checkout it's written in place and committed on the checkout's branch
+/// (a refresh inside `.worktrees/graph` lands on the graph branch, never
+/// leaving it dirty), and put back if the commit fails before it's made.
+/// Returns that value, the commit and its changesets (`None` when nothing
+/// changed), and the authority-hold release note.
+pub(crate) fn record_graph_file<T>(
+    root: &Path,
+    actor: Option<String>,
+    rel: &str,
+    message: &str,
+    op: &str,
+    decide: impl FnOnce(&Path) -> Result<(Option<Vec<u8>>, T), GraphError>,
+) -> Result<RecordedFile<T>, GraphError> {
+    use crate::coord::{self, Repo, now_ms, store_error};
+    use mdkg_coord::{Command, Mode, Outcome};
+
+    crate::graph_repair::require_writable(root)?;
+    let repo = Repo::open(root)?;
+    let mode = for_root(&repo.root);
+    crate::anchor::refuse_linked_folders(&repo.root, rel)?;
+    let scope = repo.leaf(rel)?;
+    coord::check_scope_text(&scope)?;
+    let actor = repo.actor(actor);
+    crate::msg::check_actor_mailbox(&actor, true)?;
+    let held = coord::require_authority_hold(&repo, &actor, &scope, None)?;
+    let mut store = repo.store()?;
+    let now = now_ms();
+    repo.observe(&mut store, now)?;
+    let state = store.coordinator().map_err(store_error)?;
+    let existing = coord::covering_lease(&state, &actor, &scope);
+    let taken = existing.is_none();
+    let lease = if let Some(lease) = existing {
+        if lease.scope != scope || lease.mode != Mode::Exclusive {
+            return Err(GraphError::conflict(
+                Code::CoordLeaseHeld,
+                format!("changing {rel} needs an exclusive lease on that file"),
+            )
+            .with_hint("release the covering or shared lease, then retry"));
+        }
+        lease.id.clone()
+    } else {
+        let mut capped = false;
+        let outcome = store.execute_with(|state| {
+            if coord::at_lease_cap(state, &actor, now) {
+                capped = true;
+                return Err(mdkg_coord_sqlite::StoreError::Schema("capped".into()));
+            }
+            Ok(Command::Claim {
+                owner: actor.clone(),
+                scope: scope.clone(),
+                mode: Mode::Exclusive,
+                now,
+                request: None,
+                node: None,
+            })
+        });
+        if capped {
+            return Err(coord::lease_cap_error());
+        }
+        match outcome.map_err(store_error)? {
+            Outcome::Lease { lease } => lease,
+            Outcome::Refused { error } => return Err(coord::refusal(&error)),
+            _ => {
+                return Err(GraphError::failure(
+                    Code::IoWriteFailed,
+                    format!("the lease on {rel} wasn't granted"),
+                ));
+            }
+        }
+    };
+    let release = |store: &mut Store| -> Result<(), GraphError> {
+        let outcome = store
+            .execute(&Command::Release {
+                owner: actor.clone(),
+                lease: lease.clone(),
+                now,
+            })
+            .map_err(store_error)?;
+        if let Outcome::Refused { error } = outcome {
+            return Err(coord::refusal(&error));
+        }
+        Ok(())
+    };
+    let Some(mode) = mode else {
+        let out = record_checkout_file(
+            &repo, &mut store, &actor, rel, &scope, &lease, message, now, decide,
+        );
+        let out = match out {
+            Ok((value, None)) => {
+                if taken {
+                    release(&mut store)?;
+                }
+                (value, None)
+            }
+            Ok((value, Some(made))) => (value, Some(made)),
+            // A made commit keeps the lease (its error says so).
+            Err((e, true)) => return Err(e),
+            Err((e, false)) => {
+                if taken {
+                    let _ = release(&mut store);
+                }
+                return Err(e);
+            }
+        };
+        // As `config set`: the authority's lease is released only when the
+        // change was committed; a no-op leaves the actor holding it.
+        let note = out
+            .1
+            .as_ref()
+            .and_then(|_| coord::release_at_authority(&repo, &actor, &scope, held.as_ref()));
+        return Ok((out.0, out.1, note));
+    };
+    let graph = mode.graph.name.clone();
+    let mut changesets = Vec::new();
+    let wrote = prepare_record_publish(
+        &mode,
+        &mut store,
+        (&next_request_id(), op, &actor),
+        |w, _| {
+            // The cache is at the tip, under the exclusive lock; nothing is
+            // written there but through `w`.
+            let (bytes, value) = decide(&repo.root.join(rel))?;
+            if let Some(bytes) = &bytes {
+                w.write(scope.as_str(), bytes)?;
+            }
+            Ok((
+                Publish {
+                    message: message.to_owned(),
+                    leases: vec![lease.to_string()],
+                    allowed: vec![scope.clone()],
+                    trailers: Vec::new(),
+                },
+                value,
+            ))
+        },
+        |store, prepared| {
+            let source = Source {
+                commit: prepared.commit.clone(),
+                branch: graph.clone(),
+            };
+            changesets = crate::write::record_changesets(
+                &repo,
+                store,
+                &actor,
+                &[(lease.to_string(), scope.clone())],
+                &[],
+                &source,
+                now,
+                None,
+                None,
+            )?;
+            Ok(())
+        },
+    );
+    let out = match wrote {
+        Ok(Wrote::Done(value, Some(written))) => {
+            (value, Some((written.receipt.commit, changesets)))
+        }
+        Ok(Wrote::Done(value, None)) => {
+            // Nothing changed: no changeset holds the lease, and only one
+            // this call took is released.
+            if taken {
+                release(&mut store)?;
+            }
+            (value, None)
+        }
+        // Request ids are minted per call, so a replay of this one can't
+        // be found here.
+        Ok(Wrote::Already(_)) => {
+            if taken {
+                let _ = release(&mut store);
+            }
+            return Err(GraphError::failure(
+                Code::IoWriteFailed,
+                "this change's request was already published",
+            ));
+        }
+        Err(e) => {
+            if taken {
+                let _ = release(&mut store);
+            }
+            return Err(e);
+        }
+    };
+    let note = out
+        .1
+        .as_ref()
+        .and_then(|_| coord::release_at_authority(&repo, &actor, &scope, held.as_ref()));
+    Ok((out.0, out.1, note))
+}
+
+/// [`record_graph_file`] in checkout mode: `rel` written in place under the
+/// lease, then committed and recorded; the earlier bytes are put back when
+/// the commit fails before it's made (a made commit is never undone).
+/// Whether to commit is judged against `HEAD`'s copy, not the working
+/// copy, so a retry after a stop between the write and the commit still
+/// commits (Terra #19620). A staged change of the path is refused, never
+/// replaced. On `Err`, the flag says a commit was made (the caller then
+/// keeps the lease, and the error names the commit).
+#[allow(clippy::too_many_arguments)]
+fn record_checkout_file<T>(
+    repo: &crate::coord::Repo,
+    store: &mut Store,
+    actor: &str,
+    rel: &str,
+    scope: &Scope,
+    lease: &mdkg_coord::LeaseId,
+    message: &str,
+    now: u64,
+    decide: impl FnOnce(&Path) -> Result<(Option<Vec<u8>>, T), GraphError>,
+) -> Result<(T, Made), (GraphError, bool)> {
+    let before_commit = |e: GraphError| (e, false);
+    let path = repo.root.join(rel);
+    let failed = |e: std::io::Error| {
+        GraphError::failure(Code::IoWriteFailed, format!("can't write {rel}: {e}"))
+    };
+    // Read only under the lease, never through a link.
+    let before = match std::fs::symlink_metadata(&path) {
+        Ok(m) if m.is_file() => Some(
+            std::fs::read(&path)
+                .map_err(failed)
+                .map_err(before_commit)?,
+        ),
+        Ok(_) => {
+            return Err(before_commit(GraphError::usage(
+                Code::IoWriteFailed,
+                format!("{rel} isn't a regular file"),
+            )));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(before_commit(failed(e))),
+    };
+    let git = |args: &[&str]| {
+        raw::command(&repo.top)
+            .args(["--literal-pathspecs"])
+            .args(args)
+            .run(None)
+            .map_err(io_error)
+    };
+    // A staged version of its own would be replaced by the commit's
+    // `git add`: refused, so it's never lost.
+    let staged = git(&["diff", "--cached", "--quiet", "HEAD", "--", scope.as_str()])
+        .map_err(before_commit)?;
+    if staged.status.code() != Some(0) {
+        return Err(before_commit(
+            GraphError::conflict(
+                Code::IoWriteFailed,
+                format!("{rel} has staged changes, which this commit would replace"),
+            )
+            .with_hint(format!(
+                "commit them, or unstage them (`git restore --staged -- {rel}`), then run it again"
+            )),
+        ));
+    }
+    let head = git(&["show", &format!("HEAD:{}", scope.as_str())]).map_err(before_commit)?;
+    let head = head.status.success().then_some(head.stdout);
+    let (bytes, value) = decide(&path).map_err(before_commit)?;
+    let Some(bytes) = bytes else {
+        return Ok((value, None));
+    };
+    if before.as_deref() != Some(bytes.as_slice()) {
+        staged_write(&path, &bytes)
+            .map_err(failed)
+            .map_err(before_commit)?;
+    }
+    // History already holds these bytes: nothing to commit, and no old
+    // commit is reported as this one's.
+    if head.as_deref() == Some(bytes.as_slice()) {
+        return Ok((value, None));
+    }
+    let recorded = crate::write::commit_and_record(
+        repo,
+        store,
+        actor,
+        &[(lease.to_string(), scope.clone())],
+        &[],
+        message,
+        now,
+        None,
+        None,
+    );
+    match recorded {
+        Ok(r) => Ok((value, Some((r.commit, r.changesets)))),
+        Err((error, true)) => {
+            let commit = raw::head(&repo.top).map(|h| h.commit).unwrap_or_default();
+            Err((
+                error.with_hint(format!(
+                    "{rel} was committed ({commit}) but the coordinator didn't record it; \
+                     your lease on it is kept so the commit stays protected: release it once \
+                     the branch lands (`{} release {rel}`)",
+                    mdkg_format::program::BIN
+                )),
+                true,
+            ))
+        }
+        Err((error, false)) => {
+            let restored = match &before {
+                Some(old) => staged_write(&path, old),
+                None => std::fs::remove_file(&path),
+            };
+            if let Err(restore) = restored {
+                return Err(before_commit(GraphError::failure(
+                    Code::IoWriteFailed,
+                    format!(
+                        "{}; putting {rel} back failed: {restore}",
+                        error.diagnostic.message
+                    ),
+                )));
+            }
+            Err(before_commit(error))
+        }
+    }
+}
+
+/// Writes `bytes` to `path` through a temporary file staged a folder up
+/// (beside the file's own folder), so a stop never leaves a stray file in
+/// that folder, where a skill's mirror would copy it (Terra #19620).
+fn staged_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("no parent folder"))?;
+    std::fs::create_dir_all(parent)?;
+    let stage = parent.parent().unwrap_or(parent);
+    let name = format!(
+        ".{}.{}.mdkg-tmp",
+        parent.file_name().unwrap_or_default().to_string_lossy(),
+        path.file_name().unwrap_or_default().to_string_lossy()
+    );
+    let tmp = stage.join(name);
+    match std::fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let result = (|| {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)?;
+        std::fs::File::open(parent)?.sync_all()
+    })();
+    if result.is_err() {
+        std::fs::remove_file(&tmp).ok();
+    }
+    result
+}
+
 pub(crate) struct Publish {
     /// The commit subject after `mdkg: `, such as `update task-1`.
     pub(crate) message: String,
@@ -1546,6 +1956,26 @@ mod tests {
         let error = pending_request(&not_a_directory, "request-1")
             .expect_err("a journal that cannot be opened must refuse the request");
         assert!(has_code(&error, "graph.io"), "{error:?}");
+    }
+
+    /// The graph moving under a write is a conflict (exit 5): stale and
+    /// contended alike, whichever way the error is made; other graph
+    /// errors stay failures (orchestrator on #17713).
+    #[test]
+    fn stale_and_contended_writes_exit_5() {
+        let stale = refwrite::Error::Stale {
+            path: ".mdkg/work/x.md".into(),
+        };
+        for e in [
+            from_write(stale),
+            from_write(refwrite::Error::RetryLimit),
+            graph_error("graph.write_stale", "moved"),
+            graph_error("graph.write_contended", "kept moving"),
+        ] {
+            assert_eq!(e.exit_code(), 5, "{e:?}");
+        }
+        assert_eq!(from_write(refwrite::Error::NoChange).exit_code(), 4);
+        assert_eq!(graph_error("graph.io", "disk").exit_code(), 4);
     }
 
     #[test]
@@ -2162,7 +2592,7 @@ mod tests {
         let root = bind(&clone.dir).expect("bind").expect("ref mode");
         let repo = crate::coord::Repo::open(&root).expect("repo");
         let status = crate::coord::graph_status(&repo).expect("ref mode");
-        assert_eq!(status.name, GRAPH);
+        assert_eq!(status.name.as_deref(), Some(GRAPH));
         assert_eq!(status.tip, clone.tip());
         assert!(status.hand_edits.is_empty());
         // A stale .mdkg written into the checkout is reported, not read.
@@ -2697,34 +3127,63 @@ mod tests {
         let root = bind(&clone.dir).expect("bind").expect("ref mode");
         let repo = crate::coord::Repo::open(&root).expect("repo");
         let task = task_node(&root);
-        let edited = node_edit::edit(&repo, "tester", &task, None, false).expect("edit");
-        std::fs::write(&edited.copy, format!("{}\nmine\n", node("todo"))).expect("notes");
-        // Someone publishes a change to the node meantime (as a sync would).
-        let writer = bound().expect("bound").writer().expect("writer");
-        writer
-            .write(&refwrite::Request {
-                id: "other".into(),
-                base: Some(writer.snapshot().expect("tip")),
-                changes: vec![refwrite::Change::Put {
-                    path: leaf(),
-                    bytes: node("blocked").into_bytes(),
-                }],
-                message: "sync".into(),
-                trailers: vec![],
-            })
-            .expect("other write");
-        let tip = clone.tip();
-        let e = node_edit::save(&repo, "tester", &task, "save-2", None, None).expect_err("stale");
-        assert!(
-            crate::coord::graph_git::has_code(&e, "graph.write_stale"),
-            "{e:?}"
-        );
-        assert_eq!(clone.tip(), tip);
-        assert!(
-            std::fs::read_to_string(&edited.copy)
-                .expect("copy")
-                .contains("mine")
-        );
+        // The default folder, then a `--dir` one: the hint's recovery
+        // command names that folder (Terra #17973).
+        let custom = clone.dir.join("edits");
+        std::fs::create_dir_all(&custom).expect("edit folder");
+        for (round, dir) in [(0, None), (1, Some(custom.as_path()))] {
+            let edited = node_edit::edit(&repo, "tester", &task, dir, true).expect("edit");
+            std::fs::write(&edited.copy, format!("{}\nmine\n", node("todo"))).expect("notes");
+            // Someone publishes a change to the node meantime (as a sync
+            // would).
+            let writer = bound().expect("bound").writer().expect("writer");
+            writer
+                .write(&refwrite::Request {
+                    id: format!("other-{round}"),
+                    base: Some(writer.snapshot().expect("tip")),
+                    changes: vec![refwrite::Change::Put {
+                        path: leaf(),
+                        bytes: node(["blocked", "todo"][round]).into_bytes(),
+                    }],
+                    message: "sync".into(),
+                    trailers: vec![],
+                })
+                .expect("other write");
+            let tip = clone.tip();
+            let e = node_edit::save(&repo, "tester", &task, &format!("save-{round}"), dir, None)
+                .expect_err("stale");
+            assert!(
+                crate::coord::graph_git::has_code(&e, "graph.write_stale"),
+                "{e:?}"
+            );
+            // A conflict, re-read and retry (exit 5), not a failure (4).
+            assert_eq!(e.exit_code(), 5, "{e:?}");
+            // The hint says to move the edits out before `--discard`
+            // overwrites the copy, names it, and gives the whole command:
+            // root, actor, node and folder (e2e UX).
+            let hint = e.diagnostic.hint.as_deref().expect("hint");
+            assert!(hint.contains("move your edits out of it first"), "{hint}");
+            assert!(
+                hint.contains(&*edited.copy.file_name().expect("name").to_string_lossy()),
+                "{hint}"
+            );
+            assert!(
+                hint.contains(&format!("--as=tester node edit {} ", task.id)),
+                "{hint}"
+            );
+            assert!(hint.contains(" --discard`"), "{hint}");
+            assert_eq!(
+                hint.contains(&format!("--dir={}", custom.display())),
+                dir.is_some(),
+                "{hint}"
+            );
+            assert_eq!(clone.tip(), tip);
+            assert!(
+                std::fs::read_to_string(&edited.copy)
+                    .expect("copy")
+                    .contains("mine")
+            );
+        }
     }
 
     #[test]
@@ -2950,6 +3409,67 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A stale anchor intent at the chain's seq (the graph changed the
+    /// anchor after the intent was recorded, and no record came since)
+    /// doesn't refuse every rerun: the retry adds the graph's tip to the
+    /// request id, and that publishes (g-launcher #13274).
+    #[test]
+    fn a_stale_anchor_intent_at_the_same_seq_retries_with_the_tip() {
+        let clone = Clone::new();
+        let root = bind(&clone.dir).expect("bind").expect("ref mode");
+        let mut store = clone.store();
+        claim(&mut store);
+        {
+            let _fault = FaultAfter::set("recorded");
+            crate::anchor::write_anchor(&root, &mut store, false).expect_err("fault");
+        }
+        let journal = Journal::open(&clone.dir.join(".git")).expect("journal");
+        let pending = journal.pending().expect("pending");
+        assert_eq!(pending.len(), 1, "{pending:?}");
+        let first = pending[0].id().to_owned();
+        let (store_id, _) = first
+            .strip_prefix("anchor-")
+            .and_then(|r| r.rsplit_once('-'))
+            .expect("anchor-<store>-<seq>");
+        let rel = format!("{}/{store_id}.json", crate::anchor::ANCHOR_DIR);
+        // The graph changes the anchor meantime, to a valid one (the same
+        // anchor at another time, canonical, as another clone's would be):
+        // the intent is stale (Terra #18107).
+        let prepared = clone.git(&["show", &format!("{}:{rel}", pending[0].prepared.commit)]);
+        let mut value: serde_json::Value = serde_json::from_str(&prepared).expect("anchor");
+        value["ts"] = "2026-01-01T00:00:00.000Z".into();
+        let foreign = format!("{}\n", serde_json::to_string(&value).expect("json"));
+        assert_ne!(foreign.trim_end(), prepared.trim_end());
+        let writer = bound().expect("bound").writer().expect("writer");
+        writer
+            .write(&refwrite::Request {
+                id: "elsewhere".into(),
+                base: Some(writer.snapshot().expect("tip")),
+                changes: vec![refwrite::Change::Put {
+                    path: rel.clone(),
+                    bytes: foreign.clone().into_bytes(),
+                }],
+                message: "another anchor".into(),
+                trailers: vec![],
+            })
+            .expect("other write");
+        let tip = clone.tip();
+        let report = crate::anchor::write_anchor(&root, &mut store, false).expect("retried");
+        assert!(report.data.is_some());
+        let after = clone.tip();
+        assert_ne!(after, tip, "published under the new id");
+        let text = clone.git(&["show", &format!("{after}:{rel}")]);
+        assert_ne!(text, foreign.trim_end(), "{text}");
+        assert!(
+            clone
+                .git(&["log", "-1", "--format=%B", &after])
+                .contains("anchor"),
+            "{after}"
+        );
+        // The stale one is kept for recovery, as before.
+        assert!(journal.load(&first).expect("load").is_some());
     }
 
     /// Fails the write path after `step`, on this thread, while held.

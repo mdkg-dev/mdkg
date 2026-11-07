@@ -173,8 +173,9 @@ calls: a decision comes only from your human's channel, as for MCP.
   - **Not served:** operator, host and decision operations, a decision
     post, a ledger `decide` or `residual`, a turn's or a role's lease;
     streams other than `/v1/events`. On loopback, a `human:` actor's
-    ledger writes (`entry` operations, `done --residual`) are refused
-    too: make them over the socket or with the CLI.
+    ledger writes (`entry` operations, `done --residual`) and its mail
+    (`msg send`) are refused too: make them over the socket or with the
+    CLI.
 - **HTTP status** (A12), from the CLI's exit code; read `ok` and the
   diagnostic codes, not the status:
 

@@ -27,6 +27,7 @@ pub mod git;
 pub mod ledger;
 pub mod log;
 pub mod mail;
+pub mod mail_list;
 pub mod serve;
 mod store;
 
@@ -36,6 +37,7 @@ pub use activity::{
 
 pub use store::{
     BackupInfo, BeforeCommit, ChainOutcomes, Chained, LogReport, PLAIN_FSYNC_ENV, Restored, Store,
-    StoreError, Upgrade, allow_store_upgrades, backups, build_label, copy_of, has_cargo_markers,
-    in_build_folder, restore, restore_if_head, snapshot, store_upgrades_allowed, stored_label,
+    StoreError, Upgrade, allow_store_upgrades, backups, build_label, copy_of, forbid_store_writes,
+    has_cargo_markers, in_build_folder, restore, restore_if_head, snapshot, store_upgrades_allowed,
+    store_writes_forbidden, stored_label,
 };

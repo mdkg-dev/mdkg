@@ -59,7 +59,8 @@ const REF_START: &str = include_str!("init_readme_ref.md");
 /// "Start agents" section (a graph checkout, merges into `main`) replaced
 /// by ref mode's (publishes to the graph ref, no merge), and its skill
 /// steps replaced: in ref mode install refreshes the mirrors from the
-/// graph ref, and `skills sync` and `skills add` refuse there.
+/// graph ref, `skills sync` refuses there, and `skills add` publishes to
+/// the graph ref.
 pub fn ref_readme() -> String {
     const REPLACED: [(&str, &str); 3] = [
         ("\nmdkg skills sync\nmdkg doctor\n", "\nmdkg doctor\n"),
@@ -73,8 +74,10 @@ pub fn ref_readme() -> String {
         (
             "With\n`--graph-only`, the skill is omitted; add it later with\n`mdkg skills add \
              mdkg-workflow`.\n",
-            "With\n`--graph-only`, the skill is omitted; in ref mode `mdkg skills add` refuses, \
-             so\nleave `--graph-only` off to keep it.\n",
+            "With\n`--graph-only`, the skill is omitted; add it later with\n`mdkg skills add \
+             mdkg-workflow`, which publishes it on the graph ref; once a skill\nmirror is \
+             enabled (`mdkg install --enable skills:.agents/skills`),\n`mdkg install` \
+             mirrors it.\n",
         ),
     ];
     let mut guide = INIT_README.to_owned();
@@ -135,7 +138,7 @@ impl Work {
     }
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Clone, Args)]
 pub struct InitArgs {
     /// Where work lives: local beside the store (default), or shared in git.
     /// Asked for when run in a terminal.
@@ -174,6 +177,22 @@ pub struct InitArgs {
     /// (ref mode).
     #[arg(long)]
     pub new_graph: bool,
+    /// Start the graph straight on the graph ref (refs/heads/mdkg-graph) in
+    /// this setup, as `install --setup` names them: `personal` (the graph
+    /// syncs with origin), `professional` (with --graph-remote) or `local`
+    /// (no remote). No branch gets a commit and the checkout is unchanged;
+    /// nothing is pushed. Refused, before anything is written, when the
+    /// clone already has a graph: at the checkout's root (`install --setup`
+    /// moves it), staged but missing, nested below the root, in any other
+    /// worktree of the clone, on the graph ref, or `mdkg.graph.ref` set
+    /// already; and when a fetched branch sits at the setup's own graph
+    /// destination.
+    #[arg(long, value_enum, value_name = "SETUP", conflicts_with = "in_checkout")]
+    pub setup: Option<crate::run::setup::Setup>,
+    /// With --setup professional: the graph remote, an existing remote
+    /// that shares no URL with another.
+    #[arg(long, value_name = "REMOTE", requires = "setup")]
+    pub graph_remote: Option<String>,
     /// Print JSON.
     #[arg(long)]
     pub json: bool,
@@ -243,6 +262,10 @@ pub struct InitData {
     /// checkout is unchanged.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub graph_ref: Option<String>,
+    /// With `init --setup`: the setup recorded (`personal`,
+    /// `professional` or `local`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub setup: Option<String>,
     pub dry_run: bool,
     /// Whether the folder is inside a git repository; coordination needs
     /// one.
@@ -313,7 +336,39 @@ pub fn run(root: &Path, args: &InitArgs) -> u8 {
 }
 
 fn init(root: &Path, args: &InitArgs) -> Result<Report<InitData>, GraphError> {
-    init_observed(root, args, |_| {})
+    init_observed(root, args, |_| {}).map_err(|e| layout_hint(root, args, e))
+}
+
+/// A layout refusal at a linked worktree (a graph checkout made by hand,
+/// say) also names `init --setup`, which makes a ref-mode graph with no
+/// worktree at all.
+pub(crate) fn layout_hint(root: &Path, args: &InitArgs, mut e: GraphError) -> GraphError {
+    if e.diagnostic.code != Code::InstallUnsupportedLayout || args.setup.is_some() {
+        return e;
+    }
+    let dir = |flag: &str| {
+        crate::coord::graph_git::git::command(root)
+            .args(["rev-parse", "--path-format=absolute", flag])
+            .run(None)
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim_end().to_owned())
+    };
+    let linked = matches!(
+        (dir("--git-dir"), dir("--git-common-dir")),
+        (Some(a), Some(b)) if a != b
+    );
+    if linked {
+        let more = format!(
+            "To start a graph on the graph ref without any worktree, run `{BIN} init --setup \
+             <personal|professional|local>` at the primary checkout instead."
+        );
+        e.diagnostic.hint = Some(match e.diagnostic.hint.take() {
+            Some(h) => format!("{h} {more}"),
+            None => more,
+        });
+    }
+    e
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -331,6 +386,9 @@ fn init_observed(
     // runs, then init's stricter ones for what it writes.
     check_pattern("--branch-pattern", args.branch(), init_branch_problem)?;
     check_pattern("--worktree-pattern", args.worktree(), init_worktree_problem)?;
+    if let Some(setup) = args.setup {
+        return init_setup(root, args, setup);
+    }
     // Ref mode: the graph is created on the graph ref, never in a checkout
     // (edd-01a18867, "Creating a graph without a checkout").
     if !args.in_checkout && in_git(root) {
@@ -465,6 +523,7 @@ fn init_observed(
         mcp_command: None,
         changes: files,
         graph_ref: None,
+        setup: None,
         dry_run: args.dry_run,
         git,
         notes,
@@ -488,6 +547,523 @@ fn exclude_edit(top: &Path, dry_run: bool, notes: &mut Vec<String>) -> Result<()
         notes.push(format!("{edit} added to {}", file.display()));
     }
     Ok(())
+}
+
+/// The keys `install --setup` may write, read before `init --setup` runs
+/// it so a failure before the graph ref is published can put them back.
+const SETUP_KEYS: [&str; 5] = [
+    "mdkg.graph.ref",
+    "mdkg.graph.remote",
+    "mdkg.mainRef",
+    "mdkg.follow.fetch",
+    "mdkg.graph.publishDesign",
+];
+
+/// `init --setup`: the graph starts on the graph ref in that setup, with no
+/// commit on any branch and the checkout unchanged (main-not-required).
+/// Every refusal comes before anything is written. Then install's own
+/// setup step records the setup's keys (`mdkg.graph.ref` last), and the
+/// ref-mode init commits the graph to the new graph ref. The creation is
+/// journalled under `mdkg.graph.ref`, so a stop between the two is finished
+/// by `init`; a failure before the graph ref is published puts the keys
+/// back as they were, leaving the clone in checkout mode.
+fn init_setup(
+    root: &Path,
+    args: &InitArgs,
+    setup: crate::run::setup::Setup,
+) -> Result<Report<InitData>, GraphError> {
+    use crate::coord::graph_git::graph_error;
+    use crate::run::setup::{self as install_setup, GRAPH};
+    let usage = |code: Code, message: String, hint: String| {
+        GraphError::usage(code, message).with_hint(hint)
+    };
+    let name = setup.name();
+    if !in_git(root) {
+        return Err(usage(
+            Code::InitConflict,
+            format!("init --setup {name} needs a git repository: the graph goes on a graph ref"),
+            "run `git init` first, or init without --setup".into(),
+        ));
+    }
+    let top = crate::coord::graph_git::git::toplevel(root).map_err(crate::coord::git_error)?;
+    let at_top = std::fs::canonicalize(root)
+        .ok()
+        .zip(std::fs::canonicalize(&top).ok())
+        .is_some_and(|(a, b)| a == b);
+    if !at_top {
+        return Err(usage(
+            Code::InitConflict,
+            format!(
+                "init --setup starts the repository's root graph, and {} isn't the repository's \
+                 top folder",
+                root.display()
+            ),
+            format!("run it at {}", top.display()),
+        ));
+    }
+    let from_ref = |e: mdkg_graph::graphref::Error| graph_error(e.code, e.message);
+    if let Some(graph) = mdkg_graph::graphref::resolve(&top).map_err(from_ref)? {
+        return Err(usage(
+            Code::InitConflict,
+            format!(
+                "this clone is in ref mode already (mdkg.graph.ref = {}), so init --setup has \
+                 nothing to choose",
+                graph.name
+            ),
+            format!(
+                "`{BIN} init` (without --setup, and with the same --work and --graph-only \
+                 options as before) creates or finishes the graph there; `{BIN} install --setup \
+                 {name}` changes the setup"
+            ),
+        ));
+    }
+    let git_ok = |args: &[&str]| {
+        crate::coord::graph_git::git::command(&top)
+            .args(args)
+            .run(None)
+            .is_ok_and(|o| o.status.success())
+    };
+    let head_graph = git_ok(&["cat-file", "-e", &format!("HEAD:{CONFIG_PATH}")]);
+    if config::has_config(&top) || head_graph {
+        return Err(usage(
+            Code::InitExists,
+            format!(
+                "this checkout already has a graph ({CONFIG_PATH}{}), so init --setup starts no \
+                 second one",
+                if head_graph { " on HEAD" } else { "" }
+            ),
+            format!("`{BIN} install --setup {name}` moves the checkout's graph to the graph ref"),
+        ));
+    }
+    if git_ok(&[
+        "rev-parse",
+        "-q",
+        "--verify",
+        &format!("{GRAPH}^{{commit}}"),
+    ]) {
+        return Err(usage(
+            Code::InitExists,
+            format!("{GRAPH} exists already, so init --setup creates no graph ref"),
+            format!(
+                "`{BIN} install --setup {name}` adopts the graph on it; inspect it first with \
+                 `git log {GRAPH}`"
+            ),
+        ));
+    }
+    // A graph below the root (checkout mode supports `sub/.mdkg`) would be
+    // read from the new root graph once the whole clone is in ref mode
+    // (Terra #20413). install --setup moves only a root graph, so the
+    // hint doesn't send the user there (Opus #20438).
+    let (nested, root_indexed) = checkout_graphs(&top)?;
+    // A staged root config still on disk for lstat is a dangling link,
+    // which restoring wouldn't bring back (Opus #20759): the next check
+    // names it.
+    let config_lstat = std::fs::symlink_metadata(top.join(CONFIG_PATH)).is_ok();
+    if root_indexed && !config_lstat {
+        // Staged, then removed from disk: committing alone wouldn't
+        // bring the files back, and install --setup refuses their
+        // deletion (Terra #20666).
+        return Err(usage(
+            Code::InitExists,
+            format!(
+                "this checkout already has a graph ({CONFIG_PATH} is staged but missing from \
+                 the checkout), so init --setup starts no second one"
+            ),
+            // Only the deleted paths: a plain `git restore .mdkg` would
+            // discard unstaged edits beside them (Terra #20704), and each
+            // name is literal, never a glob (Terra #20738).
+            format!(
+                "restore only its deleted files with `git ls-files -d -z -- .mdkg | xargs -0 git \
+                 --literal-pathspecs restore --`, commit the graph, and `{BIN} install --setup {name}` moves it to \
+                 the graph ref; or unstage only the config with `git rm -q --cached \
+                 {CONFIG_PATH}`"
+            ),
+        ));
+    }
+    if nested.iter().any(|p| p == CONFIG_PATH) {
+        // The index may hold a regular config the link replaced on disk:
+        // unstaging that would lose it, so it's restored instead (Terra
+        // #20897). Only a staged link (mode 120000) is unstaged.
+        let staged_link = root_indexed && {
+            let out = crate::coord::graph_git::git::command(&top)
+                .args(["ls-files", "-s", "-z", "--", CONFIG_PATH])
+                .run(None)
+                .map_err(|e| graph_error("io.git_failed", e.to_string()))?;
+            out.status.success() && out.stdout.starts_with(b"120000 ")
+        };
+        return Err(usage(
+            Code::InitExists,
+            format!(
+                "{CONFIG_PATH} is in the checkout but isn't a readable file (a dangling link?), \
+                 so init --setup starts no graph beside it"
+            ),
+            // A staged link stays in the index once removed, and the
+            // rerun would call it a staged graph (Terra #20882).
+            if staged_link {
+                format!(
+                    "remove {CONFIG_PATH} and unstage it (`git rm -q --cached {CONFIG_PATH}`), \
+                     or fix it, then run init --setup again"
+                )
+            } else if root_indexed {
+                format!(
+                    "the index holds a different {CONFIG_PATH}: put it back in place of the link \
+                     with `git restore -- {CONFIG_PATH}` (inspect it first with `git show \
+                     :{CONFIG_PATH}`), then run init --setup again"
+                )
+            } else {
+                format!("remove or fix {CONFIG_PATH}, then run init --setup again")
+            },
+        ));
+    }
+    // Every other worktree shares the config init --setup changes, so a
+    // graph anywhere in one would be left unread once the clone is in ref
+    // mode (Terra #20633). Git lists one under an ignored folder only as
+    // `dir/`, and one outside the checkout not at all, so each worktree
+    // from the records gets the same scan as this one (Terra #20691).
+    let here = std::fs::canonicalize(&top).unwrap_or_else(|_| top.clone());
+    let others = crate::coord::graph_git::git::worktrees(&top)
+        .map_err(|e| graph_error("io.git_failed", e.to_string()))?;
+    for wt in others {
+        if std::fs::canonicalize(&wt).unwrap_or_else(|_| wt.clone()) == here {
+            continue;
+        }
+        let (found, _) = checkout_graphs(&wt)?;
+        let Some(first) = found
+            .first()
+            .cloned()
+            .or_else(|| config::has_config(&wt).then(|| CONFIG_PATH.to_owned()))
+        else {
+            continue;
+        };
+        let shown = shell_word(&wt.to_string_lossy());
+        // The main checkout's git folder is the common one, whatever its
+        // `.git` is (a file with --separate-git-dir); `git worktree
+        // remove` takes only linked ones (Opus #20726).
+        let primary = main_checkout(&wt);
+        return Err(usage(
+            Code::InitExists,
+            format!(
+                "the {} {} has a graph ({first}), and ref mode applies to every worktree of the \
+                 clone, so init --setup starts no second one",
+                if primary {
+                    "main checkout"
+                } else {
+                    "linked worktree"
+                },
+                wt.display()
+            ),
+            if primary {
+                format!(
+                    "run init --setup in the main checkout instead (`cd {shown}`): it says what \
+                     to do with that graph"
+                )
+            } else {
+                format!(
+                    "init --setup changes the configuration every worktree shares: take the \
+                     graph out of that worktree first (copy any uncommitted or ignored graph \
+                     files somewhere safe: `git worktree remove {shown}` deletes them), or keep \
+                     this clone in checkout mode"
+                )
+            },
+        ));
+    }
+    if let Some(first) = nested.first() {
+        return Err(usage(
+            Code::InitExists,
+            format!(
+                "this checkout already has a graph at {first}, and ref mode applies to the whole \
+                 clone, so init --setup starts no second one"
+            ),
+            "init --setup and install --setup move only a root `.mdkg`: keep the nested graph \
+             in checkout mode, or move it to the repository's root first"
+                .into(),
+        ));
+    }
+    // The setup's own graph destination: a fetched branch there is the
+    // team's graph (or something else), never one to start beside, even
+    // with --new-graph; it honours a hand-set mdkg.graph.remoteRef (Terra
+    // #20413).
+    let remote = match setup {
+        install_setup::Setup::Personal => Some("origin"),
+        install_setup::Setup::Professional => args.graph_remote.as_deref(),
+        install_setup::Setup::Local => None,
+    };
+    if let Some(remote) = remote {
+        // The common config alone, as graph resolution reads it (Terra
+        // #20453): a worktree's own config never masks it.
+        let common = crate::coord::graph_git::git::common_dir(&top)
+            .map_err(|e| graph_error("graph.io", e.to_string()))?;
+        let file = common.join("config").to_string_lossy().into_owned();
+        let branch = crate::coord::graph_git::git::command(&top)
+            .args(["config", "--file", &file, "--get", "mdkg.graph.remoteRef"])
+            .run(None)
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+            .unwrap_or_else(|| GRAPH.to_owned());
+        let short = branch.strip_prefix("refs/heads/").unwrap_or(&branch);
+        let fetched = format!("refs/remotes/{remote}/{short}");
+        if git_ok(&[
+            "rev-parse",
+            "-q",
+            "--verify",
+            &format!("{fetched}^{{commit}}"),
+        ]) {
+            return Err(usage(
+                Code::InitGraphFetched,
+                format!(
+                    "{fetched} exists: it's this {name} setup's own graph destination, so init \
+                     --setup starts no new graph there"
+                ),
+                {
+                    // Every name a hint shows is one shell word (Terra #20453).
+                    let shown = shell_word(&fetched);
+                    let setup_args = match args.graph_remote.as_deref() {
+                        Some(r) if setup == install_setup::Setup::Professional => {
+                            format!("{name} --graph-remote {}", shell_word(r))
+                        }
+                        _ => name.to_owned(),
+                    };
+                    if short == "mdkg-graph" {
+                        format!(
+                            "`{BIN} install --setup {setup_args}` adopts it (inspect it first \
+                             with `git log {shown}`); a separate graph needs a setup whose graph \
+                             remote holds none, such as `{BIN} init --setup local`"
+                        )
+                    } else {
+                        // install --setup adopts only <remote>/mdkg-graph from
+                        // checkout mode, never the branch remoteRef names.
+                        format!(
+                            "it's the branch mdkg.graph.remoteRef names, which install --setup \
+                             doesn't adopt from checkout mode: inspect it with `git log {shown}`, \
+                             and if it isn't this repository's graph, `git config --unset \
+                             mdkg.graph.remoteRef` and run init --setup again"
+                        )
+                    }
+                },
+            ));
+        }
+    }
+    refuse_fork(&top, args)?;
+    let choice = |dry_run| install_setup::Choice {
+        setup: Some(setup),
+        graph_remote: args.graph_remote.as_deref(),
+        publish_design: false,
+        view: false,
+        dry_run,
+    };
+    let no_projections = |_: &Path, _: &[PathBuf], _: &mdkg_run::projection::Projections, _| Ok(());
+    // install's own checks (a professional setup's remote, origin for a
+    // personal one), with nothing written.
+    let preview = install_setup::setup(&top, &choice(true), no_projections)?;
+    // A graph fetched from this setup's own graph remote would be adopted,
+    // which is install's, not a new graph, even with --new-graph (#20348).
+    if let Some(from) = &preview.adopts {
+        return Err(usage(
+            Code::InitGraphFetched,
+            format!(
+                "{from} holds a graph this {name} setup would adopt, so init --setup starts no \
+                 new one"
+            ),
+            format!(
+                "`{BIN} install --setup {name}` adopts it; a separate graph needs a setup whose \
+                 graph remote holds none, such as `{BIN} init --setup local`"
+            ),
+        ));
+    }
+    // The work choice comes first, so a prompt never runs after the keys
+    // are written, and the preview shows what the run does (#20348).
+    let work = match args.work {
+        Some(w) => w,
+        None if !args.json && !args.dry_run && interactive() => ask_work()?,
+        None => Work::default(),
+    };
+    let mut args = args.clone();
+    args.work = Some(work);
+    let args = &args;
+    let graph_id = uuid::Uuid::now_v7().hyphenated().to_string();
+    if args.dry_run {
+        let mut files = Vec::new();
+        if !args.graph_only {
+            files.push(WORKFLOW_PATH);
+        }
+        files.extend([README_PATH, CONFIG_PATH]);
+        let mut notes: Vec<String> = preview
+            .notes
+            .into_iter()
+            .filter(|n| !n.contains("there's no graph yet"))
+            .collect();
+        notes.push(format!(
+            "dry run: init would commit the graph to {GRAPH}; this checkout stays unchanged"
+        ));
+        notes.push(
+            "dry run: git's user identity for that commit is checked only when it's made \
+             (`git config user.name` and `user.email`)"
+                .into(),
+        );
+        return Ok(Report::ok(InitData {
+            root: top.display().to_string(),
+            graph_id,
+            work: work.label().into(),
+            work_location: work.location().into(),
+            profile: work.legacy_profile().into(),
+            work_committed: work.committed().into(),
+            orchestration: Orchestration {
+                branch: args.branch().into(),
+                worktree: args.worktree().into(),
+            },
+            already: false,
+            agents: false,
+            mcp_command: None,
+            changes: files
+                .into_iter()
+                .map(|path| InitFile {
+                    path: path.into(),
+                    action: FileAction::Created,
+                })
+                .collect(),
+            graph_ref: Some(GRAPH.into()),
+            setup: Some(name.into()),
+            dry_run: true,
+            git: true,
+            notes,
+            next: vec![rerun(args, name)],
+        }));
+    }
+    let common = crate::coord::graph_git::git::common_dir(&top)
+        .map_err(|e| graph_error("graph.io", e.to_string()))?;
+    let config_file = common.join("config").to_string_lossy().into_owned();
+    let get = |key: &str| {
+        crate::coord::graph_git::git::command(&top)
+            .args(["config", "--file", &config_file, "--get", key])
+            .run(None)
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim_end().to_owned())
+    };
+    let before: Vec<(&str, Option<String>)> = SETUP_KEYS.iter().map(|k| (*k, get(k))).collect();
+    // The binding's shared graph lock would block setup's exclusive one.
+    crate::coord::graph_git::unbind();
+    let done = install_setup::setup(&top, &choice(false), no_projections);
+    let done = match done {
+        Ok(d) => d,
+        Err(e) => return Err(restored(e, restore_keys(&top, &config_file, &before))),
+    };
+    let made = mdkg_graph::graphref::resolve(&top)
+        .map_err(from_ref)
+        .and_then(|g| {
+            g.ok_or_else(|| graph_error("graph.ref_missing", "mdkg.graph.ref wasn't recorded"))
+        })
+        .and_then(|graph| init_ref(&top, args, &graph).map(|r| (graph, r)));
+    match made {
+        Ok((_, mut report)) => {
+            if let Some(data) = report.data.as_mut() {
+                data.setup = Some(name.into());
+                // Setup's "no graph yet" line is out of date by now.
+                let mut notes: Vec<String> = done
+                    .notes
+                    .into_iter()
+                    .filter(|n| !n.contains("there's no graph yet"))
+                    .collect();
+                notes.append(&mut data.notes);
+                data.notes = notes;
+                data.next.insert(0, format!("{BIN} install"));
+            }
+            Ok(report)
+        }
+        Err(e) => {
+            // Published already: the graph stands, and `init` finishes
+            // what's left. Otherwise back to checkout mode, as it was.
+            if !git_ok(&[
+                "rev-parse",
+                "-q",
+                "--verify",
+                &format!("{GRAPH}^{{commit}}"),
+            ]) {
+                if let Ok(Some(graph)) = mdkg_graph::graphref::resolve(&top) {
+                    graph.abandon_creation(&top).ok();
+                }
+                return Err(restored(e, restore_keys(&top, &config_file, &before)));
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Puts the setup keys back as `before` had them, after a failure that's
+/// already being reported; returns the git commands that didn't take, so
+/// the report names them (Terra #20413).
+fn restore_keys(top: &Path, file: &str, before: &[(&str, Option<String>)]) -> Vec<String> {
+    let mut failed = Vec::new();
+    // `mdkg.graph.ref` last: the clone leaves ref mode only once the rest
+    // is back.
+    for (key, value) in before.iter().rev() {
+        let cmd = crate::coord::graph_git::git::command(top);
+        let (cmd, shown) = match value {
+            Some(v) => (
+                cmd.args(["config", "--file", file, key, v]),
+                format!("git config {key} {}", shell_word(v)),
+            ),
+            None => (
+                cmd.args(["config", "--file", file, "--unset-all", key]),
+                format!("git config --unset-all {key}"),
+            ),
+        };
+        // Unsetting a key that isn't set exits 5: already as it was.
+        let ok = cmd
+            .run(None)
+            .is_ok_and(|o| o.status.success() || (value.is_none() && o.status.code() == Some(5)));
+        if !ok {
+            failed.push(shown);
+        }
+    }
+    failed
+}
+
+/// `e`, with the restore commands that failed named in its hint: the
+/// clone may still be in ref mode with a partial setup.
+fn restored(mut e: GraphError, failed: Vec<String>) -> GraphError {
+    if failed.is_empty() {
+        return e;
+    }
+    let more = format!(
+        "init --setup couldn't put the clone's setup back, so it may be in ref mode with no \
+         graph: run {} by hand",
+        failed
+            .iter()
+            .map(|c| format!("`{c}`"))
+            .collect::<Vec<_>>()
+            .join(", then ")
+    );
+    e.diagnostic.hint = Some(match e.diagnostic.hint.take() {
+        Some(h) => format!("{h}. {more}"),
+        None => more,
+    });
+    e
+}
+
+/// The `init --setup` command line `args` stand for, to run for real.
+fn rerun(args: &InitArgs, name: &str) -> String {
+    let mut words = vec![format!("{BIN} init --setup {name}")];
+    if let Some(r) = &args.graph_remote {
+        words.push(format!("--graph-remote {}", shell_word(r)));
+    }
+    if let Some(w) = args.work {
+        words.push(format!("--work {}", w.label()));
+    }
+    if args.graph_only {
+        words.push("--graph-only".into());
+    }
+    if let Some(p) = &args.branch_pattern {
+        words.push(format!("--branch-pattern {}", shell_word(p)));
+    }
+    if let Some(p) = &args.worktree_pattern {
+        words.push(format!("--worktree-pattern {}", shell_word(p)));
+    }
+    if args.new_graph {
+        words.push("--new-graph".into());
+    }
+    words.join(" ")
 }
 
 /// Ref mode's init: the graph's first commit on an orphan graph ref (the
@@ -641,6 +1217,7 @@ fn init_ref(
         mcp_command: None,
         changes: files,
         graph_ref: Some(graph.name.clone()),
+        setup: None,
         dry_run: args.dry_run,
         git: true,
         notes,
@@ -1046,6 +1623,7 @@ fn existing_graph(
         mcp_command: None,
         changes: Vec::new(),
         graph_ref: None,
+        setup: None,
         dry_run: args.dry_run,
         git: in_git(root),
         notes: Vec::new(),
@@ -1683,6 +2261,99 @@ fn in_git(root: &Path) -> bool {
     root.ancestors().any(|d| d.join(".git").exists())
 }
 
+/// Whether `wt` is the clone's main checkout: its git folder is the
+/// common one. A failed probe counts as linked, which only words the hint.
+fn main_checkout(wt: &Path) -> bool {
+    let dir = |arg: &str| {
+        crate::coord::graph_git::git::command(wt)
+            .args(["rev-parse", "--path-format=absolute", arg])
+            .run(None)
+            .ok()
+            .filter(|o| o.status.success())
+            // Only the line end: a folder name may end in a space (Terra
+            // #20758).
+            .and_then(|o| {
+                let out = String::from_utf8_lossy(&o.stdout);
+                std::fs::canonicalize(out.strip_suffix('\n').unwrap_or(&out)).ok()
+            })
+    };
+    matches!((dir("--git-dir"), dir("--git-common-dir")), (Some(a), Some(b)) if a == b)
+}
+
+/// The graph configs in one checkout: tracked, untracked, ignored (an
+/// ignored `sub/.mdkg/`), and on HEAD with only its removal staged
+/// (Terra #20453), by relative path, sorted. The flag says the root
+/// config is in the index or on HEAD. Reads trees and the index, never a
+/// blob, and a git failure is an error rather than an absent graph (Terra
+/// #20691).
+fn checkout_graphs(dir: &Path) -> Result<(Vec<String>, bool), GraphError> {
+    use crate::coord::graph_git::graph_error;
+    const NESTED: &str = ":(glob)**/.mdkg/config.json";
+    let listings: [&[&str]; 4] = [
+        &["ls-files", "-z", "-c", "--", NESTED],
+        &["ls-files", "-z", "-o", "--exclude-standard", "--", NESTED],
+        &[
+            "ls-files",
+            "-z",
+            "-o",
+            "-i",
+            "--exclude-standard",
+            "--",
+            NESTED,
+        ],
+        // The index and HEAD together (ls-tree takes no glob pathspec).
+        &["ls-files", "-z", "-c", "--with-tree=HEAD", "--", NESTED],
+    ];
+    let mut found: Vec<String> = Vec::new();
+    // The root config in the index (listings 0 and 3), or only on disk as
+    // something has_config can't read (a dangling link; listings 1, 2).
+    let mut root_indexed = false;
+    for (i, listing) in listings.iter().enumerate() {
+        let out = crate::coord::graph_git::git::command(dir)
+            .args(*listing)
+            .run(None)
+            .map_err(|e| graph_error("io.git_failed", e.to_string()))?;
+        if !out.status.success() {
+            // An unborn branch has no HEAD to list.
+            let unborn = i == 3
+                && crate::coord::graph_git::git::command(dir)
+                    .args(["rev-parse", "-q", "--verify", "HEAD^{commit}"])
+                    .run(None)
+                    .is_ok_and(|o| o.status.code() == Some(1));
+            if unborn {
+                continue;
+            }
+            let why = String::from_utf8_lossy(&out.stderr);
+            let why = why.lines().next().unwrap_or("").trim();
+            return Err(graph_error(
+                "io.git_failed",
+                format!(
+                    "can't list the graphs in {} (git ls-files: {})",
+                    dir.display(),
+                    if why.is_empty() { "no message" } else { why }
+                ),
+            ));
+        }
+        // Only config files: the ignored listing also names ignored
+        // embedded repositories (a linked worktree under an ignored
+        // `.worktrees/`) as `dir/` entries, whatever they hold (Terra
+        // #20565). The root config counts too: one only in the index
+        // (staged, then removed from disk) is on neither disk nor HEAD
+        // (Opus #20627).
+        let listed = String::from_utf8_lossy(&out.stdout);
+        let listed: Vec<&str> = listed.split('\0').collect();
+        root_indexed |= (i == 0 || i == 3) && listed.contains(&CONFIG_PATH);
+        found.extend(
+            listed
+                .into_iter()
+                .filter(|p| *p == CONFIG_PATH || p.ends_with("/.mdkg/config.json"))
+                .map(str::to_owned),
+        );
+    }
+    found.sort();
+    found.dedup();
+    Ok((found, root_indexed))
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1697,6 +2368,77 @@ mod tests {
         ParserArgs::try_parse_from(std::iter::once("init").chain(words.iter().copied()))
             .expect("valid init arguments")
             .init
+    }
+
+    /// The dry run's next command keeps every option the run needs, and a
+    /// failed restore is named in the hint (Terra #20413).
+    #[test]
+    fn init_setup_reruns_with_its_options_and_names_a_failed_restore() {
+        let args = parsed_init(&[
+            "--setup",
+            "professional",
+            "--graph-remote",
+            "mine",
+            "--work",
+            "shared",
+            "--graph-only",
+            "--dry-run",
+        ]);
+        assert_eq!(
+            rerun(&args, "professional"),
+            format!(
+                "{BIN} init --setup professional --graph-remote mine --work shared --graph-only"
+            )
+        );
+        let e = GraphError::failure(Code::IoGitFailed, "boom").with_hint("first");
+        let e = restored(e, vec!["git config --unset-all mdkg.graph.ref".into()]);
+        let hint = e.diagnostic.hint.expect("hint");
+        assert!(hint.starts_with("first. "), "{hint}");
+        assert!(
+            hint.contains("`git config --unset-all mdkg.graph.ref`"),
+            "{hint}"
+        );
+        let e = restored(GraphError::failure(Code::IoGitFailed, "boom"), Vec::new());
+        assert!(e.diagnostic.hint.is_none());
+    }
+
+    /// A main checkout whose `.git` is a file (--separate-git-dir, a git
+    /// folder name ending in a space) is still the main one; a failed
+    /// listing names git's reason (Opus #20759, Terra #20758).
+    #[test]
+    fn main_checkout_by_git_dir_and_listing_errors_say_why() {
+        let base = std::env::temp_dir().join(format!(
+            "mdkg-init-main-checkout-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("base");
+        let main = base.join("main");
+        let ok = std::process::Command::new("git")
+            .args(["init", "-q", "--separate-git-dir"])
+            .arg(base.join("git dir "))
+            .arg(&main)
+            .status()
+            .expect("git runs");
+        assert!(ok.success());
+        assert!(main.join(".git").is_file());
+        assert!(main_checkout(&main));
+        assert!(!main_checkout(&base.join("absent")));
+        // A damaged index fails the listing itself.
+        let damaged = base.join("damaged");
+        let ok = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(&damaged)
+            .status()
+            .expect("git runs");
+        assert!(ok.success());
+        std::fs::write(damaged.join(".git/index"), b"not an index").expect("index");
+        let e = checkout_graphs(&damaged).expect_err("damaged index");
+        let message = &e.diagnostic.message;
+        assert!(message.contains("(git ls-files: "), "{message}");
+        assert!(!message.contains("no message"), "{message}");
+        std::fs::remove_dir_all(&base).expect("clean up");
     }
 
     #[test]
@@ -1785,6 +2527,8 @@ mod tests {
             dry_run: false,
             in_checkout: false,
             new_graph: false,
+            setup: None,
+            graph_remote: None,
             json: false,
         };
         let full = config_text("01a170d6-ab7e-70d7-a4e0-a2aa54d9aa0b", Work::Local, &args);

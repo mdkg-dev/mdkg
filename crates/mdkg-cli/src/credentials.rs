@@ -1,7 +1,8 @@
 //! Shared high-confidence credential detection for messages and configuration.
 
 /// High-confidence credential shapes: a private key block, a known token
-/// prefix followed by a long token, a JWT, or a URL with a password.
+/// prefix followed by a long token, a JWT, a URL with a password, or a
+/// `password`/`token` assignment with a long value ([`has_assignment`]).
 ///
 /// An escaped control or space character (as JSON, logs, string literals
 /// and URLs write them) separates words as the character it stands for
@@ -180,7 +181,11 @@ fn shaped(text: &str, urls: Urls<'_>) -> bool {
     if text.contains("-----BEGIN") && text.contains("PRIVATE KEY-----") {
         return true;
     }
-    if has_jwt(text) || has_url_password(text, urls) || has_exact_token(text) {
+    if has_jwt(text)
+        || has_url_password(text, urls)
+        || has_exact_token(text)
+        || has_assignment(text)
+    {
         return true;
     }
     const PREFIXES: &[(&str, usize)] = &[
@@ -211,11 +216,43 @@ fn shaped(text: &str, urls: Urls<'_>) -> bool {
     PREFIXES.iter().any(|(prefix, min)| {
         text.match_indices(prefix).any(|(i, _)| {
             // Any letter or digit joins a word, not only an ASCII one, so
-            // `tásk-…` isn't `sk-…` after a boundary, decomposed or not.
-            let boundary = !joins_before(&text[..i]);
-            boundary && token(&text[i + prefix.len()..]) >= *min
+            // `tásk-…` isn't `sk-…` after a boundary, decomposed or not;
+            // nor does a `-` or `_` between it and a letter or digit
+            // (`my-sk-…`, `x_sk_org_…`, an identifier's separators). One
+            // that starts a word still does (`_<key>_` for emphasis, ` -<key>`).
+            // The boundary first, so a long run of prefixes inside one
+            // word isn't scanned to its end at each (Terra #18248).
+            if joins_before(text[..i].trim_end_matches(['-', '_'])) {
+                return false;
+            }
+            let rest = &text[i + prefix.len()..];
+            let n = token(rest);
+            n >= *min && key_body(prefix, &rest[..n])
         })
     })
+}
+
+/// Whether what follows a prefix can be a key. After a bare `sk-`, a UUID
+/// alone (8-4-4-4-12 hex digits) is the tail of an id quoted on its own
+/// (`sk-01a1a432-73ed-…` from `task-01a1a432-73ed-…`), which refused a
+/// review's reply (orchestrator, 2026-11-03); any other body, unhyphenated
+/// hex included, still counts (Terra #18248).
+fn key_body(prefix: &str, body: &str) -> bool {
+    prefix != "sk-" || !is_uuid(body)
+}
+
+/// `8-4-4-4-12` hex digits, either case, and nothing else. The length
+/// first, then the bytes in place: a huge token allocates nothing (Terra
+/// #18301).
+fn is_uuid(s: &str) -> bool {
+    s.len() == 36
+        && s.bytes().enumerate().all(|(i, b)| {
+            if matches!(i, 8 | 13 | 18 | 23) {
+                b == b'-'
+            } else {
+                b.is_ascii_hexdigit()
+            }
+        })
 }
 
 /// Whether the text before a token ends inside a word: its last base
@@ -271,14 +308,126 @@ fn has_exact_token(text: &str) -> bool {
     ];
     SHAPES.iter().any(|(prefix, len, exact, allowed)| {
         text.match_indices(prefix).any(|(i, _)| {
+            // The boundary before the scan, as in `shaped` (Terra #18248).
+            if joins_before(&text[..i]) {
+                return false;
+            }
             let rest = &text[i + prefix.len()..];
             let n = rest.chars().take_while(|&c| allowed(c)).count();
             let after = rest.chars().nth(n);
-            !joins_before(&text[..i])
-                && if *exact { n == *len } else { n >= *len }
+            (if *exact { n == *len } else { n >= *len })
                 && after.is_none_or(|c| !c.is_alphanumeric() && !combining(c))
         })
     })
+}
+
+/// A `password` or `token` assignment with a long value (edd-01a18867,
+/// Secret scan): a key ending in `password`, `passwd` or `token` (any
+/// case: `DB_PASSWORD`, `apiToken`, `"token"`), then `=` or `:` (spaces
+/// around it allowed, `::` and `==` aren't assignments), then a value of
+/// at least 20 characters with both a letter and a digit in it, and not a
+/// UUID (an id, not a secret). A quoted value runs to its matching quote
+/// and may hold any printable character, unless it starts a placeholder
+/// (`"$VAR"`, `"<pw>"`, `"{pw}"`, `"%s"`). An unquoted one uses the
+/// alphabet tokens and base64 use (no `.`): one that starts a placeholder
+/// stops before 20, and one that runs on into an expression (`env.X`,
+/// `svc.get_token()`, a call) isn't one, however long its first word.
+fn has_assignment(text: &str) -> bool {
+    const MIN: usize = 20;
+    let key_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.');
+    let value_char =
+        |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '/' | '+' | '=' | '~');
+    text.match_indices(['=', ':']).any(|(i, sep)| {
+        let after = &text[i + 1..];
+        let before = &text[..i];
+        // `::` (a path), `==`, `!=`, `<=`, `>=` and `:=`'s colon aren't
+        // the assignment itself.
+        if after.starts_with(['=', ':'])
+            || before.ends_with([':', '=', '!', '<', '>'])
+            || (sep == ":" && after.starts_with("//"))
+        {
+            return false;
+        }
+        let key_end = before.trim_end_matches([' ', '\t', '"', '\'']);
+        let key_start = key_end
+            .char_indices()
+            .rev()
+            .take_while(|&(_, c)| key_char(c))
+            .last()
+            .map_or(key_end.len(), |(at, _)| at);
+        let key = key_end[key_start..].to_ascii_lowercase();
+        if !["password", "passwd", "token"]
+            .iter()
+            .any(|k| key.ends_with(k))
+        {
+            return false;
+        }
+        let long = |value: &str| {
+            value.len() >= MIN
+                && value.bytes().any(|b| b.is_ascii_digit())
+                && value.bytes().any(|b| b.is_ascii_alphabetic())
+                && !is_uuid(value)
+        };
+        let value = after.trim_start_matches([' ', '\t']);
+        // A quoted value runs to its matching quote, whatever printable
+        // characters it holds (DECISION 15, Terra #18848: a `.` inside
+        // quotes is part of the value); a placeholder (`$X`, `<x>`, `{x}`,
+        // `%x`) isn't one.
+        if let Some(q) = value.chars().next().filter(|c| matches!(c, '"' | '\'')) {
+            let body = &value[1..];
+            let n = body
+                .find(|c: char| c == q || !c.is_ascii_graphic())
+                .unwrap_or(body.len());
+            let (inner, rest) = body.split_at(n);
+            return (rest.is_empty() || rest.starts_with(q))
+                && !inner.starts_with(['$', '<', '{', '%'])
+                && long(inner);
+        }
+        let end = value
+            .char_indices()
+            .find(|&(_, c)| !value_char(c))
+            .map_or(value.len(), |(at, _)| at);
+        let (value, rest) = value.split_at(end);
+        // The value ends where the assignment does: at the text's end,
+        // a space, a quote or a delimiter, or a full stop that ends a
+        // sentence. Anything else (`.get_token()`, `(`) continues an
+        // expression, and its prefix isn't a value (Terra #18736).
+        let mut next = rest.chars();
+        let ends = match next.next() {
+            None => true,
+            Some('.') => next.next().is_none_or(char::is_whitespace),
+            Some(c) => {
+                c.is_whitespace()
+                    || matches!(
+                        c,
+                        '"' | '\'' | '`' | ',' | ';' | '&' | ')' | ']' | '}' | '#' | '\\'
+                    )
+            }
+        };
+        ends && long(value)
+    })
+}
+
+/// Whether structured data (a message's parts, a JSON object) holds a
+/// credential: any string or key [`looks_secret`] flags, or an object
+/// member whose string value, written as `key=value`, is a `password` or
+/// `token` assignment. Scanning keys and values apart would miss
+/// `{"token": "<value>"}` (Terra #18736).
+pub(crate) fn value_looks_secret(v: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    match v {
+        Value::String(s) => looks_secret(s),
+        Value::Array(a) => a.iter().any(value_looks_secret),
+        Value::Object(o) => o.iter().any(|(k, x)| {
+            looks_secret(k)
+                || value_looks_secret(x)
+                // One reader for every assignment (DECISION 15): the joined
+                // pair goes through every layer `looks_secret` reads.
+                || x.as_str()
+                    .is_some_and(|x| looks_secret(&format!("{k}={x}")))
+        }),
+        _ => false,
+    }
 }
 
 /// A JWT: three dot-separated base64url parts of at least 10 characters,
@@ -369,6 +518,85 @@ fn has_url_password(text: &str, urls: Urls<'_>) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// A long word of repeated prefixes is checked in linear time: each
+    /// match's boundary first, never its whole suffix (Terra #18248).
+    #[test]
+    fn repeated_prefixes_inside_a_word_dont_scan_quadratically() {
+        let started = std::time::Instant::now();
+        for unit in ["sk-", "AKIA", "ghp_"] {
+            let text = format!("x{}", unit.repeat(100_000));
+            assert!(!looks_secret(&text), "{unit}");
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A UUID alone, by length and positions; nothing near it (Terra
+    /// #18301: the check allocates nothing, a megabyte of dashes included).
+    #[test]
+    fn is_uuid_is_exact_and_allocation_free() {
+        assert!(super::is_uuid("01a1a432-73ed-71c6-8ff2-bbd9b188f03c"));
+        assert!(super::is_uuid("01A1A432-73ED-71C6-8FF2-BBD9B188F03C"));
+        for not in [
+            "01a1a432-73ed-71c6-8ff2-bbd9b188f03",
+            "01a1a432-73ed-71c6-8ff2-bbd9b188f03cc",
+            "01a1a43273ed-71c6-8ff2-bbd9b188f03c-",
+            "01a1a432-73ed-71c6-8ff2_bbd9b188f03c",
+            "01a1a432-73ed-71c6-8ff2-bbd9b188f03g",
+        ] {
+            assert!(!super::is_uuid(not), "{not}");
+        }
+        assert!(!super::is_uuid(&"-".repeat(1 << 20)));
+        assert!(looks_secret(&format!("sk-{}", "-".repeat(1 << 20))));
+    }
+
+    /// An id that holds a key prefix inside a word isn't a key: a task id
+    /// quoted in a review (`task-01a1…` holds `sk-01a1…`) or a `disk-…`
+    /// name; a real-shaped key still is (orchestrator, 2026-11-03: a
+    /// review's reply was refused for quoting a task id).
+    #[test]
+    fn ids_that_hold_a_key_prefix_inside_a_word_pass() {
+        for text in [
+            "task-01a1a432-73ed-71c6-8ff2-bbd9b188f03c",
+            "see task-01a1a432-73ed-71c6-8ff2-bbd9b188f03c, round 2",
+            "(task-01a1a432-73ed-71c6-8ff2-bbd9b188f03c)",
+            "`task-01a1a432-73ed-71c6-8ff2-bbd9b188f03c`",
+            "fix task-01a1a432\u{2026} first",
+            "task-01a1a432\ntask-01a1a460-73ed-71c6-8ff2-bbd9b188f03c",
+            concat!("disk-", "0123456789abcdefghijklmnop"),
+            "risk-assessment-for-the-0-7-2-release-notes",
+            "mdkg-next msg thread task-01a1a432-73ed-71c6-8ff2-bbd9b188f03c --json",
+            // The id's tail quoted on its own: hex and dashes, no key.
+            "it holds 'sk-01a1a432-73ed-71c6-8ff2-bbd9b188f03c'",
+            // A dash or underscore doesn't start a token.
+            concat!("my-sk-", "AbCdEfGhIjKlMnOpQrStUvWx"),
+            concat!("x_sk_org_", "AbCdEfGhIjKlMnOpQrStUvWxYz"),
+        ] {
+            assert!(!looks_secret(text), "{text}");
+        }
+        for key in [
+            concat!("sk-", "proj-", "AbCdEfGhIjKlMnOpQrStUvWxYz012345"),
+            concat!("key: sk-", "AbCdEfGhIjKlMnOpQrStUvWx"),
+            concat!("(sk-", "ant-", "AbCdEfGhIjKlMnOpQrStUvWx)"),
+            concat!("'sk-", "0123456789abcdef0123456789abcdeG'"),
+            // Unhyphenated hex is a key shape some services use; only a
+            // UUID alone is an id (Terra #18248).
+            concat!("sk-", "0123456789abcdef0123456789abcdef"),
+            concat!("sk-", "01a1a432-73ed-71c6-8ff2-bbd9b188f03c-AbCdEf"),
+            // A dash or underscore that starts a word is still a boundary:
+            // Markdown emphasis, a list dash (Terra #18248).
+            concat!("see _ghp_", "AbCdEfGhIjKlMnOpQrStUvWxYz_ now"),
+            concat!("key: -sk-", "AbCdEfGhIjKlMnOpQrStUvWx"),
+            concat!("__sk-", "proj-AbCdEfGhIjKlMnOpQrStUvWx"),
+            concat!("sk_org_", "AbCdEfGhIjKlMnOpQrStUvWxYz"),
+        ] {
+            assert!(looks_secret(key), "{key}");
+        }
+    }
     use super::looks_secret;
 
     #[test]
@@ -445,11 +673,6 @@ mod tests {
             "scripts/export-public.sh",
             &[],
             "the public export's pattern lists",
-        ),
-        (
-            "scripts/credential-cases.json",
-            &[],
-            "the shared fragments: an ordinary case's second fragment matches alone",
         ),
         // Pending: fixtures in files other lanes held when these were split
         // (8cf3c619's review); the orchestrator routes them. Each is pinned
@@ -555,6 +778,79 @@ mod tests {
             stale.is_empty(),
             "listed files that no longer match: {stale:?}"
         );
+    }
+
+    #[test]
+    fn password_and_token_assignments_with_long_values_are_secrets() {
+        for secret in [
+            concat!("password=Zx9kq2LmQ7", "vB4nT8rW1y"),
+            concat!("DB_PASSWORD = \"Zx9kq2LmQ7", "vB4nT8rW1y\""),
+            concat!("export API_TOKEN='a1b2c3d4e5", "f6g7h8i9j0k1'"),
+            concat!("{\"token\": \"a1b2c3d4e5", "f6g7h8i9j0k1\"}"),
+            concat!("apiToken: a1b2c3d4e5f6g7h8i9", "j0k1"),
+            concat!("passwd=YWJjZGVmZ2hpamts", "bW5vcA1=="),
+            concat!("note\nauth_token=Zx9kq2LmQ7", "vB4nT8rW1y"),
+        ] {
+            assert!(looks_secret(secret), "{secret}");
+        }
+        for ordinary in [
+            "password=hunter2",
+            "token=abcdefghijklmnopqrstuvwxyz",
+            "password=$DB_PASSWORD_FROM_THE_ENV_1",
+            "token=${{ secrets.GITHUB_TOKEN_2 }}",
+            "password=<your password here 1234567>",
+            "token=env.MDKG_TOKEN_VALUE_FOR_2026()",
+            "token=01a1a597-d6bb-7652-a7ac-cf4b4d476e45",
+            "if token == expected_token_value_12345 {",
+            "let token = concat!(\"a1b2c3d4e5\", \"f6\");",
+            "mdkg::token::parse_the_value_2026_x",
+            "the token: see docs",
+            "tokens=a1b2c3d4e5f6g7h8i9j0k1",
+            "add the long `password=`/`token=` patterns",
+            "token = auth_provider_service_v2.get_token()",
+            "password=read_password_from_vault_2026(name)",
+        ] {
+            assert!(!looks_secret(ordinary), "{ordinary}");
+        }
+        // DECISION 15 (Terra #18848): a quoted value runs to its quote,
+        // punctuation included; placeholders and UUIDs in quotes aren't.
+        assert!(looks_secret(concat!(
+            "password=\"alpha01234",
+            "56789ABCDE.extra\""
+        )));
+        for ordinary in [
+            "token=\"${{ secrets.GITHUB_TOKEN_2 }}\"",
+            "token=\"<your token here 1234567>\"",
+            "password=\"$DB_PASSWORD_FROM_THE_ENV_1\"",
+            "token='01a1a597-d6bb-7652-a7ac-cf4b4d476e45'",
+            "token=\"{{ .Values.apiToken2026 }}\"",
+        ] {
+            assert!(!looks_secret(ordinary), "{ordinary}");
+        }
+        // A value that ends a sentence still counts.
+        assert!(looks_secret(concat!(
+            "the token=a1b2c3d4e5",
+            "f6g7h8i9j0k1. Then"
+        )));
+        // Structured data keeps a member's key with its value.
+        let value = concat!("a1b2c3d4e5", "f6g7h8i9j0k1");
+        // A joined pair is read through every decoding layer (DECISION 15).
+        assert!(super::value_looks_secret(&serde_json::json!({
+            "token": concat!("alpha%2F", "0123456789ABCDE")
+        })));
+        for data in [
+            serde_json::json!({"token": value}),
+            serde_json::json!([{"kind": "data", "data": {"apiToken": value}}]),
+        ] {
+            assert!(super::value_looks_secret(&data), "{data}");
+        }
+        for data in [
+            serde_json::json!({"tokens": value}),
+            serde_json::json!({"token": "01a1a597-d6bb-7652-a7ac-cf4b4d476e45"}),
+            serde_json::json!({"note": value}),
+        ] {
+            assert!(!super::value_looks_secret(&data), "{data}");
+        }
     }
 
     #[test]

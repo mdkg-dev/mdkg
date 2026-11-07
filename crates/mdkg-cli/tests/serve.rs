@@ -218,6 +218,9 @@ impl Fixture {
         let stderr = std::fs::File::create(&log).expect("log file");
         let mut child = self
             .program_as(program, "serve-test")
+            // From the fixture, as a person starts it: the CLI calls it
+            // runs check turns in its working folder too.
+            .current_dir(&self.repo)
             .args(["serve", "--json"])
             .args(extra)
             .stdout(Stdio::piped())
@@ -751,6 +754,64 @@ fn serve_starts_and_answers_in_ref_mode() {
     }
 }
 
+/// The gate read answers 200 while the gate passes and 422 with its
+/// failures when it fails, as `entry gate` exits 2 then (Terra #17946).
+#[test]
+fn the_gate_read_answers_422_with_its_failures_when_it_fails() {
+    let f = Fixture::new();
+    let (code, created) = f.run(&["new", "task", "Gated"]);
+    assert_eq!(code, 0, "{created}");
+    let id = created["data"]["node"]["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+    f.git(&["add", "-A"]);
+    f.git(&["commit", "-q", "-m", "a gated task"]);
+    let s = f.serve(&[]);
+    assert_eq!(s.envelope["ok"], true, "{}", s.envelope);
+    let gid = s.data()["graph_id"].as_str().expect("graph id").to_owned();
+    let gate = format!("/v1/graphs/{gid}/nodes/{id}/gate");
+    let (code, http) = ask(&s.socket(), "GET", &gate, Some("serve-test"), None);
+    assert_eq!(code, 200, "{http}");
+    assert_eq!(http["data"]["ok"], true, "{http}");
+    // A person, outside a turn: no agent class to judge.
+    let (exit, added) = cli_as(
+        &f,
+        "human:nick",
+        &[
+            "entry",
+            "add",
+            &id,
+            "--kind",
+            "finding",
+            "--severity",
+            "blocker",
+            "--title",
+            "Broken",
+        ],
+    );
+    assert_eq!(exit, 0, "{added}");
+    let (code, http) = ask(&s.socket(), "GET", &gate, Some("serve-test"), None);
+    let (exit, cli) = cli_as(&f, "serve-test", &["entry", "gate", &id]);
+    assert_eq!((code, exit), (422, 2), "{http}");
+    assert_eq!(http["ok"], false, "{http}");
+    assert_eq!(http["data"]["ok"], false, "{http}");
+    assert!(
+        !http["data"]["failures"]
+            .as_array()
+            .expect("failures")
+            .is_empty(),
+        "{http}"
+    );
+    assert_eq!(
+        http["diagnostics"][0]["code"], "entry.gate_failed",
+        "{http}"
+    );
+    assert_eq!(http["data"], cli["data"], "{http}");
+    s.signal("-TERM");
+    assert_eq!(s.wait(Duration::from_secs(30)), Some(0));
+}
+
 /// #16656: in ref mode serve starts past a malformed `.mdkg/config.json`
 /// in the checkout (not the graph's), still applies the user and local
 /// layers, and warns about a `serve` key in the graph ref's committed
@@ -1163,6 +1224,91 @@ fn a_person_s_ledger_writes_are_refused_on_loopback_whatever_the_spelling() {
         Some(&residual),
     );
     assert_eq!(status, 404, "{v}");
+    s.signal("-TERM");
+    assert_eq!(s.wait(Duration::from_secs(30)), Some(0));
+}
+
+/// A person's unsigned mail (DECISION 39, 2026-11-04): sent over the
+/// socket from outside a turn, refused from a turn's caller there, and
+/// never sent on loopback, which can't see the caller's process.
+#[test]
+fn a_person_s_mail_goes_over_the_socket_outside_a_turn_and_never_on_loopback() {
+    let f = Fixture::new();
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind")
+        .local_addr()
+        .expect("addr")
+        .port();
+    let addr = format!("127.0.0.1:{port}");
+    let s = f.serve(&["--listen", &addr]);
+    let token = std::fs::read_to_string(s.data()["token_file"].as_str().expect("token file"))
+        .expect("token");
+    let socket = s.socket();
+    let mail = |id: &str| json!({"to": ["lane-a"], "kind": "note", "id": id, "text": "hi"});
+    // Loopback: any spelling of a person is refused before the CLI; an
+    // agent's mail goes.
+    for actor in ["human:ana", "Human:Ana", "HUMAN:ana"] {
+        let (status, v) = ask_tcp(&addr, &token, "POST", "/v1/messages", actor, &mail("l1"));
+        assert_eq!(status, 403, "{actor}: {v}");
+        assert_eq!(code(&v), "api.actor_not_allowed", "{actor}");
+    }
+    let (status, v) = ask_tcp(&addr, &token, "POST", "/v1/messages", "lane-b", &mail("l2"));
+    assert_eq!(v["ok"], true, "{status} {v}");
+    // The socket, from outside a turn: the person's mail is sent.
+    let (status, v) = ask(
+        &socket,
+        "POST",
+        "/v1/messages",
+        Some("human:ana"),
+        Some(&mail("s1")),
+    );
+    assert_eq!(v["ok"], true, "{status} {v}");
+    assert_eq!(v["data"]["message"]["sender"], "human:ana", "{v}");
+    // A spelling that isn't a person's is the CLI's refusal.
+    let (status, v) = ask(
+        &socket,
+        "POST",
+        "/v1/messages",
+        Some("HUMAN:ana"),
+        Some(&mail("s2")),
+    );
+    assert_eq!((status, code(&v)), (400, "msg.human_actor"), "{v}");
+    // A live turn in the served checkout that some other process
+    // launched refuses nobody: the person's mail still goes (Terra's
+    // review of 5bd42768, major 1).
+    let mut other = Command::new("sleep").arg("120").spawn().expect("sleep");
+    let theirs = live_turn(&f, "c-agent", other.id());
+    let (status, v) = ask(
+        &socket,
+        "POST",
+        "/v1/messages",
+        Some("human:ana"),
+        Some(&mail("s4")),
+    );
+    drop(theirs);
+    let _ = other.kill();
+    let _ = other.wait();
+    assert_eq!(v["ok"], true, "{status} {v}");
+    // A caller descending from a live turn's launcher is refused.
+    let mine = live_turn(&f, "b-agent", std::process::id());
+    let (status, v) = ask(
+        &socket,
+        "POST",
+        "/v1/messages",
+        Some("human:ana"),
+        Some(&mail("s3")),
+    );
+    assert_eq!((status, code(&v)), (403, "api.actor_not_allowed"), "{v}");
+    drop(mine);
+    // Only the sends that passed reached lane-a.
+    let (_, inbox) = cli_as(&f, "lane-a", &["msg", "inbox"]);
+    let got: Vec<&str> = inbox["data"]["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .filter_map(|m| m["messageId"].as_str())
+        .collect();
+    assert_eq!(got, ["l2", "s1", "s4"], "{inbox}");
     s.signal("-TERM");
     assert_eq!(s.wait(Duration::from_secs(30)), Some(0));
 }

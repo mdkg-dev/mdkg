@@ -113,6 +113,7 @@
           "x-mdkg-open": true,
           "examples": [
             "replied",
+            "no_reply",
             "ran",
             "idle",
             "dry_run",

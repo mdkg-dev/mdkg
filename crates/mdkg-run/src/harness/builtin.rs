@@ -52,8 +52,9 @@ fn opencode_output(
 /// a long-lived subscription token on Anthropic's own API, is the
 /// subscription; Claude's own `apiKeyHelper` or console key isn't (review
 /// of 2f2320e).
-fn claude_login(program: &Path, cwd: &Path) -> Login {
-    let Some(out) = crate::auth::login_probe(program, cwd, &["auth", "status", "--json"]) else {
+fn claude_login(program: &Path, cwd: &Path, env: &crate::env::Environment) -> Login {
+    let Some(out) = crate::auth::login_probe(program, cwd, &["auth", "status", "--json"], env)
+    else {
         return Login::Out;
     };
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
@@ -69,8 +70,8 @@ fn claude_login(program: &Path, cwd: &Path) -> Login {
 }
 /// `codex login status`: "Logged in using ChatGPT" is the subscription; a
 /// key Codex keeps itself (`codex login --with-api-key`) isn't.
-fn codex_login(program: &Path, cwd: &Path) -> Login {
-    let Some(out) = crate::auth::login_probe(program, cwd, &["login", "status"]) else {
+fn codex_login(program: &Path, cwd: &Path, env: &crate::env::Environment) -> Login {
+    let Some(out) = crate::auth::login_probe(program, cwd, &["login", "status"], env) else {
         return Login::Out;
     };
     let text =
@@ -91,25 +92,148 @@ fn codex_login(program: &Path, cwd: &Path) -> Login {
     }
 }
 /// No check: OpenCode's own config names its providers and their keys.
-fn opencode_login(_: &Path, _: &Path) -> Login {
+fn opencode_login(_: &Path, _: &Path, _: &crate::env::Environment) -> Login {
     Login::Own
 }
 
 fn json_field(v: &serde_json::Value, key: &str) -> Option<String> {
     v.get(key).and_then(|f| f.as_str()).map(String::from)
 }
-/// Claude: its stream-json result with `is_error` true and a result that
-/// starts "Claude AI usage limit reached", or that message as the line.
+/// Whether `text` is Claude's own usage-limit wording: "Claude AI usage
+/// limit reached", or "You've hit your weekly limit" / "You've hit your
+/// <n>-hour limit" (straight or curly apostrophe), each at its start.
+fn claude_limit_text(text: &str) -> bool {
+    let text = text.trim();
+    if text.starts_with("Claude AI usage limit reached") {
+        return true;
+    }
+    let Some(rest) = ["You've hit your ", "You\u{2019}ve hit your "]
+        .iter()
+        .find_map(|p| text.strip_prefix(p))
+    else {
+        return false;
+    };
+    if rest.starts_with("weekly limit") {
+        return true;
+    }
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    digits > 0 && rest[digits..].starts_with("-hour limit")
+}
+
+/// Claude: a stream-json `rate_limit_event` whose `rate_limit_info.status`
+/// is `rejected`; a `result` with `is_error` true whose text is its limit
+/// wording; or that wording as the line. A 429 alone isn't: it may be
+/// request-rate throttling (see [`claude_limit_in`]).
 fn claude_usage_limit(line: &str) -> bool {
-    const MESSAGE: &str = "Claude AI usage limit reached";
     let line = line.trim();
-    line.starts_with(MESSAGE)
+    claude_limit_text(line)
         || serde_json::from_str::<serde_json::Value>(line).is_ok_and(|v| {
-            json_field(&v, "type").as_deref() == Some("result")
-                && v.get("is_error") == Some(&serde_json::Value::Bool(true))
-                && json_field(&v, "result").is_some_and(|r| r.starts_with(MESSAGE))
+            match json_field(&v, "type").as_deref() {
+                Some("rate_limit_event") => {
+                    v.pointer("/rate_limit_info/status")
+                        .and_then(|s| s.as_str())
+                        == Some("rejected")
+                }
+                Some("result") => {
+                    v.get("is_error") == Some(&serde_json::Value::Bool(true))
+                        && json_field(&v, "result").is_some_and(|r| claude_limit_text(&r))
+                }
+                _ => false,
+            }
         })
 }
+
+/// Whether Claude's turn ended on its usage limit, from its stream-json
+/// events in order: the final `result` is an error that either says the
+/// limit wording or follows a rejected `rate_limit_event` (whatever its
+/// own text, since Claude may end a limited turn with a result that names
+/// no limit; review of 94ff686f). A 429 with no rejection may be
+/// request-rate throttling, so it isn't one (review of 0f0a8dcb). A stream
+/// with no result counts when its last event is a rejected
+/// `rate_limit_event`.
+fn claude_limit_in(events: &[String]) -> bool {
+    let parse = |l: &String| serde_json::from_str::<serde_json::Value>(l.trim()).ok();
+    let Some(at) = events.iter().rposition(|l| {
+        parse(l).is_some_and(|v| json_field(&v, "type").as_deref() == Some("result"))
+    }) else {
+        return events.last().is_some_and(|l| claude_usage_limit(l));
+    };
+    let Some(result) = parse(&events[at]) else {
+        return false;
+    };
+    if result.get("is_error") != Some(&serde_json::Value::Bool(true)) {
+        return false;
+    }
+    if json_field(&result, "result").is_some_and(|r| claude_limit_text(&r)) {
+        return true;
+    }
+    events[..at].iter().any(|l| {
+        parse(l).is_some_and(|v| {
+            json_field(&v, "type").as_deref() == Some("rate_limit_event")
+                && v.pointer("/rate_limit_info/status")
+                    .and_then(|s| s.as_str())
+                    == Some("rejected")
+        })
+    })
+}
+
+/// Whether Claude's turn ended on provider throttling: its final `result`
+/// is an error with `api_error_status` 429 that isn't its usage limit (no
+/// limit wording, no rejected `rate_limit_event` before it). Transient: it
+/// never sets mail aside and offers no key (orchestrator, under
+/// dec-01a18ee0 item 8; review of d009bf16).
+fn claude_throttled_in(events: &[String]) -> bool {
+    let Some(result) = events.iter().rev().find_map(|l| {
+        serde_json::from_str::<serde_json::Value>(l.trim())
+            .ok()
+            .filter(|v| json_field(v, "type").as_deref() == Some("result"))
+    }) else {
+        return false;
+    };
+    result.get("is_error") == Some(&serde_json::Value::Bool(true))
+        && result.get("api_error_status").and_then(|s| s.as_u64()) == Some(429)
+        && !claude_limit_in(events)
+}
+
+/// Codex and OpenCode report no throttling of their own: OpenCode's 429
+/// quota bodies are its usage limit, and Codex's output is text.
+fn never_throttled(_: &[String]) -> bool {
+    false
+}
+
+/// Codex's output is text, so it has no event stream: any line of it.
+fn codex_limit_in(events: &[String]) -> bool {
+    events.iter().any(|l| codex_usage_limit(l))
+}
+
+/// OpenCode reports its quota as an error event, wherever it falls.
+fn opencode_limit_in(events: &[String]) -> bool {
+    events.iter().any(|l| opencode_usage_limit(l))
+}
+
+/// When Claude's limit resets, from a rejected `rate_limit_event`: its
+/// `resetsAt` (epoch seconds) and `rateLimitType` (`five_hour`,
+/// `seven_day`, ...). Codex and OpenCode don't say.
+fn claude_limit_reset(line: &str) -> Option<(u64, Option<String>)> {
+    let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    if json_field(&v, "type").as_deref() != Some("rate_limit_event")
+        || v.pointer("/rate_limit_info/status")
+            .and_then(|s| s.as_str())
+            != Some("rejected")
+    {
+        return None;
+    }
+    let info = v.get("rate_limit_info")?;
+    Some((
+        info.get("resetsAt")?.as_u64()?,
+        json_field(info, "rateLimitType"),
+    ))
+}
+/// Codex and OpenCode say nothing of when their limit resets.
+fn no_limit_reset(_: &str) -> Option<(u64, Option<String>)> {
+    None
+}
+
 /// Codex: "ERROR: You've hit your usage limit…" (straight or curly
 /// apostrophe), or a JSON error event whose message starts so, or whose
 /// code is `usage_limit_reached`.
@@ -141,19 +265,148 @@ fn codex_usage_limit(line: &str) -> bool {
                 || (is_error && json_field(event, "message").is_some_and(|m| limit(&m)))
         })
 }
-/// OpenCode: its JSON `error` event whose error says `usage_limit_reached`
-/// (its provider's code). OpenCode has no key, so the limit is only named.
+/// The response bodies of OpenCode's quota errors.
+const OPENCODE_QUOTA_BODIES: &[&str] = &["FreeUsageLimitError", "GoUsageLimitError"];
+
+/// Whether `body` (an object, or a JSON string of one) is one of
+/// [`OPENCODE_QUOTA_BODIES`], by its `type` or its `error.type`.
+fn opencode_quota_body(body: &serde_json::Value) -> bool {
+    let parsed;
+    let body = match body.as_str() {
+        Some(text) => match serde_json::from_str::<serde_json::Value>(text) {
+            Ok(v) => {
+                parsed = v;
+                &parsed
+            }
+            Err(_) => return false,
+        },
+        None => body,
+    };
+    [body.get("type"), body.pointer("/error/type")]
+        .into_iter()
+        .flatten()
+        .filter_map(|t| t.as_str())
+        .any(|t| OPENCODE_QUOTA_BODIES.contains(&t))
+}
+
+/// OpenCode: its JSON `error` event for a usage limit. Its own quota form:
+/// `error.type` is `provider.quota`, or `error.status` is 429 with a quota
+/// body in `error.response.body`. Its API-error form: the same body, or a
+/// message naming it (or the provider's `usage_limit_reached`), as
+/// `error.data.message`, or 429 as
+/// `error.data.statusCode` with a quota body in `error.data.responseBody`.
+/// And `usage_limit_reached` as `error.code`. OpenCode has no key, so the
+/// limit is only named.
 fn opencode_usage_limit(line: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(line.trim()).is_ok_and(|v| {
-        json_field(&v, "type").as_deref() == Some("error")
-            && v.get("error").is_some_and(|e| {
-                json_field(e, "code").as_deref() == Some("usage_limit_reached")
-                    || e.get("data")
-                        .and_then(|d| d.get("message"))
-                        .and_then(|m| m.as_str())
-                        == Some("usage_limit_reached")
-            })
+        if json_field(&v, "type").as_deref() != Some("error") {
+            return false;
+        }
+        let Some(e) = v.get("error") else {
+            return false;
+        };
+        let status = |s: Option<&serde_json::Value>| s.and_then(|s| s.as_u64()) == Some(429);
+        let body = |b: Option<&serde_json::Value>| b.is_some_and(opencode_quota_body);
+        let message = e.pointer("/data/message");
+        json_field(e, "type").as_deref() == Some("provider.quota")
+            || (status(e.get("status")) && body(e.pointer("/response/body")))
+            || json_field(e, "code").as_deref() == Some("usage_limit_reached")
+            || message.and_then(|m| m.as_str()) == Some("usage_limit_reached")
+            || body(message)
+            || message
+                .and_then(|m| m.as_str())
+                .is_some_and(|m| OPENCODE_QUOTA_BODIES.iter().any(|b| m.contains(b)))
+            || (status(e.pointer("/data/statusCode")) && body(e.pointer("/data/responseBody")))
     })
+}
+
+/// The most prompt OpenCode gets: it takes the prompt as one argument, and
+/// Linux caps one argument at 128 KiB.
+const OPENCODE_PROMPT_MAX: usize = 96 * 1024;
+
+fn no_turn_check(_: Option<&str>, _: &TurnOptions) -> Result<(), RunError> {
+    Ok(())
+}
+/// OpenCode's Zen models send prompts to OpenCode's servers: only when
+/// asked for by name and allowed. A model the user configured is theirs.
+fn opencode_turn_check(model: Option<&str>, opts: &TurnOptions) -> Result<(), RunError> {
+    if let Some(m) = model
+        && m.starts_with("opencode/")
+        && !opts.allow_zen
+    {
+        return Err(RunError::usage(
+            crate::error::CODE_UNSUPPORTED,
+            format!("{m} is an OpenCode Zen model, which sends prompts to OpenCode's servers"),
+        )
+        .with_hint("use your own provider, or pass --allow-zen"));
+    }
+    Ok(())
+}
+fn always_resumable(_: &str, _: bool, _: &Path, _: &TurnOptions, _: Option<&Path>) -> bool {
+    true
+}
+/// An OpenCode session from v0.1, started in the launcher's private data
+/// folder (`<turns>/home`, which only v0.1 made), isn't where the user's
+/// OpenCode looks to resume it: start a new one (review of 10915d4). One
+/// the state doesn't mark either way is judged by that folder (review of
+/// 99f5402).
+fn opencode_resumable(
+    _: &str,
+    user_session: bool,
+    turns: &Path,
+    _: &TurnOptions,
+    _: Option<&Path>,
+) -> bool {
+    user_session || std::fs::symlink_metadata(turns.join("home")).is_err()
+}
+/// A Codex session is judged by whether the user's CODEX_HOME holds it,
+/// whatever else is left (review of 1a38a2c).
+fn codex_resumable(id: &str, _: bool, _: &Path, opts: &TurnOptions, home: Option<&Path>) -> bool {
+    opts.user_codex_home
+        .clone()
+        .or_else(|| user_codex_home(home))
+        .map(|u| std::fs::canonicalize(&u).unwrap_or(u))
+        .as_deref()
+        .is_some_and(|h| codex_session_known(h, id))
+}
+fn no_early_check(_: &str, _: Role, _: CodexSettings<'_>) -> Option<Result<(), RunError>> {
+    None
+}
+/// Codex's stderr session header, checked against the sandbox it was asked
+/// for.
+fn codex_early_check(
+    stderr: &str,
+    role: Role,
+    settings: CodexSettings<'_>,
+) -> Option<Result<(), RunError>> {
+    crate::parse::codex_header_check_settings(stderr, role, settings)
+}
+
+/// Whether a Codex home holds a session file for `id`
+/// (`sessions/YYYY/MM/DD/rollout-…-<id>.jsonl`).
+fn codex_session_known(codex_home: &Path, id: &str) -> bool {
+    fn walk(dir: &Path, id: &str, depth: usize) -> bool {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        entries.flatten().any(|e| {
+            let path = e.path();
+            if path.is_dir() {
+                depth > 0 && walk(&path, id, depth - 1)
+            } else {
+                e.file_name().to_string_lossy().contains(id)
+            }
+        })
+    }
+    !id.is_empty() && walk(&codex_home.join("sessions"), id, 4)
+}
+
+/// The user's own Codex folder: `$CODEX_HOME`, else ~/.codex.
+fn user_codex_home(home: Option<&Path>) -> Option<PathBuf> {
+    std::env::var_os("CODEX_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| home.map(|h| h.join(".codex")))
 }
 
 fn standard_native(native: &str) -> Option<(Event, EventName)> {
@@ -231,7 +484,9 @@ macro_rules! adapter {
      $mcp:expr, $project:path, $layout:expr, $hooks:path,
      $native:path, $parse:path, $render:path, $binding:path,
      $efforts:expr, $overrides:path,
-     $login:path, $login_command:literal, $keychain:expr, $limit:path) => {
+     $login:path, $login_command:literal, $keychain:expr, $limit:path, $limit_in:path, $throttled_in:path, $reset:path,
+     $check_turn:path, $prompt_max:expr, $resumable:path, $chooses_session:expr,
+     $early:path, $reply_on_stdout:expr, $structured:expr) => {
         impl HarnessAdapter for $type {
             fn id(&self) -> &'static str {
                 Harness::$type.as_str()
@@ -285,8 +540,11 @@ macro_rules! adapter {
             ) -> Result<Parsed, RunError> {
                 $output(role, stdout, stderr, output_file, settings)
             }
-            fn login(&self, program: &Path, cwd: &Path) -> Login {
-                $login(program, cwd)
+            fn login(&self, program: &Path, cwd: &Path, env: &crate::env::Environment) -> Login {
+                $login(program, cwd, env)
+            }
+            fn inherited_env(&self) -> &'static [&'static str] {
+                crate::env::harness_names(Harness::$type)
             }
             fn login_command(&self) -> &'static str {
                 $login_command
@@ -297,14 +555,24 @@ macro_rules! adapter {
             fn usage_limit(&self, line: &str) -> bool {
                 $limit(line)
             }
+            fn usage_limit_in(&self, events: &[String]) -> bool {
+                $limit_in(events)
+            }
+            fn throttled_in(&self, events: &[String]) -> bool {
+                $throttled_in(events)
+            }
+            fn usage_limit_reset(&self, line: &str) -> Option<(u64, Option<String>)> {
+                $reset(line)
+            }
             fn auth_status(
                 &self,
                 program: &Path,
                 cwd: &Path,
                 policy: &crate::policy::Auth,
                 keys: &KeySource,
+                env: &crate::env::Environment,
             ) -> AuthStatus {
-                crate::auth::status(Harness::$type, program, cwd, policy, keys)
+                crate::auth::status(Harness::$type, program, cwd, policy, keys, env)
             }
             fn mcp_projection(&self) -> McpProjection {
                 $mcp
@@ -356,6 +624,39 @@ macro_rules! adapter {
             ) -> Result<(), RunError> {
                 $overrides(sandbox, approvals)
             }
+            fn check_turn(&self, model: Option<&str>, opts: &TurnOptions) -> Result<(), RunError> {
+                $check_turn(model, opts)
+            }
+            fn prompt_max(&self) -> Option<usize> {
+                $prompt_max
+            }
+            fn resumable(
+                &self,
+                id: &str,
+                user_session: bool,
+                turns: &Path,
+                opts: &TurnOptions,
+                home: Option<&Path>,
+            ) -> bool {
+                $resumable(id, user_session, turns, opts, home)
+            }
+            fn chooses_session(&self) -> bool {
+                $chooses_session
+            }
+            fn early_check(
+                &self,
+                stderr: &str,
+                role: Role,
+                settings: CodexSettings<'_>,
+            ) -> Option<Result<(), RunError>> {
+                $early(stderr, role, settings)
+            }
+            fn reply_on_stdout(&self) -> bool {
+                $reply_on_stdout
+            }
+            fn structured_output(&self) -> bool {
+                $structured
+            }
         }
     };
 }
@@ -396,7 +697,19 @@ adapter!(
     claude_login,
     "claude auth login",
     Some("mdkg-anthropic"),
-    claude_usage_limit
+    claude_usage_limit,
+    claude_limit_in,
+    claude_throttled_in,
+    claude_limit_reset,
+    no_turn_check,
+    None,
+    always_resumable,
+    // Claude takes the new session's id as an argument.
+    true,
+    no_early_check,
+    false,
+    // `stream-json`.
+    true
 );
 adapter!(
     Codex,
@@ -432,7 +745,20 @@ adapter!(
     codex_login,
     "codex login",
     Some("mdkg-openai"),
-    codex_usage_limit
+    codex_usage_limit,
+    codex_limit_in,
+    never_throttled,
+    no_limit_reset,
+    no_turn_check,
+    None,
+    codex_resumable,
+    false,
+    codex_early_check,
+    // On a key turn, with no `-o` file, its stdout is the reply.
+    true,
+    // Run without `--json`: its output is text, and a JSON line in it may
+    // be quoted (orchestrator, 2026-10-29, on #6209).
+    false
 );
 adapter!(
     OpenCode,
@@ -471,5 +797,16 @@ adapter!(
     "opencode auth login",
     // OpenCode's own config names its providers and their keys.
     None,
-    opencode_usage_limit
+    opencode_usage_limit,
+    opencode_limit_in,
+    never_throttled,
+    no_limit_reset,
+    opencode_turn_check,
+    Some(OPENCODE_PROMPT_MAX),
+    opencode_resumable,
+    false,
+    no_early_check,
+    false,
+    // `--format json`.
+    true
 );

@@ -496,12 +496,7 @@ fn mdkg_namespace_is_reserved_in_environment_and_folder_defaults() {
 #[test]
 fn humans_are_never_actors_and_their_mail_stays() {
     let (_dir, wa, _wb) = two_worktrees();
-    let (code, out) = run(
-        &wa,
-        "human:nick",
-        0,
-        &["msg", "send", "--to", "a", "--kind", "note", "--text", "hi"],
-    );
+    let (code, out) = run(&wa, "human:nick", 0, &["msg", "forward", "q0", "--to", "a"]);
     assert_eq!(
         (code, codes(&out)),
         (1, vec!["msg.human_actor".to_string()])
@@ -532,6 +527,42 @@ fn humans_are_never_actors_and_their_mail_stays() {
         &["msg", "ack", "q1", "--mailbox", "human:nick"],
     );
     assert_eq!((code, codes(&out)), (5, vec!["msg.not_holder".to_string()]));
+    // An agent's read of a person's mailbox marks nothing shown for them,
+    // by inbox or wait, and its explicit mark is refused: the person's
+    // ack still needs their own read (#20942).
+    ok(
+        &wa,
+        "b",
+        3,
+        &["msg", "wait", "--mailbox", "human:nick", "--timeout", "1"],
+    );
+    let m = &inbox["data"]["messages"][0];
+    let mark = format!("{}/{}/q1", m["seq"], m["digest"].as_str().expect("digest"));
+    let (code, out) = run(
+        &wa,
+        "b",
+        3,
+        &[
+            "msg",
+            "inbox",
+            "--mailbox",
+            "human:nick",
+            "--mark-shown",
+            &mark,
+        ],
+    );
+    assert_eq!((code, codes(&out)), (5, vec!["msg.not_holder".to_string()]));
+    let (code, out) = run(&wa, "human:nick", 4, &["msg", "ack", "q1"]);
+    assert_eq!((code, codes(&out)), (5, vec!["msg.not_shown".to_string()]));
+    // The person's own mark lets their ack through.
+    ok(
+        &wa,
+        "human:nick",
+        4,
+        &["msg", "inbox", "--mark-shown", &mark],
+    );
+    let acked = ok(&wa, "human:nick", 5, &["msg", "ack", "q1"]);
+    assert_eq!(acked["data"]["acked"][0]["messageId"], "q1", "{acked}");
 }
 
 #[test]
@@ -1593,6 +1624,285 @@ fn ack_grace_reads_the_graph_ref_in_ref_mode() {
     assert_eq!(shown_grace(&wt), json!(0));
     let acked = ok(&wt, "b", 6, &["msg", "ack", "r2"]);
     assert_eq!(acked["data"]["purged"], json!(["r2"]), "{acked}");
+}
+
+/// Runs `mdkg` in `worktree`, killed after `limit`: `None` when it ran out.
+fn bounded(worktree: &Path, args: &[&str], limit: std::time::Duration) -> Option<(i32, Value)> {
+    let mut child = isolated(&mut Command::new(env!("CARGO_BIN_EXE_mdkg")))
+        .arg("--root")
+        .arg(worktree)
+        .args(["--as", "a"])
+        .args(args)
+        .arg("--json")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("run mdkg");
+    let until = std::time::Instant::now() + limit;
+    while child.try_wait().expect("poll").is_none() {
+        if std::time::Instant::now() >= until {
+            child.kill().ok();
+            child.wait().ok();
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let out = child.wait_with_output().expect("output");
+    let envelope = serde_json::from_slice(&out.stdout).expect("one JSON envelope");
+    Some((out.status.code().unwrap_or(-1), envelope))
+}
+
+/// A watch in ref mode holds no graph lock once it streams: after the
+/// graph ref moves, a `status` beside it refreshes the cache, and the
+/// stream announces the new tip (Terra #19918).
+#[test]
+fn a_ref_mode_watch_leaves_the_graph_lock_free() {
+    let (dir, repo, wt) = initialized(true);
+    ok(
+        &wt,
+        "a",
+        2,
+        &[
+            "msg", "send", "--to", "b", "--kind", "note", "--id", "w1", "--text", "x",
+        ],
+    );
+    let out = dir.0.join("watch.out");
+    let mut watch = isolated(&mut Command::new(env!("CARGO_BIN_EXE_mdkg")))
+        .arg("--root")
+        .arg(&wt)
+        .args(["--as", "a", "msg", "watch", "--from-start", "--json"])
+        .stdout(fs::File::create(&out).expect("watch out"))
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("watch");
+    // A replayed frame means the stream is up, past where it was bound.
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while fs::read_to_string(&out).unwrap_or_default().is_empty() {
+        assert!(
+            std::time::Instant::now() < until,
+            "the watch never streamed"
+        );
+        assert!(watch.try_wait().expect("poll").is_none(), "the watch ended");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // The graph ref moves by git, as docs/git-graph.md shows; `status`
+    // then brings the cache to the new tip under the exclusive lock.
+    on_graph_ref(&dir.0, &repo, |edit| set_grace(edit, json!(0)));
+    let tip = String::from_utf8(
+        isolated(
+            Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["rev-parse", "refs/heads/mdkg-graph"]),
+        )
+        .output()
+        .expect("git")
+        .stdout,
+    )
+    .expect("utf-8");
+    let status = bounded(&wt, &["status"], std::time::Duration::from_secs(60));
+    // The stream announces the graph ref's new tip.
+    let announced = |tip: &str| {
+        fs::read_to_string(&out)
+            .unwrap_or_default()
+            .lines()
+            .any(|l| {
+                serde_json::from_str::<Value>(l).is_ok_and(|e| {
+                    e["type"] == "mdkg.graph.head_changed" && e["data"]["head"] == tip
+                })
+            })
+    };
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !announced(tip.trim()) && std::time::Instant::now() < until {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let moved = announced(tip.trim());
+    watch.kill().ok();
+    watch.wait().ok();
+    let (code, status) = status.expect("status finished beside the watch");
+    assert_eq!(code, 0, "{status}");
+    assert_eq!(
+        status["data"]["graph"]["ref"], "refs/heads/mdkg-graph",
+        "{status}"
+    );
+    assert_eq!(status["data"]["graph"]["tip"], tip.trim(), "{status}");
+    assert!(moved, "the graph ref's move was announced");
+}
+
+/// In ref mode a running watch announces a deleted graph ref as `head`
+/// null and its recreation as the tip again, while `status` and a new
+/// watch refuse the missing ref (Terra #20480).
+#[test]
+fn a_ref_mode_watch_announces_the_graph_ref_deleted_and_recreated() {
+    let (dir, repo, wt) = initialized(true);
+    let rev = |name: &str| {
+        let out = isolated(Command::new("git").arg("-C").arg(&repo).args([
+            "rev-parse",
+            "--verify",
+            name,
+        ]))
+        .output()
+        .expect("git");
+        String::from_utf8(out.stdout)
+            .expect("utf-8")
+            .trim()
+            .to_owned()
+    };
+    let tip = rev("refs/heads/mdkg-graph");
+    assert!(!tip.is_empty(), "the graph ref exists");
+    let out = dir.0.join("watch.out");
+    let mut watch = isolated(&mut Command::new(env!("CARGO_BIN_EXE_mdkg")))
+        .arg("--root")
+        .arg(&wt)
+        .args([
+            "--as",
+            "a",
+            "msg",
+            "watch",
+            "--types",
+            "mdkg.graph.head_changed",
+            "--json",
+        ])
+        .stdout(fs::File::create(&out).expect("watch out"))
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("watch");
+    // The head events so far, in order: each `data.head` as sent.
+    let heads = || -> Vec<Value> {
+        fs::read_to_string(&out)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter(|e| e["type"] == "mdkg.graph.head_changed")
+            .map(|e| {
+                e["data"]
+                    .get("head")
+                    .cloned()
+                    .unwrap_or_else(|| panic!("head is always present: {e}"))
+            })
+            .collect()
+    };
+    let mut watch_until = |count: usize, what: &str| {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while heads().len() < count {
+            assert!(std::time::Instant::now() < until, "never announced {what}");
+            assert!(watch.try_wait().expect("poll").is_none(), "the watch ended");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    };
+    watch_until(1, "the start");
+    sh(&repo, &["update-ref", "-d", "refs/heads/mdkg-graph"]);
+    watch_until(2, "the deletion");
+    for args in [&["status"][..], &["msg", "watch"][..]] {
+        let (code, refused) = bounded(&wt, args, std::time::Duration::from_secs(60))
+            .unwrap_or_else(|| panic!("{args:?} ran on without the graph ref"));
+        assert_ne!(code, 0, "{args:?}: {refused}");
+        assert!(
+            refused["diagnostics"]
+                .as_array()
+                .is_some_and(|d| d.iter().any(|d| d["code"] == "graph.ref_missing")),
+            "{args:?}: {refused}"
+        );
+    }
+    sh(&repo, &["update-ref", "refs/heads/mdkg-graph", &tip]);
+    watch_until(3, "the recreation");
+    watch.kill().ok();
+    watch.wait().ok();
+    assert_eq!(
+        heads(),
+        vec![json!(tip), Value::Null, json!(tip)],
+        "start, deleted, recreated"
+    );
+}
+
+/// A `msg wait` in ref mode holds no graph lock while it waits: after the
+/// graph ref moves, a `status` beside it refreshes the cache, and the
+/// wait still ends with the mail that arrives.
+#[test]
+fn a_ref_mode_wait_leaves_the_graph_lock_free() {
+    let (dir, repo, wt) = initialized(true);
+    // A command in `wt` first brings its cache to the tip, so the wait's
+    // bind keeps the shared lock (a stale cache is caught up under the
+    // exclusive one and keeps none).
+    ok(&wt, "b", 1, &["msg", "inbox"]);
+    let mut wait = isolated(&mut Command::new(env!("CARGO_BIN_EXE_mdkg")))
+        .arg("--root")
+        .arg(&wt)
+        .args(["--as", "b", "msg", "wait", "--timeout", "120", "--json"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("wait");
+    // The wait opens the store only once bound to the cache, so a store it
+    // holds open means it bound before the graph ref moves (review of
+    // 16af71e1): a bind after the move would refresh a stale cache and
+    // keep no lock, passing either way.
+    let store = repo.join(".git/mdkg/coord.sqlite");
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !holds_open(wait.id(), &store) {
+        assert!(
+            std::time::Instant::now() < until,
+            "the wait never opened the store"
+        );
+        assert!(wait.try_wait().expect("poll").is_none(), "the wait ended");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    on_graph_ref(&dir.0, &repo, |edit| set_grace(edit, json!(0)));
+    let status = bounded(&wt, &["status"], std::time::Duration::from_secs(60));
+    ok(
+        &wt,
+        "a",
+        2,
+        &[
+            "msg", "send", "--to", "b", "--kind", "note", "--id", "w1", "--text", "x",
+        ],
+    );
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while wait.try_wait().expect("poll").is_none() && std::time::Instant::now() < until {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    if wait.try_wait().expect("poll").is_none() {
+        wait.kill().ok();
+    }
+    let out = wait.wait_with_output().expect("wait output");
+    let (code, status) = status.expect("status finished beside the wait");
+    assert_eq!(code, 0, "{status}");
+    assert_eq!(
+        status["data"]["graph"]["ref"], "refs/heads/mdkg-graph",
+        "{status}"
+    );
+    let waited: Value = serde_json::from_slice(&out.stdout).expect("wait envelope");
+    assert_eq!(out.status.code(), Some(0), "{waited}");
+    assert_eq!(ids(&waited), ["w1"], "{waited}");
+    // The wait marked what it showed, so the ack takes it (review of
+    // 16af71e1: marked through the unbound cache, it was refused with
+    // msg.not_shown).
+    let acked = ok(&wt, "b", 3, &["msg", "ack", "w1"]);
+    assert_eq!(acked["data"]["acked"][0]["messageId"], "w1", "{acked}");
+}
+
+/// Whether process `pid` holds `path` open: by `/proc/<pid>/fd` where
+/// there is one (Linux, no package needed), else by `lsof`, which macOS
+/// always has (review of dc523916).
+fn holds_open(pid: u32, path: &Path) -> bool {
+    let fds = PathBuf::from(format!("/proc/{pid}/fd"));
+    if Path::new("/proc/self/fd").is_dir() {
+        let want = fs::canonicalize(path).ok();
+        return fs::read_dir(&fds).is_ok_and(|entries| {
+            entries
+                .flatten()
+                .filter_map(|e| fs::read_link(e.path()).ok())
+                .any(|target| Some(&target) == want.as_ref() || target == path)
+        });
+    }
+    Command::new("lsof")
+        .args(["-a", "-p", &pid.to_string()])
+        .arg(path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("lsof runs (macOS has it; elsewhere /proc is read)")
+        .success()
 }
 
 /// Changes the graph ref's config by the git route docs/git-graph.md
@@ -3009,7 +3319,7 @@ fn human_wording() {
     let envelope: Value = serde_json::from_slice(&out.stdout).expect("json");
     assert_eq!(codes(&envelope), vec!["msg.human_actor".to_string()]);
     let base = "an agent acts as itself, and a human's answer goes in a `decision` it sends; \
-                a human may only ack, read (`msg inbox|wait|thread`) and leave a channel";
+                a human may only ack, read (`msg inbox|wait|thread`), leave a channel and send mail (`msg send`, outside agent turns)";
     assert_eq!(
         envelope["diagnostics"][0]["hint"],
         format!("{base}; for other commands, unset $MDKG_ACTOR (or pass --as '')")
@@ -4473,4 +4783,274 @@ fn ack_through_skips_and_names_a_fault_unless_the_kind_names_it() {
     );
     assert_eq!(out["data"]["acked"][0]["messageId"], "fault.0193.r0");
     assert!(ids(&ok(&wb, "b", 8, &["msg", "inbox"])).is_empty());
+}
+
+/// The `msg.send` records in the coordinator store's log, by message id.
+fn send_records(repo: &Path) -> std::collections::HashMap<String, Value> {
+    let db = repo.join(".git/mdkg/coord.sqlite");
+    let conn =
+        rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("store");
+    let mut stmt = conn
+        .prepare("SELECT record FROM log ORDER BY seq")
+        .expect("log");
+    stmt.query_map([], |r| r.get::<_, String>(0))
+        .expect("rows")
+        .map(|t| serde_json::from_str::<Value>(&t.expect("row")).expect("json"))
+        .filter(|v| v["kind"] == "msg.send")
+        .map(|v| {
+            let body = v.get("body").cloned().unwrap_or(v);
+            (
+                body["message_id"].as_str().unwrap_or_default().to_string(),
+                body,
+            )
+        })
+        .collect()
+}
+
+/// A launcher turn record in `repo`'s common folder for `actor`, working
+/// in `cwd`, held live by its lock, whose launcher is the process
+/// `launcher`, as the turn check reads it.
+fn live_turn(repo: &Path, cwd: &Path, actor: &str, launcher: u32) -> fs::File {
+    let out = Command::new("ps")
+        .env("TZ", "UTC")
+        .env("LC_ALL", "C")
+        .args(["-o", "lstart=", "-p", &launcher.to_string()])
+        .output()
+        .expect("ps");
+    let started = String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let dir = mdkg_run::hooks::dir(&repo.join(".git")).join("turns");
+    fs::create_dir_all(&dir).expect("turns dir");
+    let path = dir.join(format!("{actor}.json"));
+    let record = json!({
+        "actor": actor,
+        "harness": "claude",
+        "cwd": cwd,
+        "launcher_process": {"pid": launcher, "started": started},
+    });
+    fs::write(&path, record.to_string()).expect("record");
+    let file = fs::OpenOptions::new().read(true).open(&path).expect("open");
+    file.lock().expect("lock");
+    file
+}
+
+/// A person sends mail as themselves, unsigned, from outside agent turns,
+/// while no person is enforced in the coordinator (DECISION 39,
+/// 2026-11-04): only as a well-formed lowercase `human:` name, never with
+/// `$MDKG_ACTOR` naming someone else, never from inside a turn (the turn
+/// mark, or a live launcher among its ancestors; the same for Claude,
+/// Codex and OpenCode turns, since the check doesn't depend on the
+/// harness), and each send's record says it carried no proof.
+#[test]
+fn a_person_sends_unsigned_mail_only_outside_agent_turns() {
+    let (dir, wa, wb) = two_worktrees();
+    let repo = dir.0.join("repo");
+    fn send<'a>(id: &'a str, kind: &'a str) -> [&'a str; 10] {
+        [
+            "msg", "send", "--to", "a", "--kind", kind, "--id", id, "--text", "hi",
+        ]
+    }
+    let with_env = |actor: Option<&str>, env: &[(&str, &str)], args: &[&str]| -> (i32, Value) {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_mdkg"));
+        isolated(&mut cmd).current_dir(&wa).arg("--root").arg(&wa);
+        if let Some(actor) = actor {
+            cmd.args(["--as", actor]);
+        }
+        cmd.args(args).arg("--json").env("MDKG_NOW_MS", "5");
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().expect("run mdkg");
+        let envelope: Value = serde_json::from_slice(&out.stdout).expect("json");
+        (out.status.code().unwrap_or(-1), envelope)
+    };
+
+    // Outside a turn: a note, and an answer, as the person, run from the
+    // fixture's worktree, as a person runs it.
+    let (code, sent) = with_env(Some("human:nick"), &[], &send("p1", "note"));
+    assert_eq!(code, 0, "{sent}");
+    assert_eq!(sent["data"]["message"]["sender"], "human:nick");
+    let mut answer = send("p2", "resolution").to_vec();
+    answer.extend(["--reply-to", "p1"]);
+    let (code, out) = with_env(Some("human:nick"), &[], &answer);
+    assert_eq!(code, 0, "{out}");
+    // Named by $MDKG_ACTOR alone, as every command takes it.
+    let (code, out) = with_env(
+        None,
+        &[("MDKG_ACTOR", "human:nick")],
+        &send("p3", "question"),
+    );
+    assert_eq!(code, 0, "{out}");
+
+    // Each person send's record has `person_proof: null`; an agent's has none.
+    ok(
+        &wa,
+        "a",
+        3,
+        &[
+            "msg", "send", "--to", "b", "--kind", "note", "--id", "a1", "--text", "x",
+        ],
+    );
+    let records = send_records(&repo);
+    for id in ["p1", "p2", "p3"] {
+        let r = &records[id];
+        assert_eq!(r["sender"], "human:nick", "{r}");
+        assert!(
+            r.get("person_proof").is_some_and(Value::is_null),
+            "{id}: {r}"
+        );
+    }
+    assert!(
+        records["a1"].get("person_proof").is_none(),
+        "{}",
+        records["a1"]
+    );
+
+    // Kinds a person doesn't send.
+    for kind in ["decision", "receipt", "fault"] {
+        let (code, out) = with_env(Some("human:nick"), &[], &send("k", kind));
+        assert_eq!(
+            (code, codes(&out)),
+            (1, vec!["msg.bad_kind".to_string()]),
+            "{kind}"
+        );
+    }
+    // Only the exact lowercase spelling is a person.
+    for actor in ["HUMAN:nick", "Human:nick"] {
+        let (code, out) = with_env(Some(actor), &[], &send("s", "note"));
+        assert_eq!(
+            (code, codes(&out)),
+            (1, vec!["msg.human_actor".to_string()]),
+            "{actor}"
+        );
+    }
+    // $MDKG_ACTOR naming an agent or another person can't speak for them.
+    for env in ["agent-x", "human:ann"] {
+        let (code, out) = with_env(
+            Some("human:nick"),
+            &[("MDKG_ACTOR", env)],
+            &send("i", "note"),
+        );
+        assert_eq!(
+            (code, codes(&out)),
+            (1, vec!["msg.human_actor".to_string()]),
+            "{env}"
+        );
+    }
+    // Inside a turn: the turn mark, and a live turn whose launcher is
+    // this test's process, so the mdkg it runs is the turn's descendant.
+    let (code, out) = with_env(
+        Some("human:nick"),
+        &[("MDKG_RUN_TURN", "1")],
+        &send("t1", "note"),
+    );
+    assert_eq!(
+        (code, codes(&out)),
+        (1, vec!["api.actor_not_allowed".to_string()]),
+        "{out}"
+    );
+    // A turn in another worktree whose launcher is this test's process,
+    // so the mdkg it runs is the turn's descendant.
+    let turn = live_turn(&repo, &wb, "lane-x", std::process::id());
+    let (code, out) = with_env(Some("human:nick"), &[], &send("t2", "note"));
+    assert_eq!(
+        (code, codes(&out)),
+        (1, vec!["api.actor_not_allowed".to_string()]),
+        "{out}"
+    );
+    drop(turn);
+    // A turn some other process launched doesn't refuse, even working in
+    // the worktree the send runs in: a person's mail isn't held up by an
+    // agent at work in the same checkout (Terra's review of 5bd42768,
+    // major 1).
+    let mut other = Command::new("sleep").arg("120").spawn().expect("sleep");
+    let turn = live_turn(&repo, &wa, "lane-x", other.id());
+    let (code, out) = with_env(Some("human:nick"), &[], &send("t3", "note"));
+    drop(turn);
+    assert_eq!(code, 0, "{out}");
+    // Nor one elsewhere.
+    let turn = live_turn(&repo, &wb, "lane-x", other.id());
+    let (code, out) = with_env(Some("human:nick"), &[], &send("t4", "note"));
+    drop(turn);
+    let _ = other.kill();
+    let _ = other.wait();
+    assert_eq!(code, 0, "{out}");
+
+    // Only the sends that passed reached the agent.
+    let inbox = ok(&wa, "a", 6, &["msg", "inbox"]);
+    assert_eq!(ids(&inbox), vec!["p1", "p2", "p3", "t3", "t4"]);
+}
+
+#[test]
+fn digest_reads_unacked_mail_without_marking_it_shown() {
+    let (_dir, wa, wb) = two_worktrees();
+    ok(
+        &wa,
+        "a",
+        1,
+        &[
+            "msg", "send", "--to", "b", "--kind", "note", "--id", "old", "--text", "first",
+        ],
+    );
+    ok(
+        &wa,
+        "a",
+        2,
+        &[
+            "msg",
+            "send",
+            "--to",
+            "b",
+            "--kind",
+            "note",
+            "--id",
+            "new",
+            "--supersedes",
+            "old",
+            "--text",
+            "replacement",
+        ],
+    );
+    let digest = ok(&wb, "b", 3, &["msg", "digest"]);
+    let text = digest["data"]["view"]["text"].as_str().expect("digest");
+    assert!(text.contains("replacement"), "{text}");
+    assert!(text.contains("superseded old"), "{text}");
+    assert!(!text.contains("first"), "{text}");
+    let (_, refused) = run(&wb, "b", 4, &["msg", "ack", "new"]);
+    assert_eq!(codes(&refused), ["msg.not_shown"]);
+}
+
+#[test]
+fn digest_reports_slot_replacements_and_leaves_old_delivery_acked() {
+    let (_dir, wa, wb) = two_worktrees();
+    for (id, text) in [
+        ("old-slot", "old body"),
+        ("middle-slot", "middle body"),
+        ("new-slot", "new body"),
+    ] {
+        ok(
+            &wa,
+            "a",
+            1,
+            &[
+                "msg", "send", "--to", "b", "--kind", "note", "--id", id, "--slot", "brief",
+                "--text", text,
+            ],
+        );
+    }
+    let digest = ok(&wb, "b", 2, &["msg", "digest"]);
+    let text = digest["data"]["view"]["text"].as_str().unwrap();
+    assert!(text.contains("superseded old-slot"), "{text}");
+    assert!(text.contains("superseded middle-slot"), "{text}");
+    assert!(
+        text.contains("new body") && !text.contains("old body"),
+        "{text}"
+    );
+    assert_eq!(
+        ids(&ok(&wb, "b", 3, &["msg", "inbox", "--no-mark"])),
+        ["new-slot"]
+    );
 }

@@ -33,10 +33,11 @@ use std::path::{Path, PathBuf};
 use clap::{Args, Subcommand};
 use mdkg_coord::Status;
 use mdkg_coord_sqlite::Store;
-use mdkg_coord_sqlite::ledger::{ExpiryPolicy, SendFlow};
+use mdkg_coord_sqlite::ledger::{ExpiryPolicy, NodeLink, SendFlow};
 use mdkg_coord_sqlite::mail::{
     self, Delivery, Inbox, InboxQuery, MailError, Message, Outgoing, Retention, Room, Shown, To,
 };
+use mdkg_coord_sqlite::mail_list;
 use mdkg_format::{Code, Diagnostic};
 use mdkg_graph::{ErrorKind, GraphError, config};
 
@@ -70,6 +71,8 @@ pub enum MsgCommand {
     /// Show your unacked mail (your mailbox and the roles you hold).
     #[command(after_help = examples!("msg inbox", "msg inbox --channel dev --json", "msg inbox --from orchestrator --kind question"))]
     Inbox(InboxArgs),
+    /// Compute the current mail digest without marking any message shown.
+    Digest(DigestArgs),
     /// Wait for mail; exits 6 if none arrives before the timeout.
     #[command(after_help = examples!("msg wait --timeout 300", "msg wait --after 42 --json"))]
     Wait(WaitArgs),
@@ -97,6 +100,14 @@ pub enum MsgCommand {
     /// Record a read-only sender's output (a file) as its message.
     #[command(after_help = examples!("msg import --from codex:run-7 --channel dev --kind findings review.json"))]
     Import(ImportArgs),
+    /// List mail across mailboxes by kind, read-only: no ack, no shown
+    /// mark, no purge. Only a person (`--as human:<name>`) runs it, outside
+    /// an agent's turn. A body whose retention is up reads as purged.
+    #[command(after_help = examples!(
+        "msg list --as human:nick --kind fault,review_request --json",
+        "msg list --as human:nick --channel dev --kind question --state any"
+    ))]
+    List(ListArgs),
     /// List send-time decision metadata without acknowledging mail.
     /// A row does not prove human approval or launcher promotion: the launcher
     /// revalidates against its own current configuration before using a decision.
@@ -263,16 +274,80 @@ pub struct InboxArgs {
     /// Acked mail too.
     #[arg(long)]
     all: bool,
-    /// List without counting as shown, for a reminder that shows headers
-    /// only (a hook, the MCP server): an ack of mail you were never shown
-    /// is refused, so read it without this first.
+    /// List without counting as shown or purging, for a reminder that
+    /// shows headers only (a hook): an ack of mail you were never shown is
+    /// refused, so read it without this first. The store may still be
+    /// created or upgraded; --read-only never writes it.
     #[arg(long)]
     no_mark: bool,
-    /// For the MCP server: record that these messages, each
-    /// `<seq>/<digest>/<id>` as listed, reached the reader (once its reply
-    /// is out), and list nothing.
-    #[arg(long, hide = true, value_delimiter = ',', conflicts_with = "no_mark")]
+    /// Record that exactly these messages reached you, each as
+    /// `<seq>/<digest>/<id>` from a `--no-mark` listing, so you may ack
+    /// them; list nothing. For a reader that delivers only some of what it
+    /// read: the MCP server once its reply is out, or a turn's lead read
+    /// (`--from <reports_to> --no-mark --limit 1`).
+    #[arg(long, value_delimiter = ',', conflicts_with_all = ["no_mark", "defer_mark"])]
     mark_shown: Vec<String>,
+    /// For the MCP server: list without marking, which it does itself
+    /// once its reply is out. Unlike --no-mark the read is a normal one,
+    /// so bodies past their retention are purged.
+    #[arg(long, hide = true, conflicts_with = "no_mark")]
+    defer_mark: bool,
+    /// Print JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct DigestArgs {
+    /// Read this held mailbox instead of all held mailboxes.
+    #[arg(long)]
+    mailbox: Option<String>,
+    /// Target rendered size in bytes.
+    #[arg(long, default_value_t = mdkg_run::policy::DIGEST_BUDGET as u64, value_parser = clap::value_parser!(u64).range(1..))]
+    budget: u64,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct DigestData {
+    pub mailbox: Option<String>,
+    pub agent: String,
+    pub budget: u64,
+    pub event_cursor: Option<String>,
+    pub view: mdkg_run::digest_view::View,
+}
+
+#[derive(Debug, Args)]
+pub struct ListArgs {
+    /// Only these kinds: repeat the flag or separate them with commas
+    /// (`--kind fault,review_request`). Receipts are left out unless this
+    /// names `receipt`.
+    #[arg(long, value_delimiter = ',')]
+    kind: Vec<String>,
+    /// Mail delivered to this channel's current members, and the posts to
+    /// it (repeatable). With neither this nor `--to`, every mailbox.
+    #[arg(long, value_name = "NAME")]
+    channel: Vec<String>,
+    /// Mail delivered to these mailboxes: repeat the flag or separate them
+    /// with commas.
+    #[arg(long, value_delimiter = ',')]
+    to: Vec<String>,
+    /// Only mail from these senders: repeat the flag or separate them with
+    /// commas.
+    #[arg(long, value_delimiter = ',')]
+    from: Vec<String>,
+    /// `unacked` (a delivery in scope is still unacked), `acked` (every
+    /// delivery in scope is acked) or `any`.
+    #[arg(long, default_value = "unacked")]
+    state: String,
+    /// Only mail after this cursor (the `cursor` a previous call returned).
+    #[arg(long)]
+    after: Option<u64>,
+    /// At most this many messages: 1 to 200 (default 50). A page also
+    /// stops before bodies past 1 MiB.
+    #[arg(long, allow_negative_numbers = true)]
+    limit: Option<i64>,
     /// Print JSON.
     #[arg(long)]
     json: bool,
@@ -288,6 +363,11 @@ pub struct WaitArgs {
     /// List without counting as shown (see `inbox --no-mark`).
     #[arg(long)]
     no_mark: bool,
+    /// For the MCP server: list without marking, which it does itself
+    /// once its reply is out. Unlike --no-mark the read is a normal one,
+    /// so bodies past their retention are purged.
+    #[arg(long, hide = true, conflicts_with = "no_mark")]
+    defer_mark: bool,
     /// Print JSON.
     #[arg(long)]
     json: bool,
@@ -385,6 +465,11 @@ pub struct ThreadArgs {
     /// List without counting as shown (see `inbox --no-mark`).
     #[arg(long)]
     no_mark: bool,
+    /// For the MCP server: list without marking, which it does itself
+    /// once its reply is out. Unlike --no-mark the read is a normal one,
+    /// so bodies past their retention are purged.
+    #[arg(long, hide = true, conflicts_with = "no_mark")]
+    defer_mark: bool,
     /// Print JSON.
     #[arg(long)]
     json: bool,
@@ -400,9 +485,18 @@ pub struct ImportArgs {
     /// The sender the output belongs to (for example `codex:<run>`).
     #[arg(long)]
     from: String,
-    /// The id of the message this answers.
+    /// The ids of the messages this answers (repeatable).
     #[arg(long = "reply-to")]
-    reply_to: Option<String>,
+    reply_to: Vec<String>,
+    /// Nodes the imported reply concerns (repeatable).
+    #[arg(long = "node")]
+    node: Vec<String>,
+    /// Stored node identities from a digest (not checkout-local handles).
+    #[arg(long = "node-id", hide = true)]
+    node_ids: Vec<String>,
+    /// Start a conversation even when the reply has cross-references.
+    #[arg(long, hide = true, conflicts_with = "context")]
+    standalone: bool,
     /// The conversation (default as for `send`).
     #[arg(long)]
     context: Option<String>,
@@ -431,11 +525,13 @@ impl MsgCommand {
             MsgCommand::Watch(a) => a.json,
             MsgCommand::Send(a) => a.json,
             MsgCommand::Inbox(a) => a.json,
+            MsgCommand::Digest(a) => a.json,
             MsgCommand::Wait(a) => a.json,
             MsgCommand::Ack(a) => a.json,
             MsgCommand::Forward(a) => a.json,
             MsgCommand::Thread(a) => a.json,
             MsgCommand::Import(a) => a.json,
+            MsgCommand::List(a) => a.json,
             MsgCommand::Decisions { json, .. } => *json,
         }
     }
@@ -446,11 +542,13 @@ impl MsgCommand {
             MsgCommand::Watch(_) => "msg.watch",
             MsgCommand::Send(_) => "msg.send",
             MsgCommand::Inbox(_) => "msg.inbox",
+            MsgCommand::Digest(_) => "msg.digest",
             MsgCommand::Wait(_) => "msg.wait",
             MsgCommand::Ack(_) => "msg.ack",
             MsgCommand::Forward(_) => "msg.forward",
             MsgCommand::Thread(_) => "msg.thread",
             MsgCommand::Import(_) => "msg.import",
+            MsgCommand::List(_) => "msg.list",
             MsgCommand::Decisions { .. } => "msg.decisions",
         }
     }
@@ -615,6 +713,12 @@ pub struct MessageRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(with = "Option<mdkg_run::approval::Provenance>")]
     pub decision: Option<Value>,
+    /// Nodes bound to this message.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub nodes: Vec<String>,
+    /// Earlier deliveries in this replacement chain for the held mailboxes.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub supersedes: Vec<String>,
 }
 
 fn delivery_record(d: &Delivery) -> DeliveryRecord {
@@ -655,7 +759,28 @@ fn message_record(m: &Message) -> MessageRecord {
         sent_at_ms: m.sent_ms,
         deliveries: m.deliveries.iter().map(delivery_record).collect(),
         decision: m.decision.clone(),
+        nodes: Vec::new(),
+        supersedes: Vec::new(),
     }
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ListData {
+    /// Event-stream head from the same snapshot; separate from the mail
+    /// cursor. Absent when there's no store yet.
+    #[serde(rename = "event_cursor", skip_serializing_if = "Option::is_none")]
+    pub event_cursor: Option<String>,
+    /// The channels asked for.
+    pub channels: Vec<String>,
+    /// The mailboxes the scope resolved to: `--to` and the channels'
+    /// current members. Empty: every mailbox.
+    pub mailboxes: Vec<String>,
+    /// Oldest first. A body whose retention is up reads as purged.
+    pub messages: Vec<MessageRecord>,
+    /// Pass back as `--after` for the next page.
+    pub cursor: u64,
+    /// More matched than this page holds.
+    pub more: bool,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -975,8 +1100,9 @@ fn mail_error(e: MailError) -> GraphError {
             .with_hint("ack only mail delivered to you or to a role you hold"),
         MailError::NotShown(_) => GraphError::conflict(Code::MsgNotShown, message).with_hint(
             format!(
-                "read it first (`{BIN} msg inbox`, or `{BIN} msg thread <id>`), then ack; nothing \
-                 was acked"
+                "read it first (`{BIN} msg inbox`, or `{BIN} msg thread <id>`), then ack; a \
+                 client that showed it from a `--no-mark` or `msg list` read records that with \
+                 `{BIN} msg inbox --mark-shown <seq>/<digest>/<id>`; nothing was acked"
             ),
         ),
         MailError::NoRecipients => GraphError::usage(Code::MsgNoRecipients, message)
@@ -1238,7 +1364,7 @@ pub(crate) fn check_actor(actor: &str) -> Result<(), GraphError> {
         )
         .with_hint(
             "an agent acts as itself, and a human's answer goes in a `decision` it sends; \
-             a human may only ack, read (`msg inbox|wait|thread`) and leave a channel",
+             a human may only ack, read (`msg inbox|wait|thread`), leave a channel and send mail (`msg send`, outside agent turns)",
         ));
     }
     if has_prefix(actor, "mdkg:") {
@@ -1581,20 +1707,6 @@ fn check_outcome(outcome: &str) -> Result<(), GraphError> {
     Ok(())
 }
 
-/// Every string in a body, unescaped: text, URLs and the strings inside
-/// data, so a credential at a line start or after a tab is seen as typed.
-fn strings_in<'a>(v: &'a Value, out: &mut Vec<&'a str>) {
-    match v {
-        Value::String(s) => out.push(s),
-        Value::Array(a) => a.iter().for_each(|x| strings_in(x, out)),
-        Value::Object(o) => o.iter().for_each(|(k, x)| {
-            out.push(k);
-            strings_in(x, out);
-        }),
-        _ => {}
-    }
-}
-
 /// Checks a body: at least one part, under the size cap, no credentials.
 fn check_body(parts: &Value) -> Result<(), GraphError> {
     if parts.as_array().is_none_or(Vec::is_empty) {
@@ -1610,9 +1722,7 @@ fn check_body(parts: &Value) -> Result<(), GraphError> {
         )
         .with_hint("send a URL or a path instead of the content"));
     }
-    let mut strings = Vec::new();
-    strings_in(parts, &mut strings);
-    if strings.iter().any(|s| looks_secret(s)) {
+    if crate::credentials::value_looks_secret(parts) {
         return Err(usage(
             Code::MsgSecretRefused,
             "the body looks like it holds a credential; nothing was stored",
@@ -1750,6 +1860,40 @@ fn open(root: &Path) -> Result<(Repo, Store), GraphError> {
     Ok((repo, store))
 }
 
+/// Whether a mail read leaves the store as it is: asked with `--no-mark`,
+/// or under `--read-only`.
+fn marks_nothing(no_mark: bool) -> bool {
+    no_mark || mdkg_coord_sqlite::store_writes_forbidden()
+}
+
+/// The store for a read that marks nothing ([`marks_nothing`]): its reads
+/// purge nothing and append no record, showing due bodies as purged
+/// ([`Store::set_pure_reads`]). Under `--read-only` it's opened read-only,
+/// never created, upgraded or recovered; a store that doesn't exist yet is
+/// refused with `store.read_only`, since only a write would make one.
+fn open_reader(root: &Path) -> Result<(Repo, Store), GraphError> {
+    let repo = Repo::open(root)?;
+    if !mdkg_coord_sqlite::store_writes_forbidden() {
+        let mut store = repo.store()?;
+        store.set_pure_reads();
+        return Ok((repo, store));
+    }
+    let path = mdkg_coord_sqlite::git::store_path(&repo.top).map_err(crate::coord::git_error)?;
+    crate::coord::unreachable_store(&path)?;
+    let store = Store::open_read_only(&path)
+        .map_err(|e| crate::coord::store_error_in(e, Some(repo.command_root())))?
+        .ok_or_else(|| {
+            GraphError::usage(
+                Code::StoreReadOnly,
+                "this repository has no coordinator store yet, and --read-only won't create one",
+            )
+            .with_hint(
+                "any command run without --read-only creates it; until then there is no mail",
+            )
+        })?;
+    Ok((repo, store))
+}
+
 /// The store for commands that ack or send (and so may end a body):
 /// [`mail_store`], which checks the grace, like `human_hold_days`.
 fn open_writer(root: &Path) -> Result<(Repo, Store), GraphError> {
@@ -1807,6 +1951,54 @@ pub(crate) fn receipt_activity(
         store
             .activity_since(cursor, actor, now_ms())
             .map_err(|e| GraphError::failure(Code::CoordStoreFailed, e.to_string()))
+    })
+}
+
+/// [`mdkg_run::Mail::sent_to`]: the highest number of a message `from`
+/// sent after `after` that answers `answers` (an answer kind, to its
+/// sender, replying to it or in its context), read-only (as `msg list`
+/// reads), or `after` when there's none.
+pub(crate) fn sent_to(
+    mail: &mdkg_run::CliMail,
+    from: &str,
+    answers: &mdkg_run::mail::Message,
+    after: u64,
+) -> Result<u64, mdkg_run::RunError> {
+    receipt_operation(mail, || {
+        check_actor(from)?;
+        check_mailbox(&answers.sender)?;
+        let repo = Repo::open(&mail.root)?;
+        let path = mdkg_coord_sqlite::git::store_path(&repo.top)
+            .map_err(|e| store_error(mdkg_coord_sqlite::StoreError::from(e)))?;
+        let mut cursor = after;
+        let mut found = after;
+        loop {
+            let q = mail_list::ListQuery {
+                kinds: mdkg_run::mail::ANSWER_KINDS
+                    .iter()
+                    .map(|k| k.to_string())
+                    .collect(),
+                channels: Vec::new(),
+                to: vec![answers.sender.clone()],
+                senders: vec![from.to_string()],
+                state: mail_list::ListState::Any,
+                after: cursor,
+                limit: mail_list::LIST_MAX,
+                now_ms: now_ms(),
+            };
+            let page = mail_list::read_list(&path, &q).map_err(mail_error)?;
+            for m in &page.messages {
+                let replies = m.reference_ids.contains(&answers.message_id);
+                let same_context = answers.context_id.as_deref() == Some(m.context_id.as_str());
+                if replies || same_context {
+                    found = found.max(m.seq);
+                }
+            }
+            cursor = page.cursor.max(cursor);
+            if !page.more {
+                return Ok(found);
+            }
+        }
     })
 }
 
@@ -1928,7 +2120,16 @@ fn send_report(
     a: &SendArgs,
 ) -> Result<Report<SendData>, GraphError> {
     let repo = Repo::open(root)?;
-    let sender = agent(&repo, actor)?;
+    // A person sends as themselves, unsigned, while no person is
+    // enforced here (DECISION 39, 2026-11-04); an agent as itself.
+    let person = human_actor(&repo, &actor)?.map(|(human, _)| human);
+    let sender = match &person {
+        Some(human) => {
+            unsigned_person_send(&repo, human, &a.kind)?;
+            human.clone()
+        }
+        None => agent(&repo, actor)?,
+    };
     check_sent_kind(&a.kind, &sender, true)?;
     let (decision, warnings) = if a.kind == "decision" {
         let (grant, warnings) = authority_decision::grant(
@@ -2012,6 +2213,9 @@ fn send_report(
         )?);
     }
     let mut store = mail_store(&repo)?;
+    if person.is_some() {
+        refuse_if_enforced(person_enforced(&store))?;
+    }
     let config = committed_config(&repo)?;
     let out = Outgoing {
         message_id,
@@ -2173,14 +2377,108 @@ fn inbox_query(
     })
 }
 
-fn inbox_data(q: &InboxQuery, inbox: &Inbox) -> InboxData {
-    InboxData {
+fn inbox_data(store: &mut Store, q: &InboxQuery, inbox: &Inbox) -> Result<InboxData, GraphError> {
+    let messages = inbox
+        .messages
+        .iter()
+        .map(|m| {
+            let mut record = message_record(m);
+            let flow = store.message_flow(&m.message_id).map_err(ledger_error)?;
+            record.nodes = flow.nodes.into_iter().map(|n| n.id).collect();
+            let mut pending: Vec<_> = flow
+                .supersedes
+                .into_iter()
+                .map(|id| (id, m.message_id.clone()))
+                .collect();
+            let mut seen = std::collections::BTreeSet::new();
+            while let Some((id, replacement)) = pending.pop() {
+                if seen.contains(&id) {
+                    continue;
+                }
+                let earlier = store.message(&id, q.now_ms).map_err(mail_error)?;
+                if earlier.deliveries.iter().any(|d| {
+                    q.mailboxes.contains(&d.mailbox)
+                        && d.acked_via.as_deref() == Some("supersede")
+                        && d.outcome.as_deref()
+                            == Some(format!("superseded by {replacement}").as_str())
+                }) {
+                    seen.insert(id.clone());
+                    let previous = store.message_flow(&id).map_err(ledger_error)?;
+                    pending.extend(previous.supersedes.into_iter().map(|old| (old, id.clone())));
+                    record.supersedes.push(id);
+                }
+            }
+            Ok(record)
+        })
+        .collect::<Result<Vec<_>, GraphError>>()?;
+    Ok(InboxData {
         event_cursor: Some(inbox.event_cursor.clone()),
         mailboxes: q.mailboxes.clone(),
-        messages: inbox.messages.iter().map(message_record).collect(),
+        messages,
         cursor: inbox.cursor,
         more: inbox.more,
+    })
+}
+
+fn digest_report(
+    root: &Path,
+    actor: Option<String>,
+    a: &DigestArgs,
+) -> Result<Report<DigestData>, GraphError> {
+    let (repo, mut store) = open_reader(root)?;
+    let agent = reader(&repo, actor, a.mailbox.as_deref())?;
+    if let Some(mailbox) = &a.mailbox {
+        check_mailbox(mailbox)?;
     }
+    let mut q = InboxQuery {
+        mailboxes: Vec::new(),
+        room: None,
+        kinds: Vec::new(),
+        room_kinds: Vec::new(),
+        after: None,
+        all: false,
+        limit: Some(1000),
+        now_ms: now_ms(),
+    };
+    let mut messages = Vec::new();
+    let event_cursor = loop {
+        let (page, mailboxes) = store
+            .inbox_from_for_actor(&q, &[], &agent, a.mailbox.as_deref(), now_ms)
+            .map_err(mail_error)?;
+        q.mailboxes = mailboxes;
+        let records = inbox_data(&mut store, &q, &page)?.messages;
+        for record in records {
+            let value = serde_json::to_value(record)
+                .map_err(|e| usage(Code::UsageInvalidArguments, e.to_string()))?;
+            messages.push(serde_json::from_value(value).map_err(|e| {
+                usage(
+                    Code::UsageInvalidArguments,
+                    format!("invalid mail record: {e}"),
+                )
+            })?);
+        }
+        if !page.more {
+            break Some(page.event_cursor.clone());
+        }
+        if q.after == Some(page.cursor) {
+            return Err(usage(
+                Code::UsageInvalidArguments,
+                "mail pagination did not advance",
+            ));
+        }
+        q.after = Some(page.cursor);
+    };
+    messages.retain(|m: &mdkg_run::Message| m.sender != agent && !m.sender.contains(','));
+    let budget = usize::try_from(a.budget).unwrap_or(usize::MAX);
+    let view = mdkg_run::digest_view::compute(&messages, budget, usize::MAX)
+        .map_err(|e| usage(Code::UsageInvalidArguments, e))?;
+    Ok(Report::ok(DigestData {
+        mailbox: a.mailbox.clone(),
+        agent,
+        budget: a.budget,
+        event_cursor,
+        view,
+    }))
 }
 
 fn print_inbox(d: &InboxData) {
@@ -2194,16 +2492,204 @@ fn print_inbox(d: &InboxData) {
     println!("cursor {}{more}", d.cursor);
 }
 
+/// `msg list` (edd-01a1a1f1): a person's read across mailboxes. The
+/// store file is opened read-only, so nothing in it changes: no ack, no
+/// shown mark, no purge, no log record.
+fn list_report(
+    root: &Path,
+    actor: Option<String>,
+    a: &ListArgs,
+) -> Result<Report<ListData>, GraphError> {
+    let repo = Repo::open(root)?;
+    list_reader(&repo, &actor)?;
+    let state = mail_list::ListState::parse(&a.state).ok_or_else(|| {
+        usage(
+            Code::UsageInvalidArguments,
+            "--state is unacked, acked or any",
+        )
+    })?;
+    let limit = match check_limit(a.limit)? {
+        None => mail_list::LIST_DEFAULT,
+        Some(n) if n <= mail_list::LIST_MAX => n,
+        Some(_) => {
+            return Err(usage(
+                Code::UsageBadLimit,
+                format!("--limit is at most {}", mail_list::LIST_MAX),
+            )
+            .with_hint("read the next page with --after <cursor>"));
+        }
+    };
+    // As `msg inbox` checks them: a kind no build sends (a typo) would
+    // otherwise match nothing and read as no open mail.
+    for k in &a.kind {
+        check_kind(k)?;
+    }
+    for s in &a.from {
+        check_sender(s)?;
+    }
+    for channel in &a.channel {
+        check_room(channel)?;
+    }
+    for mailbox in &a.to {
+        check_mailbox(mailbox)?;
+    }
+    let path = mdkg_coord_sqlite::git::store_path(&repo.top)
+        .map_err(|e| store_error(mdkg_coord_sqlite::StoreError::from(e)))?;
+    let q = mail_list::ListQuery {
+        kinds: a.kind.clone(),
+        channels: a.channel.clone(),
+        to: a.to.clone(),
+        senders: a.from.clone(),
+        state,
+        after: a.after.unwrap_or(0),
+        limit,
+        now_ms: now_ms(),
+    };
+    let listing = mail_list::read_list(&path, &q).map_err(mail_error)?;
+    Ok(Report::ok(ListData {
+        event_cursor: listing.event_cursor,
+        channels: a.channel.clone(),
+        mailboxes: listing.mailboxes,
+        messages: listing.messages.iter().map(message_record).collect(),
+        cursor: listing.cursor,
+        more: listing.more,
+    }))
+}
+
+/// Only a person reads across mailboxes, and never from inside an agent's
+/// turn (edd-01a1a1f1 L2; dec-01a18ee0 item 26): the outside-turn check
+/// decisions use. Like every turn check, a guard rail, not a boundary.
+fn list_reader(repo: &Repo, actor: &Option<String>) -> Result<(), GraphError> {
+    let refuse = |message: &str| {
+        usage(Code::ApiActorNotAllowed, message).with_hint(
+            "run it as a person (`--as human:<name>`) from your own shell, outside an \
+             agent's turn; an agent reads its own mail with `msg inbox`",
+        )
+    };
+    // `--as`, then `$MDKG_ACTOR`, then the folder's name, as every
+    // command resolves its actor.
+    let person = human_actor(repo, actor)?
+        .map(|(human, _)| human)
+        .filter(|a| a.starts_with("human:") && check_mailbox(a).is_ok());
+    let Some(person) = person else {
+        return Err(refuse(
+            "msg list reads across mailboxes, which only a person may do",
+        ));
+    };
+    let common = crate::coord::graph_git::git::common_dir(&repo.top)
+        .map_err(|_| refuse("msg list can't identify the coordinator"))?;
+    let cwd = std::env::current_dir()
+        .map_err(|_| refuse("msg list can't identify the working folder"))?;
+    mdkg_run::approval::outside_turn(
+        &common,
+        &person,
+        &[&repo.top, &cwd],
+        std::env::var_os(mdkg_run::profile::TURN_MARK).is_some(),
+    )
+    .map_err(|_| refuse("msg list is refused inside an agent's turn"))
+}
+
+/// A person's unsigned `msg send` (DECISION 39, 2026-11-04): only as a
+/// well-formed lowercase `human:` name (`human_actor` has already refused
+/// a `$MDKG_ACTOR` naming anyone else), of the kinds people and agents
+/// send each other, `resolution` (an answer) among them, and never from
+/// inside an agent's turn: the turn mark, a live turn's actor and the
+/// launcher ancestry ledger decisions check, but not their checkout rule,
+/// which would refuse every person send over the socket while any agent
+/// works in the served checkout. Like
+/// every turn check it's a guard rail, not a boundary: a process an agent
+/// detaches from its turn isn't caught, the accepted cost until a person
+/// is enforced ([`person_enforced`]).
+fn unsigned_person_send(repo: &Repo, person: &str, kind: &str) -> Result<(), GraphError> {
+    let refuse = |message: &str| {
+        usage(Code::ApiActorNotAllowed, message).with_hint(
+            "send as a person (`--as human:<name>`) from your own shell, outside an \
+             agent's turn; an agent sends as itself",
+        )
+    };
+    if !person.starts_with("human:") || check_mailbox(person).is_err() {
+        return Err(refuse(
+            "a person sends only as a well-formed lowercase human:<name>",
+        ));
+    }
+    if kind == "decision" || mail::RESERVED_KINDS.contains(&kind) {
+        return Err(usage(Code::MsgBadKind, "a person doesn't send that kind")
+            .with_hint("send a question, note, handoff, findings, review_request or resolution"));
+    }
+    let common = crate::coord::graph_git::git::common_dir(&repo.top)
+        .map_err(|_| refuse("msg send can't identify the coordinator"))?;
+    let cwd = std::env::current_dir()
+        .map_err(|_| refuse("msg send can't identify the working folder"))?;
+    mdkg_run::approval::outside_turn_by_ancestry(
+        &common,
+        person,
+        &[&repo.top, &cwd],
+        std::env::var_os(mdkg_run::profile::TURN_MARK).is_some(),
+    )
+    .map_err(|_| refuse("a person's mail is refused inside an agent's turn"))
+}
+
+/// Whether any person is enforced in this coordinator, so a person's
+/// unsigned write is refused. This store schema has no person tables, so
+/// none is; person keys make it real (a person's enforcement rows, and a
+/// policy file's `require`).
+fn person_enforced(_store: &Store) -> bool {
+    #[cfg(test)]
+    if FORCE_ENFORCED.with(std::cell::Cell::get) {
+        return true;
+    }
+    false
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The test seam: makes [`person_enforced`] answer true.
+    static FORCE_ENFORCED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Refuses a person's unsigned write once a person is enforced.
+fn refuse_if_enforced(enforced: bool) -> Result<(), GraphError> {
+    if enforced {
+        return Err(usage(
+            Code::PersonProofRequired,
+            "a person is enforced in this coordinator, so a person's unsigned mail is refused",
+        )
+        .with_hint("sign the write with a key registered to that person"));
+    }
+    Ok(())
+}
+
+/// Whether `actor` reads `mailbox` as someone else's: an agent reading a
+/// person's mailbox, which it may, but whose shown marks are that
+/// person's alone (#20942). A person reads only their own.
+fn reads_for_another(actor: &str, mailbox: Option<&str>) -> bool {
+    mailbox.is_some_and(|m| is_human(m) && m != actor)
+}
+
+/// `msg inbox`'s report, and whether what it lists may be marked shown.
 fn inbox_report(
     root: &Path,
     actor: Option<String>,
     a: &InboxArgs,
-) -> Result<Report<InboxData>, GraphError> {
+) -> Result<(Report<InboxData>, bool), GraphError> {
     let limit = check_limit(a.filters.limit)?;
-    let (repo, mut store) = open(root)?;
+    // Marking writes, even under --read-only, which refuses it.
+    let (repo, mut store) = if a.mark_shown.is_empty() && marks_nothing(a.no_mark) {
+        open_reader(root)?
+    } else {
+        open(root)?
+    };
     let actor = reader(&repo, actor, a.filters.mailbox.as_deref())?;
+    let marks = !reads_for_another(&actor, a.filters.mailbox.as_deref());
     let mut q = inbox_query(&a.filters, limit, a.all, now_ms())?;
     if !a.mark_shown.is_empty() {
+        if !marks {
+            return Err(GraphError::conflict(
+                Code::MsgNotHolder,
+                "only that person marks their mail shown",
+            )
+            .with_hint("read it as them (`--as human:<name>`), or mark your own mailbox"));
+        }
         q.mailboxes = read_mailboxes(&store, &actor, a.filters.mailbox.as_deref(), q.now_ms)?;
         let listed = a
             .mark_shown
@@ -2220,13 +2706,16 @@ fn inbox_report(
         store
             .mark_shown(&listed, &q.mailboxes, q.now_ms)
             .map_err(mail_error)?;
-        return Ok(Report::ok(InboxData {
-            event_cursor: None,
-            mailboxes: q.mailboxes.clone(),
-            messages: Vec::new(),
-            cursor: q.after.unwrap_or(0),
-            more: false,
-        }));
+        return Ok((
+            Report::ok(InboxData {
+                event_cursor: None,
+                mailboxes: q.mailboxes.clone(),
+                messages: Vec::new(),
+                cursor: q.after.unwrap_or(0),
+                more: false,
+            }),
+            false,
+        ));
     }
     let (inbox, mailboxes) = store
         .inbox_from_for_actor(
@@ -2238,7 +2727,7 @@ fn inbox_report(
         )
         .map_err(mail_error)?;
     q.mailboxes = mailboxes;
-    Ok(Report::ok(inbox_data(&q, &inbox)))
+    Ok((Report::ok(inbox_data(&mut store, &q, &inbox)?), marks))
 }
 
 /// How often `wait` looks: `$MDKG_WAIT_POLL_MS`, else once a second.
@@ -2250,14 +2739,31 @@ fn poll_interval() -> std::time::Duration {
     std::time::Duration::from_millis(ms.max(10))
 }
 
+/// The wait's report, and the store it read: in ref mode `root` is the
+/// graph cache, which can't be opened again once unbound, so what the
+/// report lists is marked shown through this store (review of 16af71e1).
+/// `msg wait`'s report, its store, and whether what it lists may be
+/// marked shown ([`reads_for_another`]).
 fn wait_report(
     root: &Path,
     actor: Option<String>,
     a: &WaitArgs,
-) -> Result<Report<InboxData>, GraphError> {
+) -> Result<(Report<InboxData>, Store, bool), GraphError> {
     let most = check_limit(a.filters.limit)?;
-    let (repo, mut store) = open(root)?;
+    let (repo, mut store) = if marks_nothing(a.no_mark) {
+        open_reader(root)?
+    } else {
+        open(root)?
+    };
     let actor = reader(&repo, actor, a.filters.mailbox.as_deref())?;
+    let marks = !reads_for_another(&actor, a.filters.mailbox.as_deref());
+    // In ref mode the command was bound to the graph cache, whose shared
+    // lock would otherwise last the whole wait and keep every graph write
+    // (and a `status` that refreshes the cache) waiting. The loop reads
+    // only the store, with the actor resolved above, as `msg watch` does.
+    // `repo` holds the binding too.
+    drop(repo);
+    crate::coord::graph_git::unbind();
     let started = std::time::Instant::now();
     let limit = std::time::Duration::from_secs(a.timeout);
     loop {
@@ -2277,7 +2783,11 @@ fn wait_report(
             .map_err(mail_error)?;
         q.mailboxes = mailboxes;
         if !inbox.messages.is_empty() {
-            return Ok(Report::ok(inbox_data(&q, &inbox)));
+            return Ok((
+                Report::ok(inbox_data(&mut store, &q, &inbox)?),
+                store,
+                marks,
+            ));
         }
         if started.elapsed() >= limit {
             return Err(GraphError::new(
@@ -2587,7 +3097,11 @@ fn thread_report(
     let tail = tail.or_else(|| (limit.is_none() && a.after.is_none()).then_some(DEFAULT_PAGE));
     let limit = limit.or_else(|| tail.is_none().then_some(DEFAULT_PAGE));
     let tail_ask = tail.map(|t| t.saturating_add(1));
-    let (repo, mut store) = open(root)?;
+    let (repo, mut store) = if marks_nothing(a.no_mark) {
+        open_reader(root)?
+    } else {
+        open(root)?
+    };
     // Anyone reads threads; a human must still be one (main.rs lets them
     // through to here).
     human_actor(&repo, &actor)?;
@@ -2688,7 +3202,7 @@ fn import_report(
         check_message_id(c)?;
         not_an_import(c)?;
     }
-    if let Some(r) = &a.reply_to {
+    for r in &a.reply_to {
         check_message_id(r)?;
     }
     let to = destination(&a.target)?;
@@ -2718,7 +3232,7 @@ fn import_report(
         },
         via: Some(writer),
         to,
-        reference_ids: a.reply_to.iter().cloned().collect(),
+        reference_ids: a.reply_to.clone(),
         parts,
         retention: retention(&config)?,
         human_hold_days: human_hold_days(&config)?,
@@ -2726,10 +3240,47 @@ fn import_report(
     };
     // The id is the request's digest, so re-importing the same output for
     // the same request is a no-op, whoever writes it.
-    let digest = mail::request_id(&out).map_err(mail_error)?;
+    let mut nodes = crate::entry::send_nodes(&repo, &a.node)?;
+    for id in &a.node_ids {
+        let node = NodeLink::of(id).map_err(|_| {
+            usage(
+                Code::NodeNotFound,
+                "a stored node identity must contain a UUID",
+            )
+        })?;
+        if !nodes.iter().any(|existing| existing.uuid == node.uuid) {
+            nodes.push(node);
+        }
+    }
+    let request = mail::request_id(&out).map_err(mail_error)?;
+    let digest = if nodes.is_empty() && !a.standalone {
+        request
+    } else if a.node_ids.is_empty() && !a.standalone {
+        mdkg_format::hash::Digest::of_record(&json!({"request": request, "nodes": a.node}))
+            .map_err(|e| usage(Code::UsageInvalidArguments, e.to_string()))?
+            .to_string()
+    } else {
+        mdkg_format::hash::Digest::of_record(&json!({"request": request, "nodes": nodes.iter().map(|n| &n.id).collect::<Vec<_>>(), "standalone": a.standalone}))
+            .map_err(|e| usage(Code::UsageInvalidArguments, e.to_string()))?
+            .to_string()
+    };
     let hex = digest.strip_prefix("sha256:").unwrap_or(&digest);
     out.message_id = format!("import:{}", &hex[..32]);
-    let (message, duplicate) = store.send(&out).map_err(mail_error)?;
+    if a.standalone {
+        out.context_id = Some(out.message_id.clone());
+    }
+    let (message, duplicate) = if nodes.is_empty() {
+        store.send(&out).map_err(mail_error)?
+    } else {
+        let flow = SendFlow {
+            nodes,
+            ..SendFlow::default()
+        };
+        let (message, duplicate, _) = store
+            .send_flow(&out, &flow, &ExpiryPolicy::default(), &mut |_, _| Ok(()))
+            .map_err(mail_error)?;
+        (message, duplicate)
+    };
     Ok(Report::ok(SendData {
         message: message_record(&message),
         duplicate,
@@ -2745,6 +3296,19 @@ pub fn run(root: &Path, actor: Option<String>, cmd: &mut MsgCommand) -> u8 {
     let name = cmd.name();
     match cmd {
         MsgCommand::Watch(args) => watch::run(root, args),
+        MsgCommand::List(a) => {
+            let r = list_report(root, actor, a).unwrap_or_else(Report::failed);
+            output::emit(name, json, compatibility(r, legacy), |d| {
+                if d.messages.is_empty() {
+                    println!("no mail matches");
+                }
+                for m in &d.messages {
+                    print_message(m);
+                }
+                let more = if d.more { " (more: pass --after)" } else { "" };
+                println!("cursor {}{more}", d.cursor);
+            })
+        }
         MsgCommand::Decisions {
             after,
             limit,
@@ -2784,20 +3348,33 @@ pub fn run(root: &Path, actor: Option<String>, cmd: &mut MsgCommand) -> u8 {
             output::emit(name, json, compatibility(r, legacy), print_sent)
         }
         MsgCommand::Inbox(a) => {
-            let r = inbox_report(root, actor, a).unwrap_or_else(Report::failed);
+            let (r, marks) =
+                inbox_report(root, actor, a).unwrap_or_else(|e| (Report::failed(e), false));
             let listed = listed_in(&r);
             let code = output::emit(name, json, compatibility(r, legacy), print_inbox);
-            if !a.no_mark && a.mark_shown.is_empty() {
+            if marks && !marks_nothing(a.no_mark) && !a.defer_mark && a.mark_shown.is_empty() {
                 mark_listed(root, listed);
             }
             code
         }
+        MsgCommand::Digest(a) => {
+            let r = digest_report(root, actor, a).unwrap_or_else(Report::failed);
+            output::emit(name, json, compatibility(r, legacy), |d| {
+                print!("{}", d.view.text)
+            })
+        }
         MsgCommand::Wait(a) => {
-            let r = wait_report(root, actor, a).unwrap_or_else(Report::failed);
+            let (r, store) = match wait_report(root, actor, a) {
+                Ok((r, store, marks)) => (r, marks.then_some(store)),
+                Err(e) => (Report::failed(e), None),
+            };
             let listed = listed_in(&r);
             let code = output::emit(name, json, compatibility(r, legacy), print_inbox);
-            if !a.no_mark {
-                mark_listed(root, listed);
+            if !marks_nothing(a.no_mark)
+                && !a.defer_mark
+                && let Some(mut store) = store
+            {
+                mark_listed_in(&mut store, listed);
             }
             code
         }
@@ -2848,7 +3425,7 @@ pub fn run(root: &Path, actor: Option<String>, cmd: &mut MsgCommand) -> u8 {
                 .as_ref()
                 .map(|d| d.messages.iter().map(shown).collect())
                 .unwrap_or_default();
-            let no_mark = a.no_mark;
+            let no_mark = marks_nothing(a.no_mark) || a.defer_mark;
             let after = move || {
                 if !no_mark && !listed.is_empty() {
                     mark_read(root, actor, listed);
@@ -2912,6 +3489,13 @@ fn mark_listed(root: &Path, listed: Option<Listed>) {
         return;
     };
     if let Ok((_, mut store)) = open(root) {
+        store.mark_shown(&seqs, &mailboxes, now_ms()).ok();
+    }
+}
+
+/// [`mark_listed`] through a store already open.
+fn mark_listed_in(store: &mut Store, listed: Option<Listed>) {
+    if let Some((seqs, mailboxes)) = listed {
         store.mark_shown(&seqs, &mailboxes, now_ms()).ok();
     }
 }
@@ -3163,6 +3747,112 @@ pub(crate) fn send_direct(
 mod tests {
     use super::*;
 
+    /// The enforcement hook (DECISION 39, 2026-11-04): no person is
+    /// enforced at this store schema, and once one is, a person's
+    /// unsigned send is refused with `person.proof_required` before the
+    /// store holds anything of it. Sent through `send_report` in a child
+    /// process with no turn mark and no `$MDKG_ACTOR`, so the turn this
+    /// test may run in doesn't refuse the send first.
+    #[test]
+    fn an_enforced_person_s_unsigned_send_is_refused_before_the_store() {
+        let dir =
+            std::env::temp_dir().join(format!("mdkg-person-enforced-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("README.md"), "x\n").unwrap();
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .status()
+                .is_ok_and(|s| s.success());
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "c"]);
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        let home = dir.join(".home");
+        std::fs::create_dir(&home).unwrap();
+        let out = std::process::Command::new(std::env::current_exe().expect("exe"))
+            .args([
+                "--exact",
+                "msg::tests::a_person_s_send_in_a_child_process",
+                "--test-threads=1",
+            ])
+            .current_dir(&dir)
+            .env_remove(mdkg_run::profile::TURN_MARK)
+            .env_remove("MDKG_ACTOR")
+            .env_remove("MDKG_TRUSTED_WORKTREE")
+            .env_remove("MDKG_TRUSTED_COMMON_DIR")
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("XDG_DATA_HOME", home.join(".local/share"))
+            .env("CODEX_HOME", home.join(".codex"))
+            .env("MDKG_TEST_PERSON_SEND_DIR", &dir)
+            .output()
+            .expect("child");
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success() && text.contains("1 passed"), "{out:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The child half of the test above; run alone it has no repository
+    /// to send in, and passes.
+    #[test]
+    fn a_person_s_send_in_a_child_process() {
+        let Some(dir) = std::env::var_os("MDKG_TEST_PERSON_SEND_DIR") else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        let crate::Command::Init(init) =
+            <crate::Cli as clap::Parser>::try_parse_from(["mdkg", "init", "--json"])
+                .expect("init args")
+                .command
+        else {
+            unreachable!("init")
+        };
+        assert_eq!(crate::init::run(&dir, &init), 0, "init");
+        #[derive(clap::Parser)]
+        struct Send {
+            #[command(flatten)]
+            a: SendArgs,
+        }
+        let args = |id: &str| {
+            <Send as clap::Parser>::try_parse_from([
+                "send", "--to", "a", "--kind", "note", "--id", id, "--text", "hi",
+            ])
+            .expect("args")
+            .a
+        };
+        let person = || Some("human:ana".to_string());
+        let id = |n: u8| format!("01a1aa00-0000-7000-8000-00000000000{n}");
+        // Enforced: refused, and nothing of it is stored.
+        FORCE_ENFORCED.with(|f| f.set(true));
+        let refused = send_report(&dir, person(), &args(&id(1)));
+        FORCE_ENFORCED.with(|f| f.set(false));
+        let e = refused.expect_err("refused");
+        assert_eq!(e.diagnostic.code, Code::PersonProofRequired);
+        assert_eq!(e.kind, ErrorKind::Usage);
+        // Not enforced, as at this schema: the same send goes.
+        send_report(&dir, person(), &args(&id(2))).expect("sent");
+        let db = dir.join(".git/mdkg/coord.sqlite");
+        let conn =
+            rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .expect("store");
+        let mut stmt = conn.prepare("SELECT record FROM log").expect("log");
+        let records: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .expect("rows")
+            .map(|r| r.expect("row"))
+            .collect();
+        assert!(!records.iter().any(|r| r.contains(&id(1))), "{records:?}");
+        assert!(records.iter().any(|r| r.contains(&id(2))), "{records:?}");
+    }
+
     #[test]
     fn fault_delivery_refuses_a_bad_recipient_or_fault_id_before_the_store() {
         let root = std::env::temp_dir().join(format!("mdkg-fault-guards-{}", uuid::Uuid::now_v7()));
@@ -3279,13 +3969,15 @@ mod tests {
             .is_err()
         );
         // Scanned as typed, not as escaped JSON (review of a76dd2c).
-        let mut strings = Vec::new();
-        let parts = json!([
-            {"kind": "text", "text": concat!("here:\nghp_", "abcdefghijklmnopqrstuvwxyz0123456789")},
-            {"kind": "data", "data": {"k": concat!("\tAKIA", "IOSFODNN7EXAMPLE")}}
-        ]);
-        strings_in(&parts, &mut strings);
-        assert_eq!(strings.iter().filter(|s| looks_secret(s)).count(), 2);
+        for part in [
+            json!({"kind": "text", "text": concat!("here:\nghp_", "abcdefghijklmnopqrstuvwxyz0123456789")}),
+            json!({"kind": "data", "data": {"k": concat!("\tAKIA", "IOSFODNN7EXAMPLE")}}),
+            // A member's key with its value (Terra #18736).
+            json!({"kind": "data", "data": {"token": concat!("a1b2c3d4e5", "f6g7h8i9j0k1")}}),
+        ] {
+            assert!(crate::credentials::value_looks_secret(&part), "{part}");
+            assert!(check_body(&json!([part])).is_err());
+        }
     }
 
     #[test]

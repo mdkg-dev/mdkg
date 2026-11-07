@@ -786,7 +786,7 @@ fn requirement_warnings(index: &Index, body_offsets: &HashMap<String, usize>) ->
                 .at(node.path.clone(), Some(line + offset))
                 .for_node(node.qid.clone())
         };
-        let work = matches!(node.node_type.as_str(), "task" | "bug" | "spike");
+        let work = matches!(node.node_type.as_str(), "task" | "bug" | "feat" | "spike");
         if work && parsed.items == 0 && node.status.as_deref() != Some("done") {
             out.push(
                 Diagnostic::warning(
@@ -826,7 +826,8 @@ fn requirement_warnings(index: &Index, body_offsets: &HashMap<String, usize>) ->
                     at(
                         Code::ReqDuplicateId,
                         r.line,
-                        format!("{} is already used on body line {line}", r.id),
+                        // File lines, as the diagnostic's own (e2e UX).
+                        format!("{} is already used on line {}", r.id, line + offset),
                     )
                     .also_at(node.path.clone(), Some(line + offset)),
                 );

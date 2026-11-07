@@ -499,12 +499,11 @@ fn an_unborn_code_base_refuses_the_worker_until_the_first_commit() {
 }
 
 /// G15: `follow: "merge"` in a committed definition runs under `agents up`
-/// and follows by notes in 0.7.1: the prompt says how far behind mainRef
-/// the branch is and that the automatic merge comes in 0.7.2, nothing is
-/// merged, and `agents status` shows the lag. `--unset follow` takes it
-/// off.
+/// and follows by notes: the prompt says how far behind mainRef the branch
+/// is and that automatic merge is unavailable, nothing is merged, and
+/// `agents status` shows the lag. `--unset follow` takes it off.
 #[test]
-fn follow_merge_is_notes_in_0_7_1() {
+fn follow_merge_is_notes_in_this_release() {
     let s = Scratch::new();
     s.ref_mode();
     let first = s.git(&["rev-parse", "HEAD"]);
@@ -595,7 +594,10 @@ fn follow_merge_is_notes_in_0_7_1() {
         ),
         "{prompt}"
     );
-    assert!(prompt.contains("comes in mdkg 0.7.2"), "{prompt}");
+    assert!(
+        prompt.contains("is not available in this release"),
+        "{prompt}"
+    );
     // Nothing merged, and origin/main and trunk are as they were.
     assert_eq!(s.git(&["-C", ".worktrees/w", "rev-parse", "HEAD"]), head);
     assert_eq!(s.git(&["rev-parse", "refs/remotes/origin/main"]), upstream);

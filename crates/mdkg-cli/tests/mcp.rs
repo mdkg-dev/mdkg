@@ -93,6 +93,32 @@ fn mdkg_namespace_cannot_start_an_mcp_writer() {
     }
 }
 
+/// A person's mail never goes over MCP (DECISION 39, 2026-11-04): an MCP
+/// server can't run as a person, named by `--as` or by `$MDKG_ACTOR`, so
+/// no `channel_post` sends as one.
+#[test]
+fn a_person_cannot_start_an_mcp_server() {
+    let repo = repo();
+    for (flag, env) in [(Some("human:nick"), None), (None, Some("human:nick"))] {
+        let mut command = mdkg_command();
+        command.arg("--root").arg(&repo.0);
+        if let Some(actor) = flag {
+            command.args(["--as", actor]);
+        }
+        if let Some(actor) = env {
+            command.env("MDKG_ACTOR", actor);
+        }
+        let output = command.arg("mcp").stdin(Stdio::null()).output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{flag:?} {env:?}: {output:?}"
+        );
+        let diagnostics = String::from_utf8_lossy(&output.stderr);
+        assert!(diagnostics.contains("msg.human_actor"), "{diagnostics}");
+    }
+}
+
 /// The tools whose results carry other agents' messages.
 const MAIL_TOOLS: &[&str] = &[
     "channel_post",
@@ -545,7 +571,14 @@ fn a_node_in_a_role_folder_can_t_reach_the_role_s_lease() {
     fs::remove_file(graph.join("commands")).ok();
     // The launcher took the role for this same actor.
     cli(&repo.0, "agent-x", &["claim", "role:x"]);
-    let leases = || cli_json(&repo.0, "agent-x", &["status"])["data"]["leases"].clone();
+    // Without `age_ms`, which grows as the test runs.
+    let leases = || {
+        let mut leases = cli_json(&repo.0, "agent-x", &["status"])["data"]["leases"].clone();
+        for l in leases.as_array_mut().into_iter().flatten() {
+            l.as_object_mut().map(|o| o.remove("age_ms"));
+        }
+        leases
+    };
     let before = leases();
     assert_eq!(before[0]["scope"], "role:x", "{before}");
     let mut server = Server::start(&graph);
@@ -2131,6 +2164,45 @@ fn mcp_marks_none_of_the_mail_its_reply_trimmed() {
     }
     let mut server = Server::start(&repo.0);
     let listed = envelope(&server.call("inbox", json!({}))).to_string();
+    let (kept, trimmed): (Vec<&String>, Vec<&String>) =
+        ids.iter().partition(|id| listed.contains(id.as_str()));
+    assert!(!kept.is_empty() && !trimmed.is_empty(), "{kept:?}");
+    let refused = envelope(&server.call("ack", json!({ "ids": [trimmed[0]] })));
+    assert_eq!(
+        refused["diagnostics"][0]["code"], "msg.not_shown",
+        "{refused}"
+    );
+    let acked = envelope(&server.call("ack", json!({ "ids": kept })));
+    assert_eq!(acked["ok"], true, "{acked}");
+}
+
+/// The same for a wait: its listing defers marking to the reply, so mail
+/// the reply trimmed is never shown (#17242).
+#[test]
+fn mcp_inbox_wait_marks_none_of_the_mail_its_reply_trimmed() {
+    let repo = repo();
+    let body = "x".repeat(60_000);
+    let ids: Vec<String> = (0..20).map(|n| format!("big-{n:02}")).collect();
+    for id in &ids {
+        let out = mdkg_command()
+            .arg("--root")
+            .arg(&repo.0)
+            .args([
+                "--as", "agent-y", "msg", "send", "--to", "agent-x", "--kind", "note", "--id", id,
+                "--text", &body, "--json",
+            ])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("send");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+    let mut server = Server::start(&repo.0);
+    let listed = envelope(&server.call("inbox_wait", json!({ "timeout": 1 }))).to_string();
     let (kept, trimmed): (Vec<&String>, Vec<&String>) =
         ids.iter().partition(|id| listed.contains(id.as_str()));
     assert!(!kept.is_empty() && !trimmed.is_empty(), "{kept:?}");

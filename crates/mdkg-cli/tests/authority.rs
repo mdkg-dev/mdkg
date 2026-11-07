@@ -1854,3 +1854,85 @@ fn commit_config(dir: &Path) {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// Beside a lease authority, claim takes one target at a time
+/// (orchestrator, #17108): a claim of several is refused before anything
+/// is granted here or asked of the authority.
+#[test]
+fn a_claim_of_several_is_refused_beside_an_authority() {
+    let s = Setup::new();
+    s.use_script();
+    let (code, out) = s.run("a", &["claim", "role:reviewer", "task-1"]);
+    assert_ne!(code, 0, "{out}");
+    assert!(
+        codes(&out).contains(&"usage.invalid_arguments".to_string()),
+        "{out}"
+    );
+    assert_eq!(s.args(), "", "never asked");
+    assert!(
+        !s.local_leases()
+            .iter()
+            .any(|l| l["scope"] == "role:reviewer"),
+        "nothing granted here"
+    );
+}
+
+/// `release --committed` is local only (orchestrator, #17069): a lease
+/// held through a lease authority keeps its term. After a commit to its
+/// path, renew, the turn-end `release --clean` and `release --committed`
+/// never ask the authority to release it.
+#[test]
+fn an_authority_backed_lease_is_never_released_at_commit() {
+    let s = Setup::new();
+    s.use_script();
+    s.answer(
+        json!({"schema": "mdkg.claim.v1", "ok": true,
+               "data": {"lease": lease("src.txt"), "renewed": false}, "diagnostics": []}),
+        0,
+    );
+    let (code, out) = s.run("a", &["claim", "--new", "src.txt"]);
+    assert_eq!(code, 0, "{out}");
+    fs::write(s.repo.join("src.txt"), "x\n").expect("write");
+    let out = isolated(
+        Command::new("git")
+            .arg("-C")
+            .arg(&s.repo)
+            .args(["add", "src.txt"]),
+    )
+    .output()
+    .expect("git");
+    assert!(out.status.success());
+    let out = isolated(
+        Command::new("git")
+            .arg("-C")
+            .arg(&s.repo)
+            .args(["commit", "-qm", "src"]),
+    )
+    .env("GIT_COMMITTER_DATE", "@1 +0000")
+    .output()
+    .expect("git");
+    assert!(out.status.success());
+    s.answer(
+        json!({"schema": "mdkg.renew.v1", "ok": true,
+               "data": {"renewed": [lease("src.txt")]}, "diagnostics": []}),
+        0,
+    );
+    for args in [
+        &["renew"][..],
+        &["release", "--clean"],
+        &["release", "--committed"],
+    ] {
+        let (_, out) = s.run("a", args);
+        assert!(
+            out["data"]["released"]
+                .as_array()
+                .is_none_or(|r| r.iter().all(|l| l["scope"] != "src.txt")),
+            "{args:?}: {out}"
+        );
+    }
+    assert!(
+        !s.args().contains("release"),
+        "never asked to release: {}",
+        s.args()
+    );
+}

@@ -2,7 +2,7 @@
 name: mdkg-workflow
 description: Use for every task in an mdkg project (.mdkg/), whatever the agent: mdkg is the system of record, so each turn starts with mdkg msg inbox and mdkg status, every edit is claimed first, questions and handoffs go through mdkg mail, and work closes with mdkg done.
 tags: [stage:plan, stage:execute, stage:review, mdkg]
-version: 0.7.1
+version: 0.7.2
 authors: [mdkg]
 ---
 

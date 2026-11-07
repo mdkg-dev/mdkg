@@ -111,6 +111,15 @@ fn data_that_breaks_its_type_does_not_conform() {
             "tool.ended",
             json!({"class": "a-new-class", "name": "", "ok": false}),
         ),
+        // Each harness's own tool-call id, or null when it gave none.
+        (
+            "tool.started",
+            json!({"class": "shell", "name": "Bash", "call_id": "toolu_a", "summary": ""}),
+        ),
+        (
+            "tool.ended",
+            json!({"class": "shell", "name": "Bash", "call_id": null, "ok": true}),
+        ),
         ("usage", usage.clone()),
         ("turn.started", json!({"turn_id": "t", "number": 1})),
         (
@@ -138,6 +147,10 @@ fn data_that_breaks_its_type_does_not_conform() {
         ("status", json!({"text": 3})),
         ("error", json!({"text": "x", "extra": 1})),
         ("tool.started", json!({"class": "edit", "name": "Edit"})),
+        (
+            "tool.started",
+            json!({"class": "edit", "name": "Edit", "call_id": 3, "summary": ""}),
+        ),
         (
             "tool.ended",
             json!({"class": "edit", "name": "Edit", "ok": "yes"}),

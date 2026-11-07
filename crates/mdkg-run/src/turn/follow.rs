@@ -2,9 +2,7 @@
 //! worker's turn, under its turn lease, the launcher tells it how far its
 //! branch is behind the code base, and `agents status` shows the same
 //! counts. Read-only: nothing here fetches, pushes, merges or moves any
-//! ref. The opt-in merge (`follow: "merge"`) is 0.7.2's, with a durable
-//! intent and recovery (orchestrator #13768); until then it follows by
-//! notes and says so.
+//! ref. The opt-in merge (`follow: "merge"`) follows by notes and says so.
 
 use super::{Pinned, full_ref, git_pinned, short_ref};
 
@@ -15,14 +13,14 @@ pub struct Follow {
     /// bare name, read as the base resolver reads it.
     pub main_ref: String,
     /// `follow: "merge"` in the agent's committed definition: followed by
-    /// notes in 0.7.1, with a line saying so.
+    /// notes in this release, with a line saying so.
     pub merge: bool,
 }
 
 /// The notes for a worker's prompt: how far its branch is behind
 /// `mainRef`, and the command that merges it. Nothing when it's level, or
 /// mainRef isn't here.
-pub(super) fn follow(pin: &Pinned, follow: &Follow) -> Vec<String> {
+pub(crate) fn follow(pin: &Pinned, follow: &Follow) -> Vec<String> {
     let Some((main, ahead, behind)) = lag(pin, &follow.main_ref) else {
         return Vec::new();
     };
@@ -42,7 +40,7 @@ pub(super) fn follow(pin: &Pinned, follow: &Follow) -> Vec<String> {
     if follow.merge {
         notes.push(
             "your definition asks for `follow: \"merge\"`; the launcher's automatic merge \
-             comes in mdkg 0.7.2, so merge it yourself for now"
+             is not available in this release, so merge it yourself"
                 .into(),
         );
     }
@@ -202,13 +200,16 @@ mod tests {
     }
 
     #[test]
-    fn follow_merge_is_notes_until_0_7_2() {
+    fn follow_merge_is_notes_in_this_release() {
         let f = Fixture::new();
         f.commit(&f.repo, "b");
         let head = f.head();
         let notes = follow(&f.pin(), &follow_main(true));
         assert_eq!(notes.len(), 2, "{notes:?}");
-        assert!(notes[1].contains("comes in mdkg 0.7.2"), "{notes:?}");
+        assert!(
+            notes[1].contains("is not available in this release"),
+            "{notes:?}"
+        );
         assert_eq!(f.head(), head, "nothing merged");
     }
 

@@ -235,6 +235,22 @@ pub fn outside_turn(
     outside_turn_from(common, actor, roots, marked, std::process::id())
 }
 
+/// [`outside_turn`] without its checkout rule: `roots` only name the
+/// repositories whose live turns are read, and a turn merely live in one
+/// of their checkouts refuses nobody, as serve's socket check doesn't.
+/// The turn mark, each live turn's actor and the launcher ancestry still
+/// refuse. A person's unsigned mail uses it, so an agent working in the
+/// same checkout (or in the one `mdkg serve` runs its calls from) doesn't
+/// block the person's own mail (DECISION 39, 2026-11-04).
+pub fn outside_turn_by_ancestry(
+    common: &Path,
+    actor: &str,
+    roots: &[&Path],
+    marked: bool,
+) -> Result<(), String> {
+    outside_turns(common, actor, roots, marked, std::process::id(), false)
+}
+
 /// [`outside_turn`], walking the ancestry from `start_pid` instead of this
 /// process: `mdkg serve` passes its HTTP caller's pid, read from the
 /// socket's peer credentials, so a request from inside an agent turn is
@@ -247,6 +263,19 @@ pub fn outside_turn_from(
     roots: &[&Path],
     marked: bool,
     start_pid: u32,
+) -> Result<(), String> {
+    outside_turns(common, actor, roots, marked, start_pid, true)
+}
+
+/// The turn check; `same_checkout`: a live turn working in one of
+/// `roots`' checkouts refuses too.
+fn outside_turns(
+    common: &Path,
+    actor: &str,
+    roots: &[&Path],
+    marked: bool,
+    start_pid: u32,
+    same_checkout: bool,
 ) -> Result<(), String> {
     if marked {
         return Err("decisions are refused inside an agent turn".into());
@@ -261,7 +290,8 @@ pub fn outside_turn_from(
     }
     let mut processes = None;
     for common in common_dirs {
-        outside_repository_turn(&common, actor, roots, start_pid, &mut processes)?;
+        let checkouts: &[&Path] = if same_checkout { roots } else { &[] };
+        outside_repository_turn(&common, actor, checkouts, start_pid, &mut processes)?;
     }
     Ok(())
 }
@@ -279,20 +309,22 @@ fn outside_repository_turn(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(_) => return Err("cannot check live launcher turns".into()),
     };
-    for entry in entries {
-        let path = entry.map_err(|_| "cannot inspect launcher turn")?.path();
+    // Listed first and taken in name order, so a scan is the same every
+    // time (a record that vanishes meanwhile is skipped, not the rest).
+    let mut paths = entries
+        .map(|e| e.map(|e| e.path()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("cannot list live launcher turns: {e}"))?;
+    paths.sort();
+    for path in paths {
         if path.extension().and_then(|s| s.to_str()) != Some("json") {
             continue;
         }
-        let fd = rustix::fs::open(
-            &path,
-            rustix::fs::OFlags::RDONLY
-                | rustix::fs::OFlags::NOFOLLOW
-                | rustix::fs::OFlags::NONBLOCK,
-            rustix::fs::Mode::empty(),
-        )
-        .map_err(|_| "cannot inspect launcher turn")?;
-        let file = std::fs::File::from(fd);
+        #[cfg(test)]
+        tests::before_open(&path);
+        let Some(file) = open_turn(&path)? else {
+            continue;
+        };
         match file.try_lock_shared() {
             Ok(()) => continue,
             Err(std::fs::TryLockError::WouldBlock) => (),
@@ -336,6 +368,25 @@ fn outside_repository_turn(
         )?;
     }
     Ok(())
+}
+
+/// A launcher turn record, opened without following a link; `None` when
+/// it's gone since the folder was listed: that turn ended, so it isn't
+/// live (a turn's end removes its record, which made a send from a plain
+/// shell fail now and then). Any other failure names the record.
+fn open_turn(path: &Path) -> Result<Option<std::fs::File>, String> {
+    match rustix::fs::open(
+        path,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK,
+        rustix::fs::Mode::empty(),
+    ) {
+        Ok(fd) => Ok(Some(std::fs::File::from(fd))),
+        Err(rustix::io::Errno::NOENT) => Ok(None),
+        Err(e) => Err(format!(
+            "cannot inspect launcher turn {}: {e}",
+            path.file_name().unwrap_or_default().to_string_lossy()
+        )),
+    }
 }
 
 type ProcessTable = BTreeMap<u32, (u32, String)>;
@@ -422,6 +473,10 @@ pub struct Delegate {
 pub struct Delegations {
     pub delegates: BTreeMap<String, Delegate>,
     pub warnings: Vec<String>,
+    /// Actors the user settings file grants but the machine-local file
+    /// withholds, with why (a revocation there, or that file unreadable),
+    /// so a refusal can say so rather than "no delegation" (e2e).
+    pub withheld: BTreeMap<String, String>,
     /// The graph whose launcher loaded these grants. Never inferred from mail.
     graph: Option<mdkg_format::Uuid7>,
 }
@@ -492,11 +547,14 @@ impl Delegations {
                 Ok(Some(input)) => out.narrow(&input, local),
                 Ok(None) => {}
                 Err(e) => {
-                    out.delegates.clear();
-                    out.warnings.push(format!(
+                    let why = format!(
                         "{} can't be read ({e}), so no delegation applies until it's fixed",
                         local.display()
-                    ));
+                    );
+                    for actor in std::mem::take(&mut out.delegates).into_keys() {
+                        out.withheld.insert(actor, why.clone());
+                    }
+                    out.warnings.push(why);
                 }
             }
         }
@@ -523,10 +581,9 @@ impl Delegations {
             if !revokes {
                 ignored = true;
             } else if self.delegates.remove(actor).is_some() {
-                self.warnings.push(format!(
-                    "{actor}'s delegation is revoked in {}",
-                    source.display()
-                ));
+                let why = format!("{actor}'s delegation is revoked in {}", source.display());
+                self.withheld.insert(actor.clone(), why.clone());
+                self.warnings.push(why);
             }
         }
         if ignored {
@@ -799,6 +856,88 @@ pub fn committed_node(top: &Path, commit: &str, path: &str) -> Result<Vec<u8>, S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        /// A record the scan removes just before opening it, as a turn
+        /// ending between the listing and the open would.
+        static VANISH: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn before_open(path: &Path) {
+        VANISH.with(|v| {
+            if v.borrow().as_deref() == Some(path) {
+                std::fs::remove_file(path).expect("vanish");
+                *v.borrow_mut() = None;
+            }
+        });
+    }
+
+    /// The scan goes on past a record that vanished: a live turn listed
+    /// after it still refuses (Terra #18139).
+    #[test]
+    fn a_record_vanishing_mid_scan_does_not_hide_a_live_turn_after_it() {
+        let dir = std::env::temp_dir().join(format!("mdkg-scan-{}", uuid::Uuid::now_v7()));
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        let ok = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repo)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .status()
+            .expect("git")
+            .success();
+        assert!(ok);
+        let common = repo.join(".git");
+        let turns = crate::hooks::dir(&common).join("turns");
+        std::fs::create_dir_all(&turns).expect("turns");
+        let gone = turns.join("a-ended.json");
+        std::fs::write(&gone, "{}").expect("ended record");
+        let live = turns.join("b-live.json");
+        let record = serde_json::json!({
+            "actor": "orchestrator", "harness": "claude",
+            "cwd": std::fs::canonicalize(&repo).expect("canonical"),
+        });
+        std::fs::write(&live, record.to_string()).expect("live record");
+        let held = std::fs::File::open(&live).expect("open");
+        held.lock().expect("held as a live turn holds it");
+        VANISH.with(|v| *v.borrow_mut() = Some(gone.clone()));
+        let other = dir.join("elsewhere");
+        std::fs::create_dir_all(&other).expect("elsewhere");
+        let e = outside_repository_turn(&common, "orchestrator", &[&other], 0, &mut None)
+            .expect_err("the live turn still refuses");
+        assert!(e.contains("inside a live launcher turn"), "{e}");
+        assert!(
+            !gone.exists(),
+            "the ended record was opened first, and was gone"
+        );
+        drop(held);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A turn record removed between the listing and the open is an ended
+    /// turn, never "cannot inspect"; one that can't be opened otherwise is
+    /// refused, naming it (orchestrator, 2026-11-03).
+    #[test]
+    fn a_vanished_turn_record_is_an_ended_turn_and_other_failures_name_it() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("mdkg-turns-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        assert!(open_turn(&dir.join("gone.json")).expect("gone").is_none());
+        let shut = dir.join("shut.json");
+        std::fs::write(&shut, "{}").expect("record");
+        std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        // Root opens it anyway; the refusal is what a user sees.
+        if !rustix::process::geteuid().is_root() {
+            let e = open_turn(&shut).expect_err("unreadable");
+            assert!(e.contains("cannot inspect launcher turn shut.json"), "{e}");
+        }
+        let link = dir.join("link.json");
+        std::os::unix::fs::symlink(&shut, &link).expect("link");
+        let e = open_turn(&link).expect_err("a link");
+        assert!(e.contains("link.json"), "{e}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn the_launcher_ancestry_walk_starts_from_the_given_pid() {

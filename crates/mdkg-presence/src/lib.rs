@@ -16,6 +16,11 @@ pub mod lock;
 pub mod sig;
 pub mod x509;
 
+/// Whether this build has a FIDO2 backend: [`fido2::BACKEND`], set by
+/// the `hid` module `fido2::platform()` compiled with (the `fido2` feature
+/// as Cargo resolved it for this crate, on macOS or glibc Linux).
+pub const FIDO2: bool = fido2::BACKEND;
+
 #[cfg(test)]
 mod cross_lane;
 #[cfg(test)]

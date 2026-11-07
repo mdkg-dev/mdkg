@@ -36,8 +36,8 @@ pub struct CurrentTurn {
 pub struct LastTurn {
     pub turn_id: String,
     pub number: u64,
-    /// `replied`, `ran`, `idle`, `dry_run`, `failed`, `interrupted` or
-    /// `not_started`; an open set.
+    /// `replied`, `no_reply`, `ran`, `idle`, `dry_run`, `failed`,
+    /// `interrupted` or `not_started`; an open set.
     pub outcome: Option<String>,
     pub ended_at: Option<String>,
 }
@@ -117,9 +117,13 @@ pub fn agent(run_dir: &Path, agent: &str, found: &[registry::Found], paused: boo
         let events = journal::read(run_dir, agent, &entry.start.turn_id)
             .ok()
             .flatten();
-        let derived = index::derive(run_dir, agent, entry, events.as_deref(), |s| {
-            index::turn_running(run_dir, agent, s)
-        });
+        let derived = index::derive(
+            run_dir,
+            agent,
+            entry,
+            events.as_deref(),
+            index::launcher_alive,
+        );
         if derived.state == "running" {
             if current.is_none() && last.is_none() {
                 current = Some(CurrentTurn {

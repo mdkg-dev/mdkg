@@ -9,7 +9,7 @@
 //! Code paths and adapter metadata come from the two commits; selection
 //! rules come from one committed graph authority. Uncommitted checkout edits,
 //! filters and sparse entries cannot change either input. `--head` defaults
-//! to `HEAD`. In 0.7.1 the authority is the repository-top graph, even when
+//! to `HEAD`. In 0.7.2 the authority is the repository-top graph, even when
 //! the caller selects a nested root.
 //!
 //! A path whose content at the head is what main had where the head last
@@ -33,6 +33,7 @@ pub mod config;
 pub mod git;
 pub mod glob;
 pub mod go;
+pub mod modules;
 pub mod rust;
 pub mod select;
 pub mod tree;
@@ -60,9 +61,30 @@ pub struct AffectedData {
     /// the schema, for older output.
     #[schemars(skip_serializing_if = "Vec::is_empty")]
     pub from_main: Vec<FromMain>,
-    /// Paths using whole-crate fallback because no finer Rust rule covers them.
+    /// Selection notes for a selective run: paths using whole-crate
+    /// fallback because no finer Rust rule covers them, and rule targets
+    /// the head doesn't have, which were skipped.
     #[schemars(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<SelectionWarning>,
+    /// Where the head's snapshot for the language adapters went, and the
+    /// places passed over on the way; absent when no adapter needed one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<SnapshotOut>,
+}
+
+/// Where the head's snapshot went (`tree::places`, in order).
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct SnapshotOut {
+    /// The place used; `null` when the snapshot wasn't written, and the run
+    /// is full with an `adapter_failed` reason: `error` says why.
+    pub place: Option<tree::Place>,
+    /// The places tried before it (or all of them), each with why. Empty
+    /// with `place` null when the head's tree was refused before any place
+    /// was tried (a symlink in it, say).
+    pub skipped: Vec<tree::Skipped>,
+    /// Why the snapshot wasn't written; absent when it was.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, JsonSchema)]
@@ -318,6 +340,7 @@ pub fn decide(
             main: None,
             from_main: Vec::new(),
             warnings: Vec::new(),
+            snapshot: None,
         }));
     }
     let base_sha = repo.resolve_commit(base).map_err(git_error)?;
@@ -338,6 +361,7 @@ pub fn decide(
         main: None,
         from_main: Vec::new(),
         warnings: Vec::new(),
+        snapshot: None,
     };
     let (Some(base_sha), Some(head_sha)) = (base_sha, head_sha) else {
         if strict {
@@ -425,7 +449,14 @@ pub fn decide(
         .any(|p| rust::is_manifest_name(p) || go::is_module_path(p));
     // Written only when an adapter could use it, and removed on return.
     let written = if wants_tree {
-        match tree::write(&repo, &entries) {
+        let mut skipped = Vec::new();
+        let result = tree::write(&repo, &entries, &tree::places(), &mut skipped);
+        data.snapshot = Some(SnapshotOut {
+            place: result.as_ref().ok().map(|t| t.place),
+            skipped,
+            error: result.as_ref().err().cloned(),
+        });
+        match result {
             Ok(t) => Some(t),
             Err(e) => {
                 data.reasons.push(Reason {
@@ -455,16 +486,21 @@ pub fn decide(
         })
         .collect();
     if strict && wants_tree && written.is_none() {
-        return Err(target_rules_error(
-            "the committed snapshot could not be created",
-        ));
+        let why = data
+            .snapshot
+            .as_ref()
+            .and_then(|s| s.error.as_deref())
+            .unwrap_or("unknown");
+        return Err(target_rules_error(&format!(
+            "the committed snapshot could not be created: {why}"
+        )));
     }
     if !rule_targets.is_empty() || strict {
         if let Some(rust) = &mut rust {
             match rust.unsupported_rule_target(&rule_targets) {
                 Ok(Some((target, reason))) => return Err(GraphError::failure(Code::ConfigInvalid,
                     format!("affected rule selects unsupported opt-in Rust target {} {:?} ({reason})", target.package, target.kind))
-                    .with_hint("In 0.7.1, affected rules require Cargo default test targets. Remove this rust_targets entry or make the target a default Cargo test (test = true and no required-features); run opt-in targets explicitly outside affected.")),
+                    .with_hint("In 0.7.2, affected rules require Cargo default test targets. Remove this rust_targets entry or make the target a default Cargo test (test = true and no required-features); run opt-in targets explicitly outside affected.")),
                 Ok(None) => {},
                 Err(detail) => {
                     let detail = written.as_ref().map_or(detail.clone(), |t| t.scrub(&detail));
@@ -515,13 +551,31 @@ pub fn decide(
             });
         }
         targets.extend(verdict.selects);
-        for (path, package) in verdict.fallback_crates {
+        for (path, package, why) in verdict.fallback_crates {
+            let why = why
+                .map(|w| format!(", and its test targets can't be derived: {w}"))
+                .unwrap_or_default();
             data.warnings.push(SelectionWarning {
                 path,
                 packages: vec![package],
-                detail:
-                    "no test-target rule covers this path for the package; using whole-crate tests for the combined Rust selection"
-                        .into(),
+                detail: format!(
+                    "no test-target rule covers this path for the package{why}; using whole-crate tests for the combined Rust selection"
+                ),
+            });
+        }
+        for (path, rule, target, all_missing) in verdict.missing_targets {
+            let fallback = if all_missing {
+                "; none of the rule's targets exist, so the package's whole tests run"
+            } else {
+                "; the rule's other targets still run"
+            };
+            data.warnings.push(SelectionWarning {
+                path,
+                packages: vec![target.package.clone()],
+                detail: format!(
+                    "affected.rules[{rule}] names Rust target {}, which the head doesn't have; skipped it{fallback}",
+                    target_name(&target)
+                ),
             });
         }
         data.paths.push(out);
@@ -742,6 +796,7 @@ fn explain(
         verdict.matched_by.extend(before.matched_by);
         verdict.selects.extend(before.selects);
         verdict.fallback_crates.extend(before.fallback_crates);
+        verdict.missing_targets.extend(before.missing_targets);
         let what = if change.status == 'R' {
             "rename"
         } else {
@@ -775,6 +830,15 @@ fn explain(
     (out, verdict)
 }
 
+/// A rule target as the config spells it, for warnings.
+fn target_name(target: &config::RustTarget) -> String {
+    match &target.kind {
+        config::RustTargetKind::Lib => format!("{} lib", target.package),
+        config::RustTargetKind::Test(name) => format!("{} test {name}", target.package),
+        config::RustTargetKind::Bin(name) => format!("{} bin {name}", target.package),
+    }
+}
+
 /// Sorts everything and sets the mode: full whenever there is a reason.
 fn finish(mut data: AffectedData) -> AffectedData {
     data.paths
@@ -801,11 +865,33 @@ fn print_text(data: &AffectedData) {
         Mode::Full => "full",
     };
     println!("mode: {mode}");
+    // Only a snapshot that left the temporary folder is news.
+    if let Some(snap) = &data.snapshot
+        && !snap.skipped.is_empty()
+    {
+        let place = match snap.place {
+            Some(tree::Place::Temp) => "the temporary folder",
+            Some(tree::Place::UserCache) => "the user cache",
+            Some(tree::Place::CargoTargetDir) => "$CARGO_TARGET_DIR",
+            None => "nowhere",
+        };
+        for s in &snap.skipped {
+            println!(
+                "snapshot: skipped {}: {}",
+                serde_json::to_value(s.place)
+                    .ok()
+                    .and_then(|v| v.as_str().map(str::to_string))
+                    .unwrap_or_default(),
+                output::shown_path(&s.detail)
+            );
+        }
+        println!("snapshot: written to {place}");
+    }
     for warning in &data.warnings {
         println!(
             "warning: {}: {} ({})",
             output::shown_path(&warning.path),
-            warning.detail,
+            output::shown_path(&warning.detail),
             warning
                 .packages
                 .iter()

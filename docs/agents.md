@@ -5,19 +5,22 @@ or reviewers, watching for unread mail. `agents up <name> --once` runs one
 manual pass. Manage committed definitions with `agents add`, `edit` and
 `rm`; see [agent definitions](agent-definitions.md).
 
-Agents run as you would run them yourself: with the launcher's
-whole environment, your own logins, settings, config and MCP servers, and
-each harness's own permission mode for the role. mdkg gives each worker a
-worktree; sandboxing and approvals come from the harness and your settings.
-There's no sandbox of the launcher's own, no environment
-scrubbing and no secret scanning. If you need those, run agents inside a
-sandbox of your own.
+Agents run as you would run them yourself: with your own logins,
+settings, config and MCP servers, and each harness's own permission mode
+for the role. mdkg gives each worker a worktree; sandboxing and approvals
+come from the harness and your settings. Since 0.7.2 a turn starts with an
+allowlisted environment, not the launcher's whole one: see
+[the turn's environment](#the-turns-environment). There's no sandbox of
+the launcher's own and no secret scanning. If you need those, run agents
+inside a sandbox of your own.
 So an agent can read what you can and commit files it can write, a `.env`
-file included.
-Keep secrets out of agents' worktrees and ignored. The one thing held
-back is the provider key variables (`ANTHROPIC_API_KEY`,
-`OPENAI_API_KEY`, `CODEX_API_KEY` and the like): see "Which account a
-turn bills" below.
+file or a harness's stored login included: the allowlist keeps your
+shell's exported credentials out of a turn's environment, not out of
+reach of a process running as you.
+Keep secrets out of agents' worktrees and ignored. The provider key
+variables (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `CODEX_API_KEY` and the
+like) never reach an agent, whatever the environment mode: see "Which
+account a turn bills" below.
 
 What the launcher adds is the role and the coordinator:
 - A **worker** edits its folder using the harness's native permission mode
@@ -519,7 +522,9 @@ provider's billing, withheld by family so a new one is too:
   `ANTHROPIC_BASE_URL` and the other endpoints, cloud projects, identity
   tokens), except the model choices `ANTHROPIC_MODEL`,
   `ANTHROPIC_SMALL_FAST_MODEL`, `ANTHROPIC_DEFAULT_*` and
-  `ANTHROPIC_CUSTOM_MODEL_OPTION*`;
+  `ANTHROPIC_CUSTOM_MODEL_OPTION*`, which aren't withheld but, since
+  0.7.2, reach a turn only when `env.allow` names them (or `env.inherit`
+  is on): a model set in your shell alone is no longer used;
 - every `CLAUDE_CODE_USE_*`: Bedrock, Vertex, Foundry, Mantle, Anthropic on
   AWS or Google Cloud, a gateway, and with them a few of Claude Code's
   feature switches;
@@ -528,31 +533,144 @@ provider's billing, withheld by family so a new one is too:
   some two hundred more), with its provider-only families `GOOGLE_VERTEX_*`
   and `SNOWFLAKE_CORTEX_*`.
 
-These general cloud and service credentials do reach agents, since their
-work may need them: `AWS_*` (but `AWS_BEARER_TOKEN_BEDROCK`),
-`GOOGLE_APPLICATION_CREDENTIALS`, `GITHUB_TOKEN`, `GITLAB_TOKEN`,
-`CLOUDFLARE_*`, `DATABRICKS_*`, `DIGITALOCEAN_ACCESS_TOKEN`,
-`SNOWFLAKE_ACCOUNT`, `HF_TOKEN` and `WANDB_API_KEY`, and any variable
-outside the families above. Without a provider switch, they bill nothing
-for a Claude or Codex turn.
+These general cloud and service credentials aren't withheld as provider
+keys, since an agent's work may need them: `AWS_*` (but
+`AWS_BEARER_TOKEN_BEDROCK`), `GOOGLE_APPLICATION_CREDENTIALS`,
+`GITHUB_TOKEN`, `GITLAB_TOKEN`, `CLOUDFLARE_*`, `DATABRICKS_*`,
+`DIGITALOCEAN_ACCESS_TOKEN`, `SNOWFLAKE_ACCOUNT`, `HF_TOKEN` and
+`WANDB_API_KEY`. Since 0.7.2 they reach an agent only when `env.allow`
+names them (or `env.inherit` is on): see
+[the turn's environment](#the-turns-environment). Without a provider
+switch, they bill nothing for a Claude or Codex turn.
 
 An OpenCode agent bills what OpenCode's own stored auth resolves
 (`opencode auth login`), or one of the general credentials above that
 OpenCode also accepts (`DATABRICKS_TOKEN`, `CLOUDFLARE_*`, `AWS_*`,
-`GOOGLE_APPLICATION_CREDENTIALS`) when its model names that provider. No
-other key in your environment reaches it: a provider key you relied on in
-your shell must move to OpenCode's auth. It bills whatever
-provider its model names, so an OpenCode turn on a Vertex model, with
-`GOOGLE_CLOUD_PROJECT` and Google credentials in your shell, bills that
-project. The catalog list is the union of the qualified releases'
+`GOOGLE_APPLICATION_CREDENTIALS`) when its model names that provider and,
+since 0.7.2, `env.allow` names it. No other key in your environment
+reaches it: a provider key you relied on in your shell must move to
+OpenCode's auth. It bills whatever provider its model names, so an
+OpenCode turn on a Vertex model, with `GOOGLE_CLOUD_PROJECT` and Google
+credentials in your shell and named in `env.allow`, bills that project. The catalog list is the union of the qualified releases'
 catalogs (2.1.0 and 2.2.5), kept in
 `crates/mdkg-run/src/opencode-catalog-env.txt`. Another OpenCode can name
-providers this list lacks, and their keys would reach agents, so before a
+providers this list lacks, and their keys would reach agents that name
+them in `env.allow` or set `env.inherit`, so before a
 release is qualified its `scripts/opencode-catalog-env.py` output joins
 the union (a test checks every name on it is withheld or kept on purpose).
 
 A harness that isn't logged in refuses the turn, naming its login
-command and `mdkg agents use-key <agent>`.
+command and `mdkg agents use-key <agent>`. The login check runs in the
+environment the turn will, so a login that only a variable outside the
+allowlist provides (`CLAUDE_CODE_OAUTH_TOKEN`, say) counts only when
+`env.allow` names it.
+
+## The turn's environment
+
+A harness turn, its login check and OpenCode's worker preflight start
+with an allowlisted environment (0.7.2). Before, they inherited the
+launcher's whole environment less provider keys, so a supervisor started
+from a shell handed every credential that shell exported to every agent.
+Now a turn starts with only:
+
+- what any harness needs to run: `PATH`, `HOME`, `USER`, `LOGNAME`,
+  `SHELL`, `TMPDIR`, `TERM`, `LANG`, `LC_*`, `TZ` and the XDG base folders
+  (`XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`, `XDG_CACHE_HOME`,
+  `XDG_RUNTIME_DIR`);
+- what a worker's own commits need: `GIT_AUTHOR_NAME`,
+  `GIT_AUTHOR_EMAIL`, `GIT_COMMITTER_NAME`, `GIT_COMMITTER_EMAIL`,
+  `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`, `GIT_CONFIG_NOSYSTEM` and
+  `GIT_ATTR_NOSYSTEM` (never `GIT_DIR` and the like, nor
+  `GIT_CONFIG_COUNT`, whose values can carry an auth header);
+- mdkg's own `MDKG_*`, less the launcher's pins;
+- its harness's own documented folders: Claude Code's
+  `CLAUDE_CONFIG_DIR`, Codex's `CODEX_HOME`, OpenCode's `OPENCODE_*`. None
+  of their token variables: `CLAUDE_CODE_OAUTH_TOKEN` and the like stay
+  out unless you name them;
+- the names `env.allow` adds.
+
+A harness finds its login where it stores it (the Keychain, `~/.claude`,
+`CODEX_HOME`, OpenCode's data folder) through `HOME`, `USER` and its own
+folder variables, so subscription logins keep working. Everything else is
+dropped: a `GITHUB_TOKEN`, `AWS_*`, `DATABASE_URL`, `SSH_AUTH_SOCK` or a
+tool's own variables in the launcher's shell no longer reach a turn. So
+are proxy and certificate settings (`HTTPS_PROXY`, `HTTP_PROXY`,
+`NO_PROXY`, `SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`): behind a proxy, name
+them in `env.allow` or the harness can't reach its API. On Linux, a
+login kept in the desktop keyring may also need `DBUS_SESSION_BUS_ADDRESS`.
+
+Name what your agents need in the policy's `env.allow`, in
+`agents.defaults` for every agent or in an agent definition's `policy`,
+in the committed graph (a user or machine-local layer can't change it);
+the two lists add up:
+
+```json
+{"agents": {"defaults": {"env": {"allow": ["SSH_AUTH_SOCK", "CARGO_HOME", "RUSTUP_HOME", "NEXTEST_*"]}}}}
+```
+
+`env.allow` holds names only, never values: a value comes from the
+launcher's environment when the turn starts, and an entry with `=` in it
+is refused (unquoted, in case it holds a secret). A name ending in `*` is
+a prefix, which never admits a credential-shaped name (one holding
+`TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`, `CREDENTIAL`, `AUTH` or `API_KEY`,
+or ending in `_KEY`); name such a variable exactly to pass it. Provider
+keys, host-session variables and the launcher's own pins are refused:
+nothing passes them.
+
+`"env": {"inherit": true}` gives back the launcher's whole environment,
+less provider keys and pins, as before 0.7.2. Every such turn prints a
+warning, `agents status` shows `environment: inherit` for the agent and
+warns by name, and `mdkg doctor`'s `env` check warns naming each such
+agent. Prefer `env.allow`. `agents status --json` gives each agent's
+`env_mode`: `allowlist`, `inherit`, or `session` for an interactive
+receiver, whose session has the environment of whoever started it. Both
+commands cover the agents the config names, the saved ones and the ones
+a live supervisor runs, and report the configured mode, which is what
+its turns get only once the supervisor has read it. To apply a change
+to `env`, publish it where agents read their config (see "The graph
+checkout" above): in checkout mode, run `mdkg agents edit` in the graph
+checkout, or with `--root` naming it, or commit there; in ref mode, run
+it from any checkout, since it publishes to the graph ref. A commit on a
+code branch alone doesn't count. Then restart `agents up`, and check
+each agent in `agents status --json`: its `env_mode`, and its resolved
+`policy.env.allow` (defaults and its own list together), since a change
+to the list leaves the mode `allowlist` either way. Status reads the
+config from the same place the supervisor does. A watching supervisor may also re-exec on its own (see
+"Reloads, restarts and stopping" below for what it watches), but turns
+it started before then keep the mode they started with. A one-shot pass (`agents
+up --once`) has no watcher: it uses the policies it read at start for
+every turn it runs, even turns that start after you change `env`. Let
+the pass finish, or stop it, before starting a new one: it holds its
+agents' progress locks until it ends, and stopping it part way can leave
+unfinished watches for any of its selected agents, even ones whose turn
+never started. What the next start does with each depends on whether
+its invocation changed and how it was interrupted: it may continue it,
+or refuse it and name the `mdkg agents resume <agent>` that recovers
+it, so follow what it reports, and check `agents status` before
+relying on the new mode (see "Durable supervisor progress" below). A live supervisor from a build
+before 0.7.2 (0.7.0 or 0.7.1), or one that couldn't record itself, isn't
+confirmed to start turns with the allowlist: both commands name the
+agents it runs and tell you to restart `agents up`. They find such a
+supervisor from the records it writes, and an older build writes those
+best effort, so after upgrading, stop every `agents up` started by an
+older build rather than relying on the warning. Neither command prints
+a value.
+
+The allowlist covers the processes mdkg starts: the harness, and what
+the harness starts with the environment it got. A shell that rereads
+your startup files undoes it, though, and harnesses may run commands in
+one (Codex's command tool uses a login shell by default), so anything
+your `~/.zprofile`, `~/.zshrc`, `~/.bash_profile` or `~/.profile` exports
+can reach the agent's commands again. Keep credentials out of shell
+startup files on a machine that runs agents: export them from a file you
+source by hand, or keep them in a credential helper.
+
+Even then, the allowlist isn't isolation: an agent runs as your OS user,
+so it can still read a harness's stored login file or run `security`
+itself; mdkg's deny rules are a guardrail there, not a boundary (see
+"What the permission rules do and don't do" above). The interactive
+Codex receiver delivers into a session you started, which has its own
+environment.
 
 An API key bills a turn only when you choose it, with `agents use-key`,
 and only where the policy allows that:
@@ -565,11 +683,29 @@ The fallback setting only allows `use-key`; it bills nothing by
 itself. Nothing charges the key on its own: 0.7.0's automatic key turns,
 after a usage limit and for a harness that isn't logged in, are gone in
 0.7.1, and no setting bills the key on every turn. When the
-subscription hits its usage limit (the harness's own final error line),
-the turn ends with that reason, and the mail stays unread. The turn's
+subscription hits its usage limit, the turn ends with that reason, and the
+mail stays unread, however the harness exited. The limit is read from the
+harness's own output: for Claude, its final error result, when its text
+is the limit wording or it follows a rejected `rate_limit_event`; for OpenCode, any quota error among its
+stdout events; and for every harness its final error line. For
+Claude the hint also names the limit and when it resets. The turn's
 hint and `agents status` say `subscription limit reached; mdkg agents
 use-key <agent> bills your API key for its next turn`. A turn is never
 re-run within itself.
+
+A Claude error result with HTTP 429 that names no limit (no limit wording,
+no rejected `rate_limit_event`) is the provider throttling requests, not
+the usage limit. Like a model at capacity or the limit, it never counts
+toward setting the mail aside. Its hint says `the provider throttled
+requests (HTTP 429)` and offers no key. Such a turn's show is taken back
+after it ends; if that write fails (mdkg warns `can't take back the mail's
+shows`), the show stays counted, as when the launcher itself crashes
+mid-turn. Mail is set aside only after three counted shows. A
+set-aside message is acknowledged only once its `fault` to `reports_to`
+is recorded: sent, or, when the send fails, kept as a pending file in
+the launcher's state directory with a warning (`can't report the mail set aside`),
+which `reports_to` doesn't see until it's sent. If neither is
+recorded, the mail stays unacknowledged.
 
 `mdkg agents use-key <agent>` bills that agent's next turn, one, on the
 key; `agents_use_key` is its MCP twin. It's your command, never an
@@ -650,6 +786,48 @@ mdkg refuses its own helper, and Codex's tool shells don't see the key,
 but neither is a boundary.
 For real isolation, run agents in a sandbox or a separate account.
 
+## Harness memory
+
+Each harness keeps its own memory features: Claude Code's CLAUDE.md files
+and auto memory, Codex's `AGENTS.md` files and memories, OpenCode's rules.
+mdkg leaves them on and doesn't read or write them for you.
+
+The canonical copy is mdkg's graph. A fact that has to outlast one
+harness's session, or reach an agent on another harness, goes in a node:
+a decision in a `dec-*` node, progress in the task's body, a finding in
+the task that it affects. A harness's own memory is a working copy.
+Another harness doesn't find it by itself, and a fresh session or a new
+machine may not have it.
+
+The rule: a harness finds only its own memory and instruction files, not
+another harness's. Each harness's private files are its own: `CLAUDE.md`,
+`CLAUDE.local.md` and `~/.claude` are Claude Code's, `~/.codex` is
+Codex's, and `~/.config/opencode` is OpenCode's. A file that you name
+yourself in a harness's own config (such as OpenCode's `instructions`)
+is your choice, and mdkg doesn't override it. A project's `AGENTS.md`,
+where `install` writes mdkg's block, is shared project instructions: it
+belongs to the project, not to one harness. Codex and OpenCode read it,
+and Claude Code reads it by default when the project has no `CLAUDE.md`
+or `CLAUDE.local.md`. What mdkg sets on each turn it launches:
+
+- **OpenCode:** `OPENCODE_DISABLE_CLAUDE_CODE=1` and
+  `OPENCODE_DISABLE_CLAUDE_CODE_SKILLS=1`, so it doesn't look for a
+  `CLAUDE.md`, `~/.claude/CLAUDE.md` or `.claude/skills` on its own. A file
+  that your own OpenCode config names in `instructions` still loads: that's
+  your choice, and mdkg doesn't override it. They're in the turn's own
+  environment, set after the allowlist (see
+  [The turn's environment](#the-turns-environment)). Neither `env.allow`
+  nor a value in the launcher's shell turns them off. OpenCode still
+  finds mdkg's skills in the `.agents/skills` mirror, so a project whose
+  `projections` list has only `skills:.claude/skills` should add
+  `skills:.agents/skills`.
+- **Claude Code:** nothing. It reads its own `CLAUDE.md` files, and a
+  project's `AGENTS.md` only when there's no `CLAUDE.md`. It reads nothing
+  under Codex's or OpenCode's folders.
+- **Codex:** nothing. It reads `AGENTS.override.md`, `AGENTS.md` and only
+  the fallback names that your own Codex config lists, never `CLAUDE.md`
+  by default.
+
 ## Inspecting configuration
 
 `mdkg config show` displays merged settings and each value's source without
@@ -670,6 +848,27 @@ absent XDG file does not fall back to HOME. Project settings come from
 `<git common dir>/mdkg/config.local.json`. A definition file replaces that
 agent's inline project entry.
 
+To see which agents the settings define, and where each comes from, run
+`mdkg agents list` (or `--json`). Each entry gives:
+- `name`;
+- `defined_in`: `project` for a committed definition file or an inline
+  project entry, otherwise the first of `user` and `local` that names it;
+- `file_backed`: whether it has its own `.mdkg/agents/<name>.json`;
+- `layers`: every layer whose own settings have an entry for it (for the
+  project layer, the project config or a definition file), in precedence
+  order, even where a higher layer overrides each field it sets;
+- `harness` and `role`.
+
+It reads the same settings as `config show` and redacts them the same way.
+It probes nothing and reads no saved state; `agents status` does both. An
+entry named only in the user or local layer is listed, though
+`config show` warns that it is inactive. A `null` removes an agent rather
+than defining it, so a layer whose entry is `null` isn't in `layers`. An
+agent a later layer removes this way (an entry `null`, or `agents: null`)
+is still listed for the layers that define it. If no layer after the
+`null` defines it again, it has no `harness` or `role`, because the
+effective settings no longer have it; if one does, it shows that layer's.
+
 Run from the graph root or select it with `mdkg --root <graph-root> config show`.
 If the selected root has no `.mdkg` directory, the command shows defaults and
 user settings only. It warns about an ancestor project rather than importing
@@ -680,7 +879,11 @@ This display does not validate every setting for execution. In 0.7.0,
 named `.mdkg/agents/<name>.json` definitions and orchestration settings.
 Optional `agents.defaults` and overrides for names without a definition file
 are ignored; project defaults still apply. Projections remain project-only.
-The display warns about these limits. Migrate a legacy inline agent to a
+An agent's authority fields (`role`, `reports_to`, `protect`, `placement`,
+`follow`, `cwd`, `worktree`, `base`, and since 0.7.2 its `policy.env`)
+come only from the committed graph: a user or machine-local layer that
+changes one is refused with `run.authority_override`, since a worker may
+write the machine-local file. The display warns about these limits. Migrate a legacy inline agent to a
 definition file with `mdkg agents edit <name>` before using named overrides.
 
 Definition management edits project-authored values. Status shows current
@@ -696,12 +899,15 @@ Edits to local or user configuration apply the next time the watch
 restarts, whether you restart it or a reload or reinstall does. A changed
 unfinished invocation can require
 [explicit recovery](#durable-supervisor-progress) before it starts.
-`config set` is deferred beyond 0.7.1. The
+`config set` and `config unset` change the committed project config
+([changing the committed config](git-graph.md#changing-the-committed-config)). The
 [runtime layering tests](../crates/mdkg-cli/tests/agent_layers.rs) cover
 effective values, origins and authored edits across all three harnesses.
 
-Both formats hide recognized credential values as `[redacted]`; detection
-is incomplete, and property names and source paths remain visible. The
+Both formats hide recognized credential values as `[redacted]`, and show a
+key that itself looks like a credential as `[redacted key <n>]`
+([what is and isn't guaranteed](format-0.7.md)). Detection is incomplete;
+other property names and source paths remain visible. The
 [configuration display tests](../crates/mdkg-cli/tests/config_commands.rs)
 cover source precedence, transitional notices, graphless discovery and
 redaction without modifying files.
@@ -725,6 +931,8 @@ A read-shaped command can maintain local state:
   landing overwritten before a successful observation can leave a false
   conflict. Status can also refresh its derived graph cache. It reports
   pending graph intents without replaying or publishing them.
+  `status --no-observe` skips the observation write: settlement is still
+  projected for the output, but the store isn't written.
 - `holds` still calls `Repo::observe`: it persists settlement observations
   and due lease expiry. It can therefore change the coordinator without
   editing a node.
@@ -735,23 +943,76 @@ A read-shaped command can maintain local state:
   instead of updating this derived cache, but when a coordinator store exists
   they still open it read/write, as other coordinator-backed reads do.
 - `msg inbox`, `msg wait` and `msg thread` mark the messages they list as
-  **shown**, not acked. Pass `--no-mark` to leave that state
-  unchanged; mail listed only this way can't be acked until it is listed
-  normally. The MCP `inbox`, `inbox_wait` and `channel_read` tools also mark
-  the messages their replies deliver, after the reply goes out. Those tools
-  have no `no-mark` input at 0.7.1.
+  **shown**, not acked, and delete bodies whose retention is over. Pass
+  `--no-mark` to leave the mail unchanged: nothing is marked, nothing is
+  purged and no record is written. Its store open is still the writable
+  one, so a first read can create the store (and its first record), and
+  an existing store can be upgraded or recovered from a crash; a reader
+  that must not write the store at all uses `--read-only` (below). A body
+  due for purging is listed as
+  `purged`, by the same rule the purge uses (past its TTL, past its ack
+  grace, or once a human's hold is over), so the listing matches what a
+  marking read would show. The next marking read, ack or send deletes it.
+  Mail listed only this way can't be acked until it is listed normally.
+  The MCP `inbox`, `inbox_wait`, `room_read` and `channel_read` tools
+  also mark the messages their replies deliver, after the reply goes out,
+  and purge as a normal read does. Those tools have no `no-mark` input.
 
 After a crash, SQLite's read-only open can briefly take a WAL-index
 recovery lock. This remains a residual: a lock-wait timeout does not bound
 how long a connection holding that recovery lock takes to finish.
 
 For a viewer who must not change mail state, use the CLI's `--no-mark` and
-don't ack. For a viewer with no filesystem write access, `config show` does
-not open the coordinator, and direct Git or file reads are safe. The derived
-index's in-memory fallback does not make every other cache or coordinator
-read write-free; status's cache refresh and observation write also remain
-possible. In particular, don't rely on MCP mail from the Codex
-read-only sandbox described above.
+don't ack. A person who wants mail across mailboxes (every open fault or
+review request, say) reads `msg list --as human:<name> --kind ...`: it
+opens the store read-only, so it acks, marks and purges nothing, and it
+is refused inside an agent's turn. See [mail across
+mailboxes](api.md#mail-across-mailboxes-072).
+
+A reader that delivers only some of what it read marks exactly those
+messages with `msg inbox --mark-shown <seq>/<digest>/<id>,...` (each as
+the `--no-mark` listing showed it), and lists nothing. A turn's lead read
+uses it: `msg inbox --from <reports_to> --no-mark --limit 1` finds the
+oldest mail from the agent's `reports_to` anywhere in its mailbox, and
+marking only what the turn delivers keeps `ack --through` from acking the
+mail it passed.
+
+### Reading with `--read-only`
+
+The global `--read-only` flag makes a command write nothing to the
+coordinator store, for a live view or any reader that must not change it:
+
+```sh
+mdkg --read-only status --json
+mdkg --read-only msg inbox --as <actor> --json
+mdkg --read-only msg thread <id> --json
+```
+
+- The store is opened read-only: never created, upgraded, recovered from a
+  crash or checkpointed, and the blob digest cache beside it is only read.
+  SQLite may still create an empty WAL file or update its shared-memory
+  index (`coord.sqlite-shm`); neither holds store content.
+- `status` reads as with `--no-observe`, and skips the shared-lease merge
+  check (`git merge-tree` writes git objects), so its JSON has no
+  `merge_conflicts`. An absent field there doesn't mean the branches merge
+  cleanly. `msg inbox`, `msg wait` and `msg thread` read as with
+  `--no-mark`.
+- Only `status`, `msg inbox`, `msg wait` and `msg thread` run with it. Every
+  other command, `mcp` and `serve` included, is refused with
+  `store.read_only` (exit 1) before it runs, so nothing else can change the
+  store, the graph or git under the flag. Run those without `--read-only`.
+- A read that finds the store needs an upgrade or crash recovery is refused
+  the same way and leaves it as it was. Mail reads in a repository with no
+  store yet are refused too, since only a write creates one; `status` there
+  shows an empty coordinator.
+- It covers the coordinator store only. Other local state is as described
+  above: in ref mode, binding the graph can still refresh its cache under
+  `<git common dir>/mdkg/`.
+
+For a viewer with no filesystem write access, `config show` does not open
+the coordinator, and direct Git or file reads are safe. An MCP server
+writes the store when it lists mail (and doesn't run under `--read-only`),
+so don't rely on it from the Codex read-only sandbox described above.
 
 ## Waiting for mail outside `agents up`
 
@@ -826,8 +1087,8 @@ In ref mode, when `mdkg.mainRef` or `$MDKG_MAIN_REF` names a resolvable code
 base, before each worker turn the launcher reports when its branch is behind
 that base, with a suggested merge command. If neither is configured, the
 checkout-branch fallback does not enable follow notes. The launcher never
-merges for the worker; `follow: "merge"` still gives notes in 0.7.1 and the
-automatic merge is 0.7.2. `agents status --json` includes `code_base` with
+merges for the worker; `follow: "merge"` still gives notes in 0.7.2.
+`agents status --json` includes `code_base` with
 the ref and ahead/behind counts when both are available; `work_base` is in
 saved agent state, not the status response.
 
@@ -841,7 +1102,7 @@ The policy is project `agents.defaults`, then the effective definition's
 | Field | 0.7.0 default | Also |
 |---|---|---|
 | `trigger` | `mail` | `manual`: use `agents up <name> --once` |
-| `shape` | `batch`: one run shows the unacked mail of one conversation, up to 20 (`{"kind": "batch", "max": 5}`), and replies once | |
+| `shape` | `batch`: one run shows the unacked mail of one conversation, up to 20 (`{"kind": "batch", "max": 5}`), and replies once | `digest`: group unacked mail by node or conversation, with a 48 KiB target (`{"kind":"digest","budget":49152}`) |
 | `session` | `resume` | `agents up --fresh` starts over on each agent's first turn |
 | `loop_guard` | 10 automatic turns per thread per hour | `{"turns": 4, "window_secs": 1800}`, or `false` |
 | `concurrency` | unset: no cap | a number caps the turns `agents up` runs at once (the smallest set) |
@@ -853,6 +1114,15 @@ Every field also takes `{"kind": …}` with settings, so later options
 (`schedule`, `until-done`, `fresh-each-turn`, `backoff`, budgets) can be
 written now: `agents status` reads them, and `agents up` refuses them
 until a release runs them.
+
+Use `agents add <name> --delivery digest` or `agents edit <name> --delivery
+digest` to select digest delivery. `--delivery batch` restores the default;
+the flag keeps the definition's other policy fields. `msg digest --json`
+computes a view of the current mailbox without marking mail as shown; use
+`--mailbox` to select a held mailbox and `--budget` for its rendered byte
+target. In a digest turn the final reply goes to the agent's `reports_to`;
+only messages shown with complete bodies are acknowledged on success.
+Header-only messages stay unacknowledged for a later turn.
 
 A thread the loop guard pauses keeps its mail unacked while the agent's
 other threads run. It runs again when its oldest counted turn leaves the
@@ -1042,7 +1312,10 @@ each agent:
   when that process is gone; null when none ever did;
 - `current_turn`: `{turn_id, number, started_at, output_after}`, the turn
   running now, where `output_after` is the latest `seq` in its output
-  journal; null when none;
+  journal; null when none. A turn runs until it has a receipt, an index end
+  line or a journal `turn.ended`, or its launcher is proven gone (its pid
+  not running here, or running with another start time): a supervisor
+  record that doesn't show the agent running doesn't end it;
 - `last_turn`: `{turn_id, number, outcome, ended_at}`, the last turn that
   isn't running; null when none;
 - `follow_from`: `<current_turn.turn_id>:<output_after>` while a turn
@@ -1079,15 +1352,18 @@ newest 1000 turns once it passes 2000. All of it lives under
 [--native] --json` prints a turn's live output, normalized across
 harnesses, as NDJSON: one `mdkg.api.turn_output.v1` event per line,
 flushed per line. Each event has the turn's path, a `seq` from 1 within
-the turn, a `time`, a `type` and its `data`:
+the turn, its `position` (opaque: pass it to `--after` to resume after this
+event; absent on `agent.state` and on the `turn.started` sent for a purged
+turn; a synthesized `turn.ended`'s resumes with the next turn), a `time`, a
+`type` and its `data`:
 
 | `type` | `data` |
 |---|---|
 | `turn.started` | `{turn_id, number}`, the journal's first event |
 | `harness.starting` | `{harness}`, just before the spawn |
 | `text` | `{text}`, the agent's own output |
-| `tool.started` | `{class, name, summary}`; `class` is `edit`, `shell`, `read`, `mcp` or `other` |
-| `tool.ended` | `{class, name, ok}` |
+| `tool.started` | `{class, name, call_id, summary}`; `class` is `edit`, `shell`, `read`, `mcp` or `other`; `call_id` is the harness's own id for the call (Claude's `tool_use` id; OpenCode's `callID`, else its tool part's `id`), or null |
+| `tool.ended` | `{class, name, call_id, ok}`: within one turn, a non-null `call_id` names the `tool.started` it ends; with a null one the pairing is unknown |
 | `usage` | `{input_tokens, output_tokens, cache_read_tokens, total_tokens, cost_usd}`, as the harness reports them |
 | `status`, `error` | `{text}`, harness notices; a stderr line is a `status` |
 | `turn.ended` | `{outcome}`, plus `output_gone: true` when its journal was purged first |
@@ -1128,6 +1404,19 @@ the agent never had, or an attempt that ended before it started, with
 `api.cursor_expired` and `data.earliest`; a malformed one with
 `api.bad_cursor`; an unknown agent with `run.unknown_agent`. A refusal is
 one `mdkg.agents.logs.v1` envelope, and nothing else is printed.
+
+### Turn history: `agents turns`
+
+`agents turns <agent> [--limit <n>] [--before <N>] [--turn <N>] --json`
+(`mdkg.agents.turns.v1`) lists the agent's turns from its turn index,
+newest first. Each has its `turn_id`, `number`, `started`, `ended` (null
+until its evidence records one), `state` (`running`, `ended` or
+`interrupted`), `outcome` (as `agents status` derives it; null while it
+runs) and `receipt`, its retained receipt's path, or null. A page holds at
+most `--limit` turns (default 50, at most 500); `next_before`, passed as
+`--before`, names the next, older page, and is null on the last one.
+`--turn <N>` gives turn N alone, or `api.unknown_resource` when the index
+holds no such turn. An unknown agent is `run.unknown_agent`.
 
 ### Turn receipts
 

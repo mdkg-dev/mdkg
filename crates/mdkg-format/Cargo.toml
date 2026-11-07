@@ -1,6 +1,6 @@
 [package]
 name = "mdkg-format"
-version = "0.7.1"
+version = "0.7.2"
 description = "Parse and write mdkg markdown + frontmatter nodes. Internal to mdkg, no stable API; depend on the mdkg binary"
 edition.workspace = true
 license.workspace = true

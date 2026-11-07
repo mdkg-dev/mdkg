@@ -93,7 +93,7 @@ fn make_repo(agents: Value) -> (Scratch, PathBuf) {
             fs::remove_file(repo.join("README.md")).ok();
             fs::write(
                 repo.join(".gitignore"),
-                "*.args\n*.prompt\n*.environ\n/.worktrees/\n",
+                "*.args\n*.prompt\n*.environ\nfake-reply\n/.worktrees/\n",
             )
             .expect("ignore");
             let config = repo.join(".mdkg/config.json");
@@ -173,6 +173,21 @@ fn ok(root: &Path, actor: &str, args: &[&str]) -> Value {
     let (code, out) = mdkg(root, actor, args);
     assert_eq!(code, 0, "{args:?}: {out}");
     out
+}
+
+/// `name`'s `last_exit` in `agents status --no-probe --json`, which a
+/// supervisor leaves when it ends (#20587); null when none.
+fn last_exit(root: &Path, name: &str) -> Value {
+    let status = ok(root, "launcher", &["agents", "status", "--no-probe"]);
+    status["data"]["agents"]
+        .as_array()
+        .expect("agents")
+        .iter()
+        .find(|a| a["name"] == name)
+        .unwrap_or_else(|| panic!("{name} in {status}"))
+        .get("last_exit")
+        .cloned()
+        .unwrap_or(Value::Null)
 }
 
 /// `agents up --once`: its exit code and one envelope per event.
@@ -1187,6 +1202,7 @@ fn codex_ultra_definition_reaches_a_fake_turn_and_other_harnesses_refuse_it() {
         serde_json::from_slice(&fs::read(repo.join(".git/mdkg/run/astra.json")).unwrap()).unwrap();
     assert_eq!(saved["spec"]["effort"], "ultra");
     assert_eq!(saved["turns"], 1);
+    assert_eq!(last_exit(&root, "astra")["reason"], "once");
 
     // Legacy inline entries still reach the harness-aware state validator
     // before either a saved spec or a worker checkout can be created.
@@ -1724,6 +1740,17 @@ fn a_manual_agent_isnt_woken_and_a_later_kind_refuses_the_run() {
     assert_eq!(code, 0);
     assert_eq!(events.len(), 1, "{events:?}");
     assert_eq!(events[0]["data"]["event"], "manual");
+    // Its reason is its trigger, never a failure or a cap (#20921).
+    assert_eq!(last_exit(&graph(&repo), "rev")["reason"], "manual");
+    for extra in [&["rev"][..], &["rev", "--max-turns", "2"]] {
+        let mut args = vec!["agents", "up"];
+        args.extend_from_slice(extra);
+        let (code, out) = mdkg_out(&graph(&repo), "launcher", &args);
+        assert_eq!(code, 0, "{extra:?}: {out}");
+        let exit = last_exit(&graph(&repo), "rev");
+        assert_eq!(exit["reason"], "manual", "{extra:?}: {exit}");
+        assert!(exit.get("code").is_none(), "{exit}");
+    }
     let out = isolated(
         Command::new(env!("CARGO_BIN_EXE_mdkg"))
             .arg("--root")
@@ -2526,6 +2553,11 @@ fn a_running_watch_reloads_an_edited_definition_before_its_next_turn() {
             1,
             "{harness}: {err}"
         );
+        // The cap, recorded by the re-execed image under the one id.
+        let exit = last_exit(&root, "rev");
+        assert_eq!(exit["reason"], "cap", "{harness}: {exit}");
+        assert!(exit.get("code").is_none(), "{harness}: {exit}");
+        assert!(exit["at"].is_string(), "{harness}: {exit}");
     }
 }
 
@@ -2748,6 +2780,7 @@ fn sigterm_during_a_reload_drain_stops_instead_of_re_execing() {
         watch.err()
     );
     assert!(!watch.err().contains("restarting"), "{}", watch.err());
+    assert_eq!(last_exit(&root, "rev")["reason"], "signal");
     let progress = read_progress(&repo, "rev");
     assert_eq!(progress["progress"]["ran"], 1, "{progress}");
     assert_eq!(progress["finished"], true, "{progress}");
@@ -2811,6 +2844,9 @@ fn agents_stop_drains_a_turn_in_flight_then_the_supervisor_exits() {
     let err = watch.err();
     assert!(err.contains("rev: stopped by agents stop"), "{err}");
     assert!(err.contains("every agent stopped by agents stop"), "{err}");
+    let exit = last_exit(&root, "rev");
+    assert_eq!(exit["reason"], "drained", "{exit}");
+    assert!(uuid::Uuid::parse_str(exit["supervisor_id"].as_str().unwrap()).is_ok());
     assert!(!request.exists());
     let progress = read_progress(&repo, "rev");
     assert_eq!(progress["progress"]["ran"], 1, "{progress}");
@@ -2900,6 +2936,59 @@ fn agents_stop_reaches_an_idle_agent_within_a_poll_and_clears_a_dead_supervisors
     let (code, out) = stop(&root, &["--all", "--drain"]);
     assert_eq!(code, 0, "{out}");
     assert_eq!(out["data"]["agents"], json!([]), "{out}");
+}
+
+/// A drained agent's reason is recorded as it's let go, so the
+/// supervisor that drained it neither hides nor overwrites a later run's
+/// (#20921): drain rev while the watch runs rev2, run rev once by hand,
+/// then SIGTERM the watch.
+#[test]
+fn a_drained_agents_later_run_keeps_its_own_exit_reason() {
+    let (scratch, repo) = make_repo(json!({
+        "rev": {"harness": "claude", "role": "reviewer"},
+        "rev2": {"harness": "claude", "role": "reviewer"},
+    }));
+    let root = graph(&repo);
+    // Turns don't wait: only the watch's idle loop matters here.
+    fs::write(scratch.0.join("release"), "").unwrap();
+    let claude = held_claude(&scratch.0);
+    let mdkg = Path::new(env!("CARGO_BIN_EXE_mdkg"));
+    let mut watch = Watching::start(&scratch.0, &root, mdkg, &claude, &["rev2"]);
+    watch.wait_for("watch start", |_| progress_file(&repo, "rev2").exists());
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let supervisors = repo.join(".git/mdkg/run/supervisors");
+    watch.wait_for("supervisor record", |_| {
+        fs::read_dir(&supervisors).is_ok_and(|d| {
+            d.flatten()
+                .any(|e| e.path().extension().is_some_and(|x| x == "json"))
+        })
+    });
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let (code, out) = stop(&root, &["rev", "--drain", "--wait", "30"]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(
+        out["data"]["agents"][0]["state"],
+        "stopped",
+        "{out}\n{}",
+        watch.err()
+    );
+    // The watch still names rev, stopped: rev's reason shows.
+    let drained = last_exit(&root, "rev");
+    assert_eq!(drained["reason"], "drained", "{drained}");
+    assert!(last_exit(&root, "rev2").is_null());
+    // A pass by hand, while the first watch still runs rev2.
+    send(&repo, "rev", "by hand", None);
+    let (code, out) = mdkg_out(&root, "launcher", &["agents", "up", "--once", "rev"]);
+    assert_eq!(code, 0, "{out}");
+    let once = last_exit(&root, "rev");
+    assert_eq!(once["reason"], "once", "{once}");
+    assert_ne!(once["supervisor_id"], drained["supervisor_id"], "{once}");
+    // The first watch ends: rev keeps the later reason, rev2 gets its own.
+    watch.signal("-TERM");
+    let status = watch.exit();
+    assert!(status.success(), "{}", watch.err());
+    assert_eq!(last_exit(&root, "rev"), once);
+    assert_eq!(last_exit(&root, "rev2")["reason"], "signal");
 }
 
 /// A name no definition, saved agent or registration has is nothing to
@@ -3450,7 +3539,7 @@ fn agents_logs_follows_an_agents_turns_in_order_from_a_status_position() {
     assert!(seqs.windows(2).all(|w| w[0] < w[1]), "{seqs:?}");
     assert_eq!(
         turn1[3]["data"],
-        json!({"class": "shell", "name": "Bash", "summary": "ls"})
+        json!({"class": "shell", "name": "Bash", "call_id": "t1", "summary": "ls"})
     );
     fs::write(scratch.0.join("release"), "").expect("release");
     let mut rest = follow.until("turn.ended");
@@ -4514,6 +4603,15 @@ fn a_committed_definition_the_re_exec_refuses_leaves_the_watch_finished() {
     assert!(watch.err().contains("trigger schedule"), "{}", watch.err());
     let progress = read_progress(&repo, "rev");
     assert_eq!(progress["finished"], true, "{progress}");
+    // The re-exec failed before it registered: its failure is still the
+    // reason, under the supervisor's id (#20921).
+    let exit = last_exit(&root, "rev");
+    assert_eq!(exit["reason"], "failed", "{exit}");
+    assert!(
+        exit["code"].as_str().is_some_and(|c| !c.is_empty()),
+        "{exit}"
+    );
+    assert!(uuid::Uuid::parse_str(exit["supervisor_id"].as_str().unwrap()).is_ok());
     // Fixed and started by hand: no resume needed.
     git_text(
         &graph(&repo),
@@ -5152,4 +5250,899 @@ fn agents_status_text_nests_effective_settings() {
         "{text}"
     );
     assert!(block.iter().all(|l| !l.contains("=layer=")), "{text}");
+}
+
+/// `agents turns` lists an agent's turns newest first, a page at a time,
+/// or one by number, with each turn's derived outcome and its receipt;
+/// `agents logs` lines carry the position `--after` resumes from.
+#[test]
+fn agents_turns_pages_newest_first_and_logs_lines_carry_their_position() {
+    use std::io::Write as _;
+    let (scratch, repo) = make_repo(json!({}));
+    let root = graph(&repo);
+    ok(
+        &root,
+        "launcher",
+        &[
+            "agents",
+            "add",
+            "cx",
+            "--harness",
+            "codex",
+            "--role",
+            "reviewer",
+        ],
+    );
+    send(&repo, "cx", "a request", None);
+    let (code, events, err) = up_harnesses(&scratch.0, &root, "cx");
+    assert_eq!(code, 0, "{events:?} {err}");
+    // Three more ended turns, as the index records them.
+    let index = repo.join(".git/mdkg/run/cx/turns.jsonl");
+    // ids[n] is turn n's (turn 1 is the real one, read below).
+    let mut ids = vec![String::new(), String::new()];
+    for n in 2..=4u64 {
+        let id = uuid::Uuid::now_v7().to_string();
+        let mut f = fs::OpenOptions::new()
+            .append(true)
+            .open(&index)
+            .expect("index");
+        for line in [
+            json!({"line": "start", "turn_id": id, "number": n, "files": format!("turn-{n}"),
+                "started_at": format!("2026-10-30T00:00:0{n}Z"), "supervisor_id": null,
+                "host": "elsewhere", "pid": 1, "pid_started_at": "never"}),
+            json!({"line": "end", "turn_id": id, "ended_at": format!("2026-10-30T00:01:0{n}Z"),
+                "outcome": "idle"}),
+        ] {
+            writeln!(f, "{line}").expect("append");
+        }
+        ids.push(id);
+    }
+    // Not `mdkg`: its schema is checked against the generated one, which
+    // the wave writes (schemas/ isn't committed on a lane branch).
+    let mdkg = |root: &Path, actor: &str, args: &[&str]| -> (i32, Value) {
+        let (code, out) = mdkg_out(root, actor, args);
+        (
+            code,
+            serde_json::from_str(&out).unwrap_or_else(|_| panic!("not JSON: {out}")),
+        )
+    };
+    let numbers = |out: &Value| -> Vec<u64> {
+        out["data"]["turns"]
+            .as_array()
+            .expect("turns")
+            .iter()
+            .map(|t| t["number"].as_u64().expect("number"))
+            .collect()
+    };
+    let (code, all) = mdkg(&root, "launcher", &["agents", "turns", "cx"]);
+    assert_eq!(code, 0, "{all}");
+    assert_eq!(all["schema"], "mdkg.agents.turns.v1", "{all}");
+    assert_eq!(numbers(&all), [4, 3, 2, 1], "{all}");
+    assert_eq!(all["data"]["next_before"], Value::Null, "{all}");
+    let (_, page) = mdkg(
+        &root,
+        "launcher",
+        &["agents", "turns", "cx", "--limit", "2"],
+    );
+    assert_eq!(numbers(&page), [4, 3], "{page}");
+    assert_eq!(page["data"]["next_before"], 3, "{page}");
+    let (_, page) = mdkg(
+        &root,
+        "launcher",
+        &["agents", "turns", "cx", "--limit", "2", "--before", "3"],
+    );
+    assert_eq!(numbers(&page), [2, 1], "{page}");
+    assert_eq!(page["data"]["next_before"], Value::Null, "{page}");
+    let three = &all["data"]["turns"][1];
+    assert_eq!(three["turn_id"], ids[3].as_str(), "{three}");
+    assert_eq!(three["started"], "2026-10-30T00:00:03Z", "{three}");
+    assert_eq!(three["ended"], "2026-10-30T00:01:03Z", "{three}");
+    assert_eq!(
+        (&three["state"], &three["outcome"], &three["receipt"]),
+        (&json!("ended"), &json!("idle"), &Value::Null),
+        "{three}"
+    );
+    // The real turn: its receipt is there, and its outcome is the receipt's.
+    let (code, one) = mdkg(&root, "launcher", &["agents", "turns", "cx", "--turn", "1"]);
+    assert_eq!(code, 0, "{one}");
+    let first = &one["data"]["turns"][0];
+    assert_eq!(numbers(&one), [1], "{one}");
+    assert_eq!(first["state"], "ended", "{first}");
+    assert!(first["outcome"].is_string(), "{first}");
+    assert!(first["ended"].is_string(), "{first}");
+    let receipt = first["receipt"].as_str().expect("a receipt");
+    assert!(Path::new(receipt).is_file(), "{first}");
+    // Refusals: no such turn, a bad limit, no such agent.
+    let (code, none) = mdkg(&root, "launcher", &["agents", "turns", "cx", "--turn", "9"]);
+    assert_ne!(code, 0, "{none}");
+    assert_eq!(
+        none["diagnostics"][0]["code"], "api.unknown_resource",
+        "{none}"
+    );
+    let (code, bad) = mdkg(
+        &root,
+        "launcher",
+        &["agents", "turns", "cx", "--limit", "0"],
+    );
+    assert_ne!(code, 0, "{bad}");
+    assert_eq!(bad["diagnostics"][0]["code"], "usage.bad_value", "{bad}");
+    let (code, who) = mdkg(&root, "launcher", &["agents", "turns", "nobody"]);
+    assert_ne!(code, 0, "{who}");
+    assert_eq!(who["diagnostics"][0]["code"], "run.unknown_agent", "{who}");
+    // Each logs line's position resumes after that line.
+    let turn_id = first["turn_id"].as_str().expect("id").to_string();
+    let lines = |args: &[&str]| -> Vec<Value> {
+        let (code, out) = mdkg_out(&root, "launcher", args);
+        assert_eq!(code, 0, "{out}");
+        out.lines()
+            .map(|l| serde_json::from_str(l).expect("a JSON line"))
+            .collect()
+    };
+    let log = lines(&["agents", "logs", "cx", "--turn", &turn_id]);
+    assert!(log.len() >= 2, "{log:?}");
+    for line in &log {
+        assert_eq!(
+            line["position"],
+            format!("{turn_id}:{}", line["seq"]),
+            "{line}"
+        );
+    }
+    let position = log[0]["position"].as_str().expect("position");
+    let rest = lines(&[
+        "agents", "logs", "cx", "--turn", &turn_id, "--after", position,
+    ]);
+    assert_eq!(rest, log[1..], "{rest:?}");
+}
+
+/// A synthesized line's position is one a resume honours: a purged turn's
+/// `turn.ended` and an interrupted turn's give `<turn_id>:end`, so a resume
+/// from either starts with the next turn and never sees it again; the
+/// purged turn's synthesized `turn.started` gives none.
+#[test]
+fn synthesized_lines_resume_past_their_turn_and_are_never_repeated() {
+    use std::io::Write as _;
+    let (scratch, repo) = make_repo(json!({}));
+    let root = graph(&repo);
+    ok(
+        &root,
+        "launcher",
+        &[
+            "agents",
+            "add",
+            "cx",
+            "--harness",
+            "codex",
+            "--role",
+            "reviewer",
+        ],
+    );
+    send(&repo, "cx", "a request", None);
+    let (code, events, err) = up_harnesses(&scratch.0, &root, "cx");
+    assert_eq!(code, 0, "{events:?} {err}");
+    let run = repo.join(".git/mdkg/run/cx");
+    let mut index = fs::OpenOptions::new()
+        .append(true)
+        .open(run.join("turns.jsonl"))
+        .expect("index");
+    // Turn 2: ended, its journal purged. Turn 3: a journal that stops after
+    // the harness started, its launcher on another host (interrupted).
+    let purged = uuid::Uuid::now_v7().to_string();
+    let cut = uuid::Uuid::now_v7().to_string();
+    for (n, id, end) in [(2u64, &purged, true), (3, &cut, false)] {
+        writeln!(
+            index,
+            "{}",
+            json!({"line": "start", "turn_id": id, "number": n, "files": format!("turn-{n}"),
+                "started_at": "2026-10-30T00:00:00Z", "supervisor_id": null,
+                "host": "elsewhere", "pid": 1, "pid_started_at": "never"})
+        )
+        .expect("start");
+        if end {
+            writeln!(
+                index,
+                "{}",
+                json!({"line": "end", "turn_id": id, "ended_at": "2026-10-30T00:00:01Z",
+                    "outcome": "idle"})
+            )
+            .expect("end");
+        }
+    }
+    drop(index);
+    let uri = format!("/v1/agents/cx/turns/{cut}");
+    let journal: String = [
+        json!({"schema": "mdkg.api.turn_output.v1", "turn": uri, "seq": 1,
+            "time": "2026-10-30T00:00:00.000Z", "type": "turn.started",
+            "data": {"turn_id": cut, "number": 3}}),
+        json!({"schema": "mdkg.api.turn_output.v1", "turn": uri, "seq": 2,
+            "time": "2026-10-30T00:00:00.001Z", "type": "harness.starting",
+            "data": {"harness": "codex"}}),
+    ]
+    .iter()
+    .map(|l| format!("{l}\n"))
+    .collect();
+    fs::write(run.join(format!("journals/{cut}.events.jsonl")), journal).expect("journal");
+    let lines = |f: &Follower, kind: &str| -> Vec<Value> {
+        f.until(kind)
+            .into_iter()
+            .filter(|e| e["type"] != "agent.state")
+            .collect()
+    };
+    let positions =
+        |got: &[Value]| -> Vec<Value> { got.iter().map(|e| e["position"].clone()).collect() };
+    // From turn 2: the purged turn, then the interrupted one.
+    let follow = Follower::start(&root, &["cx", "--follow", "--after", "turn:2"]);
+    let two = lines(&follow, "turn.ended");
+    assert_eq!(
+        positions(&two),
+        [Value::Null, json!(format!("{purged}:end"))],
+        "{two:?}"
+    );
+    assert_eq!(two[1]["data"]["output_gone"], true, "{two:?}");
+    let three = lines(&follow, "turn.ended");
+    assert_eq!(
+        positions(&three),
+        [
+            json!(format!("{cut}:1")),
+            json!(format!("{cut}:2")),
+            json!(format!("{cut}:end"))
+        ],
+        "{three:?}"
+    );
+    assert_eq!(follow.stop(), 0);
+    // Resuming from the purged turn's end starts with turn 3.
+    let follow = Follower::start(
+        &root,
+        &["cx", "--follow", "--after", &format!("{purged}:end")],
+    );
+    let next = lines(&follow, "turn.ended");
+    assert_eq!(next[0]["data"]["number"], 3, "{next:?}");
+    assert_eq!(next.len(), 3, "{next:?}");
+    assert_eq!(follow.stop(), 0);
+    // Resuming from the interrupted turn's end shows nothing of it again.
+    let follow = Follower::start(&root, &["cx", "--follow", "--after", &format!("{cut}:end")]);
+    let mut again = Vec::new();
+    while let Ok(line) = follow.lines.recv_timeout(std::time::Duration::from_secs(3)) {
+        let event: Value = serde_json::from_str(&line).expect("frame");
+        if event["type"] != "agent.state" {
+            again.push(event);
+        }
+    }
+    assert!(again.is_empty(), "{again:?}");
+    assert_eq!(follow.stop(), 0);
+    // And one turn, followed: its synthesized end once, and nothing when
+    // resumed from that end.
+    let (code, out) = mdkg_out(
+        &root,
+        "launcher",
+        &["agents", "logs", "cx", "--turn", &cut, "--follow"],
+    );
+    assert_eq!(code, 0, "{out}");
+    let one: Vec<Value> = out
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("frame"))
+        .collect();
+    assert_eq!(
+        positions(&one),
+        [
+            json!(format!("{cut}:1")),
+            json!(format!("{cut}:2")),
+            json!(format!("{cut}:end"))
+        ],
+        "{out}"
+    );
+    let resumed = format!("{cut}:end");
+    let (code, out) = mdkg_out(
+        &root,
+        "launcher",
+        &[
+            "agents", "logs", "cx", "--turn", &cut, "--follow", "--after", &resumed,
+        ],
+    );
+    assert_eq!((code, out.as_str()), (0, ""), "{out}");
+}
+
+/// Review of 7de881a3: a follower never synthesizes an end (whose
+/// `<turn_id>:end` position skips the rest of the turn on a resume) for a
+/// turn it can't prove over. A journal it can't read just now isn't purged,
+/// and a turn whose launcher still lives isn't over because its supervisor
+/// record doesn't show it running (a failed record write leaves it idle).
+#[test]
+fn a_follower_never_ends_a_turn_it_cannot_prove_over() {
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt;
+    let (scratch, repo) = make_repo(json!({}));
+    let root = graph(&repo);
+    ok(
+        &root,
+        "launcher",
+        &[
+            "agents",
+            "add",
+            "cx",
+            "--harness",
+            "codex",
+            "--role",
+            "reviewer",
+        ],
+    );
+    send(&repo, "cx", "a request", None);
+    let (code, events, err) = up_harnesses(&scratch.0, &root, "cx");
+    assert_eq!(code, 0, "{events:?} {err}");
+    let run = repo.join(".git/mdkg/run/cx");
+    let host = String::from_utf8(
+        Command::new("uname")
+            .arg("-n")
+            .output()
+            .expect("uname")
+            .stdout,
+    )
+    .expect("host")
+    .trim()
+    .to_string();
+    // Turn 2: ended, its journal retained but unreadable for now. Turn 3:
+    // started by a launcher that's alive (this test), under a supervisor
+    // whose record never showed the agent running, with no end yet.
+    let unreadable = uuid::Uuid::now_v7().to_string();
+    let live = uuid::Uuid::now_v7().to_string();
+    let mut index = fs::OpenOptions::new()
+        .append(true)
+        .open(run.join("turns.jsonl"))
+        .expect("index");
+    writeln!(
+        index,
+        "{}",
+        json!({"line": "start", "turn_id": unreadable, "number": 2, "files": "turn-2",
+            "started_at": "2026-10-30T00:00:00Z", "supervisor_id": null,
+            "host": "elsewhere", "pid": 1, "pid_started_at": "never"})
+    )
+    .expect("start");
+    writeln!(
+        index,
+        "{}",
+        json!({"line": "end", "turn_id": unreadable, "ended_at": "2026-10-30T00:00:01Z",
+            "outcome": "replied"})
+    )
+    .expect("end");
+    writeln!(
+        index,
+        "{}",
+        json!({"line": "start", "turn_id": live, "number": 3, "files": "turn-3",
+            "started_at": "2026-10-30T00:00:02Z", "supervisor_id": "sup-gone",
+            "host": host, "pid": std::process::id(), "pid_started_at": null})
+    )
+    .expect("start");
+    drop(index);
+    let journal = |id: &str, n: u64| -> String {
+        let uri = format!("/v1/agents/cx/turns/{id}");
+        [
+            json!({"schema": "mdkg.api.turn_output.v1", "turn": uri, "seq": 1,
+                "time": "2026-10-30T00:00:00.000Z", "type": "turn.started",
+                "data": {"turn_id": id, "number": n}}),
+            json!({"schema": "mdkg.api.turn_output.v1", "turn": uri, "seq": 2,
+                "time": "2026-10-30T00:00:00.001Z", "type": "harness.starting",
+                "data": {"harness": "codex"}}),
+        ]
+        .iter()
+        .map(|l| format!("{l}\n"))
+        .collect()
+    };
+    let unreadable_path = run.join(format!("journals/{unreadable}.events.jsonl"));
+    fs::write(&unreadable_path, journal(&unreadable, 2)).expect("journal");
+    fs::write(
+        run.join(format!("journals/{live}.events.jsonl")),
+        journal(&live, 3),
+    )
+    .expect("journal");
+    fs::set_permissions(&unreadable_path, fs::Permissions::from_mode(0o000)).expect("chmod");
+    let quiet = |f: &Follower| -> Vec<Value> {
+        let mut got = Vec::new();
+        while let Ok(line) = f.lines.recv_timeout(std::time::Duration::from_secs(3)) {
+            let event: Value = serde_json::from_str(&line).expect("frame");
+            if event["type"] != "agent.state" {
+                got.push(event);
+            }
+        }
+        got
+    };
+    let lines = |f: &Follower, kind: &str| -> Vec<Value> {
+        f.until(kind)
+            .into_iter()
+            .filter(|e| e["type"] != "agent.state")
+            .collect()
+    };
+    let positions =
+        |got: &[Value]| -> Vec<Value> { got.iter().map(|e| e["position"].clone()).collect() };
+    let follow = Follower::start(&root, &["cx", "--follow", "--after", "turn:2"]);
+    // The unreadable journal: no purged turn, no end, nothing past it.
+    let early = quiet(&follow);
+    assert!(early.is_empty(), "{early:?}");
+    // Readable again: all of it, then its end.
+    fs::set_permissions(&unreadable_path, fs::Permissions::from_mode(0o644)).expect("chmod");
+    let two = lines(&follow, "turn.ended");
+    assert_eq!(
+        positions(&two),
+        [
+            json!(format!("{unreadable}:1")),
+            json!(format!("{unreadable}:2")),
+            json!(format!("{unreadable}:end"))
+        ],
+        "{two:?}"
+    );
+    assert_eq!(two[2]["data"]["output_gone"], Value::Null, "{two:?}");
+    // The live turn: its lines, and no end while its launcher lives.
+    let three: Vec<Value> = (0..2)
+        .map(|_| {
+            loop {
+                let e = follow.next();
+                if e["type"] != "agent.state" {
+                    break e;
+                }
+            }
+        })
+        .collect();
+    assert_eq!(
+        positions(&three),
+        [json!(format!("{live}:1")), json!(format!("{live}:2"))],
+        "{three:?}"
+    );
+    let more = quiet(&follow);
+    assert!(more.is_empty(), "{more:?}");
+    // Status re-attaches to it, and a default follow starts with it.
+    let (_, cx) = status_agent(&root, "cx");
+    assert_eq!(cx["current_turn"]["turn_id"], live.as_str(), "{cx}");
+    assert_eq!(cx["follow_from"], format!("{live}:2"), "{cx}");
+    let default = Follower::start(&root, &["cx", "--follow"]);
+    let got: Vec<Value> = (0..2)
+        .map(|_| {
+            loop {
+                let e = default.next();
+                if e["type"] != "agent.state" {
+                    break e;
+                }
+            }
+        })
+        .collect();
+    assert_eq!(
+        positions(&got),
+        [json!(format!("{live}:1")), json!(format!("{live}:2"))],
+        "{got:?}"
+    );
+    let rest = quiet(&default);
+    assert!(rest.is_empty(), "{rest:?}");
+    assert_eq!(default.stop(), 0);
+    // One turn followed: the same.
+    let one = Follower::start(&root, &["cx", "--turn", &live, "--follow"]);
+    let got = quiet(&one);
+    assert_eq!(
+        positions(&got),
+        [json!(format!("{live}:1")), json!(format!("{live}:2"))],
+        "{got:?}"
+    );
+    // Its end line is terminal evidence: now both end it, once.
+    let mut index = fs::OpenOptions::new()
+        .append(true)
+        .open(run.join("turns.jsonl"))
+        .expect("index");
+    writeln!(
+        index,
+        "{}",
+        json!({"line": "end", "turn_id": live, "ended_at": "2026-10-30T00:00:03Z",
+            "outcome": "replied"})
+    )
+    .expect("end");
+    drop(index);
+    for f in [&follow, &one] {
+        let end = lines(f, "turn.ended");
+        assert_eq!(positions(&end), [json!(format!("{live}:end"))], "{end:?}");
+        assert_eq!(end[0]["data"]["outcome"], "replied", "{end:?}");
+    }
+    assert_eq!(follow.stop(), 0);
+    assert_eq!(one.stop(), 0);
+    // One turn followed whose journal can't be read at first: it waits,
+    // then sends all of it.
+    fs::set_permissions(&unreadable_path, fs::Permissions::from_mode(0o000)).expect("chmod");
+    let one = Follower::start(&root, &["cx", "--turn", &unreadable, "--follow"]);
+    let early = quiet(&one);
+    assert!(early.is_empty(), "{early:?}");
+    fs::set_permissions(&unreadable_path, fs::Permissions::from_mode(0o644)).expect("chmod");
+    let all = lines(&one, "turn.ended");
+    assert_eq!(
+        positions(&all),
+        [
+            json!(format!("{unreadable}:1")),
+            json!(format!("{unreadable}:2")),
+            json!(format!("{unreadable}:end"))
+        ],
+        "{all:?}"
+    );
+    assert_eq!(one.stop(), 0);
+}
+
+/// A turn whose final message is exactly NO_REPLY ends `no_reply`, not
+/// `replied`: in `agents up --json`, the index's end line, the journal's
+/// `turn.ended` and `agents status` last_turn, with no `reply` and no
+/// `reply_id`; the mail shown is still acked.
+#[test]
+fn a_no_reply_turn_ends_no_reply_everywhere() {
+    let (_dir, repo) = make_repo(json!({}));
+    let root = graph(&repo);
+    ok(
+        &root,
+        "launcher",
+        &[
+            "agents",
+            "add",
+            "writer",
+            "--harness",
+            "claude",
+            "--role",
+            "worker",
+            "--policy",
+            "{\"trigger\":\"manual\"}",
+        ],
+    );
+    send(&repo, "writer", "The first request.", None);
+    let (code, events) = up(&repo, &["writer"]);
+    assert_eq!(code, 0, "{events:?}");
+    assert_eq!(
+        events[0]["data"]["turn"]["outcome"], "replied",
+        "{events:?}"
+    );
+    assert!(
+        events[0]["data"]["turn"]["reply_id"].is_string(),
+        "{events:?}"
+    );
+    fs::write(repo.join(".worktrees/writer/fake-reply"), "NO_REPLY").expect("reply");
+    send(&repo, "writer", "Nothing to answer.", None);
+    let (code, events) = up(&repo, &["writer"]);
+    assert_eq!(code, 0, "{events:?}");
+    let turn = &events[0]["data"]["turn"];
+    assert_eq!(turn["outcome"], "no_reply", "{events:?}");
+    assert!(turn.get("reply").is_none(), "{events:?}");
+    assert!(turn.get("reply_id").is_none(), "{events:?}");
+    let lines = index_lines(&repo, "writer");
+    let end = lines.last().expect("an end line");
+    assert_eq!(
+        (&end["line"], &end["outcome"]),
+        (&json!("end"), &json!("no_reply")),
+        "{lines:?}"
+    );
+    let turn_id = end["turn_id"].as_str().expect("turn id");
+    let journal = fs::read_to_string(repo.join(format!(
+        ".git/mdkg/run/writer/journals/{turn_id}.events.jsonl"
+    )))
+    .expect("journal");
+    let ended: Value = journal
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).expect("journal line"))
+        .find(|e| e["type"] == "turn.ended")
+        .expect("turn.ended");
+    turn_output_conforms(&ended);
+    assert_eq!(ended["data"]["outcome"], "no_reply", "{ended}");
+    let (_, writer) = status_agent(&root, "writer");
+    assert_eq!(writer["last_turn"]["outcome"], "no_reply", "{writer}");
+    let inbox = ok(&root, "writer", &["msg", "inbox"]);
+    assert_eq!(inbox["data"]["messages"], json!([]), "{inbox}");
+}
+
+/// A turn that already answered its mail itself (a handoff to its sender
+/// in its context, by MCP or the CLI) has its final message kept, not
+/// imported as a second reply: the recipient gets one message, the turn
+/// ends `no_reply` and the shown mail is acked (#20931). Mail to someone
+/// else, or a question to the sender, doesn't count (review of 710641d2).
+#[test]
+fn a_turn_that_already_mailed_its_recipient_imports_no_second_reply() {
+    let (_dir, repo) = make_repo(json!({}));
+    let root = graph(&repo);
+    ok(
+        &root,
+        "launcher",
+        &[
+            "agents",
+            "add",
+            "writer",
+            "--harness",
+            "claude",
+            "--role",
+            "worker",
+            "--policy",
+            "{\"trigger\":\"manual\"}",
+        ],
+    );
+    let lane = repo.join(".worktrees/writer");
+    let mdkg = env!("CARGO_BIN_EXE_mdkg");
+    // The turn's own mail: to `to`, of `kind`, in the context of the mail
+    // the turn was shown (the newest unacked message's).
+    let mails = |to: &str, kind: &str| {
+        fs::write(
+            lane.join("fake-send"),
+            format!(
+                "ctx=$('{mdkg}' --as writer msg inbox --json | sed -n 's/.*\"contextId\": *\"\\([^\"]*\\)\".*/\\1/p' | tail -n 1)\n\
+                 '{mdkg}' --as writer msg send --to {to} --kind {kind} --context \"$ctx\" --text 'mid-turn' --json\n"
+            ),
+        )
+        .expect("fake-send")
+    };
+    let from_writer = || {
+        let inbox = ok(
+            &root,
+            "nick",
+            &["msg", "inbox", "--all", "--from", "writer"],
+        );
+        inbox["data"]["messages"]
+            .as_array()
+            .expect("messages")
+            .len()
+    };
+    // The first turn makes the worktree; it mails no one and replies.
+    send(&repo, "writer", "The first request.", None);
+    let (code, events) = up(&repo, &["writer"]);
+    assert_eq!(code, 0, "{events:?}");
+    assert_eq!(
+        events[0]["data"]["turn"]["outcome"], "replied",
+        "{events:?}"
+    );
+    assert_eq!(from_writer(), 1);
+    // Mail to someone else: the reply is still imported.
+    mails("orchestrator", "handoff");
+    send(&repo, "writer", "Tell the orchestrator.", None);
+    let (code, events) = up(&repo, &["writer"]);
+    assert_eq!(code, 0, "{events:?}");
+    assert_eq!(
+        events[0]["data"]["turn"]["outcome"], "replied",
+        "{events:?}"
+    );
+    assert_eq!(from_writer(), 2);
+    // A question to the sender in the same context isn't an answer: the
+    // final message is still imported (review of 710641d2).
+    mails("nick", "question");
+    send(&repo, "writer", "Ask me something first.", None);
+    let (code, events) = up(&repo, &["writer"]);
+    assert_eq!(code, 0, "{events:?}");
+    assert_eq!(
+        events[0]["data"]["turn"]["outcome"], "replied",
+        "{events:?}"
+    );
+    assert!(
+        fs::read_to_string(lane.join("fake-send.out"))
+            .unwrap_or_default()
+            .contains("\"ok\": true"),
+        "the question was sent"
+    );
+    assert_eq!(from_writer(), 4, "the question and the reply");
+    // A handoff to the sender itself: no second reply. The final message
+    // holds a credential, which the retained receipt must not keep, as it
+    // was never imported through the mail filters (review of 8a8ff4b8).
+    mails("nick", "handoff");
+    let secret = concat!("https://someone:SYNTHETIC_SKIPPED", "@example.test/d");
+    fs::write(lane.join("fake-reply"), format!("done; {secret}")).expect("fake-reply");
+    send(&repo, "writer", "Hand it back.", None);
+    let (code, events) = up(&repo, &["writer"]);
+    assert_eq!(code, 0, "{events:?}");
+    let turn = &events[0]["data"]["turn"];
+    assert_eq!(turn["outcome"], "no_reply", "{events:?}");
+    assert!(turn.get("reply_id").is_none(), "{events:?}");
+    assert!(
+        fs::read_to_string(lane.join("fake-send.out"))
+            .unwrap_or_default()
+            .contains("\"ok\": true"),
+        "the handoff was sent"
+    );
+    assert_eq!(from_writer(), 5, "the handoff alone, not a second reply");
+    let receipt = turn["receipt"]["path"].as_str().expect("receipt path");
+    let receipt = fs::read_to_string(receipt).expect("receipt");
+    assert!(
+        receipt.contains("not imported: the turn already mailed its recipient"),
+        "{receipt}"
+    );
+    assert!(!receipt.contains("SYNTHETIC_SKIPPED"), "{receipt}");
+    assert!(
+        receipt.contains("withheld: not imported, as the turn already mailed its recipient"),
+        "{receipt}"
+    );
+    let inbox = ok(&root, "writer", &["msg", "inbox"]);
+    assert_eq!(
+        inbox["data"]["messages"],
+        json!([]),
+        "the shown mail was acked"
+    );
+}
+
+/// A SIGTERM during a continuous `agents up`'s startup git (here a
+/// worker's `git worktree add`) waits for that git, then stops before any
+/// worker takes a turn, even with mail queued (reviews of 9e274d1f and
+/// 64b6b93e). That no turn starts once the handler has run, whatever the
+/// timing, is supervise::control's an_external_flag_stops_at_once.
+#[test]
+fn sigterm_during_startup_git_stops_before_any_turn_is_admitted() {
+    use std::os::unix::fs::PermissionsExt;
+    let (scratch, repo) = make_repo(json!({}));
+    let root = graph(&repo);
+    ok(
+        &root,
+        "launcher",
+        &[
+            "agents",
+            "add",
+            "w",
+            "--harness",
+            "claude",
+            "--role",
+            "worker",
+        ],
+    );
+    send(&repo, "w", "queued work", None);
+    let dir = &scratch.0;
+    let real = String::from_utf8(
+        Command::new("/bin/sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .expect("sh")
+            .stdout,
+    )
+    .expect("utf-8");
+    let shim = dir.join("shim");
+    fs::create_dir_all(&shim).expect("shim");
+    fs::write(
+        shim.join("git"),
+        format!(
+            "#!/bin/sh\n\
+             case \" $* \" in *' worktree add '*)\n\
+             : > '{in_add}'\n\
+             n=0; while [ ! -e '{release}' ] && [ $n -lt 1200 ]; do sleep 0.05; n=$((n+1)); done ;;\n\
+             esac\n\
+             exec {real} \"$@\"\n",
+            in_add = dir.join("in-add").display(),
+            release = dir.join("release").display(),
+            real = real.trim(),
+        ),
+    )
+    .expect("shim");
+    fs::set_permissions(shim.join("git"), fs::Permissions::from_mode(0o755)).expect("chmod");
+    let claude = dir.join("claude");
+    fs::write(
+        &claude,
+        format!("#!/bin/sh\n: > '{}'\nexit 1\n", dir.join("ran").display()),
+    )
+    .expect("claude");
+    fs::set_permissions(&claude, fs::Permissions::from_mode(0o755)).expect("chmod");
+    let home = dir.join("home");
+    fs::create_dir_all(home.join(".codex")).expect("home");
+    let mut up = isolated(&mut Command::new(env!("CARGO_BIN_EXE_mdkg")))
+        .current_dir(&root)
+        .arg("--root")
+        .arg(&root)
+        .args(["--as", "launcher", "agents", "up", "w", "--wait", "1"])
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                shim.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_DATA_HOME", home.join(".local/share"))
+        .env("CODEX_HOME", home.join(".codex"))
+        .env("MDKG_RUN_CLAUDE", &claude)
+        .stdout(std::process::Stdio::null())
+        .stderr(fs::File::create(dir.join("up.err")).expect("stderr"))
+        .spawn()
+        .expect("agents up");
+    // On a failed assertion, agents up and the held git end too: the git
+    // shim's wait is bounded (60 s), and this kills agents up.
+    struct KillOnPanic(u32);
+    impl Drop for KillOnPanic {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                let _ = Command::new("/bin/kill")
+                    .args(["-KILL", &self.0.to_string()])
+                    .status();
+            }
+        }
+    }
+    let _guard = KillOnPanic(up.id());
+    let err = || fs::read_to_string(dir.join("up.err")).unwrap_or_default();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !dir.join("in-add").exists() {
+        assert!(
+            up.try_wait().expect("wait").is_none(),
+            "agents up ended before its worktree add: {}",
+            err()
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no worktree add: {}",
+            err()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let _ = Command::new("/bin/kill")
+        .args(["-TERM", &up.id().to_string()])
+        .status();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert!(
+        up.try_wait().expect("wait").is_none(),
+        "agents up died under its git: {}",
+        err()
+    );
+    fs::write(dir.join("release"), "").expect("release");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = up.try_wait().expect("wait") {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "agents up never stopped: {}",
+            err()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    assert!(status.success(), "{status:?}: {}", err());
+    assert!(
+        !dir.join("ran").exists(),
+        "a turn was admitted after the SIGTERM: {}",
+        err()
+    );
+    let inbox = ok(&root, "w", &["msg", "inbox"]);
+    assert_eq!(
+        inbox["data"]["messages"].as_array().map(Vec::len),
+        Some(1),
+        "{inbox}"
+    );
+}
+
+#[test]
+fn delivery_flag_sets_shape_without_losing_other_policy_fields() {
+    let (_dir, repo) = make_repo(json!({}));
+    let root = graph(&repo);
+    let added = ok(
+        &root,
+        "launcher",
+        &[
+            "agents",
+            "add",
+            "writer",
+            "--harness",
+            "claude",
+            "--role",
+            "worker",
+            "--policy",
+            "{\"timeout\":90}",
+            "--delivery",
+            "digest",
+        ],
+    );
+    assert_eq!(added["data"]["definition"]["policy"]["shape"], "digest");
+    assert_eq!(added["data"]["definition"]["policy"]["timeout"], 90);
+    let edited = ok(
+        &root,
+        "launcher",
+        &["agents", "edit", "writer", "--delivery", "batch"],
+    );
+    assert_eq!(edited["data"]["definition"]["policy"]["shape"], "batch");
+    assert_eq!(edited["data"]["definition"]["policy"]["timeout"], 90);
+}
+
+#[test]
+fn named_once_uses_the_digest_policy() {
+    let (_dir, repo) = make_repo(
+        json!({"writer": {"harness":"claude", "role":"worker", "reports_to":"coordinator", "policy":{"shape":"digest"}}}),
+    );
+    send(&repo, "writer", "first topic", None);
+    send(&repo, "writer", "second topic", None);
+    let (code, events) = up(&repo, &["writer", "--dry-run"]);
+    assert_eq!(code, 0, "{events:?}");
+    let turn = &events[0]["data"]["turn"];
+    let prompt = turn["prompt"].as_str().expect("prompt");
+    assert!(
+        prompt.contains("first topic") && prompt.contains("second topic"),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains("final reply goes to coordinator"),
+        "{prompt}"
+    );
 }

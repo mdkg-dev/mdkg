@@ -134,7 +134,10 @@ enable/disable, hook installation and undo.
 The [settings engine](../crates/mdkg-format/src/settings/README.md), typed
 graph adapter, scoped file editor and `config show` command are implemented.
 `agents up` and `agents status` use captured effective agent and orchestration
-settings. The `config set` command remains pending; its intended interface is
+settings. Since 0.7.2, `config set` and `config unset` change the committed
+project config (see [changing the committed
+config](git-graph.md#changing-the-committed-config)). Setting the user and
+machine-local layers remains pending; that intended interface is
 distinguished below from the available display.
 
 In 0.7.0, user and machine-local agent overrides apply only to named physical
@@ -296,12 +299,30 @@ resets, and ordinary fields beneath object-valued
 named agents/workspaces stay visible; malformed scalar or array entries
 receive no name exemption. Ordinary prose such as `Basic reviewer for docs`
 stays readable.
-This is a display precaution, not comprehensive secret detection: field names
-and unrecognized strings remain visible, and the files themselves are
-unchanged. Do not paste settings output into mail or logs without checking it.
+A key that itself looks like a credential, by the same content rules (a
+token used as a map key, a password-bearing URL, an `Authorization`
+header), is shown renamed as `[redacted key <n>]`, and everything under it
+is hidden. `<n>` counts the renamed keys in the whole output and skips any
+name the object already has, so no entry is lost. `origins` and `redacted`
+name the renamed pointers, so each still resolves in `values`. `config set`
+and `config unset` show their `old` and `new` values and their diff with
+the same rules. The old and new documents are each numbered on their own,
+so a change that adds a renamed key can shift an existing key's `<n>` in
+the diff.
 
-The setter command is not yet connected. Its intended commands require
-exactly one writable scope, `--user` or `--local`:
+What is guaranteed: in both output formats of `config show`, and in `config
+set`'s and `config unset`'s `old`, `new` and `diff`, a value or key these
+rules recognize never appears, and every pointer in `origins` and
+`redacted` resolves in `values`. The files themselves are never changed.
+What is not guaranteed: this is a display precaution, not comprehensive
+secret detection. A credential of a shape these rules don't recognize,
+under a name they don't flag, stays visible. So do source paths and the key
+you pass to `config set`. Don't paste settings output into mail or logs
+without checking it.
+
+The setter for the optional layers is not yet connected. Its intended
+commands name one of them, `--user` or `--local` (without either,
+`config set` changes the committed project config):
 
 ```sh
 mdkg config set --user index.tolerant true
@@ -616,7 +637,7 @@ because its sentence does not follow EARS. Spikes state questions ending in
 `?`. Other requirements use EARS's `shall` and may begin with `Where`,
 `While`, `When`, or `If ... then` clauses. The warnings also flag duplicate
 ids, vague statements without a number, and invalid design relations. A
-task, bug or spike with no requirement items warns unless its status is
+task, bug, feat or spike with no requirement items warns unless its status is
 `done`. Markdown around the section that may change what parses, such as
 an unclosed fence or HTML that may hide the heading, warns as
 `req.bad_line` at its line. Design nodes (`edd` and `prd`) hold durable
@@ -999,7 +1020,7 @@ A record is a JSON object with exactly these eight keys:
 | `seq` | integer | 1 for the chain's first record, then +1 per record, with no gaps |
 | `prev` | string or `null` | The previous record's hash; `null` exactly when `seq` is 1 |
 | `ts` | string | When the event happened, as its writer says: the writer's clock for a live record, the original time for an imported one. RFC 3339 UTC to the millisecond, exactly `YYYY-MM-DDTHH:MM:SS.sssZ`. Records are ordered by `seq`, never by `ts` |
-| `actor` | string, not empty | Who acted: a coordination actor name, or `mdkg` for the system. A `human:<name>` appears only on the mail commands a human runs (acks, leaving a channel) |
+| `actor` | string, not empty | Who acted: a coordination actor name, or `mdkg` for the system. The actor is the identity the command ran as (`--as` or `$MDKG_ACTOR`), not proof of who ran it. A `human:<name>` appears on the commands a person may run as themselves: mail (acks, leaving a channel, their own unsigned `msg send`, and the `msg.purge` a read of their mail may write) and ledger writes (`entry` ops, `done --residual`). Only the unsigned send and the ledger writes check that they ran outside an agent turn, and that check is a guard rail |
 | `kind` | string | `<domain>.<verb>`: two or more `.`-separated segments of `[a-z0-9_]` (section 9.2) |
 | `subject` | array of strings | What the record is about, in the writer's order (below) |
 | `body` | object | Kind-specific (section 9.2) |
@@ -1046,7 +1067,7 @@ A record is a JSON object with exactly these eight keys:
 | `log.checkpoint` | A compaction (section 9.5) | none | `{from, to, first, last, count, summary}` |
 | `log.import` | Before imported history (`migrate`) | none | `{import_id, count, skipped}`; the next `count` records are the import, each with its own `ts` and `actor`. An imported record whose body's `migrate_digest` the chain already holds isn't written again; `skipped` counts those |
 | `lease.claim`, `lease.renew`, `lease.release`, `lease.expire`, `lease.reconcile`, `leaf.register`, `changeset.commit`, `changeset.abandon`, `main.observe`, `request.prune`, `alias.issue`, `work.status` | One per coordinator journal entry: claims and refused claims, renewals, releases, expiries, offline leases reconciled, a node file first seen (`leaf.register`), `done` and `sync` commits, abandons, observations of main, expired claim keys dropped, a 0.6.0-compatible alias issued, status marks | The lease's node, its scope (`path:`, `role:`, `run:` or `node:`) and `lease:`; the changesets | `{journal, command, outcome}`. Only `journal`, the journal entry's number, is part of the format. `command` and `outcome` are that entry's command and outcome as the reference implementation writes them: opaque JSON a consumer MUST NOT rely on, which may change without a new record version |
-| `msg.send` | A message is stored (not a retry of the same send) | `msg:<id>`, and `room:<name>` for a channel post | `{message_id, context_id, kind, sender, via, room, to, references, digest, size, retention}`. `digest` is the body's; the body never enters the log |
+| `msg.send` | A message is stored (not a retry of the same send) | `msg:<id>`, and `room:<name>` for a channel post | `{message_id, context_id, kind, sender, via, room, to, references, digest, size, retention}`, and `person_proof` (`null`: unsigned) when a person sends as themselves (`sender` is `human:<name>` and `via` is `null`). `digest` is the body's; the body never enters the log |
 | `msg.ack` | Deliveries change to acked, or acking purges a body | `msg:<id>` for each id the ack named, once each | `{acked: [{message_id, mailbox}], by, via, outcome_digest, purged}`: the deliveries this ack changed and the bodies it purged. An ack's outcome text enters only as a digest |
 | `msg.purge` | Bodies are purged under their retention (by whichever command finds them due) | `msg:<id>` for each | `{purged: [message_id], reason: "retention"}` |
 | `room.create`, `room.join`, `room.leave` | Channel membership changes | `room:<name>` | `{room, by, members}`, `{room, by, added}`, `{room, by, removed}` |
@@ -1264,7 +1285,7 @@ are in `conformance/v07/`, with the spec's expected codes, and
 | `edge.blocks_ancestor` | warning | A node is blocked by one of its own ancestors (section 5.2, rule 6) |
 | `edge.private_target` | error | With local work, a committed node names a private work node (section 5.2, rule 8) |
 | `edge.target_not_on_branch` | warning | With local work, a private work node names a node this branch doesn't have, or a goal's active node isn't in this checkout (section 5.2, rule 7) |
-| `req.missing` | warning | A task, bug or spike that isn't `done` has no requirement items |
+| `req.missing` | warning | A task, bug, feat or spike that isn't `done` has no requirement items |
 | `req.bad_line` | warning | A requirement item does not parse, or Markdown around it may change what parses |
 | `req.duplicate_id` | warning | Two requirement items share an id |
 | `req.not_ears` | warning | A non-spike requirement does not match an EARS form |

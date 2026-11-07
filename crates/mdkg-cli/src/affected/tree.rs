@@ -14,11 +14,71 @@
 //!   disk treats as equal in other ways (Unicode normalization).
 //! - The folder is private to the user (0700) and goes away when the value
 //!   is dropped.
+//! - It goes in the first of [`places`] that takes a new folder: the
+//!   temporary folder, else a per-user cache, else `$CARGO_TARGET_DIR`
+//!   (a sandboxed reviewer's one writable folder). Each place skipped is
+//!   reported with why, and the report names the place used, so a run
+//!   that couldn't write anywhere says so instead of going full silently.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+use schemars::JsonSchema;
+use serde::Serialize;
+
 use super::git::{Repo, TreeEntry};
+
+/// Where a snapshot can go, in the order tried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Place {
+    /// The system temporary folder (`$TMPDIR`).
+    Temp,
+    /// The user's cache: `$XDG_CACHE_HOME/mdkg/affected`, else
+    /// `~/Library/Caches/mdkg/affected` on macOS and
+    /// `~/.cache/mdkg/affected` elsewhere.
+    UserCache,
+    /// `$CARGO_TARGET_DIR/mdkg-affected`: the build folder a sandbox
+    /// grants a reviewer that runs tests.
+    CargoTargetDir,
+}
+
+/// A place a snapshot didn't go, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct Skipped {
+    pub place: Place,
+    pub detail: String,
+}
+
+/// Each place with the folder it names in this environment (`None` when
+/// it names none: a variable unset or not absolute).
+pub fn places() -> Vec<(Place, Option<PathBuf>)> {
+    let var = |name: &str| {
+        std::env::var_os(name)
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+    };
+    let cache = var("XDG_CACHE_HOME").or_else(|| {
+        var("HOME").map(|h| {
+            if cfg!(target_os = "macos") {
+                h.join("Library").join("Caches")
+            } else {
+                h.join(".cache")
+            }
+        })
+    });
+    vec![
+        (Place::Temp, Some(std::env::temp_dir())),
+        (
+            Place::UserCache,
+            cache.map(|c| c.join("mdkg").join("affected")),
+        ),
+        (
+            Place::CargoTargetDir,
+            var("CARGO_TARGET_DIR").map(|t| t.join("mdkg-affected")),
+        ),
+    ]
+}
 
 /// More than this many files, or bytes, isn't written: the run is full.
 pub const MAX_FILES: usize = 400_000;
@@ -36,6 +96,8 @@ pub struct Tree {
     /// The same folder as first named, before symlinks in the temporary
     /// folder's own path were resolved (`/var` for `/private/var`, say).
     named: PathBuf,
+    /// Where it went.
+    pub place: Place,
 }
 
 impl Tree {
@@ -80,15 +142,14 @@ fn check_path(path: &[u8]) -> Result<&str, String> {
     Ok(text)
 }
 
-fn fresh_dir() -> Result<(PathBuf, PathBuf), String> {
+fn fresh_dir(parent: &Path) -> Result<(PathBuf, PathBuf), String> {
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or_default();
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let dir =
-        std::env::temp_dir().join(format!("mdkg-affected-{}-{nanos}-{n}", std::process::id()));
+    let dir = parent.join(format!("mdkg-affected-{}-{nanos}-{n}", std::process::id()));
     // A new folder (not `create_dir_all`), private to the user.
     let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
@@ -103,8 +164,57 @@ fn fresh_dir() -> Result<(PathBuf, PathBuf), String> {
     Ok((root, dir))
 }
 
-/// Writes `entries` (the head's tree) into a new temporary folder.
-pub fn write(repo: &Repo, entries: &[TreeEntry]) -> Result<Tree, String> {
+/// A new private folder in the first place that takes one; each place
+/// before it goes in `skipped`.
+fn place_dir(
+    places: &[(Place, Option<PathBuf>)],
+    skipped: &mut Vec<Skipped>,
+) -> Result<(PathBuf, PathBuf, Place), String> {
+    for (place, parent) in places {
+        let made = match parent {
+            None => Err("not set".to_string()),
+            // The temporary folder exists already; the others are made
+            // as needed (only the snapshot itself has to be private).
+            Some(p) if *place == Place::Temp => fresh_dir(p),
+            Some(p) => std::fs::create_dir_all(p)
+                .map_err(|e| format!("can't create {}: {e}", p.display()))
+                .and_then(|()| fresh_dir(p)),
+        };
+        match made {
+            Ok((root, named)) => return Ok((root, named, *place)),
+            Err(detail) => skipped.push(Skipped {
+                place: *place,
+                detail,
+            }),
+        }
+    }
+    Err(format!(
+        "no folder could hold the head's snapshot ({})",
+        skipped
+            .iter()
+            .map(|s| format!("{}: {}", place_name(s.place), s.detail))
+            .collect::<Vec<_>>()
+            .join("; ")
+    ))
+}
+
+fn place_name(place: Place) -> &'static str {
+    match place {
+        Place::Temp => "the temporary folder",
+        Place::UserCache => "the user cache",
+        Place::CargoTargetDir => "$CARGO_TARGET_DIR",
+    }
+}
+
+/// Writes `entries` (the head's tree) into a new private folder in the
+/// first of `places` that takes one. The places passed over go in
+/// `skipped`, whether or not the write then succeeds.
+pub fn write(
+    repo: &Repo,
+    entries: &[TreeEntry],
+    places: &[(Place, Option<PathBuf>)],
+    skipped: &mut Vec<Skipped>,
+) -> Result<Tree, String> {
     let files: Vec<&TreeEntry> = entries.iter().filter(|e| e.mode != "160000").collect();
     if files.len() > MAX_FILES {
         return Err(format!(
@@ -163,12 +273,13 @@ pub fn write(repo: &Repo, entries: &[TreeEntry]) -> Result<Tree, String> {
             "the head's tree has {clash} as both a file and a folder"
         ));
     }
-    let (base, named) = fresh_dir()?;
+    let (base, named, place) = place_dir(places, skipped)?;
     let tree = Tree {
         root: base.join("tree"),
         cache: base.join("cache"),
         base,
         named,
+        place,
     };
     for dir in [&tree.root, &tree.cache] {
         std::fs::create_dir(dir).map_err(|e| format!("can't create {}: {e}", dir.display()))?;
@@ -251,5 +362,51 @@ mod tests {
         }
         assert_eq!(check_path(b".github/x.yml").unwrap(), ".github/x.yml");
         assert_eq!(check_path(b"a/.gitignore").unwrap(), "a/.gitignore");
+    }
+
+    /// A place no one can create in (a file where its folder should be, so
+    /// root is refused too), and a writable one after it.
+    #[cfg(unix)]
+    #[test]
+    fn an_unwritable_place_falls_back_to_the_next_and_says_so() {
+        use std::os::unix::fs::PermissionsExt;
+        let top =
+            std::env::temp_dir().join(format!("mdkg-affected-place-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&top);
+        std::fs::create_dir_all(&top).unwrap();
+        let locked = top.join("locked");
+        std::fs::write(&locked, "a file, not a folder\n").unwrap();
+        let open = top.join("open").join("mdkg").join("affected");
+        let places = [
+            (Place::Temp, Some(locked.clone())),
+            (Place::UserCache, None),
+            (Place::CargoTargetDir, Some(open.clone())),
+        ];
+        let mut skipped = Vec::new();
+        let (root, named, place) = place_dir(&places, &mut skipped).unwrap();
+        assert_eq!(place, Place::CargoTargetDir);
+        assert_eq!(named.parent(), Some(open.as_path()));
+        let mode = std::fs::metadata(&root).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+        assert_eq!(
+            skipped.iter().map(|s| s.place).collect::<Vec<_>>(),
+            [Place::Temp, Place::UserCache]
+        );
+        assert!(
+            skipped[0].detail.starts_with("can't create "),
+            "{skipped:?}"
+        );
+        assert_eq!(skipped[1].detail, "not set");
+
+        // Nowhere at all: an error naming every place.
+        let mut skipped = Vec::new();
+        let e = place_dir(&places[..2], &mut skipped).unwrap_err();
+        assert!(
+            e.starts_with("no folder could hold the head's snapshot"),
+            "{e}"
+        );
+        assert!(e.contains("the temporary folder: can't create"), "{e}");
+        assert!(e.contains("the user cache: not set"), "{e}");
+        std::fs::remove_dir_all(&top).unwrap();
     }
 }

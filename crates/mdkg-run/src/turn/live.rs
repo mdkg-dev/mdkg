@@ -178,12 +178,16 @@ impl Parser {
                                 .unwrap_or_default()
                                 .to_string();
                             let class = tool_class(Harness::Claude, &name);
-                            if let Some(id) = block.get("id").and_then(Value::as_str) {
+                            let id = block
+                                .get("id")
+                                .and_then(Value::as_str)
+                                .filter(|id| !id.is_empty());
+                            if let Some(id) = id {
                                 self.tools.insert(id.into(), (class, name.clone()));
                             }
                             out.push((
                                 "tool.started",
-                                json!({"class": class, "name": name,
+                                json!({"class": class, "name": name, "call_id": id,
                                     "summary": summary(block.get("input"))}),
                             ));
                         }
@@ -203,9 +207,10 @@ impl Parser {
                         .unwrap_or_default();
                     let (class, name) = self.tools.remove(id).unwrap_or(("other", String::new()));
                     let ok = block.get("is_error").and_then(Value::as_bool) != Some(true);
+                    let call_id = Some(id).filter(|id| !id.is_empty());
                     out.push((
                         "tool.ended",
-                        json!({"class": class, "name": name, "ok": ok}),
+                        json!({"class": class, "name": name, "call_id": call_id, "ok": ok}),
                     ));
                 }
             }
@@ -282,11 +287,12 @@ impl Parser {
                     .and_then(Value::as_str)
                     .unwrap_or("completed");
                 let class = tool_class(Harness::OpenCode, &name);
+                let call_id = Some(id.as_str()).filter(|id| !id.is_empty());
                 if !self.tools.contains_key(&id) {
                     self.tools.insert(id.clone(), (class, name.clone()));
                     out.push((
                         "tool.started",
-                        json!({"class": class, "name": name,
+                        json!({"class": class, "name": name, "call_id": call_id,
                             "summary": summary(state.and_then(|s| s.get("input")))}),
                     ));
                 }
@@ -294,7 +300,8 @@ impl Parser {
                     self.tools.remove(&id);
                     out.push((
                         "tool.ended",
-                        json!({"class": class, "name": name, "ok": status == "completed"}),
+                        json!({"class": class, "name": name, "call_id": call_id,
+                            "ok": status == "completed"}),
                     ));
                 }
             }
@@ -359,11 +366,8 @@ impl Sink {
         if self.failed.is_some() {
             return;
         }
-        for (kind, data) in self.parser.line(stream, line) {
-            if let Err(e) = self.writer.write(kind, data, false) {
-                self.failed = Some(e);
-                return;
-            }
+        if let Err(e) = crate::seam::output(&mut self.writer, self.parser.line(stream, line)) {
+            self.failed = Some(e);
         }
     }
 }
@@ -513,11 +517,11 @@ mod tests {
         assert_eq!(out[1].1, json!({"text": "Looking."}));
         assert_eq!(
             out[2].1,
-            json!({"class": "shell", "name": "Bash", "summary": "cargo test -p mdkg"})
+            json!({"class": "shell", "name": "Bash", "call_id": "t1", "summary": "cargo test -p mdkg"})
         );
         assert_eq!(
             out[3].1,
-            json!({"class": "shell", "name": "Bash", "ok": true})
+            json!({"class": "shell", "name": "Bash", "call_id": "t1", "ok": true})
         );
         assert_eq!(out[4].1["class"], "mcp");
         assert_eq!(out[5].1["ok"], false);
@@ -612,11 +616,11 @@ mod tests {
         );
         assert_eq!(
             out[1].1,
-            json!({"class": "shell", "name": "bash", "summary": "ls"})
+            json!({"class": "shell", "name": "bash", "call_id": "c1", "summary": "ls"})
         );
         assert_eq!(
             out[4].1,
-            json!({"class": "edit", "name": "edit", "ok": false})
+            json!({"class": "edit", "name": "edit", "call_id": "c2", "ok": false})
         );
         assert_eq!(
             out[7].1,
@@ -624,6 +628,104 @@ mod tests {
                 "total_tokens": null, "cost_usd": 0.5})
         );
         assert_eq!(out[6].1, json!({"text": "opencode reply"}));
+    }
+
+    /// Two calls of one tool overlap and end in the other order: each
+    /// tool.ended carries the call_id of the tool.started it ends.
+    #[test]
+    fn overlapping_calls_with_one_name_pair_up_by_call_id() {
+        let ids = |out: &[Out]| -> Vec<(String, Value, Value)> {
+            out.iter()
+                .filter(|(k, _)| k.starts_with("tool."))
+                .map(|(k, d)| (k.to_string(), d["call_id"].clone(), d["ok"].clone()))
+                .collect()
+        };
+        let claude = replay(
+            Harness::Claude,
+            &[
+                (
+                    Stream::Stdout,
+                    r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_a","name":"Bash","input":{"command":"sleep 2"}},{"type":"tool_use","id":"toolu_b","name":"Bash","input":{"command":"false"}}]}}"#,
+                ),
+                (
+                    Stream::Stdout,
+                    r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_b","is_error":true}]}}"#,
+                ),
+                (
+                    Stream::Stdout,
+                    r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_a","is_error":false}]}}"#,
+                ),
+            ],
+        );
+        let opencode = replay(
+            Harness::OpenCode,
+            &[
+                (
+                    Stream::Stdout,
+                    r#"{"type":"tool_use","part":{"type":"tool","callID":"call_a","tool":"bash","state":{"status":"running","input":{"command":"sleep 2"}}}}"#,
+                ),
+                (
+                    Stream::Stdout,
+                    r#"{"type":"tool_use","part":{"type":"tool","callID":"call_b","tool":"bash","state":{"status":"running","input":{"command":"false"}}}}"#,
+                ),
+                (
+                    Stream::Stdout,
+                    r#"{"type":"tool_use","part":{"type":"tool","callID":"call_b","tool":"bash","state":{"status":"error"}}}"#,
+                ),
+                (
+                    Stream::Stdout,
+                    r#"{"type":"tool_use","part":{"type":"tool","callID":"call_a","tool":"bash","state":{"status":"completed"}}}"#,
+                ),
+            ],
+        );
+        for (out, a, b) in [
+            (&claude, "toolu_a", "toolu_b"),
+            (&opencode, "call_a", "call_b"),
+        ] {
+            assert_eq!(
+                ids(out),
+                [
+                    ("tool.started".into(), json!(a), Value::Null),
+                    ("tool.started".into(), json!(b), Value::Null),
+                    ("tool.ended".into(), json!(b), json!(false)),
+                    ("tool.ended".into(), json!(a), json!(true)),
+                ]
+            );
+        }
+        // Codex runs without --json and reports no tools, so it has no
+        // call ids to carry (`output.tools` is false).
+        let codex = replay(
+            Harness::Codex,
+            &[
+                (Stream::Stderr, "exec bash -lc 'ls'"),
+                (Stream::Stderr, "tokens used"),
+            ],
+        );
+        assert!(ids(&codex).is_empty());
+        // An OpenCode part with no callID is named by its part id.
+        let by_part = replay(
+            Harness::OpenCode,
+            &[(
+                Stream::Stdout,
+                r#"{"type":"tool_use","part":{"type":"tool","id":"prt_1","tool":"read","state":{"status":"completed","input":{"filePath":"/x"}}}}"#,
+            )],
+        );
+        assert_eq!(
+            ids(&by_part),
+            [
+                ("tool.started".into(), json!("prt_1"), Value::Null),
+                ("tool.ended".into(), json!("prt_1"), json!(true)),
+            ]
+        );
+        // A call the harness gave no id has a null call_id.
+        let bare = replay(
+            Harness::Claude,
+            &[(
+                Stream::Stdout,
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{}}]}}"#,
+            )],
+        );
+        assert_eq!(bare[0].1["call_id"], Value::Null);
     }
 
     #[test]

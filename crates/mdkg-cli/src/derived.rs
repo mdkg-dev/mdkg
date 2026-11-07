@@ -31,6 +31,46 @@ pub(crate) fn index_path(root: &Path) -> Option<PathBuf> {
     )
 }
 
+/// `<common>/mdkg`, the clone's state folder, made 0700 when missing,
+/// whatever the umask (Opus #16893); an existing one keeps its mode, as
+/// the store leaves it. The search index and `work localize` come
+/// through here, and the store and the graph-ref writer make it 0700 too.
+/// Other creators (install's `mdkg/graph`, the hooks' `waiting` folder,
+/// some dry runs) still use the umask's mode; see RELEASE_NOTES.
+pub(crate) fn state_dir(common: &Path) -> std::io::Result<PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+    let dir = common.join("mdkg");
+    match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+        // The umask may have narrowed it further: exactly 0700.
+        Ok(()) => std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    if !std::fs::symlink_metadata(&dir)?.is_dir() {
+        return Err(std::io::Error::other(format!(
+            "{} must be a folder, not a link or file",
+            dir.display()
+        )));
+    }
+    Ok(dir)
+}
+
+/// Makes the folder the index file at `path` goes in: `.git/mdkg` through
+/// [`state_dir`], then `index/` in it, 0700 as well.
+fn index_dir(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    let Some(dir) = path.parent() else {
+        return Ok(());
+    };
+    if let Some(common) = dir.parent().and_then(Path::parent) {
+        state_dir(common)?;
+    }
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+}
+
 /// What a command read from the index.
 pub(crate) struct Opened<T> {
     pub value: T,
@@ -51,9 +91,7 @@ pub(crate) fn read<T>(
 ) -> Result<Opened<T>, GraphError> {
     let mut warnings = Vec::new();
     if let Some(path) = index_path(root) {
-        let opened = path
-            .parent()
-            .map_or(Ok(()), std::fs::create_dir_all)
+        let opened = index_dir(&path)
             .map_err(mdkg_index::IndexError::from)
             .and_then(|()| Db::open_synced_then(&path, root, graph, &mut read));
         match opened {
@@ -155,10 +193,7 @@ pub fn run(root: &Path, command: &IndexCommand) -> u8 {
             // Built anew in one transaction; a file that can't be opened
             // is removed first.
             Some(path) if rebuild => {
-                if let Some(dir) = path.parent() {
-                    std::fs::create_dir_all(dir)
-                        .map_err(|e| failed(mdkg_index::IndexError::from(e)))?;
-                }
+                index_dir(&path).map_err(|e| failed(mdkg_index::IndexError::from(e)))?;
                 let mut db = Db::open(&path).map_err(failed)?;
                 let sync = db.rebuild(root, &graph).map_err(failed)?;
                 Opened {

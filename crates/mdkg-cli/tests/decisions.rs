@@ -1095,8 +1095,11 @@ fn a_machine_local_grant_is_ignored_and_a_local_revocation_applies() {
         f.config("local", json!({ "orchestrator": revocation }));
         let (code, v) = f.run("orchestrator", &decision());
         assert_ne!(code, 0, "{revocation}: {v}");
-        let hint = v["diagnostics"][0]["hint"].as_str().unwrap_or("");
-        assert!(hint.contains("delegation is revoked in"), "{v}");
+        // Said first, not "no delegation" with the revocation buried in
+        // the hint (e2e UX).
+        let message = v["diagnostics"][0]["message"].as_str().unwrap_or("");
+        assert!(message.contains("delegation is revoked in"), "{v}");
+        assert!(!message.contains("has no delegation"), "{v}");
     }
     // A local file that can't be parsed may hold a revocation: it fails
     // closed, naming the file, rather than bringing the grant back.
@@ -1108,9 +1111,9 @@ fn a_machine_local_grant_is_ignored_and_a_local_revocation_applies() {
     .expect("broken local config");
     let (code, v) = f.run("orchestrator", &decision());
     assert_ne!(code, 0, "{v}");
-    let hint = v["diagnostics"][0]["hint"].as_str().unwrap_or("");
+    let message = v["diagnostics"][0]["message"].as_str().unwrap_or("");
     assert!(
-        hint.contains(&format!("{} can't be read", local.display())),
+        message.contains(&format!("{} can't be read", local.display())),
         "{v}"
     );
     // So does a symlink, even to a file holding no revocation: the local
@@ -1123,9 +1126,9 @@ fn a_machine_local_grant_is_ignored_and_a_local_revocation_applies() {
         std::os::unix::fs::symlink(&elsewhere, &local).expect("local link");
         let (code, v) = f.run("orchestrator", &decision());
         assert_ne!(code, 0, "{v}");
-        let hint = v["diagnostics"][0]["hint"].as_str().unwrap_or("");
+        let message = v["diagnostics"][0]["message"].as_str().unwrap_or("");
         assert!(
-            hint.contains(&format!("{} can't be read", local.display())),
+            message.contains(&format!("{} can't be read", local.display())),
             "{v}"
         );
         fs::remove_file(&local).expect("local link");

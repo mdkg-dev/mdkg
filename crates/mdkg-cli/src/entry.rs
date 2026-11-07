@@ -2202,7 +2202,7 @@ pub fn run(root: &Path, actor: Option<String>, cmd: &EntryCommand) -> u8 {
                 );
             }
         }),
-        EntryCommand::Gate(a) => emit(name, json, report(gate(root, a)), |d| {
+        EntryCommand::Gate(a) => emit(name, json, gate_report(gate(root, a)), |d| {
             println!("gate {} at {}", if d.ok { "ok" } else { "fails" }, d.at);
             for (what, list) in [("fails", &d.failures), ("warns", &d.warnings)] {
                 for f in list {
@@ -2366,6 +2366,32 @@ fn print_condition(what: &str, f: &Value) {
 
 fn report<T>(r: Result<T, GraphError>) -> Report<T> {
     r.map_or_else(Report::failed, Report::ok)
+}
+
+/// A failed gate is a check that found errors (exit 2), with its data:
+/// the failures are the answer (e2e UX; orchestrator on #17713).
+fn gate_report(r: Result<GateData, GraphError>) -> Report<GateData> {
+    match r {
+        Ok(d) if !d.ok => {
+            let failed = mdkg_format::Diagnostic::error(
+                Code::EntryGateFailed,
+                format!(
+                    "{}'s gate fails at {}: {} failing condition{}",
+                    d.node,
+                    d.at,
+                    d.failures.len(),
+                    if d.failures.len() == 1 { "" } else { "s" }
+                ),
+            )
+            .with_hint("settle each listed failure, then run `done` (or the gate) again");
+            Report {
+                data: Some(d),
+                diagnostics: vec![failed],
+                failure: Some(mdkg_graph::ErrorKind::Validation),
+            }
+        }
+        r => report(r),
+    }
 }
 
 fn print_update(d: &UpdateData) {

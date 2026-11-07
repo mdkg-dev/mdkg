@@ -179,6 +179,30 @@ machine, and `cargo metadata` with `--offline`
 and no rustup auto-install, so a module cache or toolchain you don't have
 makes the answer `full` (`adapter_failed`).
 
+The snapshot goes in the first of these that takes a new folder, so a
+read-only sandbox (a Codex reviewer's, say) still gets a selection:
+
+1. the temporary folder (`$TMPDIR`);
+2. the per-user cache: `$XDG_CACHE_HOME/mdkg/affected`, else
+   `~/Library/Caches/mdkg/affected` on macOS and `~/.cache/mdkg/affected`
+   elsewhere;
+3. `$CARGO_TARGET_DIR/mdkg-affected`: a sandbox that lets cargo build
+   grants its target folder, often as the only writable one.
+
+`data.snapshot.place` names the one used (`temp`, `user_cache` or
+`cargo_target_dir`) and `data.snapshot.skipped` lists each place passed
+over with why; the text output prints `snapshot:` lines only when a place
+was skipped. When the snapshot isn't written the answer is `full`, with an
+`adapter_failed` reason, `place` is `null`, and `data.snapshot.error` says
+why: every place refused a folder (each is in `skipped`), the head's
+tree was refused before any place was tried (a symlink in it, say;
+`skipped` is empty), or writing it failed in the place that took the
+folder (a full disk, say; that place isn't in `skipped`, and the folder
+is removed). Under `--targets` the command fails with that same
+error. A head
+with no `Cargo.toml` or `go.mod` needs no snapshot, and `data.snapshot` is
+left out.
+
 The committed head's config is checked with mdkg's format/version guard;
 an unsupported version or malformed 0.7 graph identity requests a full run
 (`config_invalid`). Missing or invalid uncommitted checkout config cannot
@@ -212,9 +236,46 @@ override the committed decision. These cases are covered by
   several members claim selects them all. A target whose file is missing
   at the head makes the answer `full`, and so does a non-`.rs` file under
   an outside target's folder (the target can `include_str!` it). A
-  `#[path]` or `include!` reaching into another crate's folder needs a
-  rule naming the including crate. `cargo metadata` runs with a private
-  `CARGO_HOME`. Before Cargo runs, every committed `Cargo.toml` is parsed
+  `.rs` file another crate's target reaches through a literal `#[path]`
+  or `include!` selects that crate too (below); any other way of reading
+  another crate's folder needs a rule naming the including crate.
+  `cargo metadata` runs with a private `CARGO_HOME`.
+- **Rust test files:** a changed `.rs` file that only integration tests
+  reach selects just those test targets, with no rule. `affected` reads
+  every workspace target's module tree from the head: its `mod`
+  declarations (with `#[path]`, and inline modules), and `include!`,
+  `include_str!` and `include_bytes!` with literal paths. A test's own
+  root selects that test; a shared helper such as `tests/common/temp.rs`
+  selects every test whose tree reaches it, in any crate. Dependent
+  crates aren't selected, because the file is in no library or binary.
+  A `mod` under `#[cfg]` counts, so the reading errs towards more tests.
+  A file counts only under its exact tracked spelling, never by asking
+  the filesystem: a path a tree names that isn't exactly a tracked path
+  (another case or Unicode form, which some volumes open, or a file this
+  host can't open) makes the tree uncertain, so the plan is the same on
+  every host.
+  A tree it can't read soundly (a module a macro names, a `cfg_attr`
+  path, an include with a computed path, a `mod` whose file is missing,
+  or a `mod` inside a function or macro body) counts as reaching every
+  file in the repository, since a computed path can climb out of its
+  root's folder; for a file that isn't `.rs`, its crate then runs whole
+  beside the file's own. This widening applies only to files the Rust
+  adapter maps to a member, by the **Rust** ownership rules above, and
+  matching Rust target rules can still narrow a mapped crate's fallback
+  ([Rules](#rules)). A file the adapter doesn't map (a crate's
+  `README.md`, say, which lies outside its target folders) is left to
+  the rules wherever it sits, so a file a test reads needs a rule that
+  selects that test; the exception is a non-`.rs` file under the folder of
+  a target outside its member, which is `full` (see **Rust** above). The whole-crate fallback stays,
+  with the reason in its warning, when a library, binary, example or
+  build script reaches the file, when it isn't a `.rs` file (a test may
+  read it at run time), when it was deleted, or when no tree reaches it.
+  A test that reads a `.rs` file at run time, rather than through `mod`
+  or `include!`, isn't seen by this reading: give that file a rule naming
+  the test.
+  `rust_test_files_select_the_tests_whose_module_trees_reach_them` covers
+  these cases.
+- **Rust manifests:** before Cargo runs, every committed `Cargo.toml` is parsed
   with decoded TOML keys, including Cargo's legacy `project`,
   `dev_dependencies` and `build_dependencies` aliases. Case variants of
   `Cargo.toml` are refused before Cargo runs, even on a case-sensitive host.
@@ -249,10 +310,11 @@ and manifest values containing terminal controls.
 - A cargo config outside the repository that patches dependencies into
   it (yours in `~/.cargo`, or one in a folder above the checkout) changes
   the real build but not the answer; so can a `rust-toolchain.toml` in a
-  folder above your temporary folder.
-- A `#[path]`, `include!` or cgo `#include` reaching into another
-  package's folder, or a test reading another package's files, needs a
-  rule.
+  folder above the snapshot's place (your temporary folder, user cache or
+  `$CARGO_TARGET_DIR`).
+- A cgo `#include` reaching into another package's folder, or a test
+  reading another package's files at run time, needs a rule. A Rust
+  `#[path]` or `include!` with a literal path is followed.
 - A dependency on a named registry, or a Go module or toolchain you don't
   have cached, makes the answer `full`. Anything else in a crate's folder (a README, a `fixtures/` folder)
   needs a rule. Dependents follow `path` dependencies; dev-dependencies
@@ -311,7 +373,11 @@ In `.mdkg/config.json`:
 
   A target needs a workspace package and exactly one of `test` (an integration
   target name from Cargo metadata), `bin` (binary unit tests), or `lib: true`.
-  Unknown packages, missing targets and malformed entries fail closed. Cargo metadata is still offline.
+  Unknown packages (in any target of the rule) and malformed entries fail closed. Cargo metadata is still offline.
+  A target the head doesn't have (an older head than the shared config, say)
+  is skipped with a `data.warnings` entry, and the rule's other targets still
+  run; when none of a rule's targets exist at the head, its packages' whole
+  tests run instead.
   A matching target rule narrows that package's tests; every dependent package
   remains selected. A dependent without an explicit target in the matching
   rules runs whole-crate tests. A matching `rust` whole-package rule, or any
@@ -339,8 +405,10 @@ In `.mdkg/config.json`:
   `rust_target_whole_crate_fallback_dominates_default_scopes_across_paths` cover
   these safeguards.
 - Paths mapped by the Rust adapter but lacking a test-target rule keep the
-  whole-crate fallback. `data.warnings` names the path and fallback packages;
-  text output prints the warning too. This is selective, not a full-run
+  whole-crate fallback, unless their test targets can be derived (Rust
+  test files, above). `data.warnings` names the path and fallback packages,
+  and says why no finer targets were derived; text output prints the
+  warning too. This is selective, not a full-run
   reason. Paths no adapter or rule accounts for still request a full run.
 - Every matching rule applies, and `all` wins. `none` only says a path
   needs no tests: it never drops an adapter's selection or any reason
@@ -372,8 +440,14 @@ In `.mdkg/config.json`:
 ## Repository rules
 
 This repository maps every source file and individual integration test
-files in `.mdkg/config.json`. Shared test helpers and crate module roots keep
-whole-package coverage. A newly added module without a rule warns and falls
+files in `.mdkg/config.json`. Crate module roots keep whole-package
+coverage, and so do mdkg's shared test helpers
+(`crates/mdkg-cli/tests/common/`). A new integration test file needs no
+rule, since its targets are derived. The binary's credential check
+(`no_tracked_line_looks_like_a_credential_on_its_own`) reads every tracked
+file at run time, so no selection promises to run it for a given change:
+it's a gate of the full check (`scripts/check.sh` and each wave), as the
+leak scan is. A newly added module without a rule warns and falls
 back; add its integration coverage to the rules as the module grows. Docs and
 node changes select `commands_doc` and `schemas`; `docs/concepts.md` and
 local templates also select the graph `format07` target, which checks the

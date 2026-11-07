@@ -1,5 +1,9 @@
 //! `mdkg graph`: refs, backrefs, the ready set and the critical path to a
-//! goal.
+//! goal; and graph.remote sync (`remote approve`, `sync`, `conflicts`,
+//! `resolve`, in [`sync`]).
+
+pub mod rows;
+pub mod sync;
 
 use std::path::Path;
 
@@ -60,6 +64,58 @@ pub enum GraphCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Approve graph.remote's destination for graph pushes (a person,
+    /// outside any agent turn).
+    #[command(subcommand)]
+    Remote(sync::RemoteCommand),
+    /// Pull the graph ref from graph.remote and, once the destination is
+    /// approved, push it: one explicit refspec for remoteRef, never a code
+    /// branch. Unapproved, it neither pulls nor pushes, and says how to
+    /// approve (`graph remote approve`). A person runs it, outside any agent turn;
+    /// `agents up` pulls and pushes on its own timers.
+    #[command(after_help = examples!("graph sync", "graph sync --no-push --json", "graph sync --accept-rewrite"))]
+    Sync {
+        /// Pull only.
+        #[arg(long)]
+        no_push: bool,
+        /// Accept a remote graph ref that was rewritten (it no longer
+        /// descends from the tip this clone last accepted).
+        #[arg(long)]
+        accept_rewrite: bool,
+        /// Print JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List the paths a graph sync merge took the remote's version of.
+    #[command(after_help = examples!("graph conflicts", "graph conflicts --json"))]
+    Conflicts {
+        /// Print JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Settle sync conflicts: publish the local or the remote version of
+    /// each path on the graph ref, in one commit, and clear their entries.
+    #[command(after_help = examples!(
+        "graph resolve .mdkg/work/fix-login.md --take local",
+        "graph resolve .mdkg/work/old.md .mdkg/work/new.md --take local"
+    ))]
+    Resolve {
+        /// The conflicted paths, as `graph conflicts` lists them. Paths of
+        /// one change (a rename's old and new path) settle together.
+        #[arg(required = true)]
+        paths: Vec<String>,
+        /// Which version to keep.
+        #[arg(long, value_enum)]
+        take: sync::Take,
+        /// The merge commit whose conflicts to settle (at least 7 hex
+        /// digits), as `graph conflicts` lists it. Needed when a path has
+        /// more than one open conflict.
+        #[arg(long)]
+        merge: Option<String>,
+        /// Print JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Show the longest chain of unfinished work a goal waits on.
     #[command(after_help = examples!("graph critical-path", "graph critical-path <goal-id>"))]
     CriticalPath {
@@ -79,6 +135,10 @@ impl GraphCommand {
             GraphCommand::Backrefs { .. } => "graph.backrefs",
             GraphCommand::Ready { .. } => "graph.ready",
             GraphCommand::CriticalPath { .. } => "graph.critical-path",
+            GraphCommand::Remote(sync::RemoteCommand::Approve { .. }) => "graph.remote.approve",
+            GraphCommand::Sync { .. } => "graph.sync",
+            GraphCommand::Conflicts { .. } => "graph.conflicts",
+            GraphCommand::Resolve { .. } => "graph.resolve",
         }
     }
 
@@ -87,7 +147,11 @@ impl GraphCommand {
             GraphCommand::Refs { json, .. }
             | GraphCommand::Backrefs { json, .. }
             | GraphCommand::Ready { json, .. }
-            | GraphCommand::CriticalPath { json, .. } => *json,
+            | GraphCommand::CriticalPath { json, .. }
+            | GraphCommand::Remote(sync::RemoteCommand::Approve { json, .. })
+            | GraphCommand::Sync { json, .. }
+            | GraphCommand::Conflicts { json }
+            | GraphCommand::Resolve { json, .. } => *json,
         }
     }
 }
@@ -332,7 +396,8 @@ fn critical_path(root: &Path, goal: Option<&str>) -> Result<Report<CriticalPathD
     .with(l.warnings))
 }
 
-pub fn run(root: &Path, command: &GraphCommand) -> u8 {
+/// `actor` is the global `--as`.
+pub fn run(root: &Path, command: &GraphCommand, actor: Option<String>) -> u8 {
     let (name, json) = (command.name(), command.json());
     match command {
         GraphCommand::Refs { node, ws, .. } | GraphCommand::Backrefs { node, ws, .. } => {
@@ -362,6 +427,44 @@ pub fn run(root: &Path, command: &GraphCommand) -> u8 {
                     println!("{:>3}. {}", i + 1, read::card(n));
                 }
                 eprintln!("count: {}", d.count);
+            })
+        }
+        GraphCommand::Remote(sync::RemoteCommand::Approve { dry_run, .. }) => {
+            let report = sync::approve(root, *dry_run).unwrap_or_else(Report::failed);
+            output::emit(name, json, report, sync::print_approve)
+        }
+        GraphCommand::Sync {
+            no_push,
+            accept_rewrite,
+            ..
+        } => {
+            let report =
+                sync::sync_now(root, *no_push, *accept_rewrite).unwrap_or_else(Report::failed);
+            output::emit(name, json, report, sync::print_sync)
+        }
+        GraphCommand::Conflicts { .. } => {
+            let report = sync::conflicts(root).unwrap_or_else(Report::failed);
+            output::emit(name, json, report, sync::print_conflicts)
+        }
+        GraphCommand::Resolve {
+            paths, take, merge, ..
+        } => {
+            let report = sync::resolve(root, paths, *take, merge.as_deref(), actor)
+                .unwrap_or_else(Report::failed);
+            output::emit(name, json, report, |d| {
+                println!(
+                    "{}: took the {} version{}",
+                    d.paths
+                        .iter()
+                        .map(|p| output::shown_path(p))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    d.took,
+                    d.commit.as_deref().map_or(String::new(), |c| format!(
+                        " in {}",
+                        c.get(..12).unwrap_or(c)
+                    ))
+                );
             })
         }
         GraphCommand::CriticalPath { goal, .. } => {

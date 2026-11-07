@@ -16,25 +16,30 @@ permissions:
   contents: read
 
 # The build runs inside manylinux and musllinux containers, which may lack
-# git; build.rs reads the commit for `--version`.
+# git; build.rs reads the commit for `--version`, and needs git 2.41 or
+# newer (`--attr-source`) to say whether the tree was clean: an older git
+# names the commit but prints "dirty unknown". The musl containers
+# (rust-musl-cross, Ubuntu-based) have such a git: the 0.7.1 musl wheels
+# printed it. So an old git is upgraded (from the git-core PPA where
+# apt-get is the package manager). The
+# build fails if git is still older, and each wheel's --version is
+# checked after the build.
 env:
   GIT_IN_CONTAINER: >-
-    (command -v git >/dev/null ||
-     (command -v dnf >/dev/null && dnf install -y git) ||
-     (command -v yum >/dev/null && yum install -y git) ||
-     (command -v apk >/dev/null && apk add --no-cache git)) &&
+    git_new() {
+      set -- $(git --version 2>/dev/null | sed -n 's/^git version \([0-9][0-9]*\)\.\([0-9][0-9]*\).*/\1 \2/p');
+      [ "${1:-0}" -gt 2 ] || { [ "${1:-0}" -eq 2 ] && [ "${2:-0}" -ge 41 ]; };
+    };
+    git_new ||
+    (command -v dnf >/dev/null && dnf install -y git) ||
+    (command -v yum >/dev/null && yum install -y git) ||
+    (command -v apk >/dev/null && apk add --no-cache git) ||
+    (command -v apt-get >/dev/null && export DEBIAN_FRONTEND=noninteractive &&
+     apt-get update && apt-get install -y software-properties-common &&
+     add-apt-repository -y ppa:git-core/ppa && apt-get update && apt-get install -y git) ||
+    true;
+    { git_new || { echo "git 2.41 or newer is needed for a clean --version; found: $(git --version 2>&1)" >&2; false; }; } &&
     git config --global --add safe.directory '*'
-  # FIDO2 person keys (crates/mdkg-presence) build hidapi's hidraw backend
-  # against libudev, found by pkg-config, on Linux gnu. manylinux_2_28 is
-  # AlmaLinux 8, where systemd-devel carries libudev.pc; maturin's
-  # auditwheel repair copies libudev.so.1 into the wheel (it isn't on the
-  # manylinux allow-list). musllinux wheels leave FIDO2 out (no static
-  # libudev for musl), so they need neither.
-  LIBUDEV_IN_CONTAINER: >-
-    if command -v dnf >/dev/null; then dnf install -y systemd-devel pkgconf-pkg-config;
-    elif command -v yum >/dev/null; then yum install -y systemd-devel pkgconfig;
-    else apt-get update && apt-get install -y libudev-dev pkg-config; fi &&
-    pkg-config --exists libudev
 
 jobs:
   wheels:
@@ -45,11 +50,19 @@ jobs:
         include:
           - { runner: macos-14, target: aarch64-apple-darwin }
           - { runner: macos-15-intel, target: x86_64-apple-darwin }
-          - { runner: ubuntu-22.04, target: x86_64-unknown-linux-gnu, manylinux: "2_28", libudev: true }
-          - { runner: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu, manylinux: "2_28", libudev: true }
-          - { runner: ubuntu-22.04, target: x86_64-unknown-linux-musl, manylinux: musllinux_1_2 }
-          - { runner: ubuntu-22.04-arm, target: aarch64-unknown-linux-musl, manylinux: musllinux_1_2 }
+          # The Linux wheels build without FIDO2 (--no-default-features):
+          # its hidapi backend links libudev, which auditwheel would copy into
+          # the wheel with the system libraries it links (decided 2026-11-03,
+          # #17661). Their --version says so; FIDO2 person keys are in the
+          # release archives, Homebrew and cargo builds.
+          - { runner: ubuntu-22.04, target: x86_64-unknown-linux-gnu, manylinux: "2_28", features: --no-default-features }
+          - { runner: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu, manylinux: "2_28", features: --no-default-features }
+          - { runner: ubuntu-22.04, target: x86_64-unknown-linux-musl, manylinux: musllinux_1_2, features: --no-default-features }
+          - { runner: ubuntu-22.04-arm, target: aarch64-unknown-linux-musl, manylinux: musllinux_1_2, features: --no-default-features }
     runs-on: ${{ matrix.runner }}
+    # The rehearsal's wheels took about 4 minutes; v0.7.1's x86_64 gnu
+    # wheel took 33. Past 30, fail the job rather than stall the release.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -58,9 +71,63 @@ jobs:
         with:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux || 'auto' }}
-          before-script-linux: >-
-            ${{ env.GIT_IN_CONTAINER }}${{ matrix.libudev && format(' && {{ {0}; }}', env.LIBUDEV_IN_CONTAINER) || '' }}
-          args: --release --locked --out dist
+          before-script-linux: ${{ env.GIT_IN_CONTAINER }}
+          args: --release --locked --out dist ${{ matrix.features }}
+      # Every target's binary runs on its runner: macOS natively, and the
+      # Linux ones on a runner of their architecture (musl binaries are
+      # static). A wheel that bundles libraries would have maturin's Python
+      # launcher in .data/scripts instead of the binary, which only works
+      # installed, so such a wheel is installed into a fresh venv and its
+      # mdkg run; none should now (the next step refuses one). A wheel whose
+      # --version lacks this checkout's commit, or says dirty, or a Linux
+      # wheel whose --version doesn't say it has no FIDO2, fails here,
+      # before anything is uploaded.
+      - name: Check the wheel's --version names a clean commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          wheels=(dist/*.whl)
+          [ "${#wheels[@]}" -eq 1 ] || { echo "::error::expected one wheel, found ${#wheels[@]}"; exit 1; }
+          unpacked=$(mktemp -d)
+          python3 -m zipfile -e "${wheels[0]}" "$unpacked"
+          bins=("$unpacked"/*.data/scripts/mdkg)
+          [ "${#bins[@]}" -eq 1 ] || { echo "::error::no mdkg binary in ${wheels[0]}"; exit 1; }
+          bin=${bins[0]}
+          if python3 -c 'import sys; sys.exit(open(sys.argv[1], "rb").read(2) != b"#!")' "$bin"; then
+            python3 -m venv "$unpacked/venv"
+            "$unpacked/venv/bin/python" -m pip install --quiet --no-index --no-deps "${wheels[0]}"
+            # Run the installed launcher itself, as a user would: a wheel
+            # that ships it without its execute bit fails here.
+            run=("$unpacked/venv/bin/mdkg")
+          else
+            chmod +x "$bin"
+            run=("$bin")
+          fi
+          line=$("${run[@]}" --version)
+          echo "$line"
+          want="(commit $(git rev-parse HEAD), built "
+          case "$line" in
+            *"$want"*) ;;
+            *) echo "::error::${wheels[0]}: --version doesn't name clean commit $(git rev-parse HEAD): $line"; exit 1 ;;
+          esac
+          if [ "$RUNNER_OS" = Linux ]; then
+            case "$line" in
+              *"; no FIDO2 in this build: "*) ;;
+              *) echo "::error::${wheels[0]}: a Linux wheel must build without FIDO2: $line"; exit 1 ;;
+            esac
+          else
+            case "$line" in
+              *"; no FIDO2 in this build: "*) echo "::error::${wheels[0]}: a macOS wheel must keep FIDO2: $line"; exit 1 ;;
+            esac
+          fi
+      # A wheel carries no shared libraries beside the binary: auditwheel
+      # would copy in any the binary links outside the manylinux allow-list.
+      # One that THIRD_PARTY_NOTICES.md doesn't list (none is) fails the
+      # build before anything is uploaded.
+      - name: Check the wheel bundles no unlisted library
+        shell: bash
+        run: python3 -I scripts/third-party-notices.py --check-wheel dist/*.whl
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: wheels-${{ matrix.target }}

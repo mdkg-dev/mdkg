@@ -44,6 +44,7 @@ fn receipt_transport_override_refuses_before_the_installed_callback() {
         fault: |_, _| panic!("must not bypass overridden transport"),
         clear: |_, _, _| panic!("must not bypass overridden transport"),
         clears: |_, _, _| panic!("must not bypass overridden transport"),
+        sent: |_, _, _, _| panic!("must not bypass overridden transport"),
     });
     let error = mail
         .receipt_send(&mdkg_run::mail::Receipt {
@@ -204,5 +205,28 @@ fn output_that_isnt_the_contract_is_a_mail_failure() {
     mail.program = PathBuf::from("/bin/echo");
     let e = mail.release("run:lane").expect_err("not json");
     assert_eq!(e.code, "run.mail_failed");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn digest_reads_without_marking_and_marks_only_the_given_body() {
+    let (root, mut mail) = setup("digest-mark");
+    let page = mail
+        .digest_inbox_after("lane", Some(2), 20)
+        .expect("no mark");
+    let mut m = page.messages[0].clone();
+    m.digest = "sha256:0123".into();
+    mail.mark_digest_shown("lane", &[m]).expect("mark");
+    let calls = log(&root);
+    assert!(
+        calls[0].contains("msg inbox --no-mark --limit 20 --after 2"),
+        "{:?}",
+        calls
+    );
+    assert!(
+        calls[1].contains("msg inbox --mark-shown=5/sha256:0123/m1"),
+        "{:?}",
+        calls
+    );
     let _ = fs::remove_dir_all(root);
 }

@@ -38,6 +38,36 @@ struct Shared {
     /// The registered supervisor, whose agents `agents stop` drains one
     /// at a time.
     supervisor: Option<Arc<Registered>>,
+    /// A flag a signal handler sets ([`Control::stop_on`]): read on every
+    /// [`Control::stopped`], so a stop is seen as soon as the handler runs.
+    external: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Why each agent's worker returned, when it said ([`note_end`]).
+    ends: BTreeMap<String, End>,
+}
+
+/// Why a worker returned on its own, not on a stop: kept so the
+/// supervisor's exit record names its own reason (#20977).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum End {
+    /// Its trigger is `manual`: a watch runs it no turns.
+    Manual,
+    /// It ran its `--max-turns`.
+    Cap,
+    /// The agent is no longer known.
+    UnknownAgent,
+    /// Its receiver mode changed (interactive to headless or back).
+    ModeChanged,
+}
+
+impl Shared {
+    /// Stopped by a request, or by the external flag (read each time).
+    fn is_stopped(&self) -> bool {
+        self.stopped
+            || self
+                .external
+                .as_ref()
+                .is_some_and(|f| f.load(std::sync::atomic::Ordering::SeqCst))
+    }
 }
 
 /// Shared by the watcher and each supervisor thread. Stopping never signals
@@ -54,6 +84,8 @@ impl Control {
                 failure: None,
                 progress,
                 supervisor: None,
+                external: None,
+                ends: BTreeMap::new(),
             }),
             Condvar::new(),
         )))
@@ -67,6 +99,17 @@ impl Control {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .supervisor = Some(supervisor);
+    }
+
+    /// Why `agent`'s worker returned on its own, if it said.
+    pub fn ended(&self, agent: &str) -> Option<End> {
+        self.0
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .ends
+            .get(agent)
+            .copied()
     }
 
     pub fn supervisor(&self) -> Option<Arc<Registered>> {
@@ -84,8 +127,21 @@ impl Control {
         wake.notify_all();
     }
 
+    /// Stops when `flag` is set (a SIGTERM handler's), with no copy step:
+    /// every [`Control::stopped`] and [`stop_requested`] reads it, so no
+    /// worker is admitted to a turn once the handler has run.
+    pub fn stop_on(&self, flag: Arc<std::sync::atomic::AtomicBool>) {
+        let (shared, wake) = &*self.0;
+        shared.lock().unwrap_or_else(|e| e.into_inner()).external = Some(flag);
+        wake.notify_all();
+    }
+
     pub fn stopped(&self) -> bool {
-        self.0.0.lock().unwrap_or_else(|e| e.into_inner()).stopped
+        self.0
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_stopped()
     }
 
     /// Stop admitting work and retain the first fatal reason. This differs
@@ -129,9 +185,9 @@ impl Control {
             }
             let held = shared.lock().unwrap_or_else(|e| e.into_inner());
             let (held, _) = wake
-                .wait_timeout_while(held, left.min(DRAIN_POLL), |s| !s.stopped)
+                .wait_timeout_while(held, left.min(DRAIN_POLL), |s| !s.is_stopped())
                 .unwrap_or_else(|e| e.into_inner());
-            if held.stopped {
+            if held.is_stopped() {
                 return;
             }
         }
@@ -172,6 +228,24 @@ pub fn drain_requested() -> bool {
     agent_supervisor().is_some_and(|(agent, supervisor)| {
         super::stop::requested(supervisor.run_dir(), &agent, &supervisor.id())
     })
+}
+
+/// Notes why this worker's agent is returning on its own ([`End`]).
+pub(crate) fn note_end(end: End) {
+    let Some(agent) = AGENT.with(|a| a.borrow().clone()) else {
+        return;
+    };
+    CURRENT.with(|c| {
+        if let Some(control) = c.borrow().as_ref() {
+            control
+                .0
+                .0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .ends
+                .insert(agent, end);
+        }
+    });
 }
 
 /// The id of the supervisor this thread works for, if it registered.
@@ -344,6 +418,30 @@ pub(crate) fn bounded_test(name: &str, test: impl FnOnce()) {
 
 #[cfg(test)]
 mod tests {
+    /// A set external flag (a SIGTERM handler's) stops the control at once,
+    /// with no copy step, for `stopped()` and a worker's `stop_requested()`
+    /// (review of 5d8b5299).
+    #[test]
+    fn an_external_flag_stops_at_once() {
+        let control = Control::default();
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        control.stop_on(flag.clone());
+        assert!(!control.stopped());
+        let seen = std::thread::scope(|s| {
+            s.spawn(|| {
+                with_control(Some(&control), || {
+                    let before = stop_requested();
+                    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                    (before, stop_requested())
+                })
+            })
+            .join()
+            .unwrap()
+        });
+        assert_eq!(seen, (false, true));
+        assert!(control.stopped());
+    }
+
     use super::*;
 
     #[test]

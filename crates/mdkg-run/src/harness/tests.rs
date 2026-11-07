@@ -194,13 +194,19 @@ fn every_registered_harness_implements_the_complete_trait() {
         }
 
         let program = fixture.program();
-        let login = adapter.login(&program, &fixture.0);
+        let env = crate::env::Environment::allowlist(h);
+        let login = adapter.login(&program, &fixture.0, &env);
         let keys = KeySource {
             program: program.clone(),
             limit: std::time::Duration::from_secs(2),
         };
-        let status =
-            adapter.auth_status(&program, &fixture.0, &crate::policy::Auth::default(), &keys);
+        let status = adapter.auth_status(
+            &program,
+            &fixture.0,
+            &crate::policy::Auth::default(),
+            &keys,
+            &env,
+        );
         assert_eq!(
             adapter.login_command(),
             format!(
@@ -229,7 +235,7 @@ fn every_registered_harness_implements_the_complete_trait() {
             assert_eq!(status.source, "subscription");
         }
         assert!(!status.key_in_keychain);
-        assert_eq!(crate::auth::login(h, &program, &fixture.0), login);
+        assert_eq!(crate::auth::login(h, &program, &fixture.0, &env), login);
         assert_eq!(crate::auth::login_command(h), adapter.login_command());
         assert_eq!(crate::auth::keychain_service(h), adapter.keychain_service());
     }
@@ -266,6 +272,13 @@ fn each_adapter_knows_only_its_own_usage_limit_line() {
             assert_eq!(
                 crate::auth::usage_limit_error(h, line),
                 adapter.usage_limit(line)
+            );
+            assert_eq!(
+                adapter.usage_limit_in(&[line.to_string()]),
+                owner == h,
+                "{} reading {}'s stream",
+                adapter.id(),
+                owner.as_str()
             );
         }
         assert!(!adapter.usage_limit("usage limit reached, quoted in a reply"));
@@ -333,4 +346,70 @@ fn identity_serialization_and_schema_keep_the_shipped_values() {
     let schema = serde_json::to_value(schemars::schema_for!(Harness)).expect("schema");
     assert_eq!(schema["title"], "Harness");
     assert_eq!(schema["enum"], json!(["claude", "codex", "opencode"]));
+}
+
+/// The runner's side of a turn (edd-01a1a454, step 1), as each built-in
+/// adapter answers it: the vendor points turn.rs used to match on by name.
+#[test]
+fn each_adapter_answers_the_runners_side_of_a_turn() {
+    let fixture = Fixture::new();
+    let opts = crate::turn::TurnOptions::default();
+    let turns = fixture.0.join("turns");
+    let settings = crate::profile::codex_settings(Role::Worker, None, None);
+    for h in Harness::ALL {
+        let a = h.adapter();
+        let claude = h == Harness::Claude;
+        let codex = h == Harness::Codex;
+        let opencode = h == Harness::OpenCode;
+        assert_eq!(a.prompt_max(), opencode.then_some(96 * 1024), "{h:?}");
+        assert_eq!(a.chooses_session(), claude, "{h:?}");
+        assert_eq!(a.reply_on_stdout(), codex, "{h:?}");
+        assert_eq!(a.structured_output(), !codex, "{h:?}");
+        assert!(a.early_check("", Role::Worker, settings).is_none(), "{h:?}");
+        // A Zen model is refused only by OpenCode, and only unless allowed.
+        let zen = a.check_turn(Some("opencode/some-model"), &opts);
+        assert_eq!(zen.is_err(), opencode, "{h:?}");
+        let allowed = crate::turn::TurnOptions {
+            allow_zen: true,
+            ..crate::turn::TurnOptions::default()
+        };
+        assert!(a.check_turn(Some("opencode/some-model"), &allowed).is_ok());
+        assert!(a.check_turn(None, &opts).is_ok());
+        // With no v0.1 home and no Codex session file, only Codex refuses
+        // to resume.
+        let home = fixture.0.join("home");
+        let codex_home = crate::turn::TurnOptions {
+            user_codex_home: Some(fixture.0.join("codex")),
+            ..crate::turn::TurnOptions::default()
+        };
+        assert_eq!(
+            a.resumable("s-1", false, &turns, &codex_home, Some(&home)),
+            !codex,
+            "{h:?}"
+        );
+    }
+    // A Codex session its home holds resumes; an OpenCode one left in the
+    // v0.1 private home doesn't unless the user's own.
+    let codex_home = fixture.0.join("codex");
+    let day = codex_home.join("sessions/2026/11/04");
+    std::fs::create_dir_all(&day).expect("sessions");
+    std::fs::write(day.join("rollout-x-s-1.jsonl"), "").expect("session");
+    let with_home = crate::turn::TurnOptions {
+        user_codex_home: Some(codex_home),
+        ..crate::turn::TurnOptions::default()
+    };
+    assert!(
+        Harness::Codex
+            .adapter()
+            .resumable("s-1", false, &turns, &with_home, None)
+    );
+    assert!(
+        !Harness::Codex
+            .adapter()
+            .resumable("s-2", false, &turns, &with_home, None)
+    );
+    std::fs::create_dir_all(turns.join("home")).expect("v0.1 home");
+    let oc = Harness::OpenCode.adapter();
+    assert!(!oc.resumable("s-1", false, &turns, &opts, None));
+    assert!(oc.resumable("s-1", true, &turns, &opts, None));
 }

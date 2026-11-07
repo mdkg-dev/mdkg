@@ -13,6 +13,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
+pub mod children;
+
 fn failure(message: impl Into<String>) -> io::Error {
     io::Error::other(message.into())
 }
@@ -300,6 +302,142 @@ pub fn fresh_reads() {
     if let Ok(mut list) = CHECKOUTS.lock() {
         list.clear();
     }
+    if let Ok(mut list) = VALUES.lock() {
+        list.clear();
+    }
+    if let Ok(mut list) = PARSED.lock() {
+        list.clear();
+    }
+}
+
+/// A file's identity and last change, `None` when it's missing: a value
+/// read from git is kept only while every file it was read from has the
+/// same stamp.
+type FileStamp = Option<(u64, u64, u64, i64, i64, i64, i64)>;
+
+/// The stamp of `path`, or `None` when it can't be stamped (unreadable, or
+/// a link, whose target the stamp wouldn't see): then nothing is kept.
+fn file_stamp(path: &Path) -> Option<FileStamp> {
+    use std::os::unix::fs::MetadataExt;
+    match fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_symlink() => None,
+        Ok(m) => Some(Some((
+            m.dev(),
+            m.ino(),
+            m.size(),
+            m.mtime(),
+            m.mtime_nsec(),
+            m.ctime(),
+            m.ctime_nsec(),
+        ))),
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Some(None)
+        }
+        Err(_) => None,
+    }
+}
+
+/// What a kept value was read for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ValueKey {
+    /// A key of a repository's own config file ([`common_config`]).
+    Config { common: PathBuf, key: String },
+    /// What `purpose` reads of a ref ([`has_ref`], [`cached_ref`]), seen
+    /// from a worktree's git folder.
+    Ref {
+        git_dir: PathBuf,
+        name: String,
+        purpose: &'static str,
+    },
+}
+
+/// One value read from git, with the stamps of every file it was read
+/// from, taken before the read.
+struct KeptValue {
+    key: ValueKey,
+    common: PathBuf,
+    stamps: Vec<(PathBuf, FileStamp)>,
+    value: Option<String>,
+}
+
+/// Values read from git (decided 2026-11-04, e-gitcache: f-tests step 5's
+/// remainder). Like [`checked_worktree`]'s cache, for this process until
+/// [`fresh_reads`]; and a value is used again only while every file it was
+/// read from is unchanged, so a ref, HEAD or config written by anyone
+/// (mdkg's writer or another git) is read again. [`ready_to_write`] drops
+/// the repository's values outright.
+static VALUES: Mutex<Vec<KeptValue>> = Mutex::new(Vec::new());
+
+/// The stamps of `paths`, or `None` if one can't be stamped.
+fn stamps_of(paths: Vec<PathBuf>) -> Option<Vec<(PathBuf, FileStamp)>> {
+    paths
+        .into_iter()
+        .map(|p| file_stamp(&p).map(|s| (p, s)))
+        .collect()
+}
+
+/// The value kept for `key`, if every file it was read from is unchanged.
+fn kept_value(key: &ValueKey) -> Option<Option<String>> {
+    let list = VALUES.lock().ok()?;
+    let kept = list.iter().find(|k| k.key == *key)?;
+    kept.stamps
+        .iter()
+        .all(|(path, stamp)| file_stamp(path).as_ref() == Some(stamp))
+        .then(|| kept.value.clone())
+}
+
+fn keep_value(
+    key: ValueKey,
+    common: &Path,
+    stamps: Vec<(PathBuf, FileStamp)>,
+    value: Option<String>,
+) {
+    if let Ok(mut list) = VALUES.lock() {
+        list.retain(|k| k.key != key);
+        list.push(KeptValue {
+            key,
+            common: common.to_path_buf(),
+            stamps,
+            value,
+        });
+    }
+}
+
+/// Forgets every value kept for the repository whose common dir is
+/// `common`.
+fn forget_values(common: &Path) {
+    if let Ok(mut list) = VALUES.lock() {
+        list.retain(|k| k.common != common);
+    }
+}
+
+/// Reads `key` through the value cache: the kept value while the files
+/// `paths` names stamp the same, else `read`, kept when `paths` is `Some`,
+/// every file stamps, and `read` says its answer is git's own (a git that
+/// failed to run, timed out or erred answers nothing to keep). Stamped
+/// before reading, so a change during the read is seen next time.
+fn cached_value(
+    key: ValueKey,
+    common: &Path,
+    paths: Option<Vec<PathBuf>>,
+    read: impl FnOnce() -> (Option<String>, bool),
+) -> Option<String> {
+    if paths.is_some()
+        && let Some(value) = kept_value(&key)
+    {
+        return value;
+    }
+    let stamps = paths.and_then(stamps_of);
+    let (value, answered) = read();
+    if answered && let Some(stamps) = stamps {
+        keep_value(key, common, stamps, value.clone());
+    }
+    value
 }
 
 /// How many times [`fresh_reads`] has run in this process.
@@ -596,6 +734,124 @@ impl Git {
     }
 }
 
+/// The inherited `GIT_*` variables a [`user_config_command`] or
+/// [`network_command`] keeps: the user's own ssh setup.
+const USER_SSH: &[&str] = &["GIT_SSH", "GIT_SSH_COMMAND", "GIT_SSH_VARIANT"];
+
+/// Git as the user's own `git push` from the checkout `top` (its own git
+/// folder `git_dir`, of the clone whose common folder is `common`) sees its
+/// configuration: [`common_command`]'s hardening (bounded, outputs
+/// drained, stdin closed, a process group of its own, no fsmonitor,
+/// replace objects or grafts), with the user's setup given back:
+///
+/// - no hook switched off (`GIT_CONFIG_COUNT=0`; the hooks path stays
+///   `/dev/null` until [`network_command`] names the user's);
+/// - `GIT_ALLOW_PROTOCOL` removed, so the user's `protocol.*` config
+///   decides;
+/// - every inherited `GIT_*` variable cleared but `GIT_SSH`,
+///   `GIT_SSH_COMMAND` and `GIT_SSH_VARIANT` (so `GIT_CONFIG_GLOBAL` and
+///   friends don't apply);
+/// - nothing can prompt: `GIT_TERMINAL_PROMPT=0`, `GCM_INTERACTIVE=Never`,
+///   `SSH_ASKPASS_REQUIRE=never`, `GIT_ASKPASS=false`.
+///
+/// Every read of remote configuration that graph sync's approval and
+/// guard make goes through this one view, as the network command does, so
+/// what's approved is what's contacted. The caller verifies `top` and
+/// `git_dir` belong to `common` (graph sync's `checkout`).
+pub fn user_config_command(common: &Path, git_dir: &Path, top: &Path) -> Git {
+    let mut git = common_command(common)
+        // Cancels `switch_off_hooks`'s entries: no hook is switched off.
+        .env("GIT_CONFIG_COUNT", "0")
+        .env_remove("GIT_ALLOW_PROTOCOL")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GCM_INTERACTIVE", "Never")
+        .env("SSH_ASKPASS_REQUIRE", "never")
+        .env("GIT_ASKPASS", "false");
+    for (key, _) in std::env::vars_os() {
+        let b = key.as_encoded_bytes();
+        if b.starts_with(b"GIT_")
+            && !USER_SSH.iter().any(|k| key == *k)
+            && !["GIT_TERMINAL_PROMPT", "GIT_ASKPASS", "GIT_CONFIG_COUNT"]
+                .iter()
+                .any(|k| key == *k)
+        {
+            git = git.env_remove(&key);
+        }
+    }
+    // A later `-C` (absolute), `--git-dir` and `--work-tree` set where it
+    // runs.
+    git.arg("-C")
+        .arg(top)
+        .arg("--git-dir")
+        .arg(git_dir)
+        .arg("--work-tree")
+        .arg(top)
+}
+
+/// A git command that talks to a remote for graph sync (edd-01a18867, G9):
+/// [`user_config_command`], plus
+///
+/// - **hooks run**: the user's `core.hooksPath` (a relative one made
+///   absolute against `top`, as a plain `git push` from there finds it;
+///   `~/` and `%(prefix)/` left for git to expand), or the clone's `hooks`
+///   folder, in place of `/dev/null`, so `pre-push` runs;
+/// - with no ssh setup of the user's (`GIT_SSH`, `GIT_SSH_COMMAND` or
+///   `core.sshCommand`), `ssh -o BatchMode=yes -o ConnectTimeout=15`;
+/// - `transfer.fsckObjects=true`.
+///
+/// The user's value of a key is the last one git reads outside the
+/// hardened runner's own `-c` (scope `command`), in the same view.
+/// `common` must be canonical, as the caller's checkout check leaves it.
+pub fn network_command(common: &Path, git_dir: &Path, top: &Path) -> io::Result<Git> {
+    let hooks = network_hooks_path(common, git_dir, top)?;
+    let mut git = user_config_command(common, git_dir, top);
+    let user_ssh = USER_SSH[..2]
+        .iter()
+        .any(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()))
+        || user_value(common, git_dir, top, "core.sshCommand")?.is_some();
+    if !user_ssh {
+        git = git.env(
+            "GIT_SSH_COMMAND",
+            "ssh -o BatchMode=yes -o ConnectTimeout=15",
+        );
+    }
+    // A later `-c` wins over the hardened runner's.
+    Ok(git.args([
+        "-c",
+        &format!("core.hooksPath={hooks}"),
+        "-c",
+        "transfer.fsckObjects=true",
+    ]))
+}
+
+/// The user's value of `key`, as [`network_command`] reads it: the last
+/// one git reads in [`user_config_command`]'s view outside the hardened
+/// runner's own `-c` (scope `command`), trimmed; `None` when unset or empty.
+fn user_value(common: &Path, git_dir: &Path, top: &Path, key: &str) -> io::Result<Option<String>> {
+    let out = user_config_command(common, git_dir, top)
+        .args(["config", "--show-scope", "--get-all", key])
+        .run(None)?;
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.split_once('\t'))
+        .filter(|(scope, _)| *scope != "command")
+        .map(|(_, v)| v.trim().to_owned())
+        .next_back()
+        .filter(|v| !v.is_empty()))
+}
+
+/// The hooks folder [`network_command`] runs hooks from, as it passes it
+/// to git: the user's `core.hooksPath` (a relative one made absolute
+/// against `top`; `~/` and `%(prefix)/` left for git to expand), or the
+/// clone's `hooks` folder.
+pub fn network_hooks_path(common: &Path, git_dir: &Path, top: &Path) -> io::Result<String> {
+    Ok(match user_value(common, git_dir, top, "core.hooksPath")? {
+        Some(p) if Path::new(&p).is_absolute() || p.starts_with('~') || p.starts_with("%(") => p,
+        Some(p) => top.join(p).to_string_lossy().into_owned(),
+        None => common.join("hooks").to_string_lossy().into_owned(),
+    })
+}
+
 /// Signals git's whole process group (git and anything it started).
 fn signal_group(pid: u32, signal: &str) {
     for kill in ["/bin/kill", "/usr/bin/kill"] {
@@ -674,14 +930,31 @@ fn read_output(pipe: Option<Box<dyn Read + Send>>) -> io::Result<Vec<u8>> {
     Ok(out)
 }
 
+thread_local! {
+    /// Git commands this thread started through [`run`].
+    static RUNS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many git commands this thread has started, for tests that check a
+/// read is served from [`checked_worktree`]'s cache or the value cache.
+#[doc(hidden)]
+pub fn git_runs() -> u64 {
+    RUNS.with(std::cell::Cell::get)
+}
+
 /// Runs `cmd` as [`Git::run`] describes.
 fn run(mut cmd: Command, input: Option<&[u8]>) -> io::Result<std::process::Output> {
+    RUNS.with(|n| n.set(n.get() + 1));
     if input.is_some() {
         cmd.stdin(Stdio::piped());
     }
-    let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
-    let pid = child.id();
-    let writer = match (input, child.stdin.take()) {
+    let tracked = children::spawn(cmd.stdout(Stdio::piped()).stderr(Stdio::piped()))?;
+    let pid = tracked.id();
+    let (stdin, stdout, stderr) = {
+        let mut child = tracked.child();
+        (child.stdin.take(), child.stdout.take(), child.stderr.take())
+    };
+    let writer = match (input, stdin) {
         (Some(bytes), Some(mut stdin)) => {
             let bytes = bytes.to_vec();
             Some(std::thread::spawn(move || stdin.write_all(&bytes)))
@@ -695,18 +968,8 @@ fn run(mut cmd: Command, input: Option<&[u8]>) -> io::Result<std::process::Outpu
         });
         recv
     };
-    let stdout = collect(
-        child
-            .stdout
-            .take()
-            .map(|p| Box::new(p) as Box<dyn Read + Send>),
-    );
-    let stderr = collect(
-        child
-            .stderr
-            .take()
-            .map(|p| Box::new(p) as Box<dyn Read + Send>),
-    );
+    let stdout = collect(stdout.map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let stderr = collect(stderr.map(|p| Box::new(p) as Box<dyn Read + Send>));
     let deadline = Instant::now() + time_limit();
     let timed_out = || {
         io::Error::new(
@@ -728,10 +991,11 @@ fn run(mut cmd: Command, input: Option<&[u8]>) -> io::Result<std::process::Outpu
         child.wait().ok();
     };
     let status = loop {
-        match child.try_wait()? {
+        let waited = tracked.child().try_wait()?;
+        match waited {
             Some(status) => break status,
             None if Instant::now() >= deadline => {
-                stop(&mut child);
+                stop(&mut tracked.child());
                 return Err(timed_out());
             }
             None => std::thread::sleep(Duration::from_millis(2)),
@@ -1105,7 +1369,7 @@ pub struct TreeEntry {
 /// drop its readers each turn or request, when it calls [`fresh_reads`].
 #[derive(Debug)]
 pub struct ObjectReader {
-    child: std::process::Child,
+    child: children::Tracked,
     stdin: Option<std::process::ChildStdin>,
     chunks: mpsc::Receiver<io::Result<Vec<u8>>>,
     buf: Vec<u8>,
@@ -1130,13 +1394,17 @@ impl ObjectReader {
     }
 
     fn spawned(mut command: Command, oid_bytes: usize, limit: Duration) -> io::Result<Self> {
-        let mut child = command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()?;
-        let stdin = child.stdin.take();
-        let Some(mut stdout) = child.stdout.take() else {
+        let child = children::spawn(
+            command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null()),
+        )?;
+        let (stdin, stdout) = {
+            let mut child = child.child();
+            (child.stdin.take(), child.stdout.take())
+        };
+        let Some(mut stdout) = stdout else {
             return Err(failure("cat-file has no output"));
         };
         // Bounded, so an object refused for its size buffers at most a
@@ -1314,8 +1582,9 @@ impl ObjectReader {
         self.broken = true;
         self.stdin = None;
         signal_group(self.child.id(), "-KILL");
-        self.child.kill().ok();
-        self.child.wait().ok();
+        let mut child = self.child.child();
+        child.kill().ok();
+        child.wait().ok();
     }
 }
 
@@ -1416,16 +1685,49 @@ pub fn main_ref(dir: &Path) -> String {
     name.strip_prefix("refs/heads/").unwrap_or(name).to_string()
 }
 
-/// A value from the repository's own config file only.
+/// The largest config file the value cache reads to look for includes.
+const KEPT_CONFIG_LIMIT: u64 = 1 << 20;
+
+/// A value from the repository's own config file only, kept while that
+/// file is unchanged, unless it includes another file (which its stamp
+/// can't see).
 fn common_config(common: &Path, key: &str) -> Option<String> {
+    let file = common.join("config");
+    let paths = read_capped(&file, KEPT_CONFIG_LIMIT + 1)
+        .ok()
+        .filter(|text| {
+            text.len() as u64 <= KEPT_CONFIG_LIMIT
+                && !String::from_utf8_lossy(text)
+                    .to_ascii_lowercase()
+                    .contains("include")
+        })
+        .map(|_| vec![file]);
+    let key_ = ValueKey::Config {
+        common: common.to_path_buf(),
+        key: key.to_string(),
+    };
+    cached_value(key_, common, paths, || read_common_config(common, key))
+}
+
+/// The value, and whether git answered (`config --get` exits 0, or 1 for
+/// a key that isn't set): a git that couldn't run or failed otherwise
+/// answers nothing to keep.
+fn read_common_config(common: &Path, key: &str) -> (Option<String>, bool) {
     let mut c = hardened(common);
     c.args(["config", "--file"])
         .arg(common.join("config"))
         .args(["--get", key]);
-    let out = run(c, None).ok().filter(|o| o.status.success())?;
-    String::from_utf8(out.stdout)
-        .ok()
-        .map(|v| v.trim_end_matches(['\n', '\r']).to_string())
+    let Ok(out) = run(c, None) else {
+        return (None, false);
+    };
+    match out.status.code() {
+        Some(0) => match String::from_utf8(out.stdout) {
+            Ok(v) => (Some(v.trim_end_matches(['\n', '\r']).to_string()), true),
+            Err(_) => (None, false),
+        },
+        Some(1) => (None, true),
+        _ => (None, false),
+    }
 }
 
 /// Ref guards need file-backed refs. `common` must already be the caller's
@@ -1437,7 +1739,34 @@ fn common_config(common: &Path, key: &str) -> Option<String> {
 /// Every explicit value must be exactly `files`, even in duplicate entries.
 /// The config itself must be a regular file, never a symlink.
 pub fn require_files_ref_storage(common: &Path) -> io::Result<()> {
-    ref_storage_config(common, hardened(common))
+    ref_storage_config_with(common, hardened(common), true)
+}
+
+/// Config snapshots git has parsed in this process, with its listing: the
+/// listing depends on the bytes alone (no repository, global, system or
+/// included config is read), so the same bytes are parsed once. Cleared by
+/// [`fresh_reads`]; a handful at most are kept.
+static PARSED: Mutex<Vec<(Vec<u8>, Vec<u8>)>> = Mutex::new(Vec::new());
+
+const PARSED_KEPT: usize = 8;
+
+fn parsed_listing(bytes: &[u8]) -> Option<Vec<u8>> {
+    PARSED
+        .lock()
+        .ok()?
+        .iter()
+        .find(|(b, _)| b == bytes)
+        .map(|(_, listing)| listing.clone())
+}
+
+fn keep_listing(bytes: &[u8], listing: &[u8]) {
+    if let Ok(mut list) = PARSED.lock() {
+        list.retain(|(b, _)| b != bytes);
+        if list.len() >= PARSED_KEPT {
+            list.remove(0);
+        }
+        list.push((bytes.to_vec(), listing.to_vec()));
+    }
 }
 
 const REF_CONFIG_LIMIT: u64 = 1 << 20;
@@ -1465,6 +1794,9 @@ fn read_ref_config(path: &Path) -> io::Result<Vec<u8>> {
 /// only the working folder; nothing in it is read. Fails closed on any
 /// parse error.
 pub fn parse_config_snapshot(dir: &Path, bytes: &[u8]) -> io::Result<Vec<u8>> {
+    if let Some(listing) = parsed_listing(bytes) {
+        return Ok(listing);
+    }
     let mut cmd = hardened(dir);
     cmd.env("GIT_DIR", "/dev/null")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -1479,10 +1811,17 @@ pub fn parse_config_snapshot(dir: &Path, bytes: &[u8]) -> io::Result<Vec<u8>> {
             out.status.code()
         )));
     }
+    keep_listing(bytes, &out.stdout);
     Ok(out.stdout)
 }
 
-fn ref_storage_config(common: &Path, mut cmd: Command) -> io::Result<()> {
+#[cfg(test)]
+fn ref_storage_config(common: &Path, cmd: Command) -> io::Result<()> {
+    ref_storage_config_with(common, cmd, false)
+}
+
+/// [`ref_storage_config`], reusing a listing of the same bytes when `keep`.
+fn ref_storage_config_with(common: &Path, mut cmd: Command, keep: bool) -> io::Result<()> {
     if !common.is_absolute() {
         return Err(failure(
             "ref storage needs an absolute trusted common directory",
@@ -1513,6 +1852,9 @@ fn ref_storage_config(common: &Path, mut cmd: Command) -> io::Result<()> {
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .args(["config", "--file", "-", "--no-includes", "--null", "--list"]);
+    if keep && let Some(listing) = parsed_listing(&bytes) {
+        return files_ref_storage(&listing);
+    }
     let out = run(cmd, Some(&bytes))?;
     if !out.status.success() {
         // Config values and Git's error text may be sensitive; never echo them.
@@ -1521,6 +1863,9 @@ fn ref_storage_config(common: &Path, mut cmd: Command) -> io::Result<()> {
             config.display(),
             out.status.code()
         )));
+    }
+    if keep {
+        keep_listing(&bytes, &out.stdout);
     }
     files_ref_storage(&out.stdout)
 }
@@ -1618,6 +1963,8 @@ fn held_refs(git_dir: &Path) -> io::Result<Vec<String>> {
 /// requires `update-ref` with the expected old value.
 pub fn ready_to_write(worktree: &Path) -> io::Result<()> {
     let checkout = check_worktree(worktree)?;
+    // What's written next changes refs or config: read them again after.
+    forget_values(&checkout.common);
     let refuse = |why: String| failure(format!("{}: {why}", worktree.display()));
     let out = command(worktree)
         .args(["symbolic-ref", "-q", "HEAD"])
@@ -1813,13 +2160,8 @@ pub fn hook_names(listed: &[u8]) -> Vec<std::ffi::OsString> {
 
 /// The common dir's `core.worktree` (a submodule's), resolved against it.
 fn worktree_setting(common: &Path) -> Option<PathBuf> {
-    let mut c = hardened(common);
-    c.args(["config", "--file"])
-        .arg(common.join("config"))
-        .args(["--get", "core.worktree"]);
-    let out = run(c, None).ok().filter(|o| o.status.success())?;
-    let value = String::from_utf8(out.stdout).ok()?;
-    fs::canonicalize(common.join(value.trim_end_matches(['\n', '\r']))).ok()
+    let value = common_config(common, "core.worktree")?;
+    fs::canonicalize(common.join(value)).ok()
 }
 
 /// Runs git in `dir` and returns its stdout.
@@ -1910,9 +2252,164 @@ pub fn local_offset_minutes(dir: &Path) -> i64 {
     }
 }
 
-/// Whether `refname` names a commit.
+/// Whether `refname` names a commit. A yes is kept while every file git
+/// could have resolved it from is unchanged ([`ref_files`]); a no is asked
+/// again each time.
 pub fn has_ref(repo: &Path, refname: &str) -> bool {
-    command(repo)
+    let Ok(checkout) = checkout_for(repo) else {
+        return read_has_ref(repo, refname).unwrap_or(false);
+    };
+    let key = ValueKey::Ref {
+        git_dir: checkout.git_dir.clone(),
+        name: refname.to_string(),
+        purpose: "has_ref",
+    };
+    let paths = ref_files(&checkout, refname);
+    // Only a found commit is kept: `rev-parse --verify` exits 1 both for
+    // a missing ref and for one whose commit can't be read now (an
+    // alternate that's away), and the stamps see refs, not objects.
+    cached_value(key, &checkout.common, paths, || {
+        match read_has_ref(repo, refname) {
+            Some(true) => (Some(String::new()), true),
+            _ => (None, false),
+        }
+    })
+    .is_some()
+}
+
+/// What `read` answers about the ref `name` in the worktree `repo` is in,
+/// kept as [`has_ref`]'s answers are: while every file git could resolve
+/// the name from is unchanged ([`ref_files`]), until [`fresh_reads`] or
+/// [`ready_to_write`]. Only an `Ok` answer is kept; an error is read again
+/// next time. `purpose` names what `read` reads, so two readers of one
+/// ref never share an answer. A caller whose read depends on anything but
+/// the ref (the objects it names aside) must not use this.
+pub fn cached_ref<E>(
+    repo: &Path,
+    name: &str,
+    purpose: &'static str,
+    read: impl FnOnce() -> Result<String, E>,
+) -> Result<String, E> {
+    let Ok(checkout) = checkout_for(repo) else {
+        return read();
+    };
+    let key = ValueKey::Ref {
+        git_dir: checkout.git_dir.clone(),
+        name: name.to_string(),
+        purpose,
+    };
+    let paths = ref_files(&checkout, name);
+    if paths.is_some()
+        && let Some(Some(value)) = kept_value(&key)
+    {
+        return Ok(value);
+    }
+    let stamps = paths.and_then(stamps_of);
+    let answer = read();
+    if let (Ok(value), Some(stamps)) = (&answer, stamps) {
+        keep_value(key, &checkout.common, stamps, Some(value.clone()));
+    }
+    answer
+}
+
+/// Every file git could resolve `name` from in this worktree: its HEAD,
+/// the packed refs, and the loose ref each of git's lookup rules names, in
+/// the worktree's git folder and the common one, with the ref a symbolic
+/// one among them leads to. `None` (nothing is kept) for anything but a
+/// plain ref name: an object name, an expression, a name all of hex
+/// digits, a symbolic ref leading to another, or reftable storage.
+fn ref_files(checkout: &Checkout, name: &str) -> Option<Vec<PathBuf>> {
+    let plain = |name: &str| {
+        (1..=200).contains(&name.len())
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._/-".contains(&b))
+            && !name.starts_with(['-', '/', '.'])
+            && !name.ends_with(['/', '.'])
+            && !name.contains("..")
+            && !name.contains("//")
+            && !name.contains("/.")
+            && !name.bytes().all(|b| b.is_ascii_hexdigit())
+            // Another worktree's refs, resolved through its own git folder
+            // (or the primary's `<common>/HEAD`), which isn't stamped.
+            && !name.starts_with("main-worktree/")
+            && !name.starts_with("worktrees/")
+    };
+    if !plain(name) || fs::symlink_metadata(checkout.common.join("reftable")).is_ok() {
+        return None;
+    }
+    let dirs = [&checkout.git_dir, &checkout.common];
+    let named = |name: &str| -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        for rule in ["", "refs/", "refs/tags/", "refs/heads/", "refs/remotes/"] {
+            for dir in dirs {
+                paths.push(dir.join(format!("{rule}{name}")));
+            }
+        }
+        for dir in dirs {
+            paths.push(dir.join(format!("refs/remotes/{name}/HEAD")));
+        }
+        paths
+    };
+    let mut paths = vec![
+        checkout.git_dir.join("HEAD"),
+        checkout.common.join("packed-refs"),
+    ];
+    paths.extend(named(name));
+    // A symbolic ref leads to another: that one's files too, one step.
+    let mut led = Vec::new();
+    for path in &paths {
+        let Some(target) = symbolic_target(path)? else {
+            continue;
+        };
+        if !target.starts_with("refs/") || !plain(&target) {
+            return None;
+        }
+        for dir in dirs {
+            let file = dir.join(&target);
+            if symbolic_target(&file)?.is_some() {
+                return None;
+            }
+            led.push(file);
+        }
+    }
+    paths.extend(led);
+    Some(paths)
+}
+
+/// The ref a symbolic ref file names (`ref: refs/heads/x`): `Some(None)`
+/// when `path` is missing, a folder, or a ref naming a commit, and `None`
+/// when it can't be told (a link, or a file that can't be read whole).
+fn symbolic_target(path: &Path) -> Option<Option<String>> {
+    match fs::symlink_metadata(path) {
+        Ok(m) if m.is_dir() => Some(None),
+        Ok(m) if m.is_file() => {
+            let text = read_capped(path, 4096).ok()?;
+            let text = String::from_utf8(text).ok()?;
+            Some(
+                text.trim_end()
+                    .strip_prefix("ref: ")
+                    .map(|t| t.trim().to_string()),
+            )
+        }
+        Ok(_) => None,
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Some(None)
+        }
+        Err(_) => None,
+    }
+}
+
+/// Whether `refname` names a commit, as git answers (`rev-parse --verify
+/// --quiet` exits 0 or 1); `None` when git didn't answer (it couldn't run,
+/// timed out, or failed otherwise).
+fn read_has_ref(repo: &Path, refname: &str) -> Option<bool> {
+    let out = command(repo)
         .args([
             "rev-parse",
             "--verify",
@@ -1920,7 +2417,12 @@ pub fn has_ref(repo: &Path, refname: &str) -> bool {
             &format!("{refname}^{{commit}}"),
         ])
         .run(None)
-        .is_ok_and(|o| o.status.success())
+        .ok()?;
+    match out.status.code() {
+        Some(0) => Some(true),
+        Some(1) => Some(false),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -2655,6 +3157,263 @@ mod read_cache_tests {
         WorktreeTrust::default()
     }
 
+    /// e-gitcache: a kept ref read never outlives a change to the ref,
+    /// whoever makes it.
+    #[test]
+    fn a_kept_ref_read_follows_every_ref_change() {
+        let _turn = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let (_s, wt) = linked();
+        with_worktree_trust(&none(), || {
+            fresh_reads();
+            assert!(has_ref(&wt, "main"));
+            let before = git_runs();
+            assert!(has_ref(&wt, "main"));
+            assert!(!has_ref(&wt, "topic"));
+            assert!(!has_ref(&wt, "topic"));
+            assert_eq!(git_runs(), before + 2, "main kept; a no asked again");
+            // Made by another git: seen at once.
+            sh(&wt, &["branch", "topic"]);
+            assert!(has_ref(&wt, "topic"));
+            // Packed, with no loose file left, then deleted.
+            sh(&wt, &["pack-refs", "--all"]);
+            assert!(has_ref(&wt, "topic"));
+            sh(&wt, &["branch", "-D", "topic"]);
+            assert!(!has_ref(&wt, "topic"));
+            // Found again by another of git's rules.
+            sh(&wt, &["tag", "topic"]);
+            assert!(has_ref(&wt, "topic"));
+            sh(&wt, &["update-ref", "-d", "refs/tags/topic"]);
+            assert!(!has_ref(&wt, "topic"));
+            // HEAD, followed through the branch it names.
+            assert!(has_ref(&wt, "HEAD"));
+            sh(&wt, &["checkout", "-q", "--orphan", "fresh"]);
+            assert!(!has_ref(&wt, "HEAD"), "HEAD names an unborn branch");
+            sh(&wt, &["commit", "-q", "--allow-empty", "-m", "second"]);
+            assert!(has_ref(&wt, "HEAD"), "the branch HEAD names was born");
+            // Another worktree's change to a shared ref.
+            let primary = wt.parent().unwrap().join("repo");
+            sh(&primary, &["branch", "shared"]);
+            assert!(has_ref(&wt, "shared"));
+        });
+    }
+
+    /// A ref's value read through [`cached_ref`] follows the ref: a commit
+    /// on it, a reset, or a delete by another git is read at once, and an
+    /// error is never kept.
+    #[test]
+    fn a_kept_ref_value_follows_the_ref() {
+        let _turn = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let (_s, wt) = linked();
+        with_worktree_trust(&none(), || {
+            fresh_reads();
+            let tip = |name: &str| {
+                cached_ref(&wt, name, "test", || {
+                    let out = command(&wt)
+                        .args(["rev-parse", "--verify", "--quiet", name])
+                        .run(None)
+                        .map_err(|e| e.to_string())?;
+                    if !out.status.success() {
+                        return Err("missing".to_string());
+                    }
+                    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+                })
+            };
+            let first = tip("refs/heads/side").unwrap();
+            let before = git_runs();
+            assert_eq!(tip("refs/heads/side").unwrap(), first);
+            assert_eq!(git_runs(), before, "kept");
+            sh(&wt, &["commit", "-q", "--allow-empty", "-m", "next"]);
+            let second = tip("refs/heads/side").unwrap();
+            assert_ne!(second, first, "a commit is read at once");
+            sh(&wt, &["update-ref", "refs/heads/side", &first]);
+            assert_eq!(tip("refs/heads/side").unwrap(), first, "a reset too");
+            // Packed: the loose file goes, the value stays.
+            sh(&wt, &["pack-refs", "--all"]);
+            assert_eq!(tip("refs/heads/side").unwrap(), first);
+            assert!(tip("refs/heads/gone").is_err());
+            let before = git_runs();
+            assert!(tip("refs/heads/gone").is_err());
+            assert_eq!(git_runs(), before + 1, "an error is read again");
+            // Another purpose never shares the answer.
+            let other = cached_ref(&wt, "refs/heads/side", "other", || {
+                Ok::<_, String>("x".into())
+            });
+            assert_eq!(other.unwrap(), "x");
+        });
+    }
+
+    /// A git that didn't answer (here: refused, as a timeout or a failed
+    /// spawn would be) leaves nothing kept, so the next read asks again.
+    #[test]
+    fn a_read_git_didnt_answer_is_never_kept() {
+        let _turn = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let (_s, wt) = linked();
+        with_worktree_trust(&none(), || {
+            fresh_reads();
+            let checkout = checked_worktree(&wt).unwrap();
+            let key = ValueKey::Ref {
+                git_dir: checkout.git_dir.clone(),
+                name: "main".into(),
+                purpose: "has_ref",
+            };
+            let paths = ref_files(&checkout, "main");
+            assert!(paths.is_some());
+            let failed = cached_value(key.clone(), &checkout.common, paths.clone(), || {
+                (None, false)
+            });
+            assert_eq!(failed, None);
+            assert_eq!(kept_value(&key), None, "a failed read isn't kept");
+            assert!(has_ref(&wt, "main"), "asked again, and found");
+            // A key git reports unset is its answer, and kept.
+            let common = checkout.common.clone();
+            assert_eq!(read_common_config(&common, "mdkg.unset"), (None, true));
+        });
+    }
+
+    /// A ref whose commit git can't read now (its object is away, as in an
+    /// alternate that's unavailable) answers no, which is never kept: once
+    /// the object is back, it's found.
+    #[test]
+    fn a_ref_whose_commit_is_unreadable_is_asked_again() {
+        let _turn = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let (_s, wt) = linked();
+        with_worktree_trust(&none(), || {
+            fresh_reads();
+            let common = common_dir(&wt).unwrap();
+            let objects = common.join("objects");
+            let away = common.join("objects-away");
+            fs::rename(&objects, &away).unwrap();
+            fs::create_dir(&objects).unwrap();
+            assert!(!has_ref(&wt, "main"), "its commit can't be read");
+            fs::remove_dir(&objects).unwrap();
+            fs::rename(&away, &objects).unwrap();
+            assert!(has_ref(&wt, "main"), "asked again, and found");
+        });
+    }
+
+    /// Another worktree's refs (`main-worktree/HEAD`, `worktrees/<name>/HEAD`)
+    /// resolve through files the cache doesn't stamp: never kept.
+    #[test]
+    fn another_worktrees_refs_are_never_kept() {
+        let _turn = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let (_s, wt) = linked();
+        with_worktree_trust(&none(), || {
+            fresh_reads();
+            let checkout = checked_worktree(&wt).unwrap();
+            for name in ["main-worktree/HEAD", "worktrees/wt/HEAD"] {
+                assert!(ref_files(&checkout, name).is_none(), "{name}");
+            }
+            assert!(has_ref(&wt, "main-worktree/HEAD"));
+            let primary = wt.parent().unwrap().join("repo");
+            sh(&primary, &["checkout", "-q", "--orphan", "unborn"]);
+            assert!(!has_ref(&wt, "main-worktree/HEAD"), "seen at once");
+        });
+    }
+
+    /// An object name, or anything but a plain ref name, is read every
+    /// time: what names it isn't a file the cache can stamp.
+    #[test]
+    fn an_object_name_is_never_kept() {
+        let _turn = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let (_s, wt) = linked();
+        with_worktree_trust(&none(), || {
+            fresh_reads();
+            let out = command(&wt).args(["rev-parse", "HEAD"]).run(None).unwrap();
+            let oid = String::from_utf8(out.stdout).unwrap().trim().to_string();
+            for name in [oid.as_str(), &oid[..12], "HEAD~0", "main@{0}", "side^"] {
+                let before = git_runs();
+                has_ref(&wt, name);
+                has_ref(&wt, name);
+                assert_eq!(git_runs(), before + 2, "{name} was kept");
+            }
+        });
+    }
+
+    /// A config value is kept while the config file is unchanged, and
+    /// never when it includes another file.
+    #[test]
+    fn a_kept_config_read_follows_the_config_file() {
+        let _turn = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let (_s, wt) = linked();
+        with_worktree_trust(&none(), || {
+            fresh_reads();
+            let common = common_dir(&wt).unwrap();
+            assert_eq!(common_config(&common, "mdkg.mainRef"), None);
+            let before = git_runs();
+            assert_eq!(common_config(&common, "mdkg.mainRef"), None);
+            assert_eq!(git_runs(), before, "kept");
+            sh(&wt, &["config", "mdkg.mainRef", "trunk"]);
+            assert_eq!(
+                common_config(&common, "mdkg.mainRef").as_deref(),
+                Some("trunk")
+            );
+            sh(&wt, &["config", "mdkg.mainRef", "trunk2"]);
+            assert_eq!(
+                common_config(&common, "mdkg.mainRef").as_deref(),
+                Some("trunk2")
+            );
+            sh(&wt, &["config", "include.path", "/dev/null"]);
+            let before = git_runs();
+            common_config(&common, "mdkg.mainRef");
+            common_config(&common, "mdkg.mainRef");
+            assert_eq!(git_runs(), before + 2, "an include is never kept");
+        });
+    }
+
+    /// mdkg's own writer, and the start of a turn or request, read every
+    /// value again.
+    #[test]
+    fn a_write_check_and_fresh_reads_drop_kept_values() {
+        let _turn = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let (_s, wt) = linked();
+        with_worktree_trust(&none(), || {
+            fresh_reads();
+            let common = common_dir(&wt).unwrap();
+            // Keys the write check itself doesn't read (it may keep those
+            // again, under their stamps).
+            assert!(has_ref(&wt, "main"));
+            common_config(&common, "mdkg.unread");
+            ready_to_write(&wt).unwrap();
+            let before = git_runs();
+            assert!(has_ref(&wt, "main"));
+            common_config(&common, "mdkg.unread");
+            assert_eq!(git_runs(), before + 2, "read again after a write check");
+            fresh_reads();
+            checked_worktree(&wt).unwrap();
+            let before = git_runs();
+            assert!(has_ref(&wt, "main"));
+            assert_eq!(git_runs(), before + 1, "read again after fresh_reads");
+        });
+    }
+
+    /// A config snapshot is parsed once per content: the same bytes reuse
+    /// the listing, changed bytes are parsed again, and the ref-storage
+    /// check reads a changed config at once.
+    #[test]
+    fn a_config_snapshot_is_parsed_once_per_content() {
+        let _turn = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let (_s, wt) = linked();
+        fresh_reads();
+        let one = b"[core]\n\tbare = false\n";
+        let first = parse_config_snapshot(&wt, one).unwrap();
+        let before = git_runs();
+        assert_eq!(parse_config_snapshot(&wt, one).unwrap(), first);
+        assert_eq!(git_runs(), before, "same bytes, kept");
+        let two = b"[core]\n\tbare = true\n";
+        assert_ne!(parse_config_snapshot(&wt, two).unwrap(), first);
+        assert_eq!(git_runs(), before + 1);
+        let common = common_dir(&wt).unwrap();
+        require_files_ref_storage(&common).unwrap();
+        let before = git_runs();
+        require_files_ref_storage(&common).unwrap();
+        assert_eq!(git_runs(), before, "unchanged config, kept");
+        sh(&wt, &["config", "extensions.refStorage", "reftable"]);
+        assert!(
+            require_files_ref_storage(&common).is_err(),
+            "changed: read again"
+        );
+    }
+
     #[test]
     fn a_read_reuses_the_check_and_a_fresh_check_sees_the_change() {
         let _turn = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -3132,7 +3891,7 @@ mod object_reader_tests {
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert!(started.elapsed() < Duration::from_secs(5));
         assert!(
-            reader.child.try_wait().unwrap().is_some(),
+            reader.child.child().try_wait().unwrap().is_some(),
             "{pid} still runs"
         );
         let refused = reader.info("HEAD").unwrap_err();

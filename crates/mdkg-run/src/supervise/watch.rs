@@ -177,7 +177,7 @@ impl<'a> TurnWatch<'a> {
             Phase::Completed(_) => return self.fail(invalid("turn completed more than once")),
         };
         let idle = matches!(result, Ok(report) if report.outcome == Outcome::Idle);
-        let successful = matches!(result, Ok(report) if matches!(report.outcome, Outcome::Ran | Outcome::Replied));
+        let successful = matches!(result, Ok(report) if matches!(report.outcome, Outcome::Ran | Outcome::Replied | Outcome::NoReply));
         if (admitted && idle)
             || (!admitted && successful)
             || matches!(result, Ok(report) if report.outcome == Outcome::DryRun)

@@ -374,7 +374,16 @@ fn the_gate_compares_the_reviewed_walk_at_head() {
     assert_eq!(data["ok"], true, "{data:#}");
     // A later change to a reviewed path fails on content.
     f.commit("src/lib.rs", "changed after review\n");
-    let data = f.ok("rev", &["entry", "gate", NODE]);
+    // A failed gate is a check that found errors: exit 2, the envelope
+    // not ok, its data still the answer (e2e UX; orchestrator #17713).
+    let (code, envelope) = f.run("rev", &["entry", "gate", NODE]);
+    assert_eq!(code, 2, "{envelope:#}");
+    assert_eq!(envelope["ok"], false, "{envelope:#}");
+    assert_eq!(
+        envelope["diagnostics"][0]["code"], "entry.gate_failed",
+        "{envelope:#}"
+    );
+    let data = envelope["data"].clone();
     assert_eq!(data["ok"], false, "{data:#}");
     let failure = &data["failures"][0];
     assert_eq!(failure["reason"], "not_covered", "{data:#}");
@@ -389,6 +398,7 @@ fn the_gate_compares_the_reviewed_walk_at_head() {
         .args(["entry", "gate", NODE])
         .output()
         .expect("gate");
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("\n    data:\n"), "{text}");
     assert!(
@@ -2212,7 +2222,13 @@ fn typed_list_and_show_print_what_the_store_records_gave() {
     let f = Fixture::new("Body.\n\n# Requirements\n\n- R1: The thing shall work.\n");
     let checked = |actor: &str, args: &[&str]| -> Value {
         let (code, envelope) = f.run(actor, args);
-        assert_eq!(code, 0, "mdkg {args:?}: {envelope:#}");
+        // A failed gate exits 2 with its data (orchestrator #17713).
+        let failed_gate = args[..2] == ["entry", "gate"] && envelope["data"]["ok"] == false;
+        assert_eq!(
+            code,
+            if failed_gate { 2 } else { 0 },
+            "mdkg {args:?}: {envelope:#}"
+        );
         common::conforms_envelope(&envelope);
         // The producer check too: a nested key its type doesn't declare
         // fails, so a context key that fell back to the record's `other`
@@ -2403,4 +2419,131 @@ fn typed_list_and_show_print_what_the_store_records_gave() {
     ] {
         assert!(keys.contains(key), "no entry holds {key}: {keys:?}");
     }
+}
+
+#[test]
+fn digest_import_binds_nodes_and_all_review_references() {
+    let f = Fixture::new("# Overview\n\nTest.\n");
+    for id in ["request-one", "request-two"] {
+        f.ok(
+            "orchestrator",
+            &[
+                "msg", "send", "--to", "rev", "--kind", "note", "--node", NODE, "--id", id,
+                "--text", "review",
+            ],
+        );
+    }
+    let file = f.dir.join("reply.txt");
+    fs::write(&file, "finished").unwrap();
+    let reply = f.ok(
+        "launcher",
+        &[
+            "msg",
+            "import",
+            "--from",
+            "rev",
+            "--to",
+            "orchestrator",
+            "--kind",
+            "findings",
+            "--node",
+            NODE,
+            "--reply-to",
+            "request-one",
+            "--reply-to",
+            "request-two",
+            file.to_str().unwrap(),
+        ],
+    );
+    let id = reply["message"]["messageId"].as_str().unwrap();
+    assert_eq!(
+        reply["message"]["referenceIds"],
+        json!(["request-one", "request-two"])
+    );
+    let store = mdkg_coord_sqlite::Store::open_for_repo(&f.repo, STORE_TTL_MS).unwrap();
+    assert_eq!(store.message_flow(id).unwrap().nodes[0].id, NODE);
+}
+
+#[test]
+fn digest_import_retains_cross_branch_node_and_starts_its_own_conversation() {
+    let f = Fixture::new("# Overview\n\nTest.\n");
+    let sent = f.ok(
+        "another-reviewer",
+        &[
+            "msg",
+            "send",
+            "--to",
+            "rev",
+            "--kind",
+            "note",
+            "--node",
+            NODE,
+            "--id",
+            "other-request",
+            "--text",
+            "review",
+        ],
+    );
+    let old_context = sent["message"]["contextId"].as_str().unwrap().to_owned();
+    fs::remove_file(f.repo.join(NODE_PATH)).unwrap();
+    let file = f.dir.join("reply.txt");
+    fs::write(&file, "finished").unwrap();
+    let args = [
+        "msg",
+        "import",
+        "--from",
+        "rev",
+        "--to",
+        "orchestrator",
+        "--kind",
+        "findings",
+        "--node-id",
+        NODE,
+        "--standalone",
+        "--reply-to",
+        "other-request",
+        file.to_str().unwrap(),
+    ];
+    let reply = f.ok("launcher", &args);
+    let id = reply["message"]["messageId"].as_str().unwrap();
+    assert_ne!(reply["message"]["contextId"], old_context);
+    assert_eq!(reply["message"]["contextId"], id);
+    assert_eq!(reply["message"]["referenceIds"], json!(["other-request"]));
+    let store = mdkg_coord_sqlite::Store::open_for_repo(&f.repo, STORE_TTL_MS).unwrap();
+    assert_eq!(store.message_flow(id).unwrap().nodes[0].id, NODE);
+    assert_eq!(f.ok("launcher", &args)["duplicate"], true);
+}
+
+#[test]
+fn digest_mail_transport_marks_only_delivered_bodies() {
+    let f = Fixture::new("# Overview\n\nTest.\n");
+    f.ok(
+        "orchestrator",
+        &[
+            "msg", "send", "--to", "rev", "--kind", "note", "--node", NODE, "--id", "first",
+            "--text", "one",
+        ],
+    );
+    f.ok(
+        "orchestrator",
+        &[
+            "msg", "send", "--to", "rev", "--kind", "note", "--id", "second", "--text", "two",
+        ],
+    );
+    let inbox = f.ok("rev", &["msg", "inbox", "--no-mark"]);
+    let messages = inbox["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0]["nodes"], json!([NODE]));
+    let (_, code) = f.refused("rev", &["msg", "ack", "first"]);
+    assert_eq!(code, "msg.not_shown");
+    let mark = format!(
+        "{}/{}/{}",
+        messages[0]["seq"].as_u64().unwrap(),
+        messages[0]["digest"].as_str().unwrap(),
+        messages[0]["messageId"].as_str().unwrap()
+    );
+    f.ok("rev", &["msg", "inbox", "--mark-shown", &mark]);
+    f.ok("rev", &["msg", "ack", "first"]);
+    let (_, code) = f.refused("rev", &["msg", "ack", "second"]);
+    assert_eq!(code, "msg.not_shown");
 }

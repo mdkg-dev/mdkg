@@ -82,6 +82,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 ```
 
 ### `mdkg list`
@@ -139,6 +144,11 @@ Global options:
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
 
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+
 Examples:
   mdkg list --type task --status todo
   mdkg list --blocked --json
@@ -182,6 +192,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 
 Examples:
   mdkg show <id>
@@ -244,6 +259,11 @@ Global options:
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
 
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+
 Examples:
   mdkg search lease renew
   mdkg search lease renew --limit 10 --json
@@ -276,6 +296,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 
 Examples:
   mdkg index status
@@ -311,6 +336,11 @@ Global options:
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
 
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+
 Examples:
   mdkg index rebuild
   mdkg index rebuild --verbose
@@ -345,6 +375,11 @@ Global options:
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
 
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+
 Examples:
   mdkg index status
   mdkg index status --json
@@ -361,6 +396,10 @@ Commands:
   refs           List the nodes a node points at (its edge fields and refs)
   backrefs       List the nodes that point at a node
   ready          List work items ready to start: a ready status and nothing open blocking them, in the order `next` picks
+  remote         Approve graph.remote's destination for graph pushes (a person, outside any agent turn)
+  sync           Pull the graph ref from graph.remote and, once the destination is approved, push it: one explicit refspec for remoteRef, never a code branch. Unapproved, it neither pulls nor pushes, and says how to approve (`graph remote approve`). A person runs it, outside any agent turn; `agents up` pulls and pushes on its own timers
+  conflicts      List the paths a graph sync merge took the remote's version of
+  resolve        Settle sync conflicts: publish the local or the remote version of each path on the graph ref, in one commit, and clear their entries
   critical-path  Show the longest chain of unfinished work a goal waits on
   help           Print this message or the help of the given subcommand(s)
 
@@ -379,6 +418,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 
 Examples:
   mdkg graph ready --limit 5
@@ -419,6 +463,11 @@ Global options:
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
 
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+
 Examples:
   mdkg graph refs <id>
   mdkg graph refs <id> --json
@@ -457,6 +506,11 @@ Global options:
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
 
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+
 Examples:
   mdkg graph backrefs <id>
 ```
@@ -490,9 +544,213 @@ Global options:
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
 
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+
 Examples:
   mdkg graph ready
   mdkg graph ready --limit 5 --json
+```
+
+#### `mdkg graph remote`
+
+```text
+Approve graph.remote's destination for graph pushes (a person, outside any agent turn)
+
+Usage: mdkg graph remote [OPTIONS] <COMMAND>
+
+Commands:
+  approve  Approve graph.remote's destination, so graph pushes may go there (G23). Shows the remote, its remoteRef and its effective fetch and push destinations, and pins them in <git common dir>/mdkg/graph/remote.json. Only a person runs it, outside any agent turn; configuration alone never pushes. Run it again after changing the remote's URL or remoteRef
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+  -r, --root <ROOT>
+          Run against this repository root (default: the current directory)
+
+      --as <ACTOR>
+          Act as this actor in coordination commands (default: $MDKG_ACTOR, then the worktree's folder name)
+
+      --allow-store-upgrade
+          Let a development build upgrade the coordinator store.
+
+          The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+```
+
+#### `mdkg graph remote approve`
+
+```text
+Approve graph.remote's destination, so graph pushes may go there (G23). Shows the remote, its remoteRef and its effective fetch and push destinations, and pins them in <git common dir>/mdkg/graph/remote.json. Only a person runs it, outside any agent turn; configuration alone never pushes. Run it again after changing the remote's URL or remoteRef
+
+Usage: mdkg graph remote approve [OPTIONS]
+
+Options:
+      --dry-run
+          Show what would be pinned; pin nothing
+
+      --json
+          Print JSON
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+  -r, --root <ROOT>
+          Run against this repository root (default: the current directory)
+
+      --as <ACTOR>
+          Act as this actor in coordination commands (default: $MDKG_ACTOR, then the worktree's folder name)
+
+      --allow-store-upgrade
+          Let a development build upgrade the coordinator store.
+
+          The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+
+Examples:
+  mdkg graph remote approve
+  mdkg graph remote approve --dry-run --json
+```
+
+#### `mdkg graph sync`
+
+```text
+Pull the graph ref from graph.remote and, once the destination is approved, push it: one explicit refspec for remoteRef, never a code branch. Unapproved, it neither pulls nor pushes, and says how to approve (`graph remote approve`). A person runs it, outside any agent turn; `agents up` pulls and pushes on its own timers
+
+Usage: mdkg graph sync [OPTIONS]
+
+Options:
+      --no-push
+          Pull only
+
+      --accept-rewrite
+          Accept a remote graph ref that was rewritten (it no longer descends from the tip this clone last accepted)
+
+      --json
+          Print JSON
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+  -r, --root <ROOT>
+          Run against this repository root (default: the current directory)
+
+      --as <ACTOR>
+          Act as this actor in coordination commands (default: $MDKG_ACTOR, then the worktree's folder name)
+
+      --allow-store-upgrade
+          Let a development build upgrade the coordinator store.
+
+          The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+
+Examples:
+  mdkg graph sync
+  mdkg graph sync --no-push --json
+  mdkg graph sync --accept-rewrite
+```
+
+#### `mdkg graph conflicts`
+
+```text
+List the paths a graph sync merge took the remote's version of
+
+Usage: mdkg graph conflicts [OPTIONS]
+
+Options:
+      --json
+          Print JSON
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+  -r, --root <ROOT>
+          Run against this repository root (default: the current directory)
+
+      --as <ACTOR>
+          Act as this actor in coordination commands (default: $MDKG_ACTOR, then the worktree's folder name)
+
+      --allow-store-upgrade
+          Let a development build upgrade the coordinator store.
+
+          The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+
+Examples:
+  mdkg graph conflicts
+  mdkg graph conflicts --json
+```
+
+#### `mdkg graph resolve`
+
+```text
+Settle sync conflicts: publish the local or the remote version of each path on the graph ref, in one commit, and clear their entries
+
+Usage: mdkg graph resolve [OPTIONS] --take <TAKE> <PATHS>...
+
+Arguments:
+  <PATHS>...
+          The conflicted paths, as `graph conflicts` lists them. Paths of one change (a rename's old and new path) settle together
+
+Options:
+      --take <TAKE>
+          Which version to keep
+
+          [possible values: local, remote]
+
+      --merge <MERGE>
+          The merge commit whose conflicts to settle (at least 7 hex digits), as `graph conflicts` lists it. Needed when a path has more than one open conflict
+
+      --json
+          Print JSON
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+  -r, --root <ROOT>
+          Run against this repository root (default: the current directory)
+
+      --as <ACTOR>
+          Act as this actor in coordination commands (default: $MDKG_ACTOR, then the worktree's folder name)
+
+      --allow-store-upgrade
+          Let a development build upgrade the coordinator store.
+
+          The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+
+Examples:
+  mdkg graph resolve .mdkg/work/fix-login.md --take local
+  mdkg graph resolve .mdkg/work/old.md .mdkg/work/new.md --take local
 ```
 
 #### `mdkg graph critical-path`
@@ -525,6 +783,11 @@ Global options:
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
 
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+
 Examples:
   mdkg graph critical-path
   mdkg graph critical-path <goal-id>
@@ -556,6 +819,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 
 Examples:
   mdkg scratch path
@@ -591,6 +859,11 @@ Global options:
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
 
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+
 Examples:
   mdkg scratch path
   mdkg scratch path --shared --json
@@ -622,6 +895,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 ```
 
 #### `mdkg work localize`
@@ -656,6 +934,11 @@ Global options:
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
 
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+
 Examples:
   mdkg work localize --dry-run
   mdkg work localize --apply sha256:<plan-hash>
@@ -688,6 +971,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 
 Examples:
   mdkg node edit <id>
@@ -729,6 +1017,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 ```
 
 #### `mdkg node save`
@@ -772,6 +1065,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 ```
 
 ### `mdkg config`
@@ -782,8 +1080,10 @@ Inspect configuration layers and their sources
 Usage: mdkg config [OPTIONS] <COMMAND>
 
 Commands:
-  show  Show merged settings and each value's source, without changing files
-  help  Print this message or the help of the given subcommand(s)
+  show   Show merged settings and each value's source, without changing files
+  set    Change one key of the committed project config: in ref mode a commit on the graph ref, in checkout mode a commit of `.mdkg/config.json` where the committed config is read
+  unset  Remove one key from the committed project config, so its default applies; committed as `config set` commits
+  help   Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help
@@ -800,6 +1100,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 ```
 
 #### `mdkg config show`
@@ -831,9 +1136,106 @@ Global options:
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
 
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+
 Examples:
   mdkg config show
   mdkg config show --effective --json
+```
+
+#### `mdkg config set`
+
+```text
+Change one key of the committed project config: in ref mode a commit on the graph ref, in checkout mode a commit of `.mdkg/config.json` where the committed config is read.
+
+The value is JSON (a bare word is taken as a string). The key must be one this build knows, and the changed config must pass the rules `doctor` and `validate` apply, or nothing changes.
+
+Usage: mdkg config set [OPTIONS] <KEY> <VALUE>
+
+Arguments:
+  <KEY>
+          A dotted path (`coordination.messages.ack_grace_days`) or a JSON pointer (`/coordination/messages/ack_grace_days`)
+
+  <VALUE>
+          The new value, as JSON (a negative number is a value, not a flag)
+
+Options:
+      --dry-run
+          Show the change, without claiming, writing or committing
+
+      --json
+          Print JSON
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+  -r, --root <ROOT>
+          Run against this repository root (default: the current directory)
+
+      --as <ACTOR>
+          Act as this actor in coordination commands (default: $MDKG_ACTOR, then the worktree's folder name)
+
+      --allow-store-upgrade
+          Let a development build upgrade the coordinator store.
+
+          The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+
+Examples:
+  mdkg config set coordination.messages.ack_grace_days 0
+  mdkg config set coordination.leases.default '"shared"' --dry-run
+  mdkg config set /coordination/messages/retention '"durable"' --json
+```
+
+#### `mdkg config unset`
+
+```text
+Remove one key from the committed project config, so its default applies; committed as `config set` commits
+
+Usage: mdkg config unset [OPTIONS] <KEY>
+
+Arguments:
+  <KEY>
+          A dotted path or a JSON pointer
+
+Options:
+      --dry-run
+          Show the change, without claiming, writing or committing
+
+      --json
+          Print JSON
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+  -r, --root <ROOT>
+          Run against this repository root (default: the current directory)
+
+      --as <ACTOR>
+          Act as this actor in coordination commands (default: $MDKG_ACTOR, then the worktree's folder name)
+
+      --allow-store-upgrade
+          Let a development build upgrade the coordinator store.
+
+          The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+
+Examples:
+  mdkg config unset coordination.messages.ack_grace_days
+  mdkg config unset coordination.messages.ack_grace_days --dry-run --json
 ```
 
 ### `mdkg pack`
@@ -887,6 +1289,11 @@ Global options:
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
 
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+
 Examples:
   mdkg pack <id>
 ```
@@ -925,6 +1332,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 
 Examples:
   mdkg validate
@@ -1011,6 +1423,11 @@ Global options:
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
 
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+
 Examples:
   mdkg new task Fix the login timeout --status todo
   mdkg new task "Add retries" --parent <goal-id> --priority 2 --json
@@ -1051,6 +1468,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 
 Examples:
   mdkg done <id>
@@ -1093,6 +1515,11 @@ Global options:
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
 
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+
 Examples:
   mdkg update <id> --status review
   mdkg update <id> --clear
@@ -1127,6 +1554,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 
 Examples:
   mdkg next
@@ -1164,6 +1596,11 @@ Global options:
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
 
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+
 Examples:
   mdkg goal current
   mdkg goal activate <goal-id>
@@ -1194,6 +1631,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 
 Examples:
   mdkg goal current
@@ -1228,6 +1670,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 
 Examples:
   mdkg goal next
@@ -1264,6 +1711,11 @@ Global options:
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
 
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+
 Examples:
   mdkg goal activate <goal-id>
 ```
@@ -1298,6 +1750,11 @@ Global options:
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
 
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+
 Examples:
   mdkg goal pause <goal-id>
 ```
@@ -1331,6 +1788,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 
 Examples:
   mdkg goal done <goal-id>
@@ -1368,6 +1830,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 
 Examples:
   mdkg format
@@ -1407,6 +1874,11 @@ Global options:
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
 
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+
 Examples:
   mdkg retype <id> bug
 ```
@@ -1422,7 +1894,7 @@ Usage: mdkg claim [OPTIONS] <TARGET>
 
 Arguments:
   <TARGET>
-          Node id, file or folder path, `role:<name>` or `run:<name>` (names: lowercase a-z, 0-9, `.`, `_`, `-` and `:`, up to 120)
+          Node id, file or folder path, `role:<name>` or `run:<name>` (names: lowercase a-z, 0-9, `.`, `_`, `-` and `:`, up to 120). More targets may follow: all are claimed or none, one lease each, and the options apply to every one. Beside a lease authority, several targets in one call are refused (claim each on its own); one target then is still fine
 
 Options:
       --new
@@ -1451,8 +1923,14 @@ Global options:
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
 
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+
 Examples:
   mdkg claim <id>
+  mdkg claim src/a.rs src/b.rs
   mdkg claim --new src/new_module.rs
   mdkg claim role:reviewer
 ```
@@ -1492,6 +1970,11 @@ Global options:
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
 
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+
 Examples:
   mdkg holds src/lib.rs
 ```
@@ -1522,6 +2005,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 ```
 
 #### `mdkg lease request`
@@ -1559,6 +2047,11 @@ Global options:
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
 
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+
 Examples:
   mdkg lease request src/parser.rs --reason "a security fix needs one commit here"
 ```
@@ -1589,6 +2082,11 @@ Global options:
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
 
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+
 Examples:
   mdkg renew
 ```
@@ -1598,13 +2096,13 @@ Examples:
 ```text
 Give up your lease without finishing; a lease that already ended is fine.
 
-`--all` releases every active lease you hold: run it once your head has merged and you've committed everything. Each lease is released on its own, so running it again finishes a run that stopped part way. `--clean` releases only the path leases `renew` lets lapse: nothing uncommitted in their paths, and not just claimed. The launcher runs it as each agent after every turn.
+`--all` releases every active lease you hold: run it once your head has merged and you've committed everything. Each lease is released on its own, so running it again finishes a run that stopped part way. `--clean` releases only the path leases with nothing uncommitted in their paths (ignored files, hidden index entries and submodules count as open work) that weren't just claimed. The launcher runs it as each agent after every turn. `--committed` releases, right away, the path leases you've committed to since claiming them and left with nothing uncommitted, and lists the ones it kept and why: run it after a commit to let others in.
 
 Usage: mdkg release [OPTIONS] [TARGET]
 
 Arguments:
   [TARGET]
-          Node id, file or folder path, `role:<name>`, `run:<name>`, or lease id
+          Node id, file or folder path, `role:<name>`, `run:<name>`, or lease id. More targets may follow: all are released or none, in one transaction. Beside a lease authority, several targets in one call are refused (release each on its own)
 
 Options:
       --all
@@ -1612,6 +2110,9 @@ Options:
 
       --clean
           Release your path leases whose paths have no uncommitted or staged changes in this worktree and that you didn't claim in the last 30 minutes: the leases `renew` lets lapse. Never a node, role or turn lease
+
+      --committed
+          Release your path leases whose paths have no uncommitted, staged or ignored changes in this worktree and that a commit of yours here touched since you claimed them, with no 30-minute wait. Lists each path lease it kept, and why. Only in your own worktree, and only this repository's leases (not a lease authority's)
 
       --json
           Print JSON
@@ -1631,11 +2132,17 @@ Global options:
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
 
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+
 Examples:
   mdkg release <id>
   mdkg release src/lib.rs
   mdkg release --all
   mdkg release --clean
+  mdkg release --committed
 ```
 
 ### `mdkg status`
@@ -1654,6 +2161,9 @@ Options:
       --mine
           List only your own active leases (text; JSON lists everyone's)
 
+      --no-observe
+          Don't record what main holds: write nothing to the store (a live view's poll). Settlement shown is still current
+
       --json
           Print JSON
 
@@ -1671,6 +2181,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 
 Examples:
   mdkg status
@@ -1707,6 +2222,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 
 Examples:
   mdkg sync
@@ -1746,6 +2266,11 @@ Global options:
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
 
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+
 Examples:
   mdkg abandon cs-3
   mdkg abandon --branch my-branch
@@ -1773,6 +2298,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 
 Examples:
   mdkg mcp --as <agent>
@@ -1827,6 +2357,11 @@ Global options:
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
 
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+
 Examples:
   mdkg entry list <node>
   mdkg entry fix <node> F2 --sha <sha>
@@ -1877,6 +2412,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 ```
 
 #### `mdkg entry show`
@@ -1911,6 +2451,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 ```
 
 #### `mdkg entry gate`
@@ -1945,6 +2490,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 ```
 
 #### `mdkg entry update`
@@ -1979,6 +2529,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 ```
 
 #### `mdkg entry add`
@@ -2073,6 +2628,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 ```
 
 #### `mdkg entry ask`
@@ -2167,6 +2727,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 ```
 
 #### `mdkg entry answer`
@@ -2261,6 +2826,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 ```
 
 #### `mdkg entry decide`
@@ -2355,6 +2925,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 ```
 
 #### `mdkg entry propose`
@@ -2449,6 +3024,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 ```
 
 #### `mdkg entry complete`
@@ -2543,6 +3123,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 ```
 
 #### `mdkg entry fix`
@@ -2637,6 +3222,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 ```
 
 #### `mdkg entry verify`
@@ -2731,6 +3321,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 ```
 
 #### `mdkg entry reopen`
@@ -2825,6 +3420,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 ```
 
 #### `mdkg entry reject`
@@ -2919,6 +3519,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 ```
 
 #### `mdkg entry dispute`
@@ -3013,6 +3618,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 ```
 
 #### `mdkg entry residual`
@@ -3107,6 +3717,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 ```
 
 #### `mdkg entry duplicate`
@@ -3201,6 +3816,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 ```
 
 #### `mdkg entry outdated`
@@ -3295,6 +3915,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 ```
 
 #### `mdkg entry withdraw`
@@ -3389,6 +4014,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 ```
 
 #### `mdkg entry close`
@@ -3483,6 +4113,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 ```
 
 #### `mdkg entry resolve`
@@ -3577,6 +4212,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 ```
 
 #### `mdkg entry move`
@@ -3671,6 +4311,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 ```
 
 #### `mdkg entry req`
@@ -3765,6 +4410,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 ```
 
 ### `mdkg req`
@@ -3793,6 +4443,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 
 Examples:
   mdkg req list <node> --json
@@ -3827,6 +4482,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 ```
 
 ### `mdkg msg`
@@ -3840,11 +4500,13 @@ Commands:
   watch      Follow the local coordinator event stream as one JSON event per line
   send       Send a message to a channel or to mailboxes
   inbox      Show your unacked mail (your mailbox and the roles you hold)
+  digest     Compute the current mail digest without marking any message shown
   wait       Wait for mail; exits 6 if none arrives before the timeout
   ack        Ack messages delivered to you
   forward    Re-send messages delivered to you, verbatim with their senders, as one new message; then ack them
   thread     Show a conversation's messages, oldest first
   import     Record a read-only sender's output (a file) as its message
+  list       List mail across mailboxes by kind, read-only: no ack, no shown mark, no purge. Only a person (`--as human:<name>`) runs it, outside an agent's turn. A body whose retention is up reads as purged
   decisions  List send-time decision metadata without acknowledging mail. A row does not prove human approval or launcher promotion: the launcher revalidates against its own current configuration before using a decision
   help       Print this message or the help of the given subcommand(s)
 
@@ -3863,6 +4525,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 
 Examples:
   mdkg msg inbox
@@ -3909,6 +4576,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 
 Examples:
   mdkg msg watch --json
@@ -3991,6 +4663,11 @@ Global options:
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
 
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+
 Examples:
   mdkg msg send --channel dev --kind note --text "Tests pass on main"
   mdkg msg send --to role:reviewer --kind review_request --text "Please review cs-3"
@@ -4029,7 +4706,10 @@ Options:
           Acked mail too
 
       --no-mark
-          List without counting as shown, for a reminder that shows headers only (a hook, the MCP server): an ack of mail you were never shown is refused, so read it without this first
+          List without counting as shown or purging, for a reminder that shows headers only (a hook): an ack of mail you were never shown is refused, so read it without this first. The store may still be created or upgraded; --read-only never writes it
+
+      --mark-shown <MARK_SHOWN>
+          Record that exactly these messages reached you, each as `<seq>/<digest>/<id>` from a `--no-mark` listing, so you may ack them; list nothing. For a reader that delivers only some of what it read: the MCP server once its reply is out, or a turn's lead read (`--from <reports_to> --no-mark --limit 1`)
 
       --json
           Print JSON
@@ -4049,10 +4729,55 @@ Global options:
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
 
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+
 Examples:
   mdkg msg inbox
   mdkg msg inbox --channel dev --json
   mdkg msg inbox --from orchestrator --kind question
+```
+
+#### `mdkg msg digest`
+
+```text
+Compute the current mail digest without marking any message shown
+
+Usage: mdkg msg digest [OPTIONS]
+
+Options:
+      --mailbox <MAILBOX>
+          Read this held mailbox instead of all held mailboxes
+
+      --budget <BUDGET>
+          Target rendered size in bytes
+
+          [default: 49152]
+
+      --json
+
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+  -r, --root <ROOT>
+          Run against this repository root (default: the current directory)
+
+      --as <ACTOR>
+          Act as this actor in coordination commands (default: $MDKG_ACTOR, then the worktree's folder name)
+
+      --allow-store-upgrade
+          Let a development build upgrade the coordinator store.
+
+          The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 ```
 
 #### `mdkg msg wait`
@@ -4110,6 +4835,11 @@ Global options:
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
 
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+
 Examples:
   mdkg msg wait --timeout 300
   mdkg msg wait --after 42 --json
@@ -4160,6 +4890,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 
 Examples:
   mdkg msg ack <message-id>
@@ -4217,6 +4952,11 @@ Global options:
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
 
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+
 Examples:
   mdkg msg forward 4410 4411 --to a-mail --kind findings --text "Reviews of 1a2b3c4"
   mdkg msg forward <message-id> --channel dev
@@ -4272,6 +5012,11 @@ Global options:
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
 
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+
 Examples:
   mdkg msg thread <message-id>
   mdkg msg thread --channel dev --tail 20
@@ -4302,7 +5047,10 @@ Options:
           The sender the output belongs to (for example `codex:<run>`)
 
       --reply-to <REPLY_TO>
-          The id of the message this answers
+          The ids of the messages this answers (repeatable)
+
+      --node <NODE>
+          Nodes the imported reply concerns (repeatable)
 
       --context <CONTEXT>
           The conversation (default as for `send`)
@@ -4325,8 +5073,72 @@ Global options:
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
 
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+
 Examples:
   mdkg msg import --from codex:run-7 --channel dev --kind findings review.json
+```
+
+#### `mdkg msg list`
+
+```text
+List mail across mailboxes by kind, read-only: no ack, no shown mark, no purge. Only a person (`--as human:<name>`) runs it, outside an agent's turn. A body whose retention is up reads as purged
+
+Usage: mdkg msg list [OPTIONS]
+
+Options:
+      --kind <KIND>
+          Only these kinds: repeat the flag or separate them with commas (`--kind fault,review_request`). Receipts are left out unless this names `receipt`
+
+      --channel <NAME>
+          Mail delivered to this channel's current members, and the posts to it (repeatable). With neither this nor `--to`, every mailbox
+
+      --to <TO>
+          Mail delivered to these mailboxes: repeat the flag or separate them with commas
+
+      --from <FROM>
+          Only mail from these senders: repeat the flag or separate them with commas
+
+      --state <STATE>
+          `unacked` (a delivery in scope is still unacked), `acked` (every delivery in scope is acked) or `any`
+
+          [default: unacked]
+
+      --after <AFTER>
+          Only mail after this cursor (the `cursor` a previous call returned)
+
+      --limit <LIMIT>
+          At most this many messages: 1 to 200 (default 50). A page also stops before bodies past 1 MiB
+
+      --json
+          Print JSON
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+  -r, --root <ROOT>
+          Run against this repository root (default: the current directory)
+
+      --as <ACTOR>
+          Act as this actor in coordination commands (default: $MDKG_ACTOR, then the worktree's folder name)
+
+      --allow-store-upgrade
+          Let a development build upgrade the coordinator store.
+
+          The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+
+Examples:
+  mdkg msg list --as human:nick --kind fault,review_request --json
+  mdkg msg list --as human:nick --channel dev --kind question --state any
 ```
 
 #### `mdkg msg decisions`
@@ -4363,6 +5175,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 ```
 
 ### `mdkg channel`
@@ -4394,6 +5211,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 
 Examples:
   mdkg channel list
@@ -4433,6 +5255,11 @@ Global options:
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
 
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+
 Examples:
   mdkg channel create dev
 ```
@@ -4469,6 +5296,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 
 Examples:
   mdkg channel join dev
@@ -4507,6 +5339,11 @@ Global options:
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
 
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+
 Examples:
   mdkg channel leave dev
 ```
@@ -4540,6 +5377,11 @@ Global options:
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
 
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+
 Examples:
   mdkg channel list
   mdkg channel list --mine --json
@@ -4559,7 +5401,9 @@ Commands:
   up       Wake agents on their mail and run their turns under their policies, until stopped
   stop     Stop agents gracefully: a turn in flight finishes, then each agent's supervisor admits no more of its turns. Nothing is killed. Inside an agent's turn it may stop only that agent
   logs     Show a turn's output, normalized across harnesses, or follow an agent's turns as they run
+  turns    List an agent's turns, newest first: each one's id, number, times, outcome and receipt, a page at a time
   status   Show the agents, their policies, and the threads the loop guard paused
+  list     List the agents the settings define, each with the layer that defines it and every layer with an entry for it. Reads settings only: nothing is probed and no saved state is read
   use-key  Bill an agent's next turn, one, on your API key, after its subscription hit its usage limit. Nothing charges the key on its own; the agent's policy must allow this (`auth.api_key_fallback`). Refused inside an agent's turn, and for an agent's own actor: a person runs it from their own terminal
   resume   Let a thread the loop guard paused run again, or all of an agent's
   help     Print this message or the help of the given subcommand(s)
@@ -4579,6 +5423,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 
 Examples:
   mdkg agents status
@@ -4627,6 +5476,11 @@ Options:
       --policy <POLICY>
           Per-agent turn policy, as a JSON object
 
+      --delivery <DELIVERY>
+          Mail delivery shape (batch by default)
+
+          [possible values: batch, digest]
+
       --reports-to <REPORTS_TO>
           The actor receiving turn receipts and faults: turn errors and refused replies (default: orchestrator)
 
@@ -4664,6 +5518,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 ```
 
 #### `mdkg agents edit`
@@ -4708,6 +5567,11 @@ Options:
       --policy <POLICY>
           Per-agent turn policy, as a JSON object
 
+      --delivery <DELIVERY>
+          Mail delivery shape (batch by default)
+
+          [possible values: batch, digest]
+
       --reports-to <REPORTS_TO>
           The actor receiving turn receipts and faults: turn errors and refused replies (default: orchestrator)
 
@@ -4745,6 +5609,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 ```
 
 #### `mdkg agents rm`
@@ -4776,6 +5645,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 ```
 
 #### `mdkg agents up`
@@ -4846,6 +5720,11 @@ Global options:
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
 
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+
 Examples:
   mdkg agents up
   mdkg agents up --once
@@ -4890,6 +5769,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 
 Examples:
   mdkg agents stop worker-1 --drain
@@ -4938,10 +5822,65 @@ Global options:
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
 
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+
 Examples:
   mdkg agents logs worker-1
   mdkg agents logs worker-1 --follow --json
   mdkg agents logs worker-1 --follow --after turn:1 --json
+```
+
+#### `mdkg agents turns`
+
+```text
+List an agent's turns, newest first: each one's id, number, times, outcome and receipt, a page at a time
+
+Usage: mdkg agents turns [OPTIONS] <AGENT>
+
+Arguments:
+  <AGENT>
+          The agent's name
+
+Options:
+      --limit <LIMIT>
+          At most this many turns, newest first (default 50, at most 500)
+
+      --before <BEFORE>
+          Only turns numbered below N: pass the last page's `next_before`
+
+      --turn <TURN>
+          Only turn number N
+
+      --json
+          Print JSON
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+  -r, --root <ROOT>
+          Run against this repository root (default: the current directory)
+
+      --as <ACTOR>
+          Act as this actor in coordination commands (default: $MDKG_ACTOR, then the worktree's folder name)
+
+      --allow-store-upgrade
+          Let a development build upgrade the coordinator store.
+
+          The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+
+Examples:
+  mdkg agents turns worker-1 --json
+  mdkg agents turns worker-1 --limit 20 --before 41 --json
+  mdkg agents turns worker-1 --turn 7 --json
 ```
 
 #### `mdkg agents status`
@@ -4950,6 +5889,46 @@ Examples:
 Show the agents, their policies, and the threads the loop guard paused
 
 Usage: mdkg agents status [OPTIONS]
+
+Options:
+      --no-probe
+          Run no probe: no harness login check, Keychain listing or billing read, so it's cheap to poll. `auth` and `billing` are left out
+
+      --json
+          Print JSON
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+  -r, --root <ROOT>
+          Run against this repository root (default: the current directory)
+
+      --as <ACTOR>
+          Act as this actor in coordination commands (default: $MDKG_ACTOR, then the worktree's folder name)
+
+      --allow-store-upgrade
+          Let a development build upgrade the coordinator store.
+
+          The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+
+Examples:
+  mdkg agents status
+  mdkg agents status --json
+  mdkg agents status --no-probe --json
+```
+
+#### `mdkg agents list`
+
+```text
+List the agents the settings define, each with the layer that defines it and every layer with an entry for it. Reads settings only: nothing is probed and no saved state is read
+
+Usage: mdkg agents list [OPTIONS]
 
 Options:
       --json
@@ -4970,9 +5949,14 @@ Global options:
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
 
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+
 Examples:
-  mdkg agents status
-  mdkg agents status --json
+  mdkg agents list
+  mdkg agents list --json
 ```
 
 #### `mdkg agents use-key`
@@ -5004,6 +5988,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 
 Examples:
   mdkg agents use-key worker-1
@@ -5048,6 +6037,11 @@ Global options:
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
 
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+
 Examples:
   mdkg agents resume worker-1
   mdkg agents resume worker-1 --thread <thread>
@@ -5080,6 +6074,11 @@ Global options:
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
 
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+
 Examples:
   mdkg auth key anthropic
 ```
@@ -5110,6 +6109,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 
 Examples:
   mdkg auth key anthropic
@@ -5147,6 +6151,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 
 Examples:
   mdkg hooks run --harness claude --native PreToolUse
@@ -5193,6 +6202,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 ```
 
 #### `mdkg hooks start`
@@ -5227,6 +6241,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 ```
 
 #### `mdkg hooks stop`
@@ -5261,6 +6280,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 ```
 
 #### `mdkg hooks wait`
@@ -5295,6 +6319,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 ```
 
 #### `mdkg hooks edit`
@@ -5329,6 +6358,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 ```
 
 ### `mdkg install`
@@ -5397,6 +6431,11 @@ Global options:
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
 
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+
 Examples:
   mdkg install --enable agents-md,mcp:claude,skills:.claude/skills --dry-run
   mdkg install
@@ -5434,6 +6473,11 @@ Global options:
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
 
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+
 Examples:
   mdkg store snapshots
 ```
@@ -5463,6 +6507,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 
 Examples:
   mdkg store snapshots
@@ -5501,6 +6550,11 @@ Global options:
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
 
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+
 Examples:
   mdkg store restore <copy>
 ```
@@ -5535,6 +6589,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 
 Examples:
   mdkg anchor
@@ -5577,6 +6636,11 @@ Global options:
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
 
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+
 Examples:
   mdkg export --work
   mdkg export --work --out work.jsonl
@@ -5616,6 +6680,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 
 Examples:
   mdkg verify work.jsonl
@@ -5676,6 +6745,11 @@ Global options:
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
 
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+
 Examples:
   mdkg migrate --dry-run
   mdkg migrate --apply <hash>
@@ -5707,6 +6781,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 
 Examples:
   mdkg version --json
@@ -5747,6 +6826,17 @@ Options:
       --new-graph
           Start a new graph even though a fetched ref (any `refs/remotes/...` whose tip has a committed `.mdkg/config.json`) may hold this repository's graph, or git couldn't check. Without it, init refuses; for a graph it found, it names both ways to get it: merge the team's default branch (checkout mode) or `install` (ref mode)
 
+      --setup <SETUP>
+          Start the graph straight on the graph ref (refs/heads/mdkg-graph) in this setup, as `install --setup` names them: `personal` (the graph syncs with origin), `professional` (with --graph-remote) or `local` (no remote). No branch gets a commit and the checkout is unchanged; nothing is pushed. Refused, before anything is written, when the clone already has a graph: at the checkout's root (`install --setup` moves it), staged but missing, nested below the root, in any other worktree of the clone, on the graph ref, or `mdkg.graph.ref` set already; and when a fetched branch sits at the setup's own graph destination
+
+          Possible values:
+          - personal:     `graph.remote = origin`: the graph syncs with the code's own remote
+          - professional: `graph.remote` is a private repository of your own, so the company remote is never touched
+          - local:        No remote
+
+      --graph-remote <REMOTE>
+          With --setup professional: the graph remote, an existing remote that shares no URL with another
+
       --json
           Print JSON
 
@@ -5764,6 +6854,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 
 Examples:
   mdkg init
@@ -5786,6 +6881,12 @@ Options:
       --strict
           Fail on warnings too
 
+      --only <ONLY>
+          Run one check only. `store` reads the coordinator store's schema and mail schema versions, and whether this build would upgrade it, read-only, without upgrading it or reading any other file (no config, projection or harness file), so it's cheap to poll
+
+          Possible values:
+          - store: The coordinator store's versions
+
       --json
           Print JSON
 
@@ -5804,6 +6905,11 @@ Global options:
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
 
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+
 Examples:
   mdkg doctor
   mdkg doctor --json
@@ -5820,7 +6926,7 @@ Commands:
   list      List the skills
   show      Show one skill: its frontmatter and its SKILL.md body
   validate  Check every skill (or one) and that the mirrors match it
-  add       Add a skill the binary ships (`mdkg-workflow`) to `.mdkg/skills/`, and mirror it
+  add       Add a skill the binary ships (`mdkg-workflow`) to `.mdkg/skills/`, and mirror it. In ref mode it's published on the graph ref, and `install` mirrors it
   sync      Copy `.mdkg/skills/` into the mirror folders agents read
   help      Print this message or the help of the given subcommand(s)
 
@@ -5839,6 +6945,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 
 Examples:
   mdkg skills list
@@ -5879,6 +6990,11 @@ Global options:
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
 
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+
 Examples:
   mdkg skills list
   mdkg skills list --tags stage:plan --json
@@ -5917,6 +7033,11 @@ Global options:
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
 
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+
 Examples:
   mdkg skills show mdkg-workflow
   mdkg skills show mdkg-workflow --meta
@@ -5952,6 +7073,11 @@ Global options:
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
 
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+
 Examples:
   mdkg skills validate
   mdkg skills validate mdkg-workflow --json
@@ -5960,7 +7086,7 @@ Examples:
 #### `mdkg skills add`
 
 ```text
-Add a skill the binary ships (`mdkg-workflow`) to `.mdkg/skills/`, and mirror it
+Add a skill the binary ships (`mdkg-workflow`) to `.mdkg/skills/`, and mirror it. In ref mode it's published on the graph ref, and `install` mirrors it
 
 Usage: mdkg skills add [OPTIONS] <SLUG>
 
@@ -5969,6 +7095,9 @@ Arguments:
           The shipped skill's slug
 
 Options:
+      --replace
+          Replace a copy that differs from what the binary ships (an older version, or the project's own changes) with the shipped one
+
       --json
           Print JSON
 
@@ -5987,8 +7116,14 @@ Global options:
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
 
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+
 Examples:
   mdkg skills add mdkg-workflow
+  mdkg skills add mdkg-workflow --replace
 ```
 
 #### `mdkg skills sync`
@@ -6019,6 +7154,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 
 Examples:
   mdkg skills sync --dry-run
@@ -6065,6 +7205,11 @@ Global options:
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
 
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+
 Examples:
   mdkg affected --base main --json
 ```
@@ -6098,6 +7243,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 
 Examples:
   mdkg schema
@@ -6137,6 +7287,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 ```
 
 #### `mdkg serve status`
@@ -6164,6 +7319,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 ```
 
 ### `mdkg git-serve`
@@ -6192,6 +7352,11 @@ Global options:
           Let a development build upgrade the coordinator store.
 
           The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
 ```
 
 ## Anchor output
@@ -6271,7 +7436,7 @@ Every command exits with one of these. With `--json`, the envelope's
 |---|---|
 | 0 | Success, warnings included |
 | 1 | Bad arguments: an unknown command or flag, a missing or bad value |
-| 2 | A check found errors: `validate`, `verify`, `doctor`, `skills validate` or `export`'s anchor check, or a write refused because the graph it would leave doesn't validate |
+| 2 | A check found errors: `validate`, `verify`, `doctor`, `skills validate`, `entry gate` or `export`'s anchor check, or a write refused because the graph it would leave doesn't validate |
 | 3 | Something named doesn't exist (a node, workspace, file, lease, changeset, channel, message or agent), or there's none to act on, such as no active goal |
 | 4 | The graph, store or Keychain can't be read or written, or another failure |
 | 5 | A coordination conflict, such as a lease someone else holds: sync or pick other work, then retry |

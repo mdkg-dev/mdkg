@@ -50,9 +50,8 @@ pub struct Definition {
     /// in ref mode (`mdkg.graph.ref` set) with a mainRef this clone holds,
     /// each turn `agents up` runs tells the worker how far its branch is
     /// behind, when it is; checkout mode, a level branch or a mainRef not
-    /// here give no note. `merge` is accepted but acts as `notes` in 0.7.1:
-    /// nothing is merged, and the note says the launcher's automatic merge
-    /// comes in 0.7.2.
+    /// here give no note. `merge` is accepted but acts as `notes` in this
+    /// release: nothing is merged, and the note says to merge it yourself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "follow_field")]
     pub follow: Option<String>,
@@ -340,8 +339,25 @@ pub fn check_authority_override(authored: &Value, optional: &Input) -> Result<()
                 return Err(refused(field));
             }
         }
+        // The environment its turns get: a worker can write the
+        // machine-local layer, so it must not widen what its next
+        // supervisor passes (#17692, orchestrator #17730).
+        if env_of(&before, &[name.as_str(), "policy"]) != env_of(after, &[name.as_str(), "policy"])
+        {
+            return Err(refused("policy.env"));
+        }
+    }
+    if env_of(&before, &["defaults"]) != env_of(after, &["defaults"]) {
+        return Err(refused("defaults.env"));
     }
     Ok(())
+}
+
+/// `agents.<path…>.env` in `config`, if set.
+fn env_of<'a>(config: &'a Value, path: &[&str]) -> Option<&'a Value> {
+    path.iter()
+        .try_fold(config.get("agents")?, |v, k| v.get(*k))?
+        .get("env")
 }
 
 /// Resolve raw file definitions using the same whole-entry replacement as
@@ -938,6 +954,74 @@ mod tests {
         // An unreadable graph ref is an error, never an empty list.
         f.git(&["update-ref", "-d", "refs/heads/mdkg-graph"]);
         assert!(committed_protect(&root, "lane-a").is_err());
+    }
+
+    #[test]
+    fn a_worker_writable_layer_cannot_change_an_agents_environment() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "project/.mdkg/config.json",
+            &json!({
+                "schema_version":3, "format_version":"0.7",
+                "graph_id":"0192f3a0-0000-7000-8000-000000000000",
+                "agents":{"worker":{"role":"worker","policy":{"env":{"allow":["CARGO_HOME"]}}}}
+            })
+            .to_string(),
+        );
+        let local = fixture.write("project/.git/mdkg/config.local.json", "{}");
+        let root = fixture.0.join("project");
+        let home = fixture.0.join("home");
+        fixture.commit_graph();
+        let authority = crate::orchestration::authority(&root).unwrap();
+        let project = Project::from_authority(
+            &authority,
+            &root,
+            Environment {
+                home: Some(&home),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let refused = |patch: Value, what: &str| {
+            fs::write(&local, patch.to_string()).unwrap();
+            let e = resolve_layers(&project, &[], None, None).unwrap_err();
+            assert!(
+                e.to_string()
+                    .contains(&format!("Local layer changes committed {what}")),
+                "{e}"
+            );
+            assert_eq!(e.diagnostic.code.as_str(), "run.authority_override");
+        };
+        // Widening, opting out, narrowing, or replacing the whole policy.
+        refused(
+            json!({"agents":{"worker":{"policy":{"env":{"allow":["CARGO_HOME","GITHUB_TOKEN"]}}}}}),
+            "policy.env",
+        );
+        refused(
+            json!({"agents":{"worker":{"policy":{"env":{"inherit":true}}}}}),
+            "policy.env",
+        );
+        refused(
+            json!({"agents":{"worker":{"policy":{"env":null}}}}),
+            "policy.env",
+        );
+        refused(json!({"agents":{"worker":{"policy":null}}}), "policy.env");
+        refused(
+            json!({"agents":{"defaults":{"env":{"inherit":true}}}}),
+            "defaults.env",
+        );
+        // Other policy fields still apply from the local layer.
+        fs::write(
+            &local,
+            json!({"agents":{"worker":{"policy":{"env":{"allow":["CARGO_HOME"]},"timeout":900}}}})
+                .to_string(),
+        )
+        .unwrap();
+        let resolved = resolve_layers(&project, &[], None, None).unwrap();
+        assert_eq!(
+            resolved.effective.values["agents"]["worker"]["policy"]["env"],
+            json!({"allow":["CARGO_HOME"]})
+        );
     }
 
     #[test]

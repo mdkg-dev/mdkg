@@ -223,7 +223,7 @@ fn usage_errors_never_quote_typed_values() {
     assert!(!out.to_string().contains("sk_live_x"), "{out}");
     // Stray positionals and unknown commands aren't echoed either.
     for args in [
-        vec!["claim", "task-1", "sk_live_q", "--json"],
+        vec!["holds", "src", "sk_live_q", "--json"],
         vec!["sk_live_cmd", "--json"],
     ] {
         let (code, out, _) = run(&dir.0, &args);

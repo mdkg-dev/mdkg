@@ -153,7 +153,16 @@ impl std::error::Error for Fido2Error {}
 const UNSUPPORTED_HINT: &str = "this build has no FIDO2 support: musl builds can't use FIDO2 \
      person keys; use a gnu (glibc) build, Homebrew or the macOS build, or a machine-grade \
      file key with --allow-file-key";
-#[cfg(not(all(target_os = "linux", target_env = "musl")))]
+/// A build without the `fido2` feature (the Linux PyPI wheels, which bundle
+/// no system libraries) has none either.
+#[cfg(all(
+    not(feature = "fido2"),
+    not(all(target_os = "linux", target_env = "musl"))
+))]
+const UNSUPPORTED_HINT: &str = "this build has no FIDO2 support: the Linux pip wheels leave FIDO2 \
+     out; install mdkg from a gnu release archive, Homebrew or `cargo install mdkg` for FIDO2 person \
+     keys, or use a machine-grade file key with --allow-file-key";
+#[cfg(all(feature = "fido2", not(all(target_os = "linux", target_env = "musl"))))]
 const UNSUPPORTED_HINT: &str =
     "enrol a Secure Enclave key (macOS), or a machine-grade file key with --allow-file-key";
 
@@ -822,9 +831,12 @@ impl Signer for Fido2Key {
 /// How a request to the key verifies its user.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(
-    not(any(
-        target_os = "macos",
-        all(target_os = "linux", not(target_env = "musl"))
+    not(all(
+        feature = "fido2",
+        any(
+            target_os = "macos",
+            all(target_os = "linux", not(target_env = "musl"))
+        )
     )),
     allow(dead_code)
 )]
@@ -842,9 +854,12 @@ enum Verification<'a> {
 /// refuses without it (Terra #8056 9). Without a PIN, `uv` asks the key
 /// for its built-in verification, and `up` asks for presence alone.
 #[cfg_attr(
-    not(any(
-        target_os = "macos",
-        all(target_os = "linux", not(target_env = "musl"))
+    not(all(
+        feature = "fido2",
+        any(
+            target_os = "macos",
+            all(target_os = "linux", not(target_env = "musl"))
+        )
     )),
     allow(dead_code)
 )]
@@ -858,16 +873,25 @@ fn verification(uv: bool, pin: Option<&str>) -> Verification<'_> {
 
 /// The platform's FIDO2 transport: USB HID on macOS and Linux gnu (where
 /// opening the key needs a udev rule or group access to its hidraw
-/// device), and [`Fido2Error::Unsupported`] elsewhere, Linux musl included. `pin` is the key's
+/// device), and [`Fido2Error::Unsupported`] elsewhere, Linux musl and
+/// builds without the `fido2` feature included. `pin` is the key's
 /// PIN, for a `uv` policy on a key without a biometric; it is held in
 /// memory only.
 pub fn platform(pin: Option<String>) -> Box<dyn Fido2Backend> {
     Box::new(hid::Hid::new(pin))
 }
 
-#[cfg(any(
-    target_os = "macos",
-    all(target_os = "linux", not(target_env = "musl"))
+/// Whether [`platform`] has a real backend in this build, as opposed to
+/// the stub that answers [`Fido2Error::Unsupported`]: set by whichever
+/// `hid` module compiled, so it can't disagree with the selection.
+pub const BACKEND: bool = hid::AVAILABLE;
+
+#[cfg(all(
+    feature = "fido2",
+    any(
+        target_os = "macos",
+        all(target_os = "linux", not(target_env = "musl"))
+    )
 ))]
 mod hid {
     use ctap_hid_fido2::fidokey::{
@@ -877,6 +901,9 @@ mod hid {
 
     use super::{Assertion, Fido2Backend, Fido2Error, MadeCredential, Verification, verification};
     use crate::attest::Statement;
+
+    /// This build has the USB HID backend.
+    pub(super) const AVAILABLE: bool = true;
 
     pub(super) struct Hid {
         pin: Option<String>,
@@ -997,12 +1024,18 @@ mod hid {
     }
 }
 
-#[cfg(not(any(
-    target_os = "macos",
-    all(target_os = "linux", not(target_env = "musl"))
+#[cfg(not(all(
+    feature = "fido2",
+    any(
+        target_os = "macos",
+        all(target_os = "linux", not(target_env = "musl"))
+    )
 )))]
 mod hid {
     use super::{Assertion, Fido2Backend, Fido2Error, MadeCredential};
+
+    /// This build has only the stub, which answers `Unsupported`.
+    pub(super) const AVAILABLE: bool = false;
 
     pub(super) struct Hid;
 
@@ -1412,6 +1445,47 @@ pub(crate) mod tests {
         assert_eq!(d.code, Code::ApiUnsupported);
         let hint = d.hint.as_deref().expect("hint");
         assert!(hint.contains("musl") && hint.contains("gnu"), "{hint}");
+    }
+
+    /// `BACKEND` (what `--version` reports) says false exactly when the
+    /// platform backend is the stub: on any target without one (musl,
+    /// FreeBSD, a build without the feature) it refuses as unsupported.
+    /// The true side isn't called here, since it would open a USB device.
+    #[test]
+    fn backend_is_false_exactly_when_the_platform_refuses() {
+        if !BACKEND {
+            let hid = platform(None);
+            assert_eq!(
+                hid.make_credential(RP_ID, b"challenge", true),
+                Err(Fido2Error::Unsupported)
+            );
+            assert_eq!(
+                hid.get_assertion(RP_ID, b"challenge", b"credential", true),
+                Err(Fido2Error::Unsupported)
+            );
+        }
+        assert_eq!(crate::FIDO2, BACKEND);
+    }
+
+    /// A build without the `fido2` feature (the Linux pip wheels) has no
+    /// FIDO2 transport either, and its hint names the builds that do.
+    #[cfg(all(
+        not(feature = "fido2"),
+        not(all(target_os = "linux", target_env = "musl"))
+    ))]
+    #[test]
+    fn build_without_fido2_refuses_with_a_hint() {
+        let hid = platform(None);
+        assert_eq!(
+            hid.make_credential(RP_ID, b"challenge", true),
+            Err(Fido2Error::Unsupported)
+        );
+        let d = diagnostic(&Fido2Error::Unsupported);
+        assert_eq!(d.code, Code::ApiUnsupported);
+        let hint = d.hint.as_deref().expect("hint");
+        for name in ["pip", "release archive", "Homebrew", "cargo install"] {
+            assert!(hint.contains(name), "{name}: {hint}");
+        }
     }
 
     #[test]

@@ -41,6 +41,9 @@ pub enum Mapping {
     /// This adapter's path; run these (the path's own package or crate and
     /// everything that depends on it).
     Selects(BTreeSet<Target>),
+    /// As `Selects`, with whole crates where finer targets can't be
+    /// derived, and why: a rule naming finer targets still wins.
+    Coarse(BTreeSet<Target>, String),
     /// A deleted path whose package or crate is gone at the head.
     Removed(String),
     /// This adapter's kind of path, but nothing at the head builds it (for
@@ -61,9 +64,19 @@ pub trait Adapter {
     /// crate names). An unknown target is an `Err`, so a stale rule fails
     /// closed.
     fn resolve(&mut self, names: &[String]) -> Result<BTreeSet<Target>, String>;
-    fn resolve_tests(&mut self, _targets: &[RustTarget]) -> Result<BTreeSet<Target>, String> {
+    /// Resolves a rule's Rust test targets. A target the head doesn't have
+    /// is listed in `missing`, not an `Err`: the shared config may name a
+    /// target that an older head predates.
+    fn resolve_tests(&mut self, _targets: &[RustTarget]) -> Result<TestResolution, String> {
         Err("this adapter cannot resolve Rust test targets".into())
     }
+}
+
+/// A rule's Rust test targets at the head.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct TestResolution {
+    pub found: BTreeSet<Target>,
+    pub missing: Vec<RustTarget>,
 }
 
 /// The engine's verdict for one path.
@@ -73,8 +86,15 @@ pub struct PathVerdict {
     pub selects: BTreeSet<Target>,
     /// The reasons it forces a full run, with detail.
     pub reasons: BTreeMap<ReasonCode, String>,
-    /// Whole crates used because a path lacks a finer rule.
-    pub fallback_crates: BTreeSet<(String, String)>,
+    /// Whole crates used because a path lacks a finer rule: the path, the
+    /// crate, and why the adapter couldn't derive finer targets, if it
+    /// said.
+    pub fallback_crates: BTreeSet<(String, String, Option<String>)>,
+    /// Rule targets the head doesn't have, skipped: the path whose rule
+    /// named it (the old side of a rename keeps its own path), the rule's
+    /// index, the target, and whether none of the rule's targets exist, so
+    /// its packages run whole.
+    pub missing_targets: BTreeSet<(String, usize, RustTarget, bool)>,
 }
 
 pub struct Engine<'a> {
@@ -138,11 +158,39 @@ impl Engine<'_> {
                     }
                     if !rust_targets.is_empty() {
                         let resolved = match self.rust.as_deref_mut() {
-                            Some(a) => a.resolve_tests(rust_targets),
+                            Some(a) => a.resolve_tests(rust_targets).and_then(|r| {
+                                if r.missing.is_empty() {
+                                    return Ok((r, None));
+                                }
+                                // Every missing target's package must exist at
+                                // this head: a package the head lacks is an
+                                // error, even beside targets that resolve.
+                                let packages: Vec<String> = r
+                                    .missing
+                                    .iter()
+                                    .map(|t| t.package.clone())
+                                    .collect::<BTreeSet<_>>()
+                                    .into_iter()
+                                    .collect();
+                                let whole = a.resolve(&packages)?;
+                                // None of the rule's targets exist at this
+                                // head: run their packages whole.
+                                let all_missing = r.found.is_empty();
+                                Ok((r, all_missing.then_some(whole)))
+                            }),
                             None => Err("no rust adapter applies to this repository".into()),
                         };
                         match resolved {
-                            Ok(t) => v.selects.extend(t),
+                            Ok((r, whole)) => {
+                                let all_missing = whole.is_some();
+                                v.selects.extend(r.found);
+                                v.selects.extend(whole.into_iter().flatten());
+                                v.missing_targets.extend(
+                                    r.missing
+                                        .into_iter()
+                                        .map(|t| (path.to_string(), i, t, all_missing)),
+                                );
+                            }
                             Err(e) => {
                                 v.reasons.insert(
                                     ReasonCode::ConfigInvalid,
@@ -160,7 +208,12 @@ impl Engine<'_> {
         {
             match adapter.map(path, deleted) {
                 Ok(Mapping::NotMine) => {}
-                Ok(Mapping::Selects(t)) => {
+                Ok(m @ (Mapping::Selects(_) | Mapping::Coarse(..))) => {
+                    let (t, why) = match m {
+                        Mapping::Coarse(t, why) => (t, Some(why)),
+                        Mapping::Selects(t) => (t, None),
+                        _ => unreachable!(),
+                    };
                     v.matched_by.insert(adapter.kind());
                     for target in t {
                         if let Target::Rust(package) = &target {
@@ -172,7 +225,11 @@ impl Engine<'_> {
                                 continue;
                             }
                             if !v.selects.contains(&target) {
-                                v.fallback_crates.insert((path.into(), package.clone()));
+                                v.fallback_crates.insert((
+                                    path.into(),
+                                    package.clone(),
+                                    why.clone(),
+                                ));
                             }
                         }
                         v.selects.insert(target);

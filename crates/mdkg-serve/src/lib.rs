@@ -29,6 +29,9 @@ pub mod state;
 pub mod tail;
 pub mod verify;
 
+/// Whether this build has a FIDO2 backend (`mdkg_presence::FIDO2`).
+pub use mdkg_presence::FIDO2;
+
 #[cfg(test)]
 mod guards {
     /// Every file under this crate, recursively.

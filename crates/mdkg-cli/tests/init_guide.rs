@@ -147,13 +147,14 @@ fn ref_mode_readme_describes_ref_mode() {
         "Edit canonical skills",
         "mdkg skills sync\n",
         "Skills[mdkg skills sync]",
-        "mdkg skills add mdkg-workflow",
     ] {
         assert!(
             !guide.contains(checkout_only),
             "ref-mode guide has {checkout_only:?}"
         );
     }
+    // A graph-only init adds the skill later, on the graph ref (#19581).
+    assert!(guide.contains("publishes it on the graph ref"), "{guide}");
     // The integration recipe, as written, mirrors the skills from the
     // graph ref (`skills sync` would remove them here).
     let integrations = guide
@@ -180,21 +181,23 @@ fn ref_mode_readme_describes_ref_mode() {
         agents.contains("`mdkg install` refreshes the mirrors"),
         "{agents}"
     );
-    // Skills sync and add refuse here, before writing anything.
+    // Skills sync refuses here, before writing anything; add finds the
+    // graph ref's skill already this build's.
     let (ok, output) = sh(
         &scratch,
         &path,
         &repo,
-        "set -eu\nfor c in 'skills sync' 'skills add mdkg-workflow'; do\n\
-         if mdkg $c; then exit 1; fi\ndone\nmdkg skills sync --json || true\n",
+        "set -eu\nif mdkg skills sync; then exit 1; fi\nmdkg skills sync --json || true\n\
+         mdkg skills add mdkg-workflow --json\n",
     );
     assert!(ok, "{output}");
     assert!(output.contains("skill.ref_mode"), "{output}");
+    assert!(output.contains("\"action\": \"kept\""), "{output}");
     assert_eq!(
         output
             .matches("`mdkg install` refreshes the skill mirrors")
             .count(),
-        3,
+        2,
         "{output}"
     );
     for mirror in [".agents/skills", ".claude/skills"] {
@@ -231,8 +234,8 @@ fn ref_mode_readme_describes_ref_mode() {
     assert!(!damaged.contains("edit the .mdkg/skills"), "{output}");
     assert!(!clean.contains("skill.mirror"), "{output}");
     assert!(foreign.contains("isn't another mirror"), "{output}");
-    // After a --graph-only init, skills add refuses before it writes the
-    // skill anywhere: not on the graph ref, not in the graph cache.
+    // After a --graph-only init, skills add publishes the skill on the
+    // graph ref (Terra #15099), never in the checkout.
     let (ok, output) = sh(
         &scratch,
         &path,
@@ -240,12 +243,15 @@ fn ref_mode_readme_describes_ref_mode() {
         "set -eu\ngit init -q -b main bare-skills\ncd bare-skills\ngit config user.name Test\n\
          git config user.email test@example.invalid\ngit commit -q --allow-empty -m code\ngit config mdkg.graph.ref refs/heads/mdkg-graph\n\
          mdkg init --work local --graph-only\n\
-         if mdkg skills add mdkg-workflow; then exit 1; fi\n\
          if git cat-file -e refs/heads/mdkg-graph:.mdkg/skills/mdkg-workflow/SKILL.md; then exit 1; fi\n\
-         test -z \"$(find .git -path '*skills/mdkg-workflow*')\"\n",
+         mdkg skills add mdkg-workflow --json\n\
+         git cat-file -e refs/heads/mdkg-graph:.mdkg/skills/mdkg-workflow/SKILL.md\n\
+         test ! -e .mdkg\n\
+         mdkg install --enable skills:.agents/skills >/dev/null\n\
+         test -f .agents/skills/mdkg-workflow/SKILL.md\n",
     );
     assert!(ok, "{output}");
-    assert!(output.contains("skill.ref_mode"), "{output}");
+    assert!(output.contains("\"action\": \"created\""), "{output}");
     let commands = setup_example(&guide);
     assert!(
         commands
@@ -413,15 +419,17 @@ fn clone_with_fetched_graph_ref_points_to_adoption() {
         &path,
         &clone,
         "set -eu\ngit remote remove mine\ngit fetch -q origin\n\
-         mdkg install --setup personal\nmdkg list\nmdkg status\nmdkg doctor --strict\n",
+         mdkg install --setup personal\nmdkg list\nmdkg status\nmdkg doctor\n\
+         if mdkg doctor --strict; then exit 1; fi\n",
     );
     assert!(ok, "the named install adopts the graph: {output}");
-    // Its graph remote isn't approved (no 0.7.1 command can), which doctor
-    // reports without a warning, saying when approval arrives.
+    // Its graph remote isn't approved yet: a warning (so `--strict` fails)
+    // with the approve hint, until a person approves it (0.7.2 graph sync).
     assert!(
-        output.contains("not approved: nothing is pushed to it (approving a graph remote"),
+        output.contains("not approved: nothing is pulled from or pushed to it"),
         "{output}"
     );
+    assert!(output.contains("graph remote approve"), "{output}");
     // A graph published under a custom name, which the clone's config
     // names, is found as well.
     let (ok, output) = sh(

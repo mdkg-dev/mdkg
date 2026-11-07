@@ -234,3 +234,124 @@ fn includes_in_the_system_and_xdg_configs_are_seen() {
         log.join("\n")
     );
 }
+
+/// The four commands e-gitcache measures, on a graph with 50 agents.
+const MEASURED: &[&[&str]] = &[
+    &["--as", "w1", "status"],
+    &[
+        "--as", "w1", "msg", "send", "--to", "w2", "--kind", "note", "--text", "hi",
+    ],
+    &["--as", "w1", "agents", "status"],
+    &["--as", "w1", "claim", "task-1"],
+];
+
+/// [`setup`] with 50 agent definitions committed.
+fn setup_with_agents() -> Scratch {
+    let s = setup();
+    let repo = s.0.join("repo");
+    let agents = repo.join(".mdkg/agents");
+    fs::create_dir_all(&agents).expect("agents");
+    for i in 0..50 {
+        fs::write(
+            agents.join(format!("w{i}.json")),
+            r#"{"schema":"mdkg.agent.v1","harness":"claude","role":"worker","instructions":"x","reports_to":"orchestrator","mode":"auto"}"#,
+        )
+        .expect("agent");
+    }
+    for args in [&["add", "."][..], &["commit", "-q", "-m", "agents"]] {
+        let ok = isolated(Command::new("git").arg("-C").arg(&repo).args(args))
+            .status()
+            .expect("git runs")
+            .success();
+        assert!(ok, "git {args:?}");
+    }
+    s
+}
+
+/// e-gitcache step 1: the git calls each measured command makes, by
+/// subcommand. Run with `--ignored --nocapture`.
+#[test]
+#[ignore = "measurement: prints git spawns per command"]
+fn measure_git_spawns_per_command() {
+    let s = setup_with_agents();
+    // A Claude that only says it's logged in, and records nothing.
+    let stub = s.0.join("claude-stub");
+    fs::write(
+        &stub,
+        "#!/bin/sh\necho '{\"loggedIn\": true, \"authMethod\": \"claude.ai\"}'\n",
+    )
+    .expect("stub");
+    fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).expect("chmod");
+    let fake_claude = stub.to_str().expect("utf-8").to_string();
+    // `agents status` asks each harness whether it's logged in: a stub
+    // Claude, never the real Keychain, and no inherited harness overrides.
+    let vars = [
+        ("MDKG_RUN_CLAUDE", Some(fake_claude.as_str())),
+        ("MDKG_RUN_SECURITY", Some("/usr/bin/false")),
+        ("MDKG_RUN_CODEX", None),
+        ("MDKG_RUN_OPENCODE", None),
+        ("MDKG_RUN_MDKG", None),
+    ];
+    for args in MEASURED {
+        let log = calls_with(&s.0, args, &vars);
+        let mut seen: std::collections::BTreeMap<String, usize> = Default::default();
+        for line in &log {
+            // From the subcommand on, without the hardening flags and paths.
+            let words: Vec<&str> = line.split_whitespace().collect();
+            let at = words
+                .iter()
+                .position(|w| {
+                    [
+                        "rev-parse",
+                        "config",
+                        "cat-file",
+                        "ls-tree",
+                        "status",
+                        "for-each-ref",
+                    ]
+                    .contains(w)
+                })
+                .unwrap_or(0);
+            let tail = words[at..]
+                .iter()
+                .map(|w| {
+                    if w.contains('/') {
+                        "<path>"
+                    } else if w.len() >= 40 && w.bytes().all(|b| b.is_ascii_hexdigit()) {
+                        "<oid>"
+                    } else {
+                        w
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            *seen.entry(tail).or_default() += 1;
+        }
+        eprintln!("== {} : {} spawns", args.join(" "), log.len());
+        for (call, n) in seen {
+            eprintln!("  {n} {call}");
+        }
+    }
+}
+
+/// Opus final #16701 item 2 (e-gitcache item 5), in checkout mode with no
+/// registered graph checkout only: a send looks the committed config up
+/// once (one `ls-tree` of it; its bytes come through one object reader),
+/// however many steps (the store's ack grace, the mail store, the send
+/// itself) consult it. Ref mode and a registered checkout read it on other
+/// paths, which this doesn't cover.
+#[test]
+fn a_checkout_mode_send_looks_up_the_committed_config_once() {
+    let s = setup();
+    let log = calls(
+        &s.0,
+        &[
+            "--as", "agent-a", "msg", "send", "--to", "agent-b", "--kind", "note", "--text", "hi",
+        ],
+    );
+    let reads = log
+        .iter()
+        .filter(|l| l.contains("ls-tree") && l.ends_with(".mdkg/config.json"))
+        .count();
+    assert_eq!(reads, 1, "{}", log.join("\n"));
+}

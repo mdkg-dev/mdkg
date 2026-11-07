@@ -923,10 +923,12 @@ fn call_tool(
             .insert(after_json, format!("--mailbox={actor}"));
     }
     // A listing marks nothing itself: what reaches the client, after any
-    // trim, is marked once the reply is out (`mark_replied`).
+    // trim, is marked once the reply is out (`mark_replied`). It still
+    // purges bodies past their retention, as any normal read does:
+    // `--no-mark` would make it a pure read that purges nothing.
     if LISTS_MAIL.contains(&tool.name) {
         let after_json = tool.command.split(' ').count() + 1;
-        prepared.args.insert(after_json, "--no-mark".to_string());
+        prepared.args.insert(after_json, "--defer-mark".to_string());
     }
     let started = Instant::now();
     let timeout = ctx.timeout_cap.map_or(call_timeout(tool, given), |cap| {

@@ -76,11 +76,16 @@ pub enum SkillsCommand {
         json: bool,
     },
     /// Add a skill the binary ships (`mdkg-workflow`) to `.mdkg/skills/`,
-    /// and mirror it.
-    #[command(after_help = examples!("skills add mdkg-workflow"))]
+    /// and mirror it. In ref mode it's published on the graph ref, and
+    /// `install` mirrors it.
+    #[command(after_help = examples!("skills add mdkg-workflow", "skills add mdkg-workflow --replace"))]
     Add {
         /// The shipped skill's slug.
         slug: String,
+        /// Replace a copy that differs from what the binary ships (an older
+        /// version, or the project's own changes) with the shipped one.
+        #[arg(long)]
+        replace: bool,
         /// Print JSON.
         #[arg(long)]
         json: bool,
@@ -119,12 +124,16 @@ impl SkillsCommand {
     }
 }
 
-pub fn run(root: &Path, command: &SkillsCommand) -> u8 {
+pub fn run(root: &Path, actor: Option<String>, command: &SkillsCommand) -> u8 {
     match command {
         SkillsCommand::List(a) => list(root, a),
         SkillsCommand::Show { slug, meta, json } => show(root, slug, *meta, *json),
         SkillsCommand::Validate { slug, json } => validate(root, slug.as_deref(), *json),
-        SkillsCommand::Add { slug, json } => add(root, slug, *json),
+        SkillsCommand::Add {
+            slug,
+            replace,
+            json,
+        } => add(root, actor, slug, *replace, *json),
         SkillsCommand::Sync { dry_run, json } => sync(root, *dry_run, *json),
     }
 }
@@ -518,7 +527,10 @@ pub fn validate(root: &Path, slug: Option<&str>, json: bool) -> u8 {
         let data = SkillsValidateData {
             checked: all.len(),
             errors,
-            warnings: diags.len() - errors,
+            warnings: diags
+                .iter()
+                .filter(|d| d.severity == mdkg_format::Severity::Warning)
+                .count(),
             target: slug.map(String::from),
         };
         Ok(Report {
@@ -621,6 +633,12 @@ pub fn mirror_check(root: &Path, config: &Config, only: Option<&str>) -> Vec<Dia
     // In ref mode `root` is the graph cache, which holds the sources; the
     // mirrors are in the checkout, and install refreshes them.
     let mode = crate::coord::graph_git::for_root(root);
+    // In ref mode, install's own plan for this setup: the verdicts on each
+    // mirror's content come from it (f-adopt #15953).
+    let plan = mode
+        .as_ref()
+        .map(|m| crate::run::skill_mirror_plan(&m.checkout, root));
+    let planned_under = |prefix: &str| matches!(&plan, Some(Ok(p)) if p.changes.iter().any(|c| c.path.starts_with(prefix)));
     let base = mode.as_ref().map_or(root, |m| m.checkout.as_path());
     // What install does with a mirror depends on the setup: personal and
     // local overwrite it, professional leaves tracked and linked mirrors
@@ -682,7 +700,9 @@ pub fn mirror_check(root: &Path, config: &Config, only: Option<&str>) -> Vec<Dia
                 continue;
             }
         }
-        for s in &sources {
+        // In ref mode the verdicts on each mirror's content come from the
+        // plan (below), so they match what install does in this setup.
+        for s in sources.iter().filter(|_| mode.is_none()) {
             let mirror = dir.join(&s.slug);
             let shown = rel(base, &mirror);
             let (Some(want), have) = (files_under(&s.dir), files_under(&mirror)) else {
@@ -713,6 +733,8 @@ pub fn mirror_check(root: &Path, config: &Config, only: Option<&str>) -> Vec<Dia
         }
         if only.is_none() {
             match managed(&dir) {
+                // In ref mode the plan rewrites a missing manifest.
+                None if mode.is_some() => {}
                 None => diags.push(
                     Diagnostic::warning(
                         Code::SkillMirrorManifestMissing,
@@ -723,17 +745,27 @@ pub fn mirror_check(root: &Path, config: &Config, only: Option<&str>) -> Vec<Dia
                 ),
                 Some(slugs) => {
                     for slug in slugs {
+                        let shown = rel(base, &dir.join(&slug));
+                        // A retired skill the plan removes is reported from
+                        // the plan; one it can't remove (it holds a link)
+                        // still is, here (Terra #19770).
                         if is_slug(&slug)
                             && !sources.iter().any(|s| s.slug == slug)
                             && has_dir(&dir.join(&slug))
+                            && !planned_under(&format!("{shown}/"))
                         {
-                            diags.push(
-                                Diagnostic::warning(
-                                    Code::SkillMirrorStale,
-                                    "a mirrored skill whose source is gone",
+                            let (message, hint) = if mode.is_some() {
+                                (
+                                    "a mirrored skill whose source is gone, which install leaves in place",
+                                    format!("remove {shown} yourself"),
                                 )
-                                .at(rel(base, &dir.join(&slug)), None)
-                                .with_hint(fix.clone()),
+                            } else {
+                                ("a mirrored skill whose source is gone", fix.clone())
+                            };
+                            diags.push(
+                                Diagnostic::warning(Code::SkillMirrorStale, message)
+                                    .at(shown, None)
+                                    .with_hint(hint),
                             );
                         }
                     }
@@ -741,13 +773,113 @@ pub fn mirror_check(root: &Path, config: &Config, only: Option<&str>) -> Vec<Dia
             }
         }
     }
+    if let Some(plan) = plan {
+        diags.extend(planned_verdicts(plan, only, &fix));
+    }
+    diags
+}
+
+/// Whether an install planner note is about the skill `slug`: it names the
+/// skill's source folder `.mdkg/skills/<slug>` as a whole path component, so
+/// `workflow` never matches `mdkg-workflow`'s notes (reviews #19792, #19831).
+fn note_names_skill(note: &str, slug: &str) -> bool {
+    let folder = format!("{SKILLS_DIR}/{slug}");
+    note.match_indices(&folder).any(|(at, _)| {
+        let before = note[..at].chars().next_back();
+        let after = note[at + folder.len()..].chars().next();
+        !matches!(before, Some(c) if c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
+            && matches!(after, None | Some('/' | ' ' | ',' | ':' | ')'))
+    })
+}
+
+/// Ref mode's mirror verdicts: install's own skill plan for this setup
+/// (`run::skill_mirror_plan`), as warnings for what install would change and
+/// notes for what it leaves alone. `only` keeps one skill's files.
+fn planned_verdicts(
+    plan: Result<mdkg_run::install::SkillPreview, GraphError>,
+    only: Option<&str>,
+    fix: &str,
+) -> Vec<Diagnostic> {
+    let plan = match plan {
+        Ok(plan) => plan,
+        Err(e) => {
+            return vec![
+                Diagnostic::warning(
+                    Code::SkillMirrorDrift,
+                    format!(
+                        "can't plan the skill mirrors as install would: {}",
+                        e.diagnostic.message
+                    ),
+                )
+                .with_hint(fix.to_owned()),
+            ];
+        }
+    };
+    // One skill's files: those in its folder right below a mirror root
+    // (Terra #19770), never a path that only mentions the slug.
+    let wanted = |path: &str| {
+        only.is_none_or(|slug| {
+            plan.mirrors
+                .iter()
+                .any(|m| path.starts_with(&format!("{m}/{slug}/")))
+        })
+    };
+    let mut diags = Vec::new();
+    for c in plan.changes.iter().filter(|c| wanted(&c.path)) {
+        let (code, message) = match (c.action, c.path.ends_with(MANAGED_FILE)) {
+            (_, true) => (
+                Code::SkillMirrorManifestMissing,
+                "install would rewrite this skill mirror manifest",
+            ),
+            (mdkg_run::install::Action::Created, _) => (
+                Code::SkillMirrorDrift,
+                "the mirror lacks this file; install would create it",
+            ),
+            (mdkg_run::install::Action::Removed, _) => (
+                Code::SkillMirrorStale,
+                "a mirrored file whose source is gone; install would remove it",
+            ),
+            _ => (
+                Code::SkillMirrorDrift,
+                "the mirrored file differs from the graph ref's skill; install would update it",
+            ),
+        };
+        diags.push(
+            Diagnostic::warning(code, message)
+                .at(c.path.clone(), None)
+                .with_hint(fix.to_owned()),
+        );
+    }
+    // What the planner skips and why (a secret-named file, a link), so a
+    // clean verdict never hides a file left out (Terra #19770).
+    for note in plan
+        .notes
+        .iter()
+        .filter(|n| only.is_none_or(|slug| note_names_skill(n, slug)))
+    {
+        diags.push(Diagnostic::new(
+            Code::SkillMirrorDrift,
+            mdkg_format::Severity::Info,
+            format!("install's skill plan: {note}"),
+        ));
+    }
+    for path in plan.left_alone.iter().filter(|p| wanted(p)) {
+        diags.push(
+            Diagnostic::new(
+                Code::SkillMirrorDrift,
+                mdkg_format::Severity::Info,
+                "install leaves this mirror file alone in this setup (the repository tracks it, or it's a link); copy the graph ref's version yourself",
+            )
+            .at(path.clone(), None),
+        );
+    }
     diags
 }
 
 /// In ref mode the skills are on the graph ref and the checkout has no
-/// `.mdkg/skills/`: sync would remove every mirror install wrote, and add
-/// would write only the graph cache. Both refuse before touching a file;
-/// install refreshes the mirrors (publishing an added skill is 0.7.2's).
+/// `.mdkg/skills/`: sync would remove every mirror install wrote, so it
+/// refuses before touching a file; install refreshes the mirrors, and
+/// `skills add` publishes to the graph ref.
 fn refuse_in_ref_mode(root: &Path, command: &str) -> Result<(), GraphError> {
     let Some(mode) = crate::coord::graph_git::for_root(root) else {
         return Ok(());
@@ -760,8 +892,8 @@ fn refuse_in_ref_mode(root: &Path, command: &str) -> Result<(), GraphError> {
         ),
     )
     .with_hint(format!(
-        "in ref mode, `{BIN} install` refreshes the skill mirrors; skills add needs a \
-         checkout-mode graph (0.7.2 publishes it to the graph ref)"
+        "in ref mode, `{BIN} install` refreshes the skill mirrors from the graph ref, and \
+         `{BIN} skills add` publishes a shipped skill there"
     )))
 }
 
@@ -882,18 +1014,75 @@ pub struct SkillAddData {
     pub slug: String,
     /// The SKILL.md written, relative to the root.
     pub path: String,
-    /// `created`, or `kept` when it was already there as shipped.
+    /// `created`, `replaced` (with `--replace`), or `kept` when it was
+    /// already there as shipped.
     pub action: String,
-    /// The mirror files the sync wrote.
+    /// The mirror files the sync wrote (none in ref mode, where `install`
+    /// mirrors the graph ref's skills).
     pub mirrored: Vec<mdkg_run::install::Change>,
+    /// The commit that recorded the change: on the graph ref in ref mode,
+    /// on the checkout's branch in checkout mode (absent when nothing
+    /// changed, and outside git).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+    /// The changesets that commit recorded.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub changesets: Vec<String>,
+}
+
+/// How a shipped skill meets the copy already there.
+fn add_action(
+    have: Option<&[u8]>,
+    text: &str,
+    replace: bool,
+    rel: &str,
+) -> Result<&'static str, GraphError> {
+    match have {
+        None => Ok("created"),
+        Some(have) if have == text.as_bytes() => Ok("kept"),
+        Some(_) if replace => Ok("replaced"),
+        Some(_) => Err(GraphError::usage(
+            Code::SkillExists,
+            "the skill is already here, changed from what the binary ships",
+        )
+        .at(rel.to_owned(), None)
+        .with_hint(format!(
+            "edit it in place, or take the shipped copy with `{BIN} skills add <slug> --replace` (it replaces the project's own changes)"
+        ))),
+    }
+}
+
+/// The skill's current bytes at `path`, `None` when there's none; a link
+/// or folder there is refused, never followed.
+fn current_skill(path: &Path, rel: &str) -> Result<Option<Vec<u8>>, GraphError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.is_file() => std::fs::read(path)
+            .map(Some)
+            .map_err(|e| GraphError::failure(Code::IoReadFailed, format!("can't read {rel}: {e}"))),
+        Ok(_) => Err(GraphError::usage(
+            Code::SkillExists,
+            "the skill's SKILL.md isn't a regular file",
+        )
+        .at(rel.to_owned(), None)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(GraphError::failure(
+            Code::IoReadFailed,
+            format!("can't read {rel}: {e}"),
+        )),
+    }
 }
 
 /// `skills add <slug>`: writes a skill the binary ships into
 /// `.mdkg/skills/`, then syncs the mirrors. An existing SKILL.md that
-/// differs is the project's own, so it's refused, never replaced.
-pub fn add(root: &Path, slug: &str, json: bool) -> u8 {
+/// differs is the project's own, so it's refused unless `replace` says to
+/// take the shipped copy. In ref mode (`root` is the bound graph cache) the
+/// skill is published on the graph ref under an exact lease on its
+/// SKILL.md, and `install` mirrors it; in a checkout-mode git checkout it's
+/// committed on the checkout's branch under that lease, as `agents add`
+/// commits a definition. Outside git, or before the branch's first commit,
+/// it's written in place.
+pub fn add(root: &Path, actor: Option<String>, slug: &str, replace: bool, json: bool) -> u8 {
     let report = (|| -> Result<Report<SkillAddData>, GraphError> {
-        refuse_in_ref_mode(root, "skills add")?;
         load_config(root)?;
         let Some(text) = bundled(slug) else {
             return Err(GraphError::not_found(
@@ -903,35 +1092,104 @@ pub fn add(root: &Path, slug: &str, json: bool) -> u8 {
             .with_hint(format!("shipped skills: {}", crate::init::WORKFLOW_SLUG)));
         };
         let rel = format!("{SKILLS_DIR}/{slug}/SKILL.md");
-        let path = root.join(&rel);
-        let action = match std::fs::read(&path) {
-            Ok(have) if have == text.as_bytes() => "kept",
-            Ok(_) => {
-                return Err(GraphError::usage(
-                    Code::SkillExists,
-                    "the skill is already here, changed from what the binary ships",
-                )
-                .at(rel, None)
-                .with_hint("edit it in place; move it aside first to take the shipped copy"));
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if crate::init::publish_new(root, &rel, text)? {
-                    "created"
-                } else {
-                    return Err(GraphError::conflict(
-                        Code::SkillExists,
-                        "the skill appeared while add ran",
-                    )
-                    .at(rel, None));
+        let ref_mode = crate::coord::graph_git::for_root(root).is_some();
+        // In ref mode, and in a checkout-mode git checkout, the skill is
+        // committed under an exact lease (orchestrator #19564 on #15168);
+        // outside git, or on a branch with no commit yet (fresh `init`), it's
+        // written in place, as init writes it.
+        let committed = || {
+            crate::coord::Repo::open(root)
+                .is_ok_and(|r| mdkg_coord_sqlite::git::head(&r.top).is_ok())
+        };
+        if ref_mode || committed() {
+            if !ref_mode {
+                // Mirrors need the graph at the worktree's top: refused
+                // before anything is committed (Terra #19620).
+                let repo = crate::coord::Repo::open(root)?;
+                if !repo.prefix.is_empty() {
+                    return Err(GraphError::usage(
+                        Code::InstallUnsupportedLayout,
+                        format!(
+                            "the graph is in {} below the worktree's top; skill mirrors need it at the top",
+                            repo.prefix.trim_end_matches('/')
+                        ),
+                    ));
                 }
             }
-            Err(e) => {
-                return Err(GraphError::failure(
-                    Code::IoReadFailed,
-                    format!("can't read {rel}: {e}"),
-                ));
+            let (action, published, note) = crate::coord::graph_git::record_graph_file(
+                root,
+                actor,
+                &rel,
+                &format!("skills add {slug}"),
+                "skills",
+                |path| {
+                    // Read in the cache at the tip, under the lease.
+                    let have = current_skill(path, &rel)?;
+                    let action = add_action(have.as_deref(), text, replace, &rel)?;
+                    // The shipped bytes even when kept: in checkout mode a
+                    // copy left uncommitted by a stopped run still needs its
+                    // commit, which the helper judges against HEAD.
+                    Ok((Some(text.as_bytes().to_vec()), action))
+                },
+            )?;
+            // A copy already in place but committed only now was left by
+            // a stopped run: it's this run's addition.
+            let action = if action == "kept" && published.is_some() {
+                "created"
+            } else {
+                action
+            };
+            let (commit, changesets) = published.unzip();
+            // Checkout mode mirrors here; in ref mode install mirrors the
+            // graph ref's skills.
+            let mirrored = if ref_mode {
+                Vec::new()
+            } else {
+                sync_report(root, false)
+                    .map_err(|e| match &commit {
+                        Some(c) => e.with_hint(format!(
+                            "the skill is committed ({c}); fix the mirrors, then run `{BIN} skills sync`"
+                        )),
+                        None => e,
+                    })?
+                    .changes
+                    .into_iter()
+                    .filter(|c| c.action != mdkg_run::install::Action::Unchanged)
+                    .collect()
+            };
+            let mut report = Report::ok(SkillAddData {
+                slug: slug.into(),
+                path: rel,
+                action: action.into(),
+                mirrored,
+                commit,
+                changesets: changesets.unwrap_or_default(),
+            });
+            if ref_mode && action != "kept" {
+                report = report.with(Some(Diagnostic::warning(
+                    Code::SkillMirrorDrift,
+                    format!("the skill is on the graph ref; run `{BIN} install` to mirror it"),
+                )));
             }
-        };
+            return Ok(report.with(note));
+        }
+        let path = root.join(&rel);
+        let action = add_action(current_skill(&path, &rel)?.as_deref(), text, replace, &rel)?;
+        if action == "replaced" {
+            // Parent folders are checked, never followed; the file itself
+            // is a regular file (`current_skill`), so the shipped copy
+            // replaces it in one rename.
+            crate::anchor::refuse_linked_folders(root, &rel)?;
+            crate::write::atomic_write(&path, text.as_bytes()).map_err(|e| {
+                GraphError::failure(Code::IoWriteFailed, format!("can't write {rel}: {e}"))
+            })?;
+        } else if action == "created" && !crate::init::publish_new(root, &rel, text)? {
+            return Err(GraphError::conflict(
+                Code::SkillExists,
+                "the skill appeared while add ran",
+            )
+            .at(rel, None));
+        }
         let synced = sync_report(root, false)?;
         Ok(Report::ok(SkillAddData {
             slug: slug.into(),
@@ -942,6 +1200,8 @@ pub fn add(root: &Path, slug: &str, json: bool) -> u8 {
                 .into_iter()
                 .filter(|c| c.action != mdkg_run::install::Action::Unchanged)
                 .collect(),
+            commit: None,
+            changesets: Vec::new(),
         }))
     })()
     .unwrap_or_else(Report::failed);
@@ -956,6 +1216,19 @@ pub fn add(root: &Path, slug: &str, json: bool) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_note_names_a_skill_only_by_its_whole_folder() {
+        let wf = ".mdkg/skills/mdkg-workflow/template.env.example is a secret file, so it isn't mirrored.";
+        assert!(note_names_skill(wf, "mdkg-workflow"));
+        assert!(!note_names_skill(wf, "workflow"));
+        assert!(!note_names_skill(wf, "skills"));
+        assert!(!note_names_skill(wf, "mdkg"));
+        let unread =
+            ".mdkg/skills/workflow can't be read (denied), so it isn't mirrored as a skill.";
+        assert!(note_names_skill(unread, "workflow"));
+        assert!(!note_names_skill(unread, "work"));
+    }
 
     #[test]
     fn slugs_are_kebab_case() {

@@ -894,6 +894,7 @@ fn requirement_lint_warns_with_each_code_and_never_errors() {
     const SPIKE: &str = "spike-0192f3a4-0000-7000-8000-000000000012";
     const BARE: &str = "bug-0192f3a4-0000-7000-8000-000000000013";
     const DONE: &str = "task-0192f3a4-0000-7000-8000-000000000014";
+    const FEAT: &str = "feat-0192f3a4-0000-7000-8000-000000000016";
     const RULE: &str = "rule-0192f3a4-0000-7000-8000-000000000015";
     const MISSING: &str = "edd-0192f3a4-0000-7000-8000-0000000000ff";
     // `node` writes eight frontmatter lines, so body line n is file line
@@ -942,6 +943,8 @@ fn requirement_lint_warns_with_each_code_and_never_errors() {
         "# Requirements\n- R1: Which store is faster?\n- R2: Find the faster store.\n",
     );
     let bare = node(BARE, "bug", "", "# Overview\n\nNo requirements.\n");
+    // A feat is work too (e2e UX: req.missing skipped it).
+    let feat = node(FEAT, "feat", "", "# Overview\n\nNo requirements.\n");
     // A rule's own prose under `# Requirements` isn't a requirement list.
     let rule = design_node(
         RULE,
@@ -961,6 +964,7 @@ fn requirement_lint_warns_with_each_code_and_never_errors() {
             (".mdkg/work/task.md", task),
             (".mdkg/work/spike.md", spike),
             (".mdkg/work/bare.md", bare),
+            (".mdkg/work/feat.md", feat),
             (".mdkg/work/done.md", done),
             (".mdkg/core/rule.md", rule),
         ],
@@ -969,6 +973,7 @@ fn requirement_lint_warns_with_each_code_and_never_errors() {
     let work = |rel: &str| format!(".mdkg/work/{rel}");
     let expected = vec![
         (Code::ReqMissing, work("bare.md"), None),
+        (Code::ReqMissing, work("feat.md"), None),
         (Code::ReqRelationOnDesign, design("edd.md"), Some(10)),
         (Code::ReqNotQuestion, work("spike.md"), Some(11)),
         // Body lines 7 to 14 of the task.
@@ -998,4 +1003,12 @@ fn requirement_lint_warns_with_each_code_and_never_errors() {
         .find(|d| d.code == Code::ReqNotEars)
         .expect("not_ears");
     assert_eq!(not_ears.hint.as_deref(), Some("EARS uses shall"));
+    // The duplicate names the first use by its file line, as the
+    // diagnostic's own line is (e2e UX: it said "body line 9").
+    let duplicate = receipt
+        .warnings
+        .iter()
+        .find(|d| d.code == Code::ReqDuplicateId)
+        .expect("duplicate");
+    assert_eq!(duplicate.message, "R1 is already used on line 14");
 }

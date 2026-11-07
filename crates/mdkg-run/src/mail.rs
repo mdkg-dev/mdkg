@@ -21,6 +21,9 @@ use crate::error::{CODE_MAIL_FAILED, ErrorKind, RunError};
 pub struct Message {
     pub message_id: String,
     pub seq: u64,
+    /// Immutable body digest used to mark precisely the delivered message.
+    #[serde(default)]
+    pub digest: String,
     #[serde(default)]
     pub context_id: Option<String>,
     pub kind: String,
@@ -31,6 +34,11 @@ pub struct Message {
     pub room: Option<String>,
     #[serde(default)]
     pub sent_at: Option<String>,
+    /// Nodes and replaced messages recorded with this delivery.
+    #[serde(default)]
+    pub nodes: Vec<String>,
+    #[serde(default)]
+    pub supersedes: Vec<String>,
     /// Absent once the body is purged.
     #[serde(default)]
     pub parts: Vec<Value>,
@@ -82,6 +90,20 @@ pub struct Import<'a> {
     pub file: &'a Path,
 }
 
+/// A digest reply is addressed to the configured coordinator and binds
+/// the node cards and review requests shown in this turn.
+#[derive(Debug)]
+pub struct DigestImport<'a> {
+    pub kind: &'a str,
+    pub from: &'a str,
+    pub to: &'a str,
+    pub nodes: &'a [String],
+    /// A shown direct message from the reply's destination, if any.
+    pub answer: Option<&'a str>,
+    pub references: &'a [String],
+    pub file: &'a Path,
+}
+
 /// A note the launcher sends as itself, never as the agent: what it did
 /// with the agent's turn (audit, 2026-10-22).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,6 +115,11 @@ pub struct Note<'a> {
     pub reply_to: Option<&'a str>,
     pub text: &'a str,
 }
+
+/// The kinds of mail that answer a message: a turn that sent one of these
+/// for the message it was shown has no final reply imported
+/// ([`Mail::sent_to`]).
+pub const ANSWER_KINDS: &[&str] = &["handoff", "findings"];
 
 /// Private installed-launcher receipt adapters. No CLI flag selects these.
 #[derive(Debug, Clone, Copy)]
@@ -116,6 +143,9 @@ pub struct ReceiptCallbacks {
     pub clear: fn(&CliMail, &str, &str) -> Result<Vec<String>, RunError>,
     /// How many occurrences of an agent's code were cleared.
     pub clears: fn(&CliMail, &str, &str) -> Result<u64, RunError>,
+    /// The highest number of a message `from` sent that answers a message
+    /// after `after`, or `after` when none ([`Mail::sent_to`]).
+    pub sent: fn(&CliMail, &str, &Message, u64) -> Result<u64, RunError>,
 }
 
 /// What became of a fault send.
@@ -170,6 +200,16 @@ pub trait Mail {
         Err(no_receipts())
     }
     fn receipt_send(&mut self, _receipt: &Receipt<'_>) -> Result<String, RunError> {
+        Err(no_receipts())
+    }
+    /// The highest number of a message `from` sent after message number
+    /// `after` that answers `answers`: a [`ANSWER_KINDS`] message to its
+    /// sender that replies to it or is in its context. Otherwise `after`.
+    /// A turn compares it with its start to tell whether it already
+    /// answered that message itself; questions, notes and other mail to
+    /// the sender don't count (review of 710641d2). A client that can't
+    /// tell returns an error, and the reply is imported as before.
+    fn sent_to(&mut self, _from: &str, _answers: &Message, _after: u64) -> Result<u64, RunError> {
         Err(no_receipts())
     }
     /// Sends one fault occurrence from `mdkg:supervisor` (A26).
@@ -237,6 +277,25 @@ pub trait Mail {
             more,
         })
     }
+    /// A digest computes over mail without marking bodies as shown.
+    fn digest_inbox_after(
+        &mut self,
+        _agent: &str,
+        _after: Option<u64>,
+        _limit: usize,
+    ) -> Result<Inbox, RunError> {
+        Err(RunError::failure(
+            CODE_MAIL_FAILED,
+            "mail client has no no-mark digest read",
+        ))
+    }
+    /// Mark only complete bodies delivered to a successful digest turn.
+    fn mark_digest_shown(&mut self, _agent: &str, _messages: &[Message]) -> Result<(), RunError> {
+        Err(RunError::failure(
+            CODE_MAIL_FAILED,
+            "mail client cannot mark digest bodies shown",
+        ))
+    }
     /// Blocks until unacked mail newer than `after` that wakes the agent
     /// exists (a channel post only in a waking kind); `None` on timeout.
     fn wait(
@@ -245,8 +304,25 @@ pub trait Mail {
         after: Option<u64>,
         timeout_secs: u64,
     ) -> Result<Option<Inbox>, RunError>;
+    fn wait_digest(
+        &mut self,
+        _agent: &str,
+        _after: Option<u64>,
+        _timeout_secs: u64,
+    ) -> Result<Option<Inbox>, RunError> {
+        Err(RunError::failure(
+            CODE_MAIL_FAILED,
+            "mail client has no no-mark digest wait",
+        ))
+    }
     /// Records the reply; returns its message id.
     fn import(&mut self, import: &Import<'_>) -> Result<String, RunError>;
+    fn import_digest(&mut self, _import: &DigestImport<'_>) -> Result<String, RunError> {
+        Err(RunError::failure(
+            CODE_MAIL_FAILED,
+            "mail client cannot import digest replies",
+        ))
+    }
     fn ack(&mut self, agent: &str, ids: &[String], outcome: &str) -> Result<(), RunError>;
     /// Takes the lease on a scope.
     fn claim(&mut self, scope: &str) -> Result<(), RunError>;
@@ -645,6 +721,84 @@ impl CliMail {
 const WAIT_TIMEOUT: &str = "msg.wait_timeout";
 
 impl Mail for CliMail {
+    fn digest_inbox_after(
+        &mut self,
+        agent: &str,
+        after: Option<u64>,
+        limit: usize,
+    ) -> Result<Inbox, RunError> {
+        let limit = limit.to_string();
+        let after = after.map(|n| n.to_string());
+        let mut args = vec!["msg", "inbox", "--no-mark", "--limit", &limit];
+        if let Some(a) = &after {
+            args.extend(["--after", a]);
+        }
+        let (_, data) = self.call(agent, &args)?;
+        Self::inbox_from(data)
+    }
+    fn mark_digest_shown(&mut self, agent: &str, messages: &[Message]) -> Result<(), RunError> {
+        for chunk in messages.chunks(100) {
+            let flags: Vec<String> = chunk
+                .iter()
+                .map(|m| format!("--mark-shown={}/{}/{}", m.seq, m.digest, m.message_id))
+                .collect();
+            let mut args = vec!["msg", "inbox"];
+            args.extend(flags.iter().map(String::as_str));
+            self.call(agent, &args)?;
+        }
+        Ok(())
+    }
+    fn wait_digest(
+        &mut self,
+        agent: &str,
+        after: Option<u64>,
+        timeout_secs: u64,
+    ) -> Result<Option<Inbox>, RunError> {
+        let timeout = timeout_secs.to_string();
+        let after = after.map(|n| n.to_string());
+        let kinds = format!("--channel-kind={}", crate::hooks::ROOM_WAKE_KINDS.join(","));
+        let mut args = vec!["msg", "wait", "--no-mark", "--timeout", &timeout, &kinds];
+        if let Some(a) = &after {
+            args.extend(["--after", a]);
+        }
+        match self.call(agent, &args) {
+            Ok((_, data)) => Self::inbox_from(data).map(Some),
+            Err(e) if e.code == WAIT_TIMEOUT => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+    fn import_digest(&mut self, i: &DigestImport<'_>) -> Result<String, RunError> {
+        let mut args = vec![
+            "msg".to_string(),
+            "import".into(),
+            format!("--kind={}", i.kind),
+            format!("--from={}", i.from),
+            format!("--to={}", i.to),
+        ];
+        args.extend(i.nodes.iter().map(|n| format!("--node-id={n}")));
+        if let Some(answer) = i.answer {
+            args.push(format!("--reply-to={answer}"));
+        } else {
+            args.push("--standalone".into());
+        }
+        args.extend(
+            i.references
+                .iter()
+                .filter(|r| Some(r.as_str()) != i.answer)
+                .map(|r| format!("--reply-to={r}")),
+        );
+        args.push("--".into());
+        args.push(i.file.display().to_string());
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let launcher = self.launcher.clone();
+        let (_, data) = self.call(&launcher, &refs)?;
+        data.pointer("/message/messageId")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| {
+                RunError::failure(CODE_MAIL_FAILED, "msg import didn't return a messageId")
+            })
+    }
     fn decision_audit(&mut self, agent: &str, ids: &[String]) -> Result<Vec<Value>, RunError> {
         if ids.is_empty() {
             return Ok(Vec::new());
@@ -678,6 +832,9 @@ impl Mail for CliMail {
     }
     fn receipt_send(&mut self, receipt: &Receipt<'_>) -> Result<String, RunError> {
         (self.receipt_callbacks()?.deliver)(self, receipt)
+    }
+    fn sent_to(&mut self, from: &str, answers: &Message, after: u64) -> Result<u64, RunError> {
+        (self.receipt_callbacks()?.sent)(self, from, answers, after)
     }
     fn fault_send(&mut self, fault: &crate::fault::Fault) -> Result<FaultSent, RunError> {
         (self.receipt_callbacks()?.fault)(self, fault)

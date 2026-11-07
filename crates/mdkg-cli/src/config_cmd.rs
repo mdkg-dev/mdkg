@@ -1,4 +1,6 @@
-//! Inspect merged settings without opening the coordinator or writing files.
+//! Inspect merged settings without opening the coordinator or writing
+//! files (`config show`), and change the committed project config
+//! (`config set`, `config unset`).
 
 use crate::BIN;
 use std::collections::{BTreeMap, BTreeSet};
@@ -15,6 +17,7 @@ use serde_json::Value;
 use crate::output::{self, Report};
 
 mod redact;
+pub(crate) mod set;
 
 #[derive(Debug, Subcommand)]
 pub enum ConfigCommand {
@@ -28,21 +31,75 @@ pub enum ConfigCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Change one key of the committed project config: in ref mode a
+    /// commit on the graph ref, in checkout mode a commit of
+    /// `.mdkg/config.json` where the committed config is read.
+    ///
+    /// The value is JSON (a bare word is taken as a string). The key must
+    /// be one this build knows, and the changed config must pass the rules
+    /// `doctor` and `validate` apply, or nothing changes.
+    #[command(after_help = examples!(
+        "config set coordination.messages.ack_grace_days 0",
+        "config set coordination.leases.default '\"shared\"' --dry-run",
+        "config set /coordination/messages/retention '\"durable\"' --json"
+    ))]
+    Set {
+        /// A dotted path (`coordination.messages.ack_grace_days`) or a JSON
+        /// pointer (`/coordination/messages/ack_grace_days`).
+        key: String,
+        /// The new value, as JSON (a negative number is a value, not a flag).
+        #[arg(allow_hyphen_values = true)]
+        value: String,
+        /// Show the change, without claiming, writing or committing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Print JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove one key from the committed project config, so its default
+    /// applies; committed as `config set` commits.
+    #[command(after_help = examples!(
+        "config unset coordination.messages.ack_grace_days",
+        "config unset coordination.messages.ack_grace_days --dry-run --json"
+    ))]
+    Unset {
+        /// A dotted path or a JSON pointer.
+        key: String,
+        /// Show the change, without claiming, writing or committing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Print JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 impl ConfigCommand {
     pub fn name(&self) -> &'static str {
-        "config.show"
+        match self {
+            Self::Show { .. } => "config.show",
+            Self::Set { .. } => "config.set",
+            Self::Unset { .. } => "config.unset",
+        }
     }
 
     pub fn json(&self) -> bool {
         match self {
-            Self::Show { json, .. } => *json,
+            Self::Show { json, .. } | Self::Set { json, .. } | Self::Unset { json, .. } => *json,
         }
+    }
+
+    /// Whether it writes the graph (main's checkout-mode writer gate).
+    pub fn writes_graph(&self) -> bool {
+        matches!(
+            self,
+            Self::Set { dry_run: false, .. } | Self::Unset { dry_run: false, .. }
+        )
     }
 }
 
-#[derive(Debug, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceLayer {
     BuiltIn,
@@ -98,6 +155,20 @@ pub struct ShowData {
     /// resolves it; absent in checkout mode.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub graph: Option<GraphData>,
+    /// The coordinator store's own id, as `anchor` names it: stable for the
+    /// store's life, across restores of its snapshots, and the same from
+    /// every worktree of the repository. Null outside a repository, or
+    /// before anything has created the store.
+    pub store_id: Option<String>,
+}
+
+/// The coordinator store's id, read without creating or upgrading it.
+pub(crate) fn store_id(root: &Path) -> Option<String> {
+    let path = mdkg_coord_sqlite::git::store_path(root).ok()?;
+    mdkg_coord_sqlite::Store::open_read_only(&path)
+        .ok()??
+        .store_id()
+        .ok()
 }
 
 /// Where a ref-mode graph's committed config lives, from the resolver
@@ -121,13 +192,15 @@ pub struct GraphData {
 }
 
 /// Reuse the config display rules for other views of the same settings.
-pub(crate) fn redact_display(value: &mut Value, pointer: &str) {
-    redact::values(value, pointer, false, &mut Vec::new());
+/// A key that looks like a credential is renamed, as `config show`
+/// renames it; the returned renames map pointers into the original.
+pub(crate) fn redact_display(value: &mut Value, pointer: &str) -> redact::Renames {
+    redact::tree(value, pointer, &mut Vec::new())
 }
 
 pub(crate) fn display_text(text: &str) -> String {
     let mut value = Value::String(text.to_string());
-    redact_display(&mut value, "");
+    let _ = redact_display(&mut value, "");
     value.as_str().expect("display string").to_string()
 }
 
@@ -150,7 +223,7 @@ pub(crate) fn effective_agent(
     let root = format!("/agents/{}", name.replace('~', "~0").replace('/', "~1"));
     let mut values = snapshot.effective.values.get("agents")?.get(name)?.clone();
     let mut redacted = Vec::new();
-    redact::values(&mut values, &root, false, &mut redacted);
+    let renames = redact::tree(&mut values, &root, &mut redacted);
     let origins = snapshot
         .effective
         .origins
@@ -158,7 +231,7 @@ pub(crate) fn effective_agent(
         .filter(|(p, _)| at_or_below(p, &root))
         .map(|(p, o)| {
             (
-                p.clone(),
+                renames.pointer(p),
                 OriginData {
                     layer: o.layer.into(),
                     path: o.path.clone(),
@@ -239,12 +312,13 @@ pub(crate) fn ref_mode_root(root: &Path) -> Result<Option<PathBuf>, GraphError> 
     }
 }
 
-/// The ref-mode root graph's folder. 0.7.1's ref mode reads the
-/// repository-root graph from `.mdkg` only (graph_git's bind,
-/// `graphref::graph_paths`); honouring a registered `mdkg.graph.<id>.dir`
-/// there is 0.7.2 (orchestrator #16095). So doctor, config show, every
-/// bound command and the setup move into ref mode refuse one naming another
-/// folder, saying where the graph's config is on `tip` when there is one.
+/// The ref-mode root graph's folder. Ref mode keeps the repository-root
+/// graph at `.mdkg` (graph_git's bind, `graphref::graph_paths`;
+/// orchestrator #19410 on #16095): no mdkg writer records a root
+/// `mdkg.graph.<id>.dir`, so only a hand-set key names another folder. So
+/// doctor, config show, every bound command and the setup move into ref
+/// mode refuse one naming another folder, saying where the graph's config
+/// is on `tip` when there is one, and which key to unset.
 /// Records that disagree keep `GraphRef::folder`'s own refusal.
 pub(crate) fn root_graph_folder(
     top: &Path,
@@ -298,6 +372,12 @@ pub(crate) fn unsupported_root_folder(
     graph_ref: &str,
 ) -> GraphError {
     let default = mdkg_graph::committed::DEFAULT_DIR;
+    // Each key's own command (`key` may list several, comma-separated).
+    let unset = key
+        .split(", ")
+        .map(|k| format!("`git config --unset {k}`"))
+        .collect::<Vec<_>>()
+        .join(" and ");
     let has = |folder: &str| {
         tip.and_then(|tip| {
             mdkg_graph::committed::config_file_if_present_dir(top, tip, "", folder)
@@ -323,22 +403,21 @@ pub(crate) fn unsupported_root_folder(
     GraphError::failure(
         Code::ConfigInvalid,
         format!(
-            "{key} registers the repository-root graph in `{dir}`, but ref mode reads that \
-             graph only from `{default}` in this version{found}"
+            "{key} registers the repository-root graph in `{dir}`, but ref mode keeps that \
+             graph in `{default}`{found}"
         ),
     )
     .with_hint(match (has(dir), has(default)) {
         // The move is done on the ref: only the record is left (Terra
         // #16224).
         (Some(false), Some(true)) => format!(
-            "the graph is already in `{default}` on {graph_ref}, so remove {key} (`git config \
-             --unset <key>` for each); or stay in checkout mode until 0.7.2 (`{BIN} install \
-             --checkout-mode` moves back)"
+            "the graph is already in `{default}` on {graph_ref}, so remove the key: {unset}; or \
+             stay in checkout mode (`{BIN} install --checkout-mode` moves back)"
         ),
         _ => format!(
-            "stay in checkout mode until 0.7.2 (`{BIN} install --checkout-mode` moves back), or \
-             move the graph's `{dir}` folder to `{default}` in a commit to the graph and only \
-             then remove {key}"
+            "move the graph's `{dir}` folder to `{default}` in a commit to the graph, and only \
+             then remove the key: {unset}; or stay in checkout mode (`{BIN} install \
+             --checkout-mode` moves back)"
         ),
     })
 }
@@ -460,7 +539,23 @@ fn names_graph_ref(listed: &[u8]) -> bool {
         .any(|key| key.eq_ignore_ascii_case(b"mdkg.graph.ref"))
 }
 
-fn show(root: &Path) -> Result<Report<ShowData>, GraphError> {
+/// The settings `config show` reads, layered, before any display rule:
+/// shared by `config show` and `agents list`.
+struct Layered {
+    effective: settings::Effective,
+    sources: SourcePaths,
+    warnings: Vec<String>,
+    definition_names: BTreeSet<String>,
+    authored_names: BTreeSet<String>,
+    /// The names the project layer defines: `authored_names` less an
+    /// inline entry that is `null` with no definition file, since a `null`
+    /// removes an agent rather than defining it.
+    project_defines: BTreeSet<String>,
+    ref_root: Option<PathBuf>,
+    read_commit: Option<String>,
+}
+
+fn layered(root: &Path) -> Result<Layered, GraphError> {
     if !std::fs::metadata(root)
         .map_err(|_| GraphError::failure(Code::IoReadFailed, "cannot inspect the selected root"))?
         .is_dir()
@@ -495,74 +590,246 @@ fn show(root: &Path) -> Result<Report<ShowData>, GraphError> {
     let project_root = ref_root.as_deref().unwrap_or(root);
     let has_project = ref_root.is_some() || has_project(root)?;
     let mut read_commit = None;
-    let (effective, sources, mut warnings, definition_names, authored_names) = if has_project {
-        // Definitions and configuration share one committed authority. The
-        // project identity is checked before any optional sources are read.
-        let authority =
-            mdkg_run::orchestration::authority(project_root).map_err(crate::run::graph_error)?;
-        read_commit = Some(authority.commit.clone());
-        let project = layers::Project::from_authority(&authority, project_root, environment)?;
-        let additions = mdkg_run::orchestration::agent::authority_layer_inputs(&authority)
-            .map_err(crate::run::graph_error)?;
-        let definition_names = additions
-            .iter()
-            .filter_map(|input| input.value.get("agents").and_then(Value::as_object))
-            .flat_map(|agents| agents.keys().cloned())
-            .collect::<BTreeSet<_>>();
-        let authored_names = project
-            .project_input()
-            .value
-            .get("agents")
-            .and_then(Value::as_object)
-            .into_iter()
-            .flat_map(|agents| agents.keys().cloned())
-            .chain(definition_names.iter().cloned())
-            .collect::<BTreeSet<_>>();
-        let resolved =
-            mdkg_run::orchestration::agent::resolve_layers(&project, &additions, None, None)?;
-        let paths = project.paths();
-        (
-            resolved.effective,
-            SourcePaths {
-                user: paths.user.clone(),
-                project: project.project_input().origin.path.clone(),
-                local: paths.local.clone(),
-            },
-            resolved.warnings.iter().map(ToString::to_string).collect(),
-            definition_names,
-            authored_names,
-        )
-    } else {
-        // A user-only view never imports an enclosing repository's local
-        // settings or discovers Git. It also works outside a checkout.
-        let user = Paths::user_path(environment).map_err(settings_error)?;
-        let input = user
-            .as_deref()
-            .map(|p| Input::read(Layer::User, p))
-            .transpose()
-            .map_err(settings_error)?
-            .flatten()
-            .map(layers::normalize)
-            .transpose()?;
-        let effective = Layers {
-            user: input,
-            project: None,
-            local: None,
-        }
-        .resolve(&settings::defaults().map_err(settings_error)?, &[], None)
-        .map_err(settings_error)?;
-        (
-            effective,
-            SourcePaths {
-                user,
+    let (effective, sources, warnings, definition_names, authored_names, project_defines) =
+        if has_project {
+            // Definitions and configuration share one committed authority. The
+            // project identity is checked before any optional sources are read.
+            let authority = mdkg_run::orchestration::authority(project_root)
+                .map_err(crate::run::graph_error)?;
+            read_commit = Some(authority.commit.clone());
+            let project = layers::Project::from_authority(&authority, project_root, environment)?;
+            let additions = mdkg_run::orchestration::agent::authority_layer_inputs(&authority)
+                .map_err(crate::run::graph_error)?;
+            let definition_names = additions
+                .iter()
+                .filter_map(|input| input.value.get("agents").and_then(Value::as_object))
+                .flat_map(|agents| agents.keys().cloned())
+                .collect::<BTreeSet<_>>();
+            let authored_names = project
+                .project_input()
+                .value
+                .get("agents")
+                .and_then(Value::as_object)
+                .into_iter()
+                .flat_map(|agents| agents.keys().cloned())
+                .chain(definition_names.iter().cloned())
+                .collect::<BTreeSet<_>>();
+            let project_defines = project
+                .project_input()
+                .value
+                .get("agents")
+                .and_then(Value::as_object)
+                .into_iter()
+                .flat_map(|agents| agents.iter())
+                .filter(|(_, v)| !v.is_null())
+                .map(|(k, _)| k.clone())
+                .chain(definition_names.iter().cloned())
+                .collect::<BTreeSet<_>>();
+            let resolved =
+                mdkg_run::orchestration::agent::resolve_layers(&project, &additions, None, None)?;
+            let paths = project.paths();
+            (
+                resolved.effective,
+                SourcePaths {
+                    user: paths.user.clone(),
+                    project: project.project_input().origin.path.clone(),
+                    local: paths.local.clone(),
+                },
+                resolved.warnings.iter().map(ToString::to_string).collect(),
+                definition_names,
+                authored_names,
+                project_defines,
+            )
+        } else {
+            // A user-only view never imports an enclosing repository's local
+            // settings or discovers Git. It also works outside a checkout.
+            let user = Paths::user_path(environment).map_err(settings_error)?;
+            let input = user
+                .as_deref()
+                .map(|p| Input::read(Layer::User, p))
+                .transpose()
+                .map_err(settings_error)?
+                .flatten()
+                .map(layers::normalize)
+                .transpose()?;
+            let effective = Layers {
+                user: input,
                 project: None,
                 local: None,
-            },
-            ancestor_notice(root),
-            BTreeSet::new(),
-            BTreeSet::new(),
-        )
+            }
+            .resolve(&settings::defaults().map_err(settings_error)?, &[], None)
+            .map_err(settings_error)?;
+            (
+                effective,
+                SourcePaths {
+                    user,
+                    project: None,
+                    local: None,
+                },
+                ancestor_notice(root),
+                BTreeSet::new(),
+                BTreeSet::new(),
+                BTreeSet::new(),
+            )
+        };
+    Ok(Layered {
+        effective,
+        sources,
+        warnings,
+        definition_names,
+        authored_names,
+        project_defines,
+        ref_root,
+        read_commit,
+    })
+}
+
+/// One agent the layered settings name, for `agents list`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ListedAgent {
+    /// The agent's name; one that looks like a credential is
+    /// `[redacted key <n>]`, numbered within this list.
+    pub name: String,
+    /// The layer that defines it: `project` for a committed definition
+    /// file (`.mdkg/agents/<name>.json`) or an inline entry in the project
+    /// config; otherwise the first of `user` and `local` that names it.
+    pub defined_in: SourceLayer,
+    /// Defined by its own committed file rather than inline in the config.
+    pub file_backed: bool,
+    /// Every layer whose own settings have an entry for it (the project
+    /// layer: the project config or a definition file), in precedence order:
+    /// a layer counts even where a higher one overrides each field it sets.
+    pub layers: Vec<SourceLayer>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+}
+
+/// The agents the settings `config show` reads name, with their layers;
+/// values are redacted as `config show` redacts them. Reads settings
+/// only: nothing is probed and no saved state is read.
+pub(crate) fn agents(root: &Path) -> Result<(Vec<ListedAgent>, Vec<String>), GraphError> {
+    let Layered {
+        effective,
+        sources,
+        warnings,
+        definition_names,
+        project_defines,
+        ..
+    } = layered(root)?;
+    // The names each layer's own input gives: an effective leaf keeps
+    // only the winning layer, so a field every layer sets would hide the
+    // others (Terra #20933). The project layer is the project config's
+    // entries and the definition files. An entry that is `null` removes
+    // the agent rather than defining it, so that layer doesn't count.
+    let named_in = |layer: Layer, path: &Option<PathBuf>| -> BTreeSet<String> {
+        path.as_deref()
+            .and_then(|p| Input::read(layer, p).ok().flatten())
+            .and_then(|input| {
+                input
+                    .value
+                    .get("agents")
+                    .and_then(Value::as_object)
+                    .map(|a| {
+                        a.iter()
+                            .filter(|(_, v)| !v.is_null())
+                            .map(|(k, _)| k.clone())
+                            .collect()
+                    })
+            })
+            .unwrap_or_default()
     };
+    let by_layer = [
+        (SourceLayer::User, named_in(Layer::User, &sources.user)),
+        (SourceLayer::Project, project_defines.clone()),
+        (SourceLayer::Local, named_in(Layer::Local, &sources.local)),
+    ];
+    let mut names: BTreeSet<String> = effective
+        .values
+        .get("agents")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|a| {
+            a.iter()
+                .filter(|(_, v)| !v.is_null())
+                .map(|(k, _)| k.clone())
+        })
+        .collect();
+    for (_, named) in &by_layer {
+        names.extend(named.iter().cloned());
+    }
+    names.remove("defaults");
+    // Each entry is read raw and redacted on its own, and a name that looks
+    // like a credential gets a label from one count over this list that
+    // skips every name shown as it is. No entry is looked up by a label,
+    // so none can be mistaken for another (Terra #20949, #20956).
+    let taken: BTreeSet<&String> = names
+        .iter()
+        .filter(|n| !redact::key_looks_secret(n))
+        .collect();
+    let mut count = 0;
+    let mut listed = Vec::new();
+    for name in &names {
+        let at = format!("/agents/{}", name.replace('~', "~0").replace('/', "~1"));
+        let layers: Vec<SourceLayer> = by_layer
+            .iter()
+            .filter(|(_, named)| named.contains(name))
+            .map(|(layer, _)| *layer)
+            .collect();
+        let file_backed = definition_names.contains(name);
+        let defined_in = if file_backed || project_defines.contains(name) {
+            SourceLayer::Project
+        } else {
+            layers.first().copied().unwrap_or(SourceLayer::Project)
+        };
+        let secret_name = redact::key_looks_secret(name);
+        let shown = effective.values.pointer(&at).cloned().map(|mut entry| {
+            redact::entry(&mut entry, &at, secret_name);
+            entry
+        });
+        let field = |f: &str| {
+            shown
+                .as_ref()
+                .and_then(|e| e.get(f))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        };
+        let shown_name = if secret_name {
+            loop {
+                count += 1;
+                let label = redact::key_name(count);
+                if !taken.contains(&label) {
+                    break label;
+                }
+            }
+        } else {
+            name.clone()
+        };
+        listed.push(ListedAgent {
+            name: shown_name,
+            defined_in,
+            file_backed,
+            layers,
+            harness: field("harness"),
+            role: field("role"),
+        });
+    }
+    let warnings = warnings.iter().map(|w| display_text(w)).collect();
+    Ok((listed, warnings))
+}
+
+fn show(root: &Path) -> Result<Report<ShowData>, GraphError> {
+    let Layered {
+        effective,
+        sources,
+        mut warnings,
+        definition_names,
+        authored_names,
+        ref_root,
+        read_commit,
+        ..
+    } = layered(root)?;
     let optional = effective
         .origins
         .iter()
@@ -611,7 +878,7 @@ fn show(root: &Path) -> Result<Report<ShowData>, GraphError> {
     warnings.extend(notices);
     let mut values = effective.values;
     let mut redacted = Vec::new();
-    redact::values(&mut values, "", false, &mut redacted);
+    let renames = redact::tree(&mut values, "", &mut redacted);
     let graph = match (&ref_root, read_commit) {
         (Some(top), Some(commit)) => Some(graph_data(top, commit)?),
         _ => None,
@@ -624,7 +891,7 @@ fn show(root: &Path) -> Result<Report<ShowData>, GraphError> {
             .into_iter()
             .map(|(pointer, origin)| {
                 (
-                    pointer,
+                    renames.pointer(&pointer),
                     OriginData {
                         layer: origin.layer.into(),
                         path: origin.path,
@@ -636,10 +903,44 @@ fn show(root: &Path) -> Result<Report<ShowData>, GraphError> {
         warnings,
         redacted,
         graph,
+        store_id: store_id(root),
     }))
 }
 
-pub fn run(root: &Path, command: &ConfigCommand) -> u8 {
+pub fn run(root: &Path, actor: Option<String>, command: &ConfigCommand) -> u8 {
+    let (key, change, dry_run) = match command {
+        ConfigCommand::Show { .. } => return run_show(root, command),
+        ConfigCommand::Set {
+            key,
+            value,
+            dry_run,
+            ..
+        } => (key, set::Change::Set(value), *dry_run),
+        ConfigCommand::Unset { key, dry_run, .. } => (key, set::Change::Unset, *dry_run),
+    };
+    output::emit(
+        command.name(),
+        command.json(),
+        set::run(root, actor, key, &change, dry_run).unwrap_or_else(Report::failed),
+        |data| {
+            print!("{}", output::shown_body(&data.diff));
+            let what = match (&data.commit, data.dry_run, data.changed) {
+                (_, true, true) => "would change".to_owned(),
+                (_, _, false) => "unchanged".to_owned(),
+                (Some(commit), _, _) => format!("committed {commit}"),
+                (None, _, _) => "changed".to_owned(),
+            };
+            let on = data
+                .graph_ref
+                .as_deref()
+                .map(|r| format!(" on {}", output::shown(r)))
+                .unwrap_or_default();
+            println!("{}: {what}{on}", output::shown(&data.key));
+        },
+    )
+}
+
+fn run_show(root: &Path, command: &ConfigCommand) -> u8 {
     output::emit(
         command.name(),
         command.json(),

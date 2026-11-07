@@ -225,34 +225,49 @@ pub fn write_anchor(
         // Ref mode: the anchor is published on the graph ref through the
         // write path; nothing is left in the cache for anyone to commit.
         // The request id is the chain position, so a rerun at the same seq
-        // returns the first publish.
+        // returns the first publish. A stale intent left at that id (the
+        // graph changed the anchor since it was recorded) would refuse
+        // every rerun, so one retry adds the graph's tip: a new id at the
+        // same seq, distinct for each later tip (anchor-stale-retry).
         Some(mode) => {
-            use crate::coord::graph_git::{Publish, prepare_record_publish};
+            use crate::coord::graph_git::{Publish, graph_error, prepare_record_publish};
             let rel = format!("{ANCHOR_DIR}/{id}.json");
             let request = format!("anchor-{id}-{last}");
             let actor = std::env::var("MDKG_ACTOR")
                 .ok()
                 .filter(|a| !a.trim().is_empty())
                 .unwrap_or_else(|| "mdkg".into());
-            prepare_record_publish(
-                &mode,
-                store,
-                (&request, "anchor", &actor),
-                |w, _| {
-                    w.write(&rel, text.as_bytes())?;
-                    Ok((
-                        Publish {
-                            message: format!("anchor {id}"),
-                            leases: Vec::new(),
-                            allowed: vec![mdkg_coord::Scope::new(rel.as_str())],
-                            trailers: Vec::new(),
-                        },
-                        (),
-                    ))
-                },
-                // An anchor holds no lease: there's no changeset to record.
-                |_, _| Ok(()),
-            )?;
+            let mut publish = |request: &str| {
+                prepare_record_publish(
+                    &mode,
+                    store,
+                    (request, "anchor", &actor),
+                    |w, _| {
+                        w.write(&rel, text.as_bytes())?;
+                        Ok((
+                            Publish {
+                                message: format!("anchor {id}"),
+                                leases: Vec::new(),
+                                allowed: vec![mdkg_coord::Scope::new(rel.as_str())],
+                                trailers: Vec::new(),
+                            },
+                            (),
+                        ))
+                    },
+                    // An anchor holds no lease: there's no changeset to record.
+                    |_, _| Ok(()),
+                )
+            };
+            match publish(&request) {
+                Err(e) if e.diagnostic.code == Code::GraphIntentStale => {
+                    let tip = mdkg_graph::graphref::tip(&mode.checkout, &mode.graph)
+                        .map_err(|e| graph_error(e.code, e.message))?;
+                    publish(&format!("{request}-{}", &tip[..tip.len().min(12)]))?;
+                }
+                other => {
+                    other?;
+                }
+            }
         }
         None => write_whole(&path, &text)?,
     }

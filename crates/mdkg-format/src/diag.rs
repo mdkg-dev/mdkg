@@ -168,12 +168,14 @@ codes! {
     CoordSyncFailed => "coord.sync_failed", "Stacking on another branch's version failed.";
     CoordPathMissing => "coord.path_missing", "A claimed path doesn't exist in any worktree yet.";
     CoordLeaseLimit => "coord.lease_limit", "The actor already holds the most leases one actor may; it releases some first.";
+    CoordMergeConflict => "coord.merge_conflict", "A co-holder's branch conflicts with yours (by git merge-tree, committed work only) in files under your shared lease; advisory, nothing is refused.";
     CoordLeaseShared => "coord.lease_shared", "Other actors hold shared leases overlapping yours.";
     CoordNodeDone => "coord.node_done", "The claimed node is already done.";
     CoordContainsAbandoned => "coord.contains_abandoned", "A changeset's commit contains abandoned work, which would reach main with it.";
     CoordStoreFailed => "coord.store_failed", "The coordinator store can't be opened or read.";
     CoordStoreRestored => "coord.store_restored", "The restored store is older than this build: the next command this build runs upgrades it again, copying it first.";
     CoordStoreUpgraded => "coord.store_upgraded", "This command upgraded the coordinator store, after copying it as it was beside it; `store restore` brings the copy back.";
+    CoordStoreWeakSync => "coord.store_weak_sync", "This command created the coordinator store with a plain fsync only (MDKG_STORE_PLAIN_FSYNC=1), where the file system refused the full barrier: a weaker guarantee.";
     CoordAuthorityFailed => "coord.authority_failed", "The configured lease authority can't be trusted, run or understood; nothing was granted locally, though the authority may have acted.";
     CoordAuthorityRemote => "coord.authority_remote", "Leases are held by a lease authority; status shows only the local store.";
     CoordAuthorityNote => "coord.authority_note", "A diagnostic from the lease authority with a code this build doesn't know; the message starts with that code.";
@@ -188,7 +190,7 @@ codes! {
     EdgePrivateTarget => "edge.private_target", "A committed node names a profile C work node, which git never holds, so every fresh clone breaks: work refers to design, never the other way round.";
     EdgeBlocksAncestor => "edge.blocks_ancestor", "A node is blocked by a parent, epic or goal above it (written as its blocked_by, or the ancestor's blocks): the two could only wait on each other, so the ready set ignores the edge.";
 
-    MsgHumanActor => "msg.human_actor", "A command a human:* mailbox can't run (a human only acks, reads their own mail and threads, and leaves channels as themselves), a $MDKG_ACTOR naming anyone but that human, or a --from naming a human.";
+    MsgHumanActor => "msg.human_actor", "A command a human:* mailbox can't run (a human only acks, reads their own mail and threads, leaves channels and sends mail as themselves), a $MDKG_ACTOR naming anyone but that human, or a --from naming a human.";
     MsgReservedActor => "msg.reserved_actor", "An actor can't be named role:* or run:*; hold a role with a lease instead.";
     MsgBadKind => "msg.bad_kind", "The message kind isn't one this build knows, or is one only mdkg sends (receipt, fault).";
     MsgBadId => "msg.bad_id", "A message id, mailbox, channel, role, turn or agent name isn't well formed; a claimed path, or a node in a folder named like a role or a turn, would overlap one; or a role or turn claim is ambiguous with a workspace alias.";
@@ -245,6 +247,7 @@ codes! {
     RunCwdOutside => "run.cwd_outside", "An agent's folder must be one of the repository's worktrees.";
     InstallUnmergeable => "install.unmergeable", "A config file can't be merged safely, so install left it alone.";
     InstallUnsupportedLayout => "install.unsupported_layout", "install needs the graph at the top of its worktree.";
+    InstallLegacyProjections => "install.legacy_projections", "The config has no projections key, so install uses the legacy default list; in 0.7.3 a config without the key lists none.";
     InitExists => "init.exists", "The folder already has an mdkg graph (.mdkg/config.json).";
     DoctorCheckFailed => "doctor.check_failed", "A doctor check failed; its record in the output says which and why.";
     DoctorCheckWarned => "doctor.check_warned", "A doctor check found something to look at; its record says what.";
@@ -253,7 +256,7 @@ codes! {
     SkillMirrorDrift => "skill.mirror_drift", "A mirrored skill is missing or differs from its .mdkg/skills source.";
     SkillMirrorStale => "skill.mirror_stale", "A mirror holds a managed skill whose source is gone.";
     SkillMirrorTargetsUnsupported => "skill.mirror_targets_unsupported", "skills sync writes only .agents/skills and .claude/skills, and the config names other mirror folders.";
-    SkillRefMode => "skill.ref_mode", "skills sync and skills add write a checkout's .mdkg/skills, which a ref-mode checkout lacks; install refreshes the skill mirrors there.";
+    SkillRefMode => "skill.ref_mode", "skills sync writes a checkout's .mdkg/skills, which a ref-mode checkout lacks; install refreshes the skill mirrors there, and skills add publishes to the graph ref.";
     SkillExists => "skill.exists", "The skill is already in .mdkg/skills, changed from what the binary ships; it's kept.";
     InitNeedsMigrate => "init.needs_migrate", "The folder has an mdkg 0.6 graph; migrate moves it to 0.7, and init changes nothing.";
     InitConflict => "init.conflict", "init was given a profile or orchestration name that differs from the graph's own; it changes nothing.";
@@ -296,6 +299,7 @@ codes! {
     ApiReplayed => "api.replayed", "The request's nonce was already used, or it was signed for another boot of serve.";
     ApiGraphUnknown => "api.graph_unknown", "This serve process doesn't serve the graph the request names.";
     ApiActorNotAllowed => "api.actor_not_allowed", "The actor may not make this request from this machine, turn or interface.";
+    PersonProofRequired => "person.proof_required", "A person's write needs a proof by a key registered to that person: a person is enforced in this coordinator, so an unsigned write as any human:<name> is refused.";
     ApiUnreachable => "api.unreachable", "The bound coordinator couldn't be reached; nothing was written locally.";
     ApiRemoteBound => "api.remote_bound", "This clone is bound to a remote coordinator, and the command runs only on the coordinator's host.";
     ApiRemoteConflict => "api.remote_conflict", "The store's lease mode or the clone's binding conflicts with the request.";
@@ -352,7 +356,8 @@ codes! {
     GraphOverlappingWorkspace => "graph.overlapping_workspace", "A graph folder is not a dedicated folder, or overlaps another graph folder or code.";
     GraphShape => "graph.shape", "The graph's shape doesn't suit its remote: a full-shape graph on a remote other than the code's.";
     GraphRemoteInvalid => "graph.remote_invalid", "The graph remote or its remote ref is misconfigured.";
-    GraphRemoteChanged => "graph.remote_changed", "The graph remote's effective destination differs from the pinned one.";
+    GraphRemoteChanged => "graph.remote_changed", "The graph remote's effective destination, or the git setup a push runs with, differs from the pinned one.";
+    GraphRemoteUnapproved => "graph.remote_unapproved", "The graph remote was never approved by a person, or approval was asked for inside an agent turn; nothing is pulled or pushed.";
     GraphOpenChangesets => "graph.open_changesets", "The move to the graph ref waits: changesets are still open, and they settle only on main.";
     GraphUncommitted => "graph.uncommitted", "The move to the graph ref waits: the checkout's graph has uncommitted changes.";
     GraphDiverged => "graph.diverged", "The move to the graph ref waits: the checkout's graph has changes the graph branch doesn't.";
@@ -382,6 +387,7 @@ codes! {
     GraphUnsupported => "graph.unsupported", "The command isn't supported in ref mode.";
     GraphWriteNoop => "graph.write_noop", "A graph write's content is what the graph already holds; nothing was written.";
     MsgReservedId => "msg.reserved_id", "Message ids and new conversations beginning `fault.` are reserved to mdkg's own senders.";
+    StoreReadOnly => "store.read_only", "The command would write the coordinator store, and `--read-only` forbids that; nothing was written.";
     StoreIntegrity => "store.integrity", "The store holds a row its own rules forbid, such as a message under a fault's id that isn't that fault; nothing was taken from it.";
     RunNotLoggedIn => "run.not_logged_in", "The agent's harness reports it isn't logged in, so none of its turns run until it is.";
     RunSupervisorExited => "run.supervisor_exited", "An agent's supervisor exited with an error, or gave up on its startup sync or lease check.";
@@ -391,6 +397,7 @@ codes! {
     RunWrapperRefused => "run.wrapper_refused", "The launch wrapper refused the turn (exit 125) before starting the harness; the agent isn't run again.";
     // The base resolver (edd graph-ref-authority, L5b).
     RunNoBase => "run.no_base", "No commit to start a worker's worktree from: the code base is unborn, or no base, mainRef or checkout branch names one.";
+    FlowDigestTooLarge => "flow.digest_too_large", "The digest exceeds the harness prompt cap, so no turn was admitted.";
     // mdkg flow (edd-01a1878e), a-flow's codes.
     EntryVerdictUnbacked => "entry.verdict_unbacked", "A findings verdict needs a finding the completing reviewer opened, reopened or seconded on the node since the round opened.";
     EntryFixAbsent => "entry.fix_absent", "A verify's SHA undoes the fix: some fix commit's paths are back as they were at its first parent.";
@@ -399,7 +406,7 @@ codes! {
     EntryRoundUnanchored => "entry.round_unanchored", "The review round opened unanchored: its walks need an anchored round before it.";
     EntryLedgerUnwritten => "entry.ledger_unwritten", "done wrote no # Ledger section: the node file can't take one that compares equal without it, or would go over index.limits.max_file_bytes with it.";
     // a-flow-p4's requirement lint (A28).
-    ReqMissing => "req.missing", "A task, bug or spike has no requirement items (a warning).";
+    ReqMissing => "req.missing", "A task, bug, feat or spike has no requirement items (a warning).";
     ReqBadLine => "req.bad_line", "A requirement item doesn't parse as R<n>, or Markdown around it may change what parses (a warning).";
     ReqDuplicateId => "req.duplicate_id", "Two requirement items in one node share an id (a warning).";
     ReqNotEars => "req.not_ears", "A non-spike requirement matches none of the EARS forms (a warning).";

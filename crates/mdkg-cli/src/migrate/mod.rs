@@ -11,7 +11,7 @@
 //!   into git the work history a migration moved to the store.
 
 // Migrating a branch against an already-migrated main: cut from 0.7.1
-// (decided 2026-10-28), kept for 0.7.2. Only `migrated_main_of` is used.
+// (decided 2026-10-28). Only `migrated_main_of` is used.
 #[allow(dead_code)]
 mod against;
 pub mod apply;
@@ -659,8 +659,7 @@ fn not_migrated(p: &plan::Source) -> Result<(), GraphError> {
 }
 
 /// The graph's source. A branch whose main is already migrated is refused:
-/// migrating it against main is cut from 0.7.1 (decided 2026-10-28) and
-/// waits for 0.7.2 in `against`.
+/// migrating it against main is not supported by this release.
 fn source_for(
     root: &Path,
     history: Option<plan::History>,
@@ -685,7 +684,7 @@ fn branch_cut_hint() -> String {
     format!(
         "merge main into this branch first, taking main's file for each node that conflicts \
          and redoing this branch's change in it; a node only this branch has must be made \
-         again on 0.7 (`{} new`). 0.7.2 migrates such a branch against main",
+         again on 0.7 (`{} new`)",
         crate::BIN
     )
 }

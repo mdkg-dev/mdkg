@@ -39,7 +39,7 @@
       "type": "object",
       "properties": {
         "root": {
-          "description": "The folder checked: the graph found at or above where doctor ran,\nor that folder when there's none.",
+          "description": "The folder checked: the graph found at or above where doctor ran,\nor that folder when there's none. With `--only store` it's always\nthe folder doctor ran in (or `--root`), whose git repository's\nstore is read.",
           "type": "string"
         },
         "checks": {
@@ -70,7 +70,7 @@
       "type": "object",
       "properties": {
         "name": {
-          "description": "The setup component, including `binary`, `path`, `git`, `config`,\n`graph`, `store`, `mirrors`, `mcp`, `agents`, `hooks` or `builds`;\nin ref mode `code_base` and the `graph.*` checks, in checkout mode\n`main` and a `graph.ref` warning.",
+          "description": "The setup component, including `binary`, `path`, `git`, `config`,\n`graph`, `store`, `mirrors`, `mcp`, `agents`, `env`, `hooks` or\n`builds`;\nin ref mode `code_base` and the `graph.*` checks, in checkout mode\n`main` and a `graph.ref` warning.",
           "type": "string"
         },
         "status": {
@@ -316,12 +316,14 @@
         "coord.sync_failed",
         "coord.path_missing",
         "coord.lease_limit",
+        "coord.merge_conflict",
         "coord.lease_shared",
         "coord.node_done",
         "coord.contains_abandoned",
         "coord.store_failed",
         "coord.store_restored",
         "coord.store_upgraded",
+        "coord.store_weak_sync",
         "coord.authority_failed",
         "coord.authority_remote",
         "coord.authority_note",
@@ -385,6 +387,7 @@
         "run.cwd_outside",
         "install.unmergeable",
         "install.unsupported_layout",
+        "install.legacy_projections",
         "init.exists",
         "doctor.check_failed",
         "doctor.check_warned",
@@ -431,6 +434,7 @@
         "api.replayed",
         "api.graph_unknown",
         "api.actor_not_allowed",
+        "person.proof_required",
         "api.unreachable",
         "api.remote_bound",
         "api.remote_conflict",
@@ -484,6 +488,7 @@
         "graph.shape",
         "graph.remote_invalid",
         "graph.remote_changed",
+        "graph.remote_unapproved",
         "graph.open_changesets",
         "graph.uncommitted",
         "graph.diverged",
@@ -513,6 +518,7 @@
         "graph.unsupported",
         "graph.write_noop",
         "msg.reserved_id",
+        "store.read_only",
         "store.integrity",
         "run.not_logged_in",
         "run.supervisor_exited",
@@ -520,6 +526,7 @@
         "run.loop_paused",
         "run.wrapper_refused",
         "run.no_base",
+        "flow.digest_too_large",
         "entry.verdict_unbacked",
         "entry.fix_absent",
         "msg.review_unranged",

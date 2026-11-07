@@ -242,10 +242,108 @@ fn public_auth(path: &str, value: &Value) -> bool {
             }))
 }
 
-pub(super) fn values(value: &mut Value, path: &str, sensitive: bool, hidden: &mut Vec<String>) {
+/// Keys renamed because the key itself looked like a credential, as
+/// `(old pointer, new pointer)` in the order they were renamed: an outer
+/// key before the keys under it, each old pointer under its parent's new
+/// one.
+#[derive(Debug, Default)]
+pub(crate) struct Renames {
+    list: Vec<(String, String)>,
+    count: usize,
+}
+
+impl Renames {
+    /// `pointer` as it reads in the redacted tree.
+    pub(crate) fn pointer(&self, pointer: &str) -> String {
+        let mut pointer = pointer.to_owned();
+        for (old, new) in &self.list {
+            if pointer == *old {
+                pointer.clone_from(new);
+            } else if let Some(rest) = pointer
+                .strip_prefix(old.as_str())
+                .filter(|r| r.starts_with('/'))
+            {
+                pointer = format!("{new}{rest}");
+            }
+        }
+        pointer
+    }
+}
+
+/// Whether a key looks like a credential, by the rules values follow.
+pub(super) fn key_looks_secret(key: &str) -> bool {
+    contents(key)
+}
+
+/// Redacts one entry, read at `path`, as it is redacted inside the whole
+/// tree; `sensitive` when its own key looks like a credential, so
+/// everything under it is hidden as a renamed key's is.
+pub(super) fn entry(value: &mut Value, path: &str, sensitive: bool) {
+    walk(
+        value,
+        path,
+        sensitive,
+        &mut Vec::new(),
+        &mut Renames::default(),
+    );
+}
+
+/// The name a key that looks like a credential is shown under. The
+/// number counts these keys in the whole tree, so names never collide.
+pub(super) fn key_name(n: usize) -> String {
+    format!("[redacted key {n}]")
+}
+
+/// Hides credential-like leaves (by their content, or by their own or a
+/// parent's key name), and also renames
+/// any object key that itself looks like a credential (a token used as a
+/// map key, say), hiding everything under it. Pointers into the
+/// original tree read through the returned [`Renames`].
+pub(super) fn tree(value: &mut Value, path: &str, hidden: &mut Vec<String>) -> Renames {
+    let mut renames = Renames::default();
+    walk(value, path, false, hidden, &mut renames);
+    renames
+}
+
+fn walk(
+    value: &mut Value,
+    path: &str,
+    sensitive: bool,
+    hidden: &mut Vec<String>,
+    renames: &mut Renames,
+) {
     match value {
         Value::Object(fields) => {
+            // Rename first, keeping the keys' order. A new name never
+            // matches a key the object already has.
+            let mut renamed = std::collections::BTreeSet::new();
+            if fields.keys().any(|k| contents(k)) {
+                let old = std::mem::take(fields);
+                let taken: std::collections::BTreeSet<String> = old.keys().cloned().collect();
+                for (key, mut value) in old {
+                    if !contents(&key) {
+                        fields.insert(key, value);
+                        continue;
+                    }
+                    let name = loop {
+                        renames.count += 1;
+                        let name = key_name(renames.count);
+                        if !taken.contains(&name) {
+                            break name;
+                        }
+                    };
+                    let pointer = child(path, &name);
+                    renames.list.push((child(path, &key), pointer.clone()));
+                    // Everything under it is hidden, each leaf listed.
+                    walk(&mut value, &pointer, true, hidden, renames);
+                    renamed.insert(name.clone());
+                    fields.insert(name, value);
+                }
+            }
             for (key, value) in fields {
+                if renamed.contains(key) {
+                    continue;
+                }
                 let public_flag =
                     key == "api_key_fallback" && (value.is_boolean() || value.is_null());
                 let public_count = key == "context_tokens"
@@ -258,8 +356,8 @@ pub(super) fn values(value: &mut Value, path: &str, sensitive: bool, hidden: &mu
                         path,
                         "/agents" | "/workspaces" | "/subgraphs" | "/authority/delegates"
                     );
-                let pointer = format!("{path}/{}", key.replace('~', "~0").replace('/', "~1"));
-                values(
+                let pointer = child(path, key);
+                walk(
                     value,
                     &pointer,
                     sensitive
@@ -269,6 +367,7 @@ pub(super) fn values(value: &mut Value, path: &str, sensitive: bool, hidden: &mu
                             && !auth_policy
                             && !structural_name),
                     hidden,
+                    renames,
                 );
             }
         }
@@ -277,11 +376,12 @@ pub(super) fn values(value: &mut Value, path: &str, sensitive: bool, hidden: &mu
             for (index, value) in items.iter_mut().enumerate() {
                 // Capture option context before replacing any string leaf.
                 let option = value.as_str().and_then(credential_option);
-                values(
+                walk(
                     value,
                     &format!("{path}/{index}"),
                     sensitive || previous_option || option == Some(true),
                     hidden,
+                    renames,
                 );
                 previous_option = option == Some(false);
             }
@@ -291,5 +391,33 @@ pub(super) fn values(value: &mut Value, path: &str, sensitive: bool, hidden: &mu
             hidden.push(path.into());
         }
         _ => {}
+    }
+}
+
+fn child(path: &str, key: &str) -> String {
+    format!("{path}/{}", key.replace('~', "~0").replace('/', "~1"))
+}
+
+#[cfg(test)]
+mod tests {
+    /// A key's own redaction: by content for the key, and everything under
+    /// a credential-shaped key hidden.
+    #[test]
+    fn an_entry_is_redacted_on_its_own_as_in_the_tree() {
+        assert!(super::key_looks_secret(concat!(
+            "Authorization: Bearer SYNTHETIC_",
+            "X"
+        )));
+        assert!(!super::key_looks_secret("worker"));
+        let mut plain = serde_json::json!({"role": "worker", "api_token": "SYNTHETIC_T"});
+        super::entry(&mut plain, "/agents/worker", false);
+        assert_eq!(
+            plain,
+            serde_json::json!({"role": "worker", "api_token": "[redacted]"})
+        );
+        let mut hidden = serde_json::json!({"role": "worker"});
+        super::entry(&mut hidden, "/agents/x", true);
+        assert_eq!(hidden, serde_json::json!({"role": "[redacted]"}));
+        assert_eq!(super::key_name(2), "[redacted key 2]");
     }
 }

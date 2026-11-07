@@ -44,6 +44,33 @@ wakes the asker like a decision does, but grants nothing. The refusal hints
 say so. A send from an actor with no delegation names the user settings file a
 person grants it in, with the JSON above.
 
+## A person's own mail
+
+A person can also send mail as themselves, with no delegate: `msg send --as
+human:alice --kind question --to orchestrator --text "..."` (or with
+`$MDKG_ACTOR` set to `human:alice`), of any kind but `decision`, `receipt`
+and `fault`; `resolution` answers a question. It's unsigned, and accepted only
+while no person key is enforced in the coordinator. These checks apply:
+
+- it runs outside any agent turn: the turn marker, each live turn's actor and
+  the launcher-ancestry check decisions use. Unlike a decision, a turn merely
+  live in the checkout the send runs in (or the one serve runs its calls from)
+  doesn't refuse it, so an agent at work there doesn't hold up your mail;
+- the name is the exact lowercase `human:` form, a well-formed mailbox;
+- `$MDKG_ACTOR` doesn't name an agent or another person when `--as` names the
+  person (`msg.human_actor`).
+
+It works from the CLI and over serve's local socket, where the caller's process
+is checked; on loopback (`api.actor_not_allowed`) and over MCP, which can't run
+as a person, it's refused. Once a person is enforced in the coordinator, an
+unsigned send is refused with `person.proof_required`. The log record of each
+such send carries `person_proof: null`, so unsigned person mail can be told
+apart later.
+
+The accepted cost: until enforcement is on, any process you run outside an
+agent turn can send as you, including one an agent detaches from its turn, which
+the turn check can't see (as in the known limits below).
+
 ## Checking a decision
 
 The send gate checks the turn environment marker, locked records in discovered

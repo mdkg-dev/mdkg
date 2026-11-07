@@ -661,9 +661,9 @@ fn git_config_at(
     if let Some(f) = file {
         cmd.arg("--file").arg(f);
     }
-    let out = cmd
-        .args(args)
-        .output()
+    // Tracked: a `git config` write must not outlive an mdkg stopped by a
+    // signal.
+    let out = mdkg_git::children::output(cmd.args(args))
         .map_err(|e| RunError::io("can't run git config", e))?;
     match out.status.code() {
         Some(0) => Ok(Some(

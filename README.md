@@ -45,11 +45,18 @@ name, and reads and migrates 0.6 graphs: see
 | npm | `npm install --global mdkg` |
 | Shell (macOS, Linux) | `curl --proto '=https' --tlsv1.2 -LsSf https://github.com/mdkg-dev/mdkg/releases/latest/download/mdkg-installer.sh \| sh` |
 | Cargo | `cargo install mdkg --locked` |
-| PyPI | `pipx install mdkg`, or `uv tool install mdkg` |
+| PyPI | `pipx install mdkg`, or `uv tool install mdkg` (on Linux, without FIDO2 person keys) |
 
 There are prebuilt binaries for macOS (Apple silicon and Intel) and Linux
 (x86_64 and arm64, glibc and musl). Each release lists their SHA-256
-checksums in `sha256.sum`. Windows is deferred beyond 0.7.1; use WSL. Requires Git 2.41 or later.
+checksums in `sha256.sum`. Windows isn't supported yet; use WSL. Requires Git 2.41 or later.
+
+The Linux PyPI wheels leave out FIDO2 security keys, so they bundle no
+system libraries; their `mdkg --version` says so. The musl builds have no
+FIDO2 either. Person keys aren't usable from the CLI yet in this release
+(`mdkg person` is still to come), so nothing needs FIDO2 today; once they
+are, use a gnu release archive, the shell installer, Homebrew or `cargo
+install mdkg` on Linux for a FIDO2 person key.
 
 Building from source on Linux (`cargo install`) also needs `pkg-config`
 and the libudev headers, for FIDO2 person keys: `sudo apt-get install

@@ -21,6 +21,7 @@ pub mod refwrite;
 pub mod requirements;
 pub mod resolve;
 pub mod store_work;
+pub mod sync;
 pub mod templates;
 pub mod validate;
 

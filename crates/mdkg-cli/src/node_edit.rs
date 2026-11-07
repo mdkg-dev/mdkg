@@ -553,7 +553,7 @@ fn shell_word(s: &str) -> String {
 /// A local work node (kept under `.git/mdkg/work`, off the graph ref)
 /// isn't edited through a copy: refused before any lease, naming its file.
 fn not_local_work(node: &IndexNode) -> Result<(), GraphError> {
-    if !Path::new(&node.path).is_absolute() {
+    if !mdkg_graph::store_work::is_store_path(&node.path) {
         return Ok(());
     }
     Err(GraphError::usage(
@@ -689,7 +689,9 @@ pub(crate) fn save(
     let record = load_record(mode, &node.id, actor).filter(|r| r.path == path);
     let (held, name) = copy_dir(repo, dir, &path)?;
     let shown = held.shown.join(&name).display().to_string();
-    let (bytes, preimage, from_copy) = match content {
+    // `discard`: the whole `node edit --discard` for this copy (its root,
+    // actor, node and `--dir`), for a stale refusal's hint.
+    let (bytes, preimage, discard) = match content {
         Some((bytes, expected)) => {
             let preimage = expected
                 .map(str::to_owned)
@@ -701,7 +703,7 @@ pub(crate) fn save(
                     )
                     .with_hint("pass the preimage `node edit` printed, or run `node edit` first")
                 })?;
-            (bytes.to_vec(), preimage, false)
+            (bytes.to_vec(), preimage, None)
         }
         None => {
             let r = record.as_ref().filter(|r| r.copy == shown);
@@ -766,9 +768,14 @@ pub(crate) fn save(
                 )
                 .with_hint(format!("run `{again}` again"))
             })?;
-            (bytes, r.preimage.clone(), true)
+            (
+                bytes,
+                r.preimage.clone(),
+                Some(format!("{again} --discard")),
+            )
         }
     };
+    let from_copy = discard.is_some();
     let text = std::str::from_utf8(&bytes)
         .map_err(|_| GraphError::usage(Code::UsageInvalidArguments, "the node isn't UTF-8"))?;
     let parsed = mdkg_format::frontmatter::parse(text, &path)
@@ -810,10 +817,20 @@ pub(crate) fn save(
                         "graph.write_stale",
                         format!("the graph changed {} since `node edit`", node.id),
                     )
-                    .with_hint(
-                        "your copy is kept: re-read the node, merge, then `node edit --discard` \
-                         and save again",
-                    ));
+                    // `--discard` overwrites the copy, so the edits are
+                    // moved out of it first (e2e UX).
+                    .with_hint(if let Some(discard) = &discard {
+                        format!(
+                            "your copy {} is kept: move your edits out of it first, since \
+                             `{discard}` replaces it with the graph's version; then run \
+                             that, re-apply them and save again",
+                            crate::output::shown_path(&shown)
+                        )
+                    } else {
+                        "re-read the node, merge your change into it, and save it with the \
+                         new preimage"
+                            .to_string()
+                    }));
                 }
                 w.write(&path, &bytes)?;
                 Ok((

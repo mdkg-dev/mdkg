@@ -56,6 +56,15 @@ fn directories(common: &Path, relative: &Path) -> Result<PathBuf, GraphError> {
             return Err(bad("invalid localize metadata path"));
         };
         path.push(part);
+        if path == common.join("mdkg") {
+            // `.git/mdkg` itself: made 0700 if missing; an existing one
+            // (install may have made it with the umask's mode) keeps its mode.
+            crate::derived::state_dir(common).map_err(write_error)?;
+            File::open(common)
+                .and_then(|f| f.sync_all())
+                .map_err(write_error)?;
+            continue;
+        }
         match fs::create_dir(&path) {
             Ok(()) => {
                 File::open(path.parent().unwrap_or(common))

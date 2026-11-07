@@ -831,7 +831,7 @@ fn an_enable_racing_another_publish_is_refused_not_lost() {
     let out = cmd.output().expect("mdkg");
     let v: Value = serde_json::from_slice(&out.stdout).expect("json");
     assert!(mark.exists(), "the shim never raced: {v}");
-    assert_ne!(out.status.code(), Some(0), "{v}");
+    assert_eq!(out.status.code(), Some(5), "{v}");
     assert_eq!(codes(&v), ["graph.write_stale"], "{v}");
     assert_eq!(s.git(&["rev-parse", GRAPH]), t1, "the other publish stands");
 }
@@ -923,7 +923,7 @@ fn a_projection_list_changed_during_a_publish_isnt_synced() {
     let out = cmd.output().expect("mdkg");
     let v: Value = serde_json::from_slice(&out.stdout).expect("json");
     assert!(mark.exists(), "the shim never raced: {v}");
-    assert_ne!(out.status.code(), Some(0), "{v}");
+    assert_eq!(out.status.code(), Some(5), "{v}");
     assert_eq!(codes(&v), ["graph.write_stale"], "{v}");
     assert!(!s.repo().join(".codex/hooks.json").exists(), "{v}");
 }
@@ -2177,13 +2177,18 @@ fn hooks_allow_graph_refresh_when_their_ignore_files_are_unchanged() {
     }
 }
 
-fn installed_hooks_refuse_before_graph_refresh(dry: bool) {
-    for (harness, target) in [
-        ("claude", Some(".claude/settings.local.json")),
-        ("codex", Some(".codex/hooks.json")),
-        ("opencode", Some(".opencode/plugins/mdkg/server.ts")),
-        ("git", None),
-    ] {
+/// One harness per test: each case makes six `install` calls of 5 to 20s
+/// each on a loaded machine, so the four harnesses in one test came near
+/// nextest's 3-minute kill (about 119s unloaded) and passed it under load.
+fn installed_hooks_refuse_before_graph_refresh(harness: &str, dry: bool) {
+    let target = match harness {
+        "claude" => Some(".claude/settings.local.json"),
+        "codex" => Some(".codex/hooks.json"),
+        "opencode" => Some(".opencode/plugins/mdkg/server.ts"),
+        "git" => None,
+        other => panic!("no hook target for {other}"),
+    };
+    {
         let s = Scratch::new();
         s.checkout_graph("main");
         // Fixture commits must not execute the Git hooks installed below.
@@ -2288,13 +2293,43 @@ fn installed_hooks_refuse_before_graph_refresh(dry: bool) {
 }
 
 #[test]
-fn previously_installed_hooks_refuse_graph_refresh() {
-    installed_hooks_refuse_before_graph_refresh(false);
+fn previously_installed_claude_hooks_refuse_graph_refresh() {
+    installed_hooks_refuse_before_graph_refresh("claude", false);
 }
 
 #[test]
-fn previously_installed_hooks_refuse_graph_refresh_dry_run() {
-    installed_hooks_refuse_before_graph_refresh(true);
+fn previously_installed_claude_hooks_refuse_graph_refresh_dry_run() {
+    installed_hooks_refuse_before_graph_refresh("claude", true);
+}
+
+#[test]
+fn previously_installed_codex_hooks_refuse_graph_refresh() {
+    installed_hooks_refuse_before_graph_refresh("codex", false);
+}
+
+#[test]
+fn previously_installed_codex_hooks_refuse_graph_refresh_dry_run() {
+    installed_hooks_refuse_before_graph_refresh("codex", true);
+}
+
+#[test]
+fn previously_installed_opencode_hooks_refuse_graph_refresh() {
+    installed_hooks_refuse_before_graph_refresh("opencode", false);
+}
+
+#[test]
+fn previously_installed_opencode_hooks_refuse_graph_refresh_dry_run() {
+    installed_hooks_refuse_before_graph_refresh("opencode", true);
+}
+
+#[test]
+fn previously_installed_git_hooks_refuse_graph_refresh() {
+    installed_hooks_refuse_before_graph_refresh("git", false);
+}
+
+#[test]
+fn previously_installed_git_hooks_refuse_graph_refresh_dry_run() {
+    installed_hooks_refuse_before_graph_refresh("git", true);
 }
 
 fn initial_ignore_negation_refuses_before_publication(professional: bool, dry: bool) {
@@ -3636,17 +3671,151 @@ fn rollback_from_a_linked_worktree_reattaches_the_primary_view() {
     assert!(!worker.join(".worktrees/graph").exists(), "{v}");
 }
 
-/// #16358: with a custom graph ref, rollback refuses up front, in ref mode,
-/// with nothing changed (install makes a graph checkout only on
-/// mdkg-graph), naming the rename route with the ref quoted for a shell;
-/// a dry run refuses the same way, and ref mode keeps working.
+impl Scratch {
+    /// The clone's `mdkg.graph.<id>.ref` records' values.
+    fn ref_records(&self) -> Vec<String> {
+        let out = self
+            .isolated(Command::new("git").arg("-C").arg(self.repo()))
+            .args([
+                "config",
+                "--file",
+                ".git/config",
+                "--get-regexp",
+                r"^mdkg\.graph\..*\.ref$",
+            ])
+            .output()
+            .expect("git");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.split_once(' ').map(|(_, v)| v.to_owned()))
+            .collect()
+    }
+
+    /// A clone moved to ref mode from checkout mode (so main carries the
+    /// graph, as checkout mode needs), whose graph ref is then renamed to
+    /// `custom`, records included, with one task written through it.
+    /// Returns the tip. With `view` false, the `.worktrees/graph` view is
+    /// removed.
+    fn custom_ref_mode(&self, custom: &str, view: bool) -> String {
+        moved(self);
+        if !view {
+            self.git(&["worktree", "remove", "--force", ".worktrees/graph"]);
+        }
+        self.to_custom(custom)
+    }
+
+    /// Renames a ref-mode clone's graph ref (mdkg-graph) to `custom`,
+    /// records included, and writes one task through it. Returns the tip.
+    fn to_custom(&self, custom: &str) -> String {
+        let tip = self.git(&["rev-parse", GRAPH]);
+        // Deleted first, so `custom` may sit under `mdkg-graph/`.
+        self.git(&["update-ref", "-d", GRAPH, &tip]);
+        self.git(&["update-ref", custom, &tip, ""]);
+        self.git(&["config", "mdkg.graph.ref", custom]);
+        let ids = self.git(&[
+            "config",
+            "--file",
+            ".git/config",
+            "--name-only",
+            "--get-regexp",
+            r"^mdkg\.graph\..*\.ref$",
+        ]);
+        for key in ids.lines().filter(|k| *k != "mdkg.graph.ref") {
+            self.git(&["config", key, custom]);
+        }
+        let (code, v) = self.mdkg(&["new", "task", "On the custom ref", "--json"]);
+        assert_eq!(code, 0, "{v}");
+        let records = self.ref_records();
+        assert!(
+            !records.is_empty() && records.iter().all(|r| r == custom),
+            "{records:?}"
+        );
+        self.git(&["rev-parse", custom])
+    }
+}
+
+/// #16358, lifted in 0.7.2: rollback from a custom graph ref moves the graph
+/// to mdkg-graph (created at its tip; the custom ref is kept), repoints the
+/// records, and leaves a registered graph checkout, so reads and hooks keep
+/// their guard. A dry run changes nothing and names the move.
 #[test]
-fn rollback_with_a_custom_ref_refuses_and_changes_nothing() {
+fn rollback_from_a_custom_ref_moves_the_graph_to_mdkg_graph() {
+    for (custom, view) in [
+        ("refs/heads/team-graph", true),
+        ("refs/heads/graphs/team", false),
+    ] {
+        let s = Scratch::new();
+        let tip = s.custom_ref_mode(custom, view);
+        let config = |s: &Scratch| s.git(&["config", "--list", "--local"]);
+        let before = config(&s);
+        let (code, v) = s.mdkg(&["install", "--checkout-mode", "--dry-run", "--json"]);
+        assert_eq!(code, 0, "{custom}: {v}");
+        assert!(
+            notes(&v).contains(&format!("{GRAPH} would be created at {custom}'s tip")),
+            "{custom}: {v}"
+        );
+        if !view {
+            // #17890 minor: the dry run names the checkout the real run
+            // makes on mdkg-graph.
+            assert!(
+                notes(&v).contains("would create graph worktree"),
+                "{custom}: {v}"
+            );
+        }
+        assert_eq!(config(&s), before, "{custom}: a dry run changes nothing");
+        assert!(
+            s.git(&["for-each-ref", "--format=%(refname)", GRAPH])
+                .is_empty(),
+            "{custom}: no branch made by a dry run"
+        );
+
+        let (code, v) = s.mdkg(&["install", "--checkout-mode", "--json"]);
+        assert_eq!(code, 0, "{custom}: {v}");
+        assert_eq!(s.config("mdkg.graph.ref"), None, "{custom}");
+        assert_eq!(s.git(&["rev-parse", GRAPH]), tip, "{custom}");
+        assert_eq!(s.git(&["rev-parse", custom]), tip, "{custom}: kept");
+        assert_eq!(s.ref_records(), vec![GRAPH.to_owned()], "{custom}: {v}");
+        let view_path = s.repo().join(".worktrees/graph");
+        assert_eq!(
+            s.git_in(&view_path, &["symbolic-ref", "HEAD"]),
+            GRAPH,
+            "{v}"
+        );
+        if view {
+            // A reattached view is registered by install, as after a
+            // rollback from mdkg-graph.
+            assert!(
+                notes(&v).contains("registers it as the graph checkout"),
+                "{v}"
+            );
+            let (code, v) = s.mdkg(&["install", "--json"]);
+            assert_eq!(code, 0, "{custom}: {v}");
+        }
+        assert!(
+            !s.worktree_records().is_empty(),
+            "{custom}: registered: {v}"
+        );
+        s.status_works();
+        let (code, list) = s.mdkg(&["list", "--json"]);
+        assert_eq!(code, 0, "{list}");
+        assert!(list.to_string().contains("On the custom ref"), "{list}");
+        // Running it again has nothing left to do.
+        let (code, v) = s.mdkg(&["install", "--checkout-mode", "--json"]);
+        assert_eq!(code, 0, "{custom}: {v}");
+        assert!(notes(&v).contains("already in checkout mode"), "{v}");
+    }
+}
+
+/// An `mdkg-graph` that already holds other commits is someone's to keep:
+/// the rollback refuses before changing anything, and the hint names the
+/// compare-and-swap that points it at the graph once it's inspected.
+#[test]
+fn rollback_from_a_custom_ref_refuses_an_mdkg_graph_holding_other_commits() {
     let s = Scratch::new();
-    s.code("main");
-    s.git(&["config", "mdkg.graph.ref", "refs/heads/team-graph"]);
-    let (code, v) = s.mdkg(&["init", "--json"]);
-    assert_eq!(code, 0, "{v}");
+    let tip = s.custom_ref_mode("refs/heads/team-graph", true);
+    let tree = s.git(&["rev-parse", "refs/heads/main^{tree}"]);
+    let main = s.git(&["commit-tree", &tree, "-p", "refs/heads/main", "-m", "other"]);
+    s.git(&["update-ref", GRAPH, &main, ""]);
     let config = |s: &Scratch| s.git(&["config", "--list", "--local"]);
     let before = config(&s);
     for args in [
@@ -3658,41 +3827,397 @@ fn rollback_with_a_custom_ref_refuses_and_changes_nothing() {
         assert!(codes(&v).contains(&"graph.ref_invalid".to_owned()), "{v}");
         let hint = v["diagnostics"].to_string();
         assert!(
-            hint.contains("git branch -m -- team-graph mdkg-graph"),
+            hint.contains(&format!("git update-ref {GRAPH} {tip} {main}")),
             "{v}"
         );
         assert_eq!(config(&s), before, "nothing changed");
+        assert_eq!(s.git(&["rev-parse", GRAPH]), main);
     }
     s.status_works();
 }
 
-/// #16562: an option-looking graph ref (`refs/heads/-f`) is named after
-/// `--` in the rename hint, so following it renames that ref and never
-/// reads it as `git branch`'s force flag.
+/// #17890 minor: a custom ref under `mdkg-graph/` keeps git from making
+/// mdkg-graph; the rollback refuses with what to rename, changing nothing.
 #[test]
-fn rollback_hint_ends_options_before_an_option_looking_ref() {
+fn rollback_refuses_a_custom_ref_under_mdkg_graph() {
     let s = Scratch::new();
-    s.code("main");
-    s.git(&["config", "mdkg.graph.ref", "refs/heads/-f"]);
-    let (code, v) = s.mdkg(&["init", "--json"]);
-    assert_eq!(code, 0, "{v}");
+    s.custom_ref_mode("refs/heads/mdkg-graph/team", false);
+    let before = s.git(&["config", "--list", "--local"]);
+    for args in [
+        &["install", "--checkout-mode", "--dry-run", "--json"][..],
+        &["install", "--checkout-mode", "--json"],
+    ] {
+        let (code, v) = s.mdkg(args);
+        assert_ne!(code, 0, "{args:?}: {v}");
+        assert!(codes(&v).contains(&"graph.ref_invalid".to_owned()), "{v}");
+        assert!(
+            v["diagnostics"].to_string().contains("git branch -m"),
+            "{v}"
+        );
+        assert_eq!(s.git(&["config", "--list", "--local"]), before, "{v}");
+    }
+    s.status_works();
+}
+
+/// #17890 major 3: when that mdkg-graph is checked out in a worktree, the
+/// hint frees it there before the update-ref, which would otherwise move
+/// the branch under its files.
+#[test]
+fn the_conflict_hint_frees_a_checked_out_mdkg_graph_first() {
+    let s = Scratch::new();
+    s.custom_ref_mode("refs/heads/team-graph", true);
+    let tree = s.git(&["rev-parse", "refs/heads/main^{tree}"]);
+    let main = s.git(&["commit-tree", &tree, "-p", "refs/heads/main", "-m", "other"]);
+    s.git(&["update-ref", GRAPH, &main, ""]);
+    let other = s.0.join("other");
+    s.git(&[
+        "worktree",
+        "add",
+        "-q",
+        other.to_str().expect("utf-8"),
+        "mdkg-graph",
+    ]);
     let (code, v) = s.mdkg(&["install", "--checkout-mode", "--json"]);
     assert_ne!(code, 0, "{v}");
     let hint = v["diagnostics"].to_string();
-    assert!(hint.contains("git branch -m -- -f mdkg-graph"), "{v}");
-    let main = s.git(&["rev-parse", "refs/heads/main"]);
-    s.git(&["branch", "-m", "--", "-f", "mdkg-graph"]);
+    let free = hint.find("switch --detach").expect("frees the branch");
+    let update = hint.find("git update-ref").expect("names the update-ref");
+    assert!(free < update, "{v}");
+    assert_eq!(s.git(&["rev-parse", GRAPH]), main, "nothing moved");
+}
+
+/// A move interrupted after `mdkg.graph.ref` went but before the records
+/// named mdkg-graph is finished by a rerun.
+#[test]
+fn an_interrupted_move_from_a_custom_ref_is_finished_by_a_rerun() {
+    let s = Scratch::new();
+    let tip = s.custom_ref_mode("refs/heads/team-graph", false);
+    s.git(&["update-ref", GRAPH, &tip, ""]);
+    s.git(&["config", "--unset", "mdkg.graph.ref"]);
+    let (code, v) = s.mdkg(&["install", "--checkout-mode", "--dry-run", "--json"]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(s.ref_records(), vec!["refs/heads/team-graph".to_owned()]);
+    let (code, v) = s.mdkg(&["install", "--checkout-mode", "--json"]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(s.ref_records(), vec![GRAPH.to_owned()], "{v}");
+    assert!(!s.worktree_records().is_empty(), "registered: {v}");
+    s.status_works();
+}
+
+/// #17890 major 2: with a root and a nested graph, a retarget that
+/// stopped after the first record is finished by a rerun, whichever
+/// record comes first.
+#[test]
+fn a_partial_retarget_of_two_graphs_is_finished_by_a_rerun() {
+    let s = Scratch::new();
+    s.nested_moved(false);
+    s.git(&["worktree", "remove", "--force", ".worktrees/graph"]);
+    let custom = "refs/heads/team-graph";
+    // The nested graph's identity names the graph ref too.
+    let nested = "mdkg.graph.01a19fa0-0000-7000-8000-000000000002";
+    s.git(&["config", &format!("{nested}.root"), "w"]);
+    s.git(&["config", &format!("{nested}.ref"), GRAPH]);
+    let tip = s.to_custom(custom);
+    let keys = s.git(&[
+        "config",
+        "--file",
+        ".git/config",
+        "--name-only",
+        "--get-regexp",
+        r"^mdkg\.graph\..*\.ref$",
+    ]);
+    let keys: Vec<&str> = keys.lines().filter(|k| *k != "mdkg.graph.ref").collect();
+    assert_eq!(keys.len(), 2, "{keys:?}");
+    s.git(&["update-ref", GRAPH, &tip, ""]);
+    s.git(&["config", "--unset", "mdkg.graph.ref"]);
+    s.git(&["config", keys[0], GRAPH]);
+    let (code, v) = s.mdkg(&["install", "--checkout-mode", "--json"]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(s.ref_records(), vec![GRAPH.to_owned(); 2], "{v}");
     assert_eq!(
-        s.git(&["rev-parse", "refs/heads/main"]),
-        main,
-        "main untouched"
+        s.worktree_records().lines().count(),
+        2,
+        "both registered: {v}"
     );
-    s.git(&["rev-parse", "--verify", "refs/heads/mdkg-graph"]);
+    s.status_works();
+}
+
+/// #18056 major 1: a separate clone sitting in the `.worktrees/graph`
+/// slot, detached at the graph's commit, is never switched: only a linked
+/// worktree of this repository is the view.
+#[test]
+fn rollback_never_switches_another_clone_in_the_slot() {
+    let s = Scratch::new();
+    let tip = s.custom_ref_mode("refs/heads/team-graph", false);
+    let slot = s.repo().join(".worktrees/graph");
+    s.git(&[
+        "clone",
+        "-q",
+        "--no-checkout",
+        s.repo().to_str().expect("utf-8"),
+        slot.to_str().expect("utf-8"),
+    ]);
+    s.git_in(&slot, &["checkout", "-q", "--detach", &tip]);
+    // The clone's own mdkg-graph, elsewhere.
+    s.git_in(&slot, &["branch", "mdkg-graph", "origin/main"]);
+    let (_, v) = s.mdkg(&["install", "--checkout-mode", "--json"]);
     assert!(
-        s.git(&["for-each-ref", "--format=%(refname)", "refs/heads/-f"])
-            .is_empty(),
-        "the option-looking ref was the one renamed"
+        s.git_in(&slot, &["rev-parse", "--abbrev-ref", "HEAD"]) == "HEAD",
+        "the clone stays detached: {v}"
     );
+    assert_eq!(s.git_in(&slot, &["rev-parse", "HEAD"]), tip, "{v}");
+}
+
+/// #18506 major 1: with mdkg-graph already checked out in a registered
+/// checkout (a 0.7.0 nested graph's retained record, its checkout moved),
+/// the rollback leaves a separate detached view alone instead of failing
+/// its switch after the mode changed; install and reads then work.
+#[test]
+fn rollback_leaves_the_view_detached_when_a_registered_checkout_holds_mdkg_graph() {
+    let s = Scratch::new();
+    s.nested_moved(false);
+    let kept = s.worktree_records();
+    assert_eq!(kept.lines().count(), 1, "the nested record stays: {kept}");
+    // The registered checkout moves; the graph goes to a custom ref, so
+    // mdkg-graph is free to check out there, at the custom ref's tip; a
+    // new detached view takes the slot.
+    let old = s.0.join("old-checkout");
+    s.git(&[
+        "worktree",
+        "move",
+        ".worktrees/graph",
+        old.to_str().expect("utf-8"),
+    ]);
+    let tip = s.to_custom("refs/heads/team-graph");
+    s.git(&["update-ref", GRAPH, &tip, ""]);
+    s.git_in(&old, &["switch", "-q", "mdkg-graph"]);
+    s.git(&[
+        "worktree",
+        "add",
+        "-q",
+        "--detach",
+        ".worktrees/graph",
+        &tip,
+    ]);
+    let view = s.repo().join(".worktrees/graph");
+    for _ in 0..2 {
+        let (code, v) = s.mdkg(&["install", "--checkout-mode", "--json"]);
+        assert_eq!(code, 0, "{v}");
+        assert!(
+            notes(&v).contains("stays detached") || notes(&v).contains("already"),
+            "{v}"
+        );
+        assert!(
+            s.git_in(&view, &["rev-parse", "--abbrev-ref", "HEAD"]) == "HEAD",
+            "{v}"
+        );
+    }
+    assert_eq!(s.config("mdkg.graph.ref"), None);
+    let (code, v) = s.mdkg(&["install", "--json"]);
+    assert_eq!(code, 0, "{v}");
+    s.status_works();
+}
+
+/// #18506 major 2: a `.worktrees/graph` that's a symlink to another
+/// linked worktree is never treated as the view, so that worktree isn't
+/// switched.
+#[cfg(unix)]
+#[test]
+fn rollback_never_switches_through_a_symlinked_slot() {
+    let s = Scratch::new();
+    let tip = s.custom_ref_mode("refs/heads/team-graph", false);
+    let elsewhere = s.0.join("elsewhere");
+    s.git(&[
+        "worktree",
+        "add",
+        "-q",
+        "--detach",
+        elsewhere.to_str().expect("utf-8"),
+        &tip,
+    ]);
+    let slot = s.repo().join(".worktrees/graph");
+    fs::create_dir_all(slot.parent().expect("parent")).expect("dir");
+    std::os::unix::fs::symlink(&elsewhere, &slot).expect("symlink");
+    let (code, v) = s.mdkg(&["install", "--checkout-mode", "--json"]);
+    assert_eq!(code, 0, "{v}");
+    assert!(notes(&v).contains("is a symlink"), "{v}");
+    assert!(
+        s.git_in(&elsewhere, &["rev-parse", "--abbrev-ref", "HEAD"]) == "HEAD",
+        "the linked worktree stays detached: {v}"
+    );
+    // Following the note: the link goes (its target stays), and a rerun
+    // makes and registers the graph checkout.
+    fs::remove_file(&slot).expect("unlink");
+    assert!(elsewhere.join(".git").exists());
+    let (code, v) = s.mdkg(&["install", "--checkout-mode", "--json"]);
+    assert_eq!(code, 0, "{v}");
+    assert!(!s.worktree_records().is_empty(), "registered: {v}");
+    s.status_works();
+}
+
+/// #18724: with `.worktrees` itself the symlink, the note names that link
+/// (never the child, whose `rm` would fail on a folder or delete a file in
+/// the target), and following it recovers.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_worktrees_folder_is_named_as_the_link() {
+    for child_is_dir in [true, false] {
+        let s = Scratch::new();
+        s.custom_ref_mode("refs/heads/team-graph", false);
+        let target = s.0.join("elsewhere-worktrees");
+        fs::create_dir_all(&target).expect("dir");
+        if child_is_dir {
+            fs::create_dir_all(target.join("graph")).expect("dir");
+        } else {
+            fs::write(target.join("graph"), "keep").expect("file");
+        }
+        let parent = s.repo().join(".worktrees");
+        if parent.exists() {
+            fs::remove_dir_all(&parent).expect("clear");
+        }
+        std::os::unix::fs::symlink(&target, &parent).expect("symlink");
+        let (code, v) = s.mdkg(&["install", "--checkout-mode", "--json"]);
+        assert_eq!(code, 0, "{child_is_dir}: {v}");
+        let rm = format!("`rm {}`", parent.display());
+        assert!(notes(&v).contains(&rm), "{child_is_dir}: {v}");
+        assert!(target.join("graph").exists(), "{child_is_dir}: target kept");
+        // Following the note: only the link goes; a rerun recovers.
+        fs::remove_file(&parent).expect("unlink");
+        assert!(target.join("graph").exists(), "{child_is_dir}: target kept");
+        let (code, v) = s.mdkg(&["install", "--checkout-mode", "--json"]);
+        assert_eq!(code, 0, "{child_is_dir}: {v}");
+        assert!(!s.worktree_records().is_empty(), "{child_is_dir}: {v}");
+        s.status_works();
+    }
+}
+
+/// #18056 major 2: another graph's record naming an old ref doesn't
+/// derail a rerun of an interrupted rollback, which still reattaches the
+/// view.
+#[test]
+fn a_foreign_identity_record_doesnt_derail_recovery() {
+    let s = Scratch::new();
+    moved(&s);
+    let main = s.git(&["rev-parse", "refs/heads/main"]);
+    s.git(&["update-ref", "refs/heads/old-graph", &main, ""]);
+    let other = "mdkg.graph.0192f3a0-0000-7000-8000-0000000000aa";
+    s.git(&["config", &format!("{other}.ref"), "refs/heads/old-graph"]);
+    s.git(&["config", &format!("{other}.dir"), ".old"]);
+    // As if a rollback stopped right after unsetting the ref.
+    s.git(&["config", "--unset", "mdkg.graph.ref"]);
+    let view = s.repo().join(".worktrees/graph");
+    assert!(s.git_in(&view, &["rev-parse", "--abbrev-ref", "HEAD"]) == "HEAD");
+    let (code, v) = s.mdkg(&["install", "--checkout-mode", "--json"]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(s.git_in(&view, &["symbolic-ref", "HEAD"]), GRAPH, "{v}");
+    assert_eq!(
+        s.config(&format!("{other}.ref")).as_deref(),
+        Some("refs/heads/old-graph"),
+        "another graph's record is never retargeted: {v}"
+    );
+}
+
+/// #18056 major 3: a registered graph checkout moved with `git worktree
+/// move` still counts as the graph checkout (records hold admin names).
+#[test]
+fn a_moved_registered_graph_checkout_is_not_refused() {
+    let s = Scratch::new();
+    moved(&s);
+    let (code, v) = s.mdkg(&["install", "--checkout-mode", "--json"]);
+    assert_eq!(code, 0, "{v}");
+    let (code, v) = s.mdkg(&["install", "--json"]);
+    assert_eq!(code, 0, "{v}");
+    assert!(!s.worktree_records().is_empty(), "registered: {v}");
+    let moved_to = s.0.join("moved-graph");
+    s.git(&[
+        "worktree",
+        "move",
+        ".worktrees/graph",
+        moved_to.to_str().expect("utf-8"),
+    ]);
+    let (code, v) = s.mdkg(&["install", "--checkout-mode", "--json"]);
+    assert_eq!(code, 0, "{v}");
+    assert!(!codes(&v).contains(&"graph.ref_invalid".to_owned()), "{v}");
+}
+
+/// #17890 major 1: an mdkg-graph checked out in another worktree is
+/// found before the mode changes, so a view the rollback must switch is
+/// never left detached in checkout mode.
+#[test]
+fn rollback_refuses_an_mdkg_graph_checked_out_elsewhere() {
+    let s = Scratch::new();
+    let tip = s.custom_ref_mode("refs/heads/team-graph", true);
+    s.git(&["update-ref", GRAPH, &tip, ""]);
+    let other = s.0.join("other");
+    s.git(&[
+        "worktree",
+        "add",
+        "-q",
+        other.to_str().expect("utf-8"),
+        "mdkg-graph",
+    ]);
+    let config = |s: &Scratch| s.git(&["config", "--list", "--local"]);
+    let before = config(&s);
+    for args in [
+        &["install", "--checkout-mode", "--dry-run", "--json"][..],
+        &["install", "--checkout-mode", "--json"],
+    ] {
+        let (code, v) = s.mdkg(args);
+        assert_ne!(code, 0, "{args:?}: {v}");
+        assert!(codes(&v).contains(&"graph.ref_invalid".to_owned()), "{v}");
+        assert!(
+            v["diagnostics"].to_string().contains("switch --detach"),
+            "{v}"
+        );
+        assert_eq!(config(&s), before, "{args:?}: nothing changed");
+    }
+    s.status_works();
+    // Freed, the rollback goes through and the view is attached.
+    s.git(&[
+        "-C",
+        other.to_str().expect("utf-8"),
+        "switch",
+        "-q",
+        "--detach",
+    ]);
+    let (code, v) = s.mdkg(&["install", "--checkout-mode", "--json"]);
+    assert_eq!(code, 0, "{v}");
+    let view = s.repo().join(".worktrees/graph");
+    assert_eq!(s.git_in(&view, &["symbolic-ref", "HEAD"]), GRAPH, "{v}");
+}
+
+/// #17890 major 1: a rollback that stopped after the mode change but
+/// before the view's switch is finished by a rerun, which reattaches the
+/// view so install registers it.
+#[test]
+fn an_interrupted_view_switch_is_finished_by_a_rerun() {
+    let s = Scratch::new();
+    let tip = s.custom_ref_mode("refs/heads/team-graph", true);
+    s.git(&["update-ref", GRAPH, &tip, ""]);
+    s.git(&["config", "--unset", "mdkg.graph.ref"]);
+    let ids = s.git(&[
+        "config",
+        "--file",
+        ".git/config",
+        "--name-only",
+        "--get-regexp",
+        r"^mdkg\.graph\..*\.ref$",
+    ]);
+    for key in ids.lines() {
+        s.git(&["config", key, GRAPH]);
+    }
+    let view = s.repo().join(".worktrees/graph");
+    assert!(s.git_in(&view, &["rev-parse", "--abbrev-ref", "HEAD"]) == "HEAD");
+    let (code, v) = s.mdkg(&["install", "--checkout-mode", "--dry-run", "--json"]);
+    assert_eq!(code, 0, "{v}");
+    assert!(notes(&v).contains("would switch to mdkg-graph"), "{v}");
+    let (code, v) = s.mdkg(&["install", "--checkout-mode", "--json"]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(s.git_in(&view, &["symbolic-ref", "HEAD"]), GRAPH, "{v}");
+    let (code, v) = s.mdkg(&["install", "--json"]);
+    assert_eq!(code, 0, "{v}");
+    assert!(!s.worktree_records().is_empty(), "registered: {v}");
+    s.status_works();
 }
 
 /// Review #15944: a rollback interrupted after `mdkg.graph.ref` went is
@@ -4273,4 +4798,481 @@ fn the_move_refuses_whatever_the_graph_branch_lacks() {
     assert_ne!(code, 0, "{v}");
     assert!(codes(&v).contains(&"graph.uncommitted".to_owned()), "{v}");
     assert_eq!(s.config("mdkg.graph.ref"), None);
+}
+
+/// Commits `text` as the graph ref's mdkg-workflow skill, by hand, in a
+/// detached scratch worktree (the graph ref is never checked out).
+fn commit_ref_skill(s: &Scratch, text: &str) {
+    let edit = s.0.join("skill-edit");
+    s.git(&[
+        "worktree",
+        "add",
+        "-q",
+        "--detach",
+        edit.to_str().expect("utf-8"),
+        GRAPH,
+    ]);
+    fs::write(edit.join(".mdkg/skills/mdkg-workflow/SKILL.md"), text).expect("skill");
+    s.git_in(&edit, &["commit", "-q", "-am", "an older skill"]);
+    let head = s.git_in(&edit, &["rev-parse", "HEAD"]);
+    s.git(&["update-ref", GRAPH, &head]);
+    s.git(&[
+        "worktree",
+        "remove",
+        "--force",
+        edit.to_str().expect("utf-8"),
+    ]);
+}
+
+/// Terra #15099: in ref mode, doctor judges the graph ref's skill (not a
+/// checkout copy), `skills add --replace` publishes this build's skill on
+/// the graph ref under a lease, and install then mirrors the current one.
+#[test]
+fn ref_mode_skill_refresh_reads_and_publishes_the_graph_refs_skill() {
+    let s = Scratch::new();
+    s.ref_mode("main");
+    let (code, v) = s.mdkg(&["install", "--enable", "skills:.claude/skills", "--json"]);
+    assert_eq!(code, 0, "{v}");
+    let skill = format!("{GRAPH}:.mdkg/skills/mdkg-workflow/SKILL.md");
+    let shipped = s.git(&["show", &skill]);
+    let old = shipped.replacen("version: 0.7", "version: 0.0", 1);
+    assert_ne!(old, shipped, "the shipped skill has a version line");
+    commit_ref_skill(&s, &old);
+    // A checkout copy that matches this build can't stand in for the ref's.
+    fs::create_dir_all(s.repo().join(".mdkg/skills/mdkg-workflow")).expect("dir");
+    fs::write(
+        s.repo().join(".mdkg/skills/mdkg-workflow/SKILL.md"),
+        format!("{shipped}\n"),
+    )
+    .expect("copy");
+
+    let (_, doctor) = s.mdkg(&["doctor", "--json"]);
+    let agents = check_of(&doctor, "agents");
+    assert_eq!(agents["status"], "warning", "{doctor}");
+    let summary = agents["summary"].as_str().unwrap_or_default();
+    assert!(summary.contains("on the graph ref"), "{doctor}");
+    assert!(
+        agents["hint"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("skills add mdkg-workflow --replace"),
+        "{doctor}"
+    );
+    fs::remove_dir_all(s.repo().join(".mdkg")).expect("rm copy");
+
+    // Without --replace the ref's differing copy is kept and named.
+    let tip = s.git(&["rev-parse", GRAPH]);
+    let (code, refused) = s.mdkg(&["skills", "add", "mdkg-workflow", "--json"]);
+    assert_ne!(code, 0, "{refused}");
+    assert_eq!(
+        refused["diagnostics"][0]["code"], "skill.exists",
+        "{refused}"
+    );
+    assert_eq!(s.git(&["rev-parse", GRAPH]), tip, "nothing published");
+
+    let (code, added) = s.mdkg(&["skills", "add", "mdkg-workflow", "--replace", "--json"]);
+    assert_eq!(code, 0, "{added}");
+    assert_eq!(added["data"]["action"], "replaced", "{added}");
+    assert_ne!(s.git(&["rev-parse", GRAPH]), tip, "published: {added}");
+    assert_eq!(
+        added["data"]["commit"].as_str(),
+        Some(s.git(&["rev-parse", GRAPH]).as_str()),
+        "{added}"
+    );
+    assert_eq!(s.git(&["show", &skill]), shipped);
+    assert!(!s.repo().join(".mdkg").exists(), "no checkout copy");
+    // Again: it's this build's, so nothing is published.
+    let tip = s.git(&["rev-parse", GRAPH]);
+    let (code, kept) = s.mdkg(&["skills", "add", "mdkg-workflow", "--json"]);
+    assert_eq!(code, 0, "{kept}");
+    assert_eq!(kept["data"]["action"], "kept", "{kept}");
+    assert_eq!(s.git(&["rev-parse", GRAPH]), tip);
+
+    // Install mirrors the ref's current skill, and doctor agrees.
+    let (code, v) = s.mdkg(&["install", "--json"]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(
+        fs::read_to_string(s.repo().join(".claude/skills/mdkg-workflow/SKILL.md"))
+            .expect("mirror")
+            .trim_end(),
+        shipped.trim_end()
+    );
+    let (_, doctor) = s.mdkg(&["doctor", "--json"]);
+    assert_eq!(check_of(&doctor, "agents")["status"], "ok", "{doctor}");
+}
+
+/// g-release #15168 (orchestrator #19564): in checkout mode, a skill
+/// refresh inside the managed `.worktrees/graph` commits on the graph
+/// branch, so the checkout is never left dirty and install doesn't freeze.
+#[test]
+fn checkout_mode_skill_refresh_in_the_graph_checkout_commits_on_its_branch() {
+    let s = Scratch::new();
+    s.checkout_graph("main");
+    let (code, v) = s.mdkg(&["install", "--json"]);
+    assert_eq!(code, 0, "{v}");
+    let graph = s.repo().join(".worktrees/graph");
+    assert!(graph.join(".mdkg/config.json").is_file(), "{v}");
+    let skill = graph.join(".mdkg/skills/mdkg-workflow/SKILL.md");
+    let shipped = fs::read_to_string(&skill).expect("skill");
+    let old = shipped.replacen("version: 0.7", "version: 0.0", 1);
+    assert_ne!(old, shipped, "the shipped skill has a version line");
+    fs::write(&skill, &old).expect("older skill");
+    s.git_in(&graph, &["commit", "-q", "-am", "an older skill"]);
+    let before = s.git(&["rev-parse", "refs/heads/mdkg-graph"]);
+
+    let (code, added) = s.mdkg_in(
+        &graph,
+        &["skills", "add", "mdkg-workflow", "--replace", "--json"],
+    );
+    assert_eq!(code, 0, "{added}");
+    assert_eq!(added["data"]["action"], "replaced", "{added}");
+    let tip = s.git(&["rev-parse", "refs/heads/mdkg-graph"]);
+    assert_ne!(tip, before, "committed on the graph branch: {added}");
+    assert_eq!(
+        added["data"]["commit"].as_str(),
+        Some(tip.as_str()),
+        "{added}"
+    );
+    assert_eq!(
+        s.git(&[
+            "show",
+            "refs/heads/mdkg-graph:.mdkg/skills/mdkg-workflow/SKILL.md"
+        ]),
+        shipped.trim_end()
+    );
+    assert_eq!(
+        s.git_in(&graph, &["status", "--porcelain", "--", ".mdkg"]),
+        ""
+    );
+    // Nothing is frozen: install goes through the graph checkout again.
+    let (code, v) = s.mdkg(&["install", "--json"]);
+    assert_eq!(code, 0, "{v}");
+}
+
+/// Terra #19581 major: with a lease authority configured, a ref-mode
+/// `skills add` that changes nothing (`kept`) leaves the authority's lease
+/// with the actor, as `config set` does; a published change releases it.
+#[cfg(unix)]
+#[test]
+fn a_kept_skill_keeps_the_authority_lease_and_a_publish_releases_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let s = Scratch::new();
+    s.ref_mode("main");
+    let rel = ".mdkg/skills/mdkg-workflow/SKILL.md";
+    let shipped = s.git(&["show", &format!("{GRAPH}:{rel}")]);
+    let common = fs::canonicalize(s.repo().join(".git")).expect("common dir");
+    let common = common.to_string_lossy().into_owned();
+    let config = s.0.join("home/.config");
+    let folder = config.join("mdkg/lease-authority");
+    fs::create_dir_all(&folder).expect("folder");
+    for f in [config.join("mdkg"), folder.clone()] {
+        fs::set_permissions(&f, fs::Permissions::from_mode(0o700)).expect("mode");
+    }
+    // The script finds its answers beside itself and logs each command.
+    let script = s.0.join("authority.sh");
+    fs::write(
+        &script,
+        "#!/bin/sh\nd=$(dirname \"$0\")\necho \"$@\" >> \"$d/args.log\"\n\
+         cat \"$d/$1.json\"\n",
+    )
+    .expect("script");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("mode");
+    let held = serde_json::json!({
+        "schema": "mdkg.holds.v1", "ok": true, "diagnostics": [],
+        "data": {"holds": true, "lease": {
+            "id": "lease-remote-1", "owner": "repo", "scope": rel,
+            "status": "active", "until": "2999-01-01T00:00:00Z",
+            "deadline_ms": 32_503_680_000_000u64, "mode": "exclusive"}}
+    });
+    fs::write(s.0.join("holds.json"), held.to_string()).expect("holds");
+    let mut released = held.clone();
+    released["schema"] = serde_json::json!("mdkg.release.v1");
+    released["data"] = serde_json::json!({"lease": held["data"]["lease"]});
+    released["data"]["lease"]["status"] = serde_json::json!("released");
+    fs::write(s.0.join("release.json"), released.to_string()).expect("release");
+    let key = mdkg_format::Digest::of_bytes(common.as_bytes());
+    let file = folder.join(format!("{}.json", key.hex()));
+    fs::write(
+        &file,
+        serde_json::json!({"common_dir": common, "command": [script], "timeout_ms": 120_000})
+            .to_string(),
+    )
+    .expect("record");
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).expect("mode");
+    let log = || fs::read_to_string(s.0.join("args.log")).unwrap_or_default();
+
+    let (code, kept) = s.mdkg(&["skills", "add", "mdkg-workflow", "--json"]);
+    assert_eq!(code, 0, "{kept}");
+    assert_eq!(kept["data"]["action"], "kept", "{kept}");
+    assert!(log().contains(&format!("holds {rel}")), "{}", log());
+    assert!(!log().contains("release"), "a no-op keeps it: {}", log());
+
+    fs::remove_file(s.0.join("args.log")).expect("log");
+    commit_ref_skill(&s, &shipped.replacen("version: 0.7", "version: 0.0", 1));
+    let (code, added) = s.mdkg(&["skills", "add", "mdkg-workflow", "--replace", "--json"]);
+    assert_eq!(code, 0, "{added}");
+    assert_eq!(added["data"]["action"], "replaced", "{added}");
+    assert!(
+        log().contains("release lease-remote-1"),
+        "a publish releases: {}",
+        log()
+    );
+}
+
+/// Terra #19581 minor: after a ref-mode `--graph-only` init the graph ref
+/// has no skill, and doctor says so rather than call it this build's.
+#[test]
+fn doctor_names_a_missing_ref_skill() {
+    let s = Scratch::new();
+    s.code("main");
+    s.git(&["config", "mdkg.graph.ref", GRAPH]);
+    let (code, init) = s.mdkg(&["init", "--graph-only", "--json"]);
+    assert_eq!(code, 0, "{init}");
+    let (_, doctor) = s.mdkg(&["doctor", "--json"]);
+    let summary = check_of(&doctor, "agents")["summary"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        summary.contains("there's no mdkg-workflow skill"),
+        "{doctor}"
+    );
+    assert!(!summary.contains("is this build's"), "{doctor}");
+}
+
+/// Terra #19637: in checkout mode a dangling link at the skill's SKILL.md
+/// is neither absent nor this build's, and the hint doesn't offer an add
+/// that would refuse it.
+#[cfg(unix)]
+#[test]
+fn doctor_names_a_linked_checkout_skill() {
+    let s = Scratch::new();
+    s.checkout_graph("main");
+    let skill = s.repo().join(".mdkg/skills/mdkg-workflow/SKILL.md");
+    fs::remove_file(&skill).expect("rm");
+    std::os::unix::fs::symlink(s.0.join("nowhere"), &skill).expect("link");
+    let (_, doctor) = s.mdkg(&["doctor", "--json"]);
+    let agents = check_of(&doctor, "agents");
+    assert_eq!(agents["status"], "warning", "{doctor}");
+    assert!(
+        agents["summary"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("a link or a folder"),
+        "{doctor}"
+    );
+    assert!(
+        agents["hint"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("aside and leave that path empty"),
+        "{doctor}"
+    );
+    // The repair the hint names works (Terra #19695).
+    fs::remove_file(&skill).expect("move the link aside");
+    let (code, added) = s.mdkg(&["skills", "add", "mdkg-workflow", "--json"]);
+    assert_eq!(code, 0, "{added}");
+    assert_eq!(added["data"]["action"], "created", "{added}");
+    let (_, doctor) = s.mdkg(&["doctor", "--json"]);
+    assert_eq!(check_of(&doctor, "agents")["status"], "ok", "{doctor}");
+}
+
+/// Terra #19770: in ref mode, one skill's validation keeps to that skill's
+/// folder below each mirror root, and a source file install skips (a
+/// secret-named one) is named rather than hidden behind a clean verdict.
+#[test]
+fn ref_mode_validate_names_skipped_files_and_keeps_to_one_skill() {
+    let s = Scratch::new();
+    s.ref_mode("main");
+    let (code, v) = s.mdkg(&["install", "--enable", "skills:.claude/skills", "--json"]);
+    assert_eq!(code, 0, "{v}");
+    // A second skill on the graph ref, with a file install never mirrors.
+    let edit = s.0.join("skill-edit");
+    s.git(&[
+        "worktree",
+        "add",
+        "-q",
+        "--detach",
+        edit.to_str().expect("utf-8"),
+        GRAPH,
+    ]);
+    fs::create_dir_all(edit.join(".mdkg/skills/skills")).expect("dir");
+    fs::write(
+        edit.join(".mdkg/skills/skills/SKILL.md"),
+        "---\nname: skills\ndescription: a skill named like the mirror folder\n---\n",
+    )
+    .expect("skill");
+    fs::write(
+        edit.join(".mdkg/skills/skills/template.env.example"),
+        "A=1\n",
+    )
+    .expect("env");
+    // mdkg-workflow gets a skipped file too: its note names `.mdkg/skills/`,
+    // so a slug match anywhere in the note would show it for `skills`.
+    fs::write(
+        edit.join(".mdkg/skills/mdkg-workflow/other.env.example"),
+        "B=1\n",
+    )
+    .expect("env");
+    s.git_in(&edit, &["add", "-A"]);
+    s.git_in(&edit, &["commit", "-q", "-m", "a second skill"]);
+    let head = s.git_in(&edit, &["rev-parse", "HEAD"]);
+    s.git(&["update-ref", GRAPH, &head]);
+    s.git(&[
+        "worktree",
+        "remove",
+        "--force",
+        edit.to_str().expect("utf-8"),
+    ]);
+    let (code, v) = s.mdkg(&["install", "--json"]);
+    assert_eq!(code, 0, "{v}");
+
+    let (_, all) = s.mdkg(&["skills", "validate", "--json"]);
+    assert!(all.to_string().contains("template.env.example"), "{all}");
+    assert!(all.to_string().contains("other.env.example"), "{all}");
+    // A change to mdkg-workflow's mirror isn't reported for `skills`.
+    let other = s.repo().join(".claude/skills/mdkg-workflow/SKILL.md");
+    let mut text = fs::read_to_string(&other).expect("mirror");
+    text.push_str("\nchanged\n");
+    let mut perms = fs::metadata(&other).expect("meta").permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    perms.set_readonly(false);
+    fs::set_permissions(&other, perms).expect("writable");
+    fs::write(&other, text).expect("change");
+    let (_, one) = s.mdkg(&["skills", "validate", "skills", "--json"]);
+    assert!(!one.to_string().contains("mdkg-workflow"), "{one}");
+    assert!(one.to_string().contains("template.env.example"), "{one}");
+    let (_, wf) = s.mdkg(&["skills", "validate", "mdkg-workflow", "--json"]);
+    assert!(wf.to_string().contains("skill.mirror_drift"), "{wf}");
+}
+
+/// f-adopt #15953: in ref mode `skills validate` judges the mirrors with
+/// install's own plan for the setup. The professional setup leaves a
+/// tracked mirror file alone, so validate notes it (info) rather than
+/// warn of drift that install would never repair.
+#[test]
+fn ref_mode_validate_follows_installs_plan_for_the_setup() {
+    let s = Scratch::new();
+    s.checkout_graph("main");
+    let tracked = s.repo().join(".claude/skills/mdkg-workflow/SKILL.md");
+    fs::create_dir_all(tracked.parent().expect("folder")).expect("mkdir");
+    fs::write(
+        &tracked,
+        "---\nname: mdkg-workflow\ndescription: company copy\n---\n",
+    )
+    .expect("tracked");
+    s.git(&["add", ".claude/skills/mdkg-workflow/SKILL.md"]);
+    s.git(&["commit", "-q", "-m", "company skill copy"]);
+    let mine = s.0.join("mine.git");
+    s.git_in(&s.0, &["init", "-q", "--bare", &mine.to_string_lossy()]);
+    s.git(&["remote", "add", "mine", &mine.to_string_lossy()]);
+    let (code, v) = s.mdkg(&[
+        "install",
+        "--setup",
+        "professional",
+        "--graph-remote",
+        "mine",
+        "--json",
+    ]);
+    assert_eq!(code, 0, "{v}");
+    let (code, v) = s.mdkg(&["install", "--enable", "skills:.claude/skills", "--json"]);
+    assert_eq!(code, 0, "{v}");
+    assert!(
+        fs::read_to_string(&tracked)
+            .expect("kept")
+            .contains("company copy"),
+        "install left the tracked file alone: {v}"
+    );
+    let (_, v) = s.mdkg(&["skills", "validate", "--json"]);
+    let diags = v["diagnostics"].as_array().cloned().unwrap_or_default();
+    let at = ".claude/skills/mdkg-workflow/SKILL.md";
+    let here: Vec<_> = diags
+        .iter()
+        .filter(|d| d["path"].as_str() == Some(at))
+        .collect();
+    assert!(
+        here.iter().any(|d| d["severity"] == "info"
+            && d["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("leaves this mirror file alone")),
+        "{v}"
+    );
+    assert!(
+        !here.iter().any(|d| d["severity"] == "warning"),
+        "no drift install wouldn't repair: {v}"
+    );
+}
+
+/// H-M6 (review of cd2cbe8a; orchestrator #20070): in the professional
+/// setup, the install.legacy_projections hint, `config set projections
+/// <today's list>`, records the list on the graph ref without writing the
+/// AGENTS.md block that setup leaves alone, and a later graph write still
+/// succeeds. An empty `--enable ""` writes no key, so it still warns.
+#[test]
+fn the_legacy_projections_hint_leaves_a_professional_agents_md_alone() {
+    const CODE: &str = "install.legacy_projections";
+    let s = Scratch::new();
+    s.checkout_graph("main");
+    let mine = s.0.join("mine.git");
+    s.git_in(&s.0, &["init", "-q", "--bare", &mine.to_string_lossy()]);
+    s.git(&["remote", "add", "mine", &mine.to_string_lossy()]);
+    let (code, v) = s.mdkg(&[
+        "install",
+        "--setup",
+        "professional",
+        "--graph-remote",
+        "mine",
+        "--json",
+    ]);
+    assert_eq!(code, 0, "{v}");
+    let (code, v) = s.mdkg(&["config", "unset", "projections", "--json"]);
+    assert_eq!(code, 0, "{v}");
+    let warned = |v: &Value| codes(v).iter().filter(|c| *c == CODE).count();
+    let (code, v) = s.mdkg(&["install", "--json"]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(warned(&v), 1, "{v}");
+    let hint = v["diagnostics"]
+        .as_array()
+        .and_then(|ds| ds.iter().find(|d| d["code"] == CODE))
+        .and_then(|d| d["hint"].as_str())
+        .expect("hint")
+        .to_owned();
+    let list = serde_json::json!([
+        "agents-md",
+        "mcp:claude",
+        "mcp:codex",
+        "mcp:opencode",
+        "skills:.agents/skills",
+        "skills:.claude/skills"
+    ]);
+    assert!(
+        hint.contains(&format!("config set projections '{list}'`")),
+        "{hint}"
+    );
+    // An empty list names nothing, writes no key, and still warns.
+    let (code, v) = s.mdkg(&["install", "--enable", "", "--json"]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(warned(&v), 1, "{v}");
+    // The hint's command records the list and writes no AGENTS.md.
+    let (code, v) = s.mdkg(&["config", "set", "projections", &list.to_string(), "--json"]);
+    assert_eq!(code, 0, "{v}");
+    let config: Value =
+        serde_json::from_str(&s.git(&["show", &format!("{GRAPH}:.mdkg/config.json")]))
+            .expect("config");
+    assert_eq!(config["projections"], list, "{config}");
+    // A later graph write isn't frozen.
+    let (code, v) = s.mdkg(&[
+        "config",
+        "set",
+        "coordination.messages.ack_grace_days",
+        "2",
+        "--json",
+    ]);
+    assert_eq!(code, 0, "{v}");
+    // Then install: no warning, and the setup still leaves AGENTS.md alone.
+    let (code, v) = s.mdkg(&["install", "--json"]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(warned(&v), 0, "{v}");
+    assert!(!s.repo().join("AGENTS.md").exists(), "{v}");
 }

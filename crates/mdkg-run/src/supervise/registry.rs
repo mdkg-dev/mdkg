@@ -24,7 +24,9 @@ use crate::RunError;
 use crate::builds::Build;
 
 const SCHEMA: &str = "mdkg.run.supervisor.v1";
-const CAP: u64 = 64 * 1024;
+/// A record's size limit: room for thousands of long agent names, so a
+/// valid supervisor's record is never discarded as too large.
+const CAP: u64 = 1024 * 1024;
 
 /// Carries this supervisor's id and the agents it stopped across a
 /// re-exec, bound to its pid as the exec token is.
@@ -57,6 +59,13 @@ pub struct Record {
     pub started_ms: u64,
     pub build: Option<Build>,
     pub agents: BTreeMap<String, AgentState>,
+    /// Whether this supervisor's build starts turns with the policy's
+    /// environment (0.7.2 and later): it re-execs at a turn boundary when
+    /// the config changes, so its agents run with the configured mode. A
+    /// live record without it is an older build's, whose turns inherit the
+    /// launcher's whole environment.
+    #[serde(default)]
+    pub env_tracked: bool,
 }
 
 /// What the supervisor hands its re-exec ([`ENV`]).
@@ -157,6 +166,7 @@ impl Registered {
                 .iter()
                 .map(|a| (a.clone(), AgentState::Idle))
                 .collect(),
+            env_tracked: true,
         };
         let registered = Self {
             lock,
@@ -213,6 +223,135 @@ impl Registered {
         )
         .map_err(|e| RunError::io("can't write the supervisor record", e))
     }
+}
+
+/// Why a supervisor ended, kept per agent once its process is gone, so a
+/// client that doesn't hold its output can still tell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ExitReason {
+    /// It ran its `--max-turns`.
+    Cap,
+    /// Its trigger is `manual`: a watch runs it no turns.
+    Manual,
+    /// Its receiver mode changed (interactive to headless or back): start
+    /// it again to run it in its new mode.
+    ModeChanged,
+    /// `--once`: what was waiting ran.
+    Once,
+    /// Drained by `agents stop`.
+    Drained,
+    /// Stopped by SIGTERM, its turns finished.
+    Signal,
+    /// It failed; `code` says why.
+    Failed,
+}
+
+const EXIT_SCHEMA: &str = "mdkg.run.supervisor_exit.v1";
+const EXITS: &str = "supervisor-exits";
+
+/// How an agent's last supervisor ended: `<run dir>/supervisor-exits/
+/// <agent>.json`, written by the holder of the agent's progress lock as
+/// it lets go, naming that lock's watch. It counts only while the agent's
+/// progress names the same watch, finished ([`current_exit`]): a later
+/// run starts or resumes a watch and so hides it, with nothing to clear.
+/// A supervisor killed outright (SIGKILL, a crash) writes none, so the
+/// one there is older or absent: unknown.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct Exit {
+    pub schema: String,
+    pub supervisor_id: String,
+    pub reason: ExitReason,
+    /// The failure's diagnostic code, with `failed` only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    /// When it exited, in ms since the epoch.
+    pub at_ms: u64,
+    /// The watch it ended: its progress record's `watch_id`. A record
+    /// without one (from before #20977) never counts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch_id: Option<String>,
+}
+
+/// `agent`'s exit record in `dir`. A name that isn't an agent's (a path,
+/// `..`, an absolute name from a forged handoff) is refused, so a record
+/// is only ever written inside `dir` (#20977).
+fn exit_path(dir: &Path, agent: &str) -> Result<PathBuf, RunError> {
+    crate::state::check_name(agent)?;
+    Ok(dir.join(format!("{}.json", crate::state::file_name(agent))))
+}
+
+/// Records why supervisor `supervisor_id` is letting go of the agent
+/// whose progress lock is `held`, naming that lock's watch (#20977).
+/// Only a holder writes: a released lock writes nothing, so a run that
+/// let the agent go never overwrites a later one's reason. Best effort:
+/// a failure is the caller's warning, never its exit code.
+pub fn record_exit(
+    run_dir: &Path,
+    supervisor_id: &str,
+    held: &super::progress::Locked,
+    reason: ExitReason,
+    code: Option<&str>,
+) -> Result<(), RunError> {
+    if held.released() {
+        return Ok(());
+    }
+    let Some(record) = held.record() else {
+        return Ok(());
+    };
+    let Some(dir) = super::files::folder(run_dir, EXITS, true)? else {
+        return Ok(());
+    };
+    let path = exit_path(&dir, &record.agent)?;
+    let exit = Exit {
+        schema: EXIT_SCHEMA.into(),
+        supervisor_id: supervisor_id.into(),
+        reason,
+        code: code.map(str::to_string),
+        at_ms: crate::state::now_ms(),
+        watch_id: Some(record.watch_id.clone()),
+    };
+    let bytes = serde_json::to_vec(&exit)
+        .map_err(|e| RunError::failure("io.write_failed", e.to_string()))?;
+    super::files::replace(&path, &bytes)
+        .map_err(|e| RunError::io("can't record why the supervisor exited", e))
+}
+
+/// Whether a live supervisor runs `agent` and hasn't drained it: then its
+/// last exit isn't shown, whatever older supervisor still names it.
+pub fn holds(found: &[Found], agent: &str) -> bool {
+    found.iter().any(|f| {
+        f.live
+            && f.record
+                .agents
+                .get(agent)
+                .is_some_and(|s| *s != AgentState::Stopped)
+    })
+}
+
+/// `agent`'s exit record as it is, if one is readable. Unreadable or
+/// foreign records read as none: the reason is then unknown.
+/// [`current_exit`] decides whether it still counts.
+pub fn last_exit(run_dir: &Path, agent: &str) -> Option<Exit> {
+    let dir = super::files::folder(run_dir, EXITS, false).ok()??;
+    let bytes = read_owned(&exit_path(&dir, agent).ok()?, "a supervisor exit record").ok()?;
+    serde_json::from_slice::<Exit>(&bytes)
+        .ok()
+        .filter(|e| e.schema == EXIT_SCHEMA)
+}
+
+/// How `agent`'s last run ended, when that's still the news: its exit
+/// record names the watch `progress` (the agent's current progress
+/// record) names, and that watch is finished. A later run that started
+/// or resumed a watch, a record from before watches were named, or none
+/// at all: `None`, never a guess.
+pub fn current_exit(
+    run_dir: &Path,
+    agent: &str,
+    progress: Option<&super::progress::Record>,
+) -> Option<Exit> {
+    let progress = progress.filter(|p| p.finished && p.agent == agent)?;
+    last_exit(run_dir, agent).filter(|e| e.watch_id.as_deref() == Some(progress.watch_id.as_str()))
 }
 
 /// Removes the records and locks of supervisors that are gone, except
@@ -274,15 +413,16 @@ fn live_lock(path: &Path) -> Option<bool> {
     }
 }
 
-fn read_record(path: &Path) -> Result<Record, RunError> {
+/// An owned, protected regular file of at most [`CAP`], read whole.
+fn read_owned(path: &Path, what: &str) -> Result<Vec<u8>, RunError> {
     let mut file = fs::OpenOptions::new()
         .read(true)
         .custom_flags(super::files::flags())
         .open(path)
-        .map_err(|e| RunError::io("can't open a supervisor record", e))?;
+        .map_err(|e| RunError::io(&format!("can't open {what}"), e))?;
     let m = file
         .metadata()
-        .map_err(|e| RunError::io("can't inspect a supervisor record", e))?;
+        .map_err(|e| RunError::io(&format!("can't inspect {what}"), e))?;
     if !m.is_file()
         || m.len() > CAP
         || m.uid() != rustix::process::geteuid().as_raw()
@@ -290,14 +430,19 @@ fn read_record(path: &Path) -> Result<Record, RunError> {
     {
         return Err(RunError::failure(
             "io.read_failed",
-            "a supervisor record isn't an owned, protected regular file of at most 64 KiB",
+            format!("{what} isn't an owned, protected regular file of at most 1 MiB"),
         ));
     }
     let mut bytes = Vec::new();
     (&mut file)
         .take(CAP + 1)
         .read_to_end(&mut bytes)
-        .map_err(|e| RunError::io("can't read a supervisor record", e))?;
+        .map_err(|e| RunError::io(&format!("can't read {what}"), e))?;
+    Ok(bytes)
+}
+
+fn read_record(path: &Path) -> Result<Record, RunError> {
+    let bytes = read_owned(path, "a supervisor record")?;
     let record: Record = serde_json::from_slice(&bytes)
         .map_err(|_| RunError::failure("io.read_failed", "invalid supervisor record"))?;
     if record.schema != SCHEMA {
@@ -364,6 +509,38 @@ pub fn list(run_dir: &Path) -> Result<(Vec<Found>, Vec<String>), RunError> {
     Ok((found, problems))
 }
 
+/// The agents run by a live supervisor whose turns may inherit the
+/// launcher's whole environment whatever the config says, because nothing
+/// confirms it is a 0.7.2 or later build. Two pieces of evidence:
+/// - a live supervisor record without `env_tracked` (0.7.1);
+/// - a live launcher's process build receipt (`agents up` writes one
+///   from 0.7.0 on) with no live `env_tracked` record of the same pid:
+///   0.7.0, which keeps no record, or any build whose registration
+///   failed.
+///
+/// Sorted, each name once. Names only.
+pub fn unconfirmed_env(found: &[Found], processes: &[crate::builds::Process]) -> Vec<String> {
+    let tracked = |pid: u32| {
+        found
+            .iter()
+            .any(|f| f.live && f.record.env_tracked && f.record.pid == pid)
+    };
+    let mut names: Vec<String> = found
+        .iter()
+        .filter(|f| f.live && !f.record.env_tracked)
+        .flat_map(|f| f.record.agents.keys().cloned())
+        .chain(
+            processes
+                .iter()
+                .filter(|p| p.kind == crate::builds::Kind::Launcher && !tracked(p.pid))
+                .flat_map(|p| p.agents.iter().cloned()),
+        )
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
 /// The live supervisor running `agent`, with its state there.
 pub fn running(found: &[Found], agent: &str) -> Option<(Record, AgentState)> {
     found.iter().rev().filter(|f| f.live).find_map(|f| {
@@ -382,6 +559,178 @@ mod tests {
         let scratch = super::super::files::Scratch::new("supervisor-registry");
         let run = scratch.run_dir();
         (scratch, run)
+    }
+
+    /// An exit record names its progress lock's watch and counts only
+    /// while the agent's progress names that watch, finished: a later
+    /// run's start or resume hides it with nothing to clear, a released
+    /// lock writes nothing, a name that isn't an agent's is refused, and a
+    /// record from before watches were named, or one that isn't the user's
+    /// protected file, reads as none (#20587, #20921, #20977).
+    #[test]
+    fn an_exit_counts_only_for_the_finished_watch_it_names() {
+        use super::super::progress::Locked;
+        let (_scratch, run) = run_dir();
+        let graph = uuid::Uuid::now_v7();
+        let inspect = |agent: &str| super::super::progress::inspect(&run, graph, agent).unwrap();
+        let shown = |agent: &str| current_exit(&run, agent, inspect(agent).as_ref());
+
+        // A run ends with a cap: shown once its watch is finished.
+        let mut alice = Locked::open(&run, graph, "alice").unwrap();
+        alice.start(&"a".repeat(64), None).unwrap();
+        let first = alice.record().unwrap().watch_id.clone();
+        record_exit(&run, "sup-1", &alice, ExitReason::Cap, None).unwrap();
+        assert!(shown("alice").is_none(), "not while its watch runs");
+        alice.finish().unwrap();
+        let exit = shown("alice").expect("cap shown");
+        assert_eq!(exit.reason, ExitReason::Cap);
+        assert_eq!(exit.watch_id.as_deref(), Some(first.as_str()));
+        assert_eq!(exit.supervisor_id, "sup-1");
+        drop(alice);
+
+        // A later run starts a new watch: the old reason is hidden, though
+        // nothing cleared its file; then that run's own reason shows.
+        let mut alice = Locked::open(&run, graph, "alice").unwrap();
+        alice.start(&"a".repeat(64), None).unwrap();
+        assert_ne!(alice.record().unwrap().watch_id, first);
+        assert!(
+            shown("alice").is_none(),
+            "an older watch's reason is hidden"
+        );
+        assert!(
+            last_exit(&run, "alice").is_some(),
+            "its file is still there"
+        );
+        // Released (drained), then a write by that run is a no-op.
+        record_exit(&run, "sup-2", &alice, ExitReason::Drained, None).unwrap();
+        alice.release().unwrap();
+        record_exit(&run, "sup-2", &alice, ExitReason::Failed, Some("x.y")).unwrap();
+        let exit = shown("alice").expect("drained shown");
+        assert_eq!(
+            (exit.reason, exit.supervisor_id.as_str()),
+            (ExitReason::Drained, "sup-2")
+        );
+        drop(alice);
+
+        // A failure carries its code; a manual trigger is its own reason.
+        let mut bob = Locked::open(&run, graph, "b:ob").unwrap();
+        bob.start(&"b".repeat(64), None).unwrap();
+        record_exit(
+            &run,
+            "sup-3",
+            &bob,
+            ExitReason::Failed,
+            Some("coord.store_failed"),
+        )
+        .unwrap();
+        bob.finish().unwrap();
+        let exit = shown("b:ob").unwrap();
+        assert_eq!(exit.reason, ExitReason::Failed);
+        assert_eq!(exit.code.as_deref(), Some("coord.store_failed"));
+        drop(bob);
+
+        // A record whose watch isn't named (an older build's) never counts.
+        let path = run.join(EXITS).join("alice.json");
+        let mut old: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        old.as_object_mut().unwrap().remove("watch_id");
+        super::super::files::replace(&path, &serde_json::to_vec(&old).unwrap()).unwrap();
+        assert!(last_exit(&run, "alice").is_some());
+        assert!(shown("alice").is_none());
+
+        // A name that isn't an agent's makes no path: nothing outside.
+        let outside = run.join("outside");
+        for bad in [
+            outside.to_str().unwrap().to_string(),
+            "../outside".to_string(),
+            "a/../../outside".to_string(),
+            ".hidden".to_string(),
+        ] {
+            let dir = super::super::files::folder(&run, EXITS, false)
+                .unwrap()
+                .unwrap();
+            assert!(exit_path(&dir, &bad).is_err(), "{bad}");
+            assert!(last_exit(&run, &bad).is_none());
+        }
+        assert!(!outside.with_extension("json").exists());
+
+        // A group-writable record isn't trusted.
+        let path = run
+            .join(EXITS)
+            .join(format!("{}.json", crate::state::file_name("b:ob")));
+        fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o666)).unwrap();
+        assert!(last_exit(&run, "b:ob").is_none());
+    }
+
+    #[test]
+    fn an_older_builds_live_supervisor_names_its_agents_as_untracked() {
+        let (_scratch, run) = run_dir();
+        let agents = vec!["alice".to_string(), "bob".to_string()];
+        // A launcher's receipt with no supervisor record: 0.7.0, which
+        // keeps none, or a build whose registration failed.
+        let exe = std::env::current_exe().unwrap();
+        let build = Build {
+            version: "0.7.0".into(),
+            commit: "0".repeat(40),
+            dirty: Some(false),
+            built: "2026-10-28T00:00:00Z".into(),
+        };
+        let _receipt = crate::builds::publish(
+            &run,
+            crate::builds::Kind::Launcher,
+            &exe,
+            build.clone(),
+            agents.clone(),
+        )
+        .unwrap()
+        .unwrap();
+        // An MCP server's receipt runs no agents' turns.
+        let _mcp = crate::builds::publish(
+            &run,
+            crate::builds::Kind::Mcp,
+            &exe,
+            build,
+            vec!["carol".into()],
+        )
+        .unwrap()
+        .unwrap();
+        let processes = crate::builds::live(&run).unwrap().processes;
+        assert_eq!(processes.len(), 2);
+        let (found, _) = list(&run).unwrap();
+        assert_eq!(unconfirmed_env(&found, &processes), ["alice", "bob"]);
+        // Its tracked record, same pid: confirmed.
+        let reg = Registered::register(&run, &agents, None, None)
+            .unwrap()
+            .unwrap();
+        let (found, _) = list(&run).unwrap();
+        assert!(found[0].record.env_tracked);
+        assert!(unconfirmed_env(&found, &processes).is_empty());
+        assert!(unconfirmed_env(&found, &[]).is_empty());
+        // A 0.7.1 record has no env_tracked: it still reads, and its
+        // agents are named, with or without a receipt.
+        let path = run.join("supervisors").join(format!("{}.json", reg.id()));
+        let mut old: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        old.as_object_mut().unwrap().remove("env_tracked");
+        fs::write(&path, old.to_string()).unwrap();
+        let (found, problems) = list(&run).unwrap();
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(unconfirmed_env(&found, &[]), ["alice", "bob"]);
+        assert_eq!(unconfirmed_env(&found, &processes), ["alice", "bob"]);
+    }
+
+    #[test]
+    fn a_record_of_many_long_named_agents_still_reads() {
+        let (_scratch, run) = run_dir();
+        // 600 agents with 120-character names: over 64 KiB of record.
+        let agents: Vec<String> = (0..600).map(|i| format!("a{i:0>119}")).collect();
+        let reg = Registered::register(&run, &agents, None, None)
+            .unwrap()
+            .unwrap();
+        let path = run.join("supervisors").join(format!("{}.json", reg.id()));
+        assert!(fs::metadata(&path).unwrap().len() > 64 * 1024);
+        let (found, problems) = list(&run).unwrap();
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(found.len(), 1);
+        assert!(found[0].live);
     }
 
     #[test]

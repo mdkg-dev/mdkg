@@ -311,6 +311,36 @@ fn no_reply_turn_summary() {
     assert!(!stdout.lines().any(|l| l.trim() == "NO_REPLY"), "{stdout}");
     let lane_inbox = ok(&lane, "lane-agent", &["msg", "inbox"]);
     assert_eq!(lane_inbox["data"]["messages"], serde_json::json!([]));
+    // Its JSON report: outcome no_reply, with no reply and no reply_id.
+    ok(
+        &repo,
+        "orchestrator",
+        &[
+            "msg",
+            "send",
+            "--to",
+            "lane-agent",
+            "--kind",
+            "handoff",
+            "--text",
+            "merged again",
+        ],
+    );
+    let out = isolated(&mut Command::new(env!("CARGO_BIN_EXE_mdkg")))
+        .current_dir(&root)
+        .arg("--root")
+        .arg(&root)
+        .args(["--as", "launcher"])
+        .args(common::agent_turn_args(&root, &args))
+        .arg("--json")
+        .output()
+        .expect("run mdkg");
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    let turn = &report["data"]["turn"];
+    assert_eq!(turn["outcome"], "no_reply", "{report}");
+    assert!(turn.get("reply").is_none(), "{report}");
+    assert!(turn.get("reply_id").is_none(), "{report}");
 }
 
 #[test]
@@ -738,69 +768,133 @@ const WITHHELD_BY_FAMILY: &[&str] = &[
     "CLAUDE_API_KEY",
 ];
 
+/// Sets `agents.defaults.env` in the launcher's committed config, or
+/// removes it with `None`.
+fn set_default_env(repo: &Path, env: Option<Value>) {
+    let config = graph(repo).join(".mdkg/config.json");
+    let mut cfg: Value = serde_json::from_slice(&fs::read(&config).expect("config")).expect("json");
+    let defaults = cfg["agents"]["defaults"]
+        .as_object_mut()
+        .map(std::mem::take)
+        .unwrap_or_default();
+    let mut defaults = Value::Object(defaults);
+    match env {
+        Some(env) => defaults["env"] = env,
+        None => {
+            defaults.as_object_mut().expect("object").remove("env");
+        }
+    }
+    cfg["agents"]["defaults"] = defaults;
+    fs::write(&config, cfg.to_string()).expect("write config");
+    commit_graph_config(&graph(repo));
+}
+
+/// A turn's environment, and its login check's, by default: only the
+/// allowlist (0.7.2), so a credential in the launcher's shell never reaches
+/// an agent; `env.allow` adds names; `env.inherit` gives back the
+/// launcher's whole environment, less provider keys, with a warning. Every
+/// value here is synthetic.
 #[test]
-fn an_agent_runs_with_the_launchers_environment_but_not_its_pins() {
+fn an_agent_runs_with_the_allowlisted_environment_not_the_launchers() {
     let (_dir, repo, lane) = repo();
-    ok(
-        &repo,
-        "orchestrator",
-        &[
-            "msg",
-            "send",
-            "--to",
-            "lane-agent",
-            "--kind",
-            "note",
-            "--text",
-            "hi",
-        ],
-    );
     let canary = format!("canary-{}", std::process::id());
-    let out = isolated(&mut Command::new(env!("CARGO_BIN_EXE_mdkg")))
-        .current_dir(graph(&repo))
-        .arg("--root")
-        .arg(graph(&repo))
-        .args(["--as", "launcher"])
-        .args(common::agent_turn_args(
-            &graph(&repo),
+    let fake = concat!("not-", "a-secret");
+    // What the launcher's shell might export besides what a harness needs.
+    let extra = [
+        "GITHUB_TOKEN",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_PROFILE",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "DATABASE_URL",
+        "ANTHROPIC_MODEL",
+        "CLAUDE_CODE_ENABLE_TELEMETRY",
+        "CLAUDE_REMOTE_CONTROL_SESSION_NAME_PREFIX",
+    ];
+    let turn = |round: usize| {
+        ok(
+            &repo,
+            "orchestrator",
             &[
-                "turn",
+                "msg",
+                "send",
+                "--to",
                 "lane-agent",
-                "--harness",
-                "claude",
-                "--role",
-                "worker",
-                "--cwd",
-                lane.to_str().unwrap(),
-                "--json",
+                "--kind",
+                "note",
+                "--text",
+                &format!("hi {round}"),
             ],
-        ))
-        .env("ANTHROPIC_API_KEY", &canary)
-        .env("GITHUB_TOKEN", &canary)
-        .env("AWS_SECRET_ACCESS_KEY", &canary)
-        .env("AWS_PROFILE", &canary)
-        .env("GOOGLE_APPLICATION_CREDENTIALS", &canary)
-        .envs(mdkg_run::auth::KEY_VARS.iter().map(|k| (k, &canary)))
-        .envs(WITHHELD_BY_FAMILY.iter().map(|k| (k, &canary)))
-        .env("ANTHROPIC_MODEL", &canary)
-        .env("CLAUDE_CODE_ENABLE_TELEMETRY", &canary)
-        .env("CLAUDE_REMOTE_CONTROL_SESSION_NAME_PREFIX", &canary)
-        .env("DATABASE_URL", &canary)
-        // A launcher run with its own pins (by another launcher): they
-        // stay its own.
-        .env(
-            "MDKG_TRUSTED_WORKTREE",
-            fs::canonicalize(graph(&repo)).expect("graph"),
+        );
+        for f in ["claude.environ", "claude-auth.environ"] {
+            let _ = fs::remove_file(lane.join(f));
+        }
+        let out = isolated(&mut Command::new(env!("CARGO_BIN_EXE_mdkg")))
+            .current_dir(graph(&repo))
+            .arg("--root")
+            .arg(graph(&repo))
+            .args(["--as", "launcher"])
+            .args(common::agent_turn_args(
+                &graph(&repo),
+                &[
+                    "turn",
+                    "lane-agent",
+                    "--harness",
+                    "claude",
+                    "--role",
+                    "worker",
+                    "--cwd",
+                    lane.to_str().unwrap(),
+                    "--json",
+                ],
+            ))
+            .env("FAKE_TOKEN", fake)
+            .env("ANTHROPIC_API_KEY", &canary)
+            .envs(extra.iter().map(|k| (k, &canary)))
+            .envs(mdkg_run::auth::KEY_VARS.iter().map(|k| (k, &canary)))
+            .envs(WITHHELD_BY_FAMILY.iter().map(|k| (k, &canary)))
+            // A launcher run with its own pins (by another launcher): they
+            // stay its own.
+            .env(
+                "MDKG_TRUSTED_WORKTREE",
+                fs::canonicalize(graph(&repo)).expect("graph"),
+            )
+            .env("LC_ALL", "C")
+            .output()
+            .expect("run mdkg");
+        // The turn's own stdout: the fake's synthetic output.
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let env = fs::read_to_string(lane.join("claude.environ")).expect("the agent's environment");
+        // The login check sees what the agent will, so the harness still
+        // starts with its login, and a stray key or provider switch can't
+        // make it report a login the turn wouldn't use.
+        let login =
+            fs::read_to_string(lane.join("claude-auth.environ")).expect("the login check's");
+        (
+            env,
+            login,
+            String::from_utf8_lossy(&out.stderr).into_owned(),
         )
-        .env("LC_ALL", "C")
-        .output()
-        .expect("run mdkg");
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stdout)
-    );
-    let env = fs::read_to_string(lane.join("claude.environ")).expect("the agent's environment");
+    };
+    let has = |seen: &str, var: &str| seen.lines().any(|l| l.starts_with(&format!("{var}=")));
+    let never = |seen: &str| {
+        for var in mdkg_run::auth::KEY_VARS
+            .iter()
+            .chain(WITHHELD_BY_FAMILY)
+            .chain(&["MDKG_TRUSTED_WORKTREE"])
+        {
+            assert!(
+                !has(seen, var),
+                "{var} reached the agent or its login check"
+            );
+        }
+    };
+
+    // The default: the allowlist.
+    let (env, login, stderr) = turn(1);
     // The launcher recorded the turn's mark while it ran, and removed it.
     assert!(
         lane.join("claude.mark.environ").exists(),
@@ -811,47 +905,129 @@ fn an_agent_runs_with_the_launchers_environment_but_not_its_pins() {
         fs::read_dir(&turns).map_or(true, |mut d| d.next().is_none()),
         "no mark left after the turn"
     );
-    // The login check sees what the agent will: a stray key or provider
-    // switch can't make it report a login the turn wouldn't use.
-    let login = fs::read_to_string(lane.join("claude-auth.environ")).expect("the login check's");
-    // The user's environment, as they'd start the agent themselves, less
-    // the provider key variables and switches: a stray one would move the
-    // turn from the subscription to API or cloud billing.
     for seen in [&env, &login] {
-        for var in [
-            "GITHUB_TOKEN",
-            "AWS_SECRET_ACCESS_KEY",
-            "AWS_PROFILE",
-            "GOOGLE_APPLICATION_CREDENTIALS",
-            "DATABASE_URL",
-            "ANTHROPIC_MODEL",
-            "CLAUDE_CODE_ENABLE_TELEMETRY",
-            "CLAUDE_REMOTE_CONTROL_SESSION_NAME_PREFIX",
-        ] {
+        never(seen);
+        for var in extra.iter().chain(&["FAKE_TOKEN"]) {
+            assert!(
+                !has(seen, var),
+                "{var} reached the agent or its login check"
+            );
+        }
+        for var in ["PATH", "HOME", "LC_ALL", "GIT_AUTHOR_NAME"] {
+            assert!(has(seen, var), "{var} missing");
+        }
+    }
+    assert!(env.lines().any(|l| l == "MDKG_ACTOR=lane-agent"));
+    assert!(!stderr.contains("env.inherit"), "no inherit warning");
+
+    // env.allow adds exact names, and a prefix, which never admits a
+    // credential-shaped name.
+    set_default_env(
+        &repo,
+        Some(serde_json::json!({"allow": ["GITHUB_TOKEN", "DATABASE_*", "FAKE_*"]})),
+    );
+    let (env, login, _) = turn(2);
+    for seen in [&env, &login] {
+        never(seen);
+        assert!(seen.lines().any(|l| l == format!("GITHUB_TOKEN={canary}")));
+        assert!(seen.lines().any(|l| l == format!("DATABASE_URL={canary}")));
+        for var in ["FAKE_TOKEN", "AWS_SECRET_ACCESS_KEY", "AWS_PROFILE"] {
+            assert!(
+                !has(seen, var),
+                "{var} reached the agent or its login check"
+            );
+        }
+    }
+    // `agents status --json` shows the resolved names, credential-shaped
+    // ones included, unredacted: they're names, never values.
+    let lane_status = |status: &Value| {
+        status["data"]["agents"]
+            .as_array()
+            .expect("agents")
+            .iter()
+            .find(|a| a["name"] == "lane-agent")
+            .expect("lane-agent")
+            .clone()
+    };
+    let agent = lane_status(&ok(&graph(&repo), "launcher", &["agents", "status"]));
+    assert_eq!(
+        agent["policy"]["env"]["allow"],
+        serde_json::json!(["GITHUB_TOKEN", "DATABASE_*", "FAKE_*"]),
+        "{agent}"
+    );
+    assert_eq!(agent["env_mode"], "allowlist", "{agent}");
+    // doctor's env check, through the same shared reader.
+    let env_check = || {
+        let (_, doctor) = mdkg(&graph(&repo), "launcher", &["doctor"]);
+        doctor["data"]["checks"]
+            .as_array()
+            .expect("checks")
+            .iter()
+            .find(|c| c["name"] == "env")
+            .expect("env check")
+            .clone()
+    };
+    let check = env_check();
+    assert_eq!(check["status"], "ok", "{check}");
+    assert!(!check.to_string().contains(canary.as_str()), "{check}");
+
+    // env.inherit: the launcher's whole environment, less provider keys
+    // and pins, warned on the turn.
+    set_default_env(&repo, Some(serde_json::json!({"inherit": true})));
+    let (env, login, stderr) = turn(3);
+    for seen in [&env, &login] {
+        never(seen);
+        for var in extra {
             assert!(
                 seen.lines().any(|l| l == format!("{var}={canary}")),
                 "{var} missing"
             );
         }
-        for var in mdkg_run::auth::KEY_VARS.iter().chain(WITHHELD_BY_FAMILY) {
-            assert!(
-                !seen.lines().any(|l| l.starts_with(&format!("{var}="))),
-                "{var} reached the agent or its login check"
-            );
-        }
     }
-    for var in ["PATH=", "HOME=", "LC_ALL=C", "MDKG_ACTOR=lane-agent"] {
-        assert!(
-            env.lines().any(|l| l.starts_with(var)),
-            "{var} missing:\n{env}"
-        );
-    }
-    // No pins: they'd make every mdkg the agent's tests build refuse.
-    assert!(!env.contains("MDKG_TRUSTED_"), "{env}");
+    assert!(
+        stderr.contains("env.inherit is true"),
+        "the inherit warning"
+    );
+    let status = ok(&graph(&repo), "launcher", &["agents", "status"]);
+    let agent = status["data"]["agents"]
+        .as_array()
+        .expect("agents")
+        .iter()
+        .find(|a| a["name"] == "lane-agent")
+        .expect("lane-agent");
+    assert_eq!(agent["env_mode"], "inherit", "{agent}");
+    assert!(
+        status["data"]["config_warnings"]
+            .as_array()
+            .expect("warnings")
+            .iter()
+            .any(|w| w
+                .as_str()
+                .is_some_and(|w| w.contains("agent lane-agent has env.inherit"))),
+        "{status}"
+    );
+    let check = env_check();
+    assert_eq!(check["status"], "warning", "{check}");
+    assert!(
+        check["summary"]
+            .as_str()
+            .is_some_and(|s| s.contains("to lane-agent")),
+        "{check}"
+    );
+    assert!(!check.to_string().contains(canary.as_str()), "{check}");
+    set_default_env(&repo, None);
+    let status = ok(&graph(&repo), "launcher", &["agents", "status"]);
+    let agent = status["data"]["agents"]
+        .as_array()
+        .expect("agents")
+        .iter()
+        .find(|a| a["name"] == "lane-agent")
+        .expect("lane-agent");
+    assert_eq!(agent["env_mode"], "allowlist", "{agent}");
 }
 
 #[test]
-fn a_codex_agent_runs_with_the_launchers_environment_and_codex_home() {
+fn a_codex_agent_runs_with_the_allowlisted_environment_and_codex_home() {
     let (_dir, repo, lane) = repo();
     ok(
         &repo,
@@ -900,7 +1076,8 @@ fn a_codex_agent_runs_with_the_launchers_environment_and_codex_home() {
         "codex never ran: {}",
         String::from_utf8_lossy(&out.stdout)
     );
-    assert!(env.lines().any(|l| l == format!("E2E_CANARY={canary}")));
+    // Off the allowlist (0.7.2): the launcher's other variables stay out.
+    assert!(!env.lines().any(|l| l.starts_with("E2E_CANARY=")));
     for var in ["OPENAI_API_KEY", "CODEX_API_KEY"] {
         assert!(
             !env.lines().any(|l| l.starts_with(&format!("{var}="))),
@@ -925,6 +1102,11 @@ fn an_opencode_worker_turn_runs_only_after_its_build_preflight() {
     fs::create_dir_all(xdg.join("opencode")).expect("xdg");
     fs::create_dir_all(&home).expect("home");
     let user = xdg.join("opencode/opencode.json");
+    // The fake's controls reach it, and its preflight, through env.allow.
+    set_default_env(
+        &repo,
+        Some(serde_json::json!({"allow": ["FAKE_OPENCODE_*"]})),
+    );
     // One note, which every refused turn must leave unread for the next.
     let sent = ok(
         &repo,
@@ -3748,4 +3930,52 @@ fn a_template_copy_names_its_own_folder_and_refuses_a_database_that_names_the_bu
         refused.is_err(),
         "a binary file naming the build folder was copied"
     );
+}
+
+/// H-M6 (0.7.2): a config with no `projections` key gets the legacy
+/// default from install, which 0.7.3 drops. install and doctor warn and
+/// name the key; once the key is listed, neither does. Nothing else
+/// changes: install still writes the AGENTS.md block.
+#[test]
+fn install_and_doctor_warn_about_the_legacy_projections_default() {
+    let (_dir, _repo, lane) = repo();
+    let path = lane.join(".mdkg/config.json");
+    let mut cfg: Value = serde_json::from_slice(&fs::read(&path).expect("config")).expect("json");
+    cfg.as_object_mut().expect("object").remove("projections");
+    fs::write(&path, serde_json::to_vec_pretty(&cfg).expect("json")).expect("w");
+    let legacy = |out: &Value| {
+        out["diagnostics"]
+            .as_array()
+            .expect("diagnostics")
+            .iter()
+            .filter(|d| d["code"] == "install.legacy_projections")
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let install = ok(&lane, "nick", &["install"]);
+    let warned = legacy(&install);
+    assert_eq!(warned.len(), 1, "{install}");
+    assert_eq!(warned[0]["severity"], "warning", "{install}");
+    let message = warned[0]["message"].as_str().expect("message");
+    assert!(message.contains("`projections`"), "{message}");
+    assert!(message.contains("0.7.3"), "{message}");
+    assert!(message.contains("agents-md"), "{message}");
+    let hint = warned[0]["hint"].as_str().expect("hint");
+    assert!(hint.contains("config set projections '["), "{hint}");
+    // The legacy default is still written.
+    assert!(
+        fs::read_to_string(lane.join("AGENTS.md"))
+            .expect("AGENTS.md")
+            .contains(mdkg_run::install::BLOCK_START)
+    );
+    let (_, doctor) = mdkg(&lane, "nick", &["doctor"]);
+    assert_eq!(legacy(&doctor).len(), 1, "{doctor}");
+    // Listing the key ends the warning.
+    let listed = ok(&lane, "nick", &["install", "--enable", "mcp:claude"]);
+    assert!(legacy(&listed).is_empty(), "{listed}");
+    let cfg: Value = serde_json::from_slice(&fs::read(&path).expect("config")).expect("json");
+    assert!(cfg["projections"].is_array(), "{cfg}");
+    assert!(legacy(&ok(&lane, "nick", &["install"])).is_empty());
+    let (_, doctor) = mdkg(&lane, "nick", &["doctor"]);
+    assert!(legacy(&doctor).is_empty(), "{doctor}");
 }

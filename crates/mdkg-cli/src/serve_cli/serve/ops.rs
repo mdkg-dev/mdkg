@@ -8,7 +8,7 @@
 //!
 //! - **Refused before the backend:** a route no operation has, a
 //!   host-class operation (the router), a stream other than
-//!   `/v1/events` (none is served in 0.7.1), and on loopback a person's
+//!   `/v1/events` (none is served in 0.7.2), and on loopback a person's
 //!   ledger operation (below).
 //! - **Refused by the backend:** any class but `any` (operator, host and
 //!   decision operations), a decision post, a ledger `decide` or
@@ -21,6 +21,10 @@
 //!   (any spelling) may make no ledger write (`entry …`, `done
 //!   --residual`): those come over the socket, where the caller's process
 //!   is checked, or from the CLI.
+//! - **A person's mail on loopback** (DECISION 39, 2026-11-04): for the
+//!   same reason, a `human:*` actor's `msg send` is refused there. Over
+//!   the socket the peer check has refused a turn's caller, and the CLI
+//!   checks the rest (the name, and that no person is enforced).
 //! - **A long poll** (`msg wait`) is a request whose call stops when its
 //!   client goes away, and as soon as the drain starts (after any turn
 //!   grace), answering `api.draining`; any other call runs to its end
@@ -120,7 +124,7 @@ impl Ops {
             }
         };
         if op.kind == Kind::Stream {
-            return unsupported("this stream isn't served in 0.7.1; GET /v1/events is");
+            return unsupported("this stream isn't served in 0.7.2; GET /v1/events is");
         }
         let given = match self.arguments(op, req) {
             Ok(given) => given,
@@ -147,6 +151,16 @@ impl Ops {
                     "a person's ledger operations aren't served on loopback",
                 )
                 .with_hint("make them over the local socket or with the mdkg CLI"),
+            );
+        }
+        if req.peer == Peer::Loopback && person(&actor) && op.name == "msg.send" {
+            return super::local::refusal_at(
+                403,
+                Diagnostic::error(
+                    Code::ApiActorNotAllowed,
+                    "a person's mail isn't sent on loopback",
+                )
+                .with_hint("send it over the local socket or with the mdkg CLI"),
             );
         }
         let backend: Arc<dyn Backend> = self.backend.clone();

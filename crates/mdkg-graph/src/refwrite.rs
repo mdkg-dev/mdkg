@@ -856,6 +856,55 @@ impl RefWriter {
         })
     }
 
+    /// Moves the graph ref from `old` to `new`, an existing commit that
+    /// descends from `old`, by a compare-and-swap under the exclusive graph
+    /// lock: graph sync's local step (edd-01a18867, Sync, "The
+    /// algorithm"). `new` must hold this writer's graph. `false` when the
+    /// ref no longer holds `old` (a lost race: the caller tries again).
+    pub fn advance(&self, lock: &GraphLock, old: &str, new: &str) -> Result<bool> {
+        self.held(lock)?;
+        self.config_unchanged()?;
+        self.writable()?;
+        if !full_oid(old) || !full_oid(new) || self.head(new)? != new {
+            return Err(invalid("advance takes two full commit object IDs"));
+        }
+        let ancestor = self.run(&["merge-base", "--is-ancestor", old, new], None)?;
+        if !ancestor.status.success() {
+            return Err(invalid(format!(
+                "{new} doesn't descend from the graph tip {old}"
+            )));
+        }
+        self.same_graph(Some(new))?;
+        self.update_ref(&self.graph_ref, new, old, "mdkg: graph sync")
+    }
+
+    /// Moves the graph ref from `old` to `new`, which need not descend from
+    /// it, by the same compare-and-swap as [`RefWriter::advance`]: graph
+    /// sync adopting a rewritten remote a person accepted (DECISION 9).
+    /// `kept` must be a ref under `refs/mdkg/backup/` that holds `old`
+    /// already, so the history the move leaves is never lost. `false` when
+    /// the ref no longer holds `old`.
+    pub fn replace(&self, lock: &GraphLock, old: &str, new: &str, kept: &str) -> Result<bool> {
+        self.held(lock)?;
+        self.config_unchanged()?;
+        self.writable()?;
+        if !full_oid(old) || !full_oid(new) || self.head(new)? != new {
+            return Err(invalid("replace takes two full commit object IDs"));
+        }
+        if !kept.starts_with("refs/mdkg/backup/") || self.resolve(kept)?.as_deref() != Some(old) {
+            return Err(invalid(format!(
+                "replacing the graph tip {old} needs a backup ref holding it, not {kept}"
+            )));
+        }
+        self.same_graph(Some(new))?;
+        self.update_ref(
+            &self.graph_ref,
+            new,
+            old,
+            "mdkg: graph sync adopts a rewrite",
+        )
+    }
+
     /// Restore a persisted request's base after process restart. Only a full
     /// commit object ID is accepted; moving ref names would change its meaning.
     pub fn snapshot_at(&self, commit: &str) -> Result<Snapshot> {

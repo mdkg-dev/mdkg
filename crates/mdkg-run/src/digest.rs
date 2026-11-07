@@ -332,6 +332,9 @@ mod tests {
             via: Some("orchestrator".into()),
             room: Some("review".into()),
             sent_at: Some("2026-10-22T14:03:11Z".into()),
+            digest: String::new(),
+            nodes: Vec::new(),
+            supersedes: Vec::new(),
             parts,
         }
     }

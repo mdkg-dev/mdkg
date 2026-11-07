@@ -14,6 +14,7 @@ use mdkg_graph::GraphError;
 use mdkg_run::orchestration::agent::{self, Definition};
 use mdkg_run::policy::Policy;
 use mdkg_run::state;
+use mdkg_run::supervise::registry::ExitReason;
 use mdkg_run::supervise::{self, Event, Guard, Supervised, Up};
 use mdkg_run::{TurnReport, receiver};
 use serde::Serialize;
@@ -26,8 +27,10 @@ use mdkg_format::program::BIN;
 
 mod logs;
 mod stop;
+mod turns;
 pub use logs::{LogsArgs, LogsData};
 pub use stop::{StopArgs, StopData};
+pub use turns::{TurnsArgs, TurnsData};
 
 #[derive(Debug, Subcommand)]
 pub enum AgentsCommand {
@@ -54,10 +57,28 @@ pub enum AgentsCommand {
     /// agent's turns as they run.
     #[command(after_help = examples!("agents logs worker-1", "agents logs worker-1 --follow --json", "agents logs worker-1 --follow --after turn:1 --json"))]
     Logs(LogsArgs),
+    /// List an agent's turns, newest first: each one's id, number, times,
+    /// outcome and receipt, a page at a time.
+    #[command(after_help = examples!("agents turns worker-1 --json", "agents turns worker-1 --limit 20 --before 41 --json", "agents turns worker-1 --turn 7 --json"))]
+    Turns(TurnsArgs),
     /// Show the agents, their policies, and the threads the loop guard
     /// paused.
-    #[command(after_help = examples!("agents status", "agents status --json"))]
+    #[command(after_help = examples!("agents status", "agents status --json", "agents status --no-probe --json"))]
     Status {
+        /// Run no probe: no harness login check, Keychain listing or
+        /// billing read, so it's cheap to poll. `auth` and `billing` are
+        /// left out.
+        #[arg(long)]
+        no_probe: bool,
+        /// Print JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List the agents the settings define, each with the layer that
+    /// defines it and every layer with an entry for it. Reads settings only:
+    /// nothing is probed and no saved state is read.
+    #[command(after_help = examples!("agents list", "agents list --json"))]
+    List {
         /// Print JSON.
         #[arg(long)]
         json: bool,
@@ -105,7 +126,9 @@ impl AgentsCommand {
             AgentsCommand::Up(_) => "agents.up",
             AgentsCommand::Stop(_) => "agents.stop",
             AgentsCommand::Logs(_) => "agents.logs",
+            AgentsCommand::Turns(_) => "agents.turns",
             AgentsCommand::Status { .. } => "agents.status",
+            AgentsCommand::List { .. } => "agents.list",
             AgentsCommand::Resume { .. } => "agents.resume",
             AgentsCommand::UseKey { .. } => "agents.use-key",
         }
@@ -118,7 +141,9 @@ impl AgentsCommand {
             AgentsCommand::Up(a) => a.json,
             AgentsCommand::Stop(a) => a.json,
             AgentsCommand::Logs(a) => a.json,
-            AgentsCommand::Status { json }
+            AgentsCommand::Turns(a) => a.json,
+            AgentsCommand::Status { json, .. }
+            | AgentsCommand::List { json }
             | AgentsCommand::Resume { json, .. }
             | AgentsCommand::UseKey { json, .. } => *json,
         }
@@ -152,6 +177,9 @@ pub struct DefinitionArgs {
     /// Per-agent turn policy, as a JSON object.
     #[arg(long)]
     pub policy: Option<String>,
+    /// Mail delivery shape (batch by default).
+    #[arg(long, value_parser = ["batch", "digest"])]
+    pub delivery: Option<String>,
     /// The actor receiving turn receipts and faults: turn errors and refused
     /// replies (default: orchestrator).
     #[arg(long)]
@@ -592,6 +620,14 @@ fn definition_report(
                     Some(serde_json::from_str(policy).map_err(|e| bad_agent(&a.agent, e))?),
                 );
             }
+            if let Some(delivery) = &a.delivery {
+                let policy = object
+                    .entry("policy")
+                    .or_insert_with(|| serde_json::json!({}))
+                    .as_object_mut()
+                    .ok_or_else(|| bad_agent(&a.agent, "policy must be an object"))?;
+                policy.insert("shape".into(), Value::String(delivery.clone()));
+            }
             let definition = Definition::parse(&a.agent, value).map_err(graph_error)?;
             Ok(Change::Write {
                 definition: Box::new(definition),
@@ -740,6 +776,10 @@ pub struct AgentStatus {
     pub effective: Option<crate::config_cmd::EffectiveAgentData>,
     /// Named in the config's `agents`.
     pub configured: bool,
+    /// Defined by its own file, `.mdkg/agents/<name>.json` (then
+    /// `effective` is its layered definition), rather than inline in the
+    /// config.
+    pub file_backed: bool,
     /// Has saved machine-local runtime state.
     pub known: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -751,6 +791,11 @@ pub struct AgentStatus {
     pub turns: u64,
     #[serde(serialize_with = "serialize_status_policy")]
     pub policy: Policy,
+    /// Which environment its turns start with: `allowlist`, `inherit`
+    /// (`env.inherit: true`, the launcher's whole environment less provider
+    /// keys), or `session` for an interactive receiver. Names only, never
+    /// values (crate::env in mdkg-run).
+    pub env_mode: EnvMode,
     /// Threads the loop guard pauses now.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub paused: Vec<String>,
@@ -770,12 +815,14 @@ pub struct AgentStatus {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dropped_allow: Vec<mdkg_run::profile::DroppedAllow>,
     /// The account its turns would bill now, from its harness's own login
-    /// check and the Keychain's list (no key is read).
+    /// check and the Keychain's list (no key is read). Absent under
+    /// `--no-probe`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth: Option<mdkg_run::auth::AuthStatus>,
     /// The key, offered or marked: after a usage limit, the `agents use-key`
     /// command to bill the next turn on it; a mark waiting for that turn;
-    /// or a mark held because it couldn't be recorded durably.
+    /// or a mark held because it couldn't be recorded durably. Absent
+    /// under `--no-probe`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub billing: Option<String>,
     /// What a client needs to re-attach (API v1 A18): `stopped`, `idle`,
@@ -788,6 +835,17 @@ pub struct AgentStatus {
     pub current_turn: Option<mdkg_run::turn::observe::CurrentTurn>,
     /// The last turn that isn't running; null when none.
     pub last_turn: Option<mdkg_run::turn::observe::LastTurn>,
+    /// How its last supervisor ended, while none runs it: `reason` is
+    /// `cap` (`--max-turns` reached), `once`, `manual` (a `manual`
+    /// trigger: a watch runs it no turns), `mode_changed` (its receiver
+    /// changed mode), `drained` (`agents stop`, as of the drain), `signal`
+    /// (SIGTERM, turns finished) or `failed` (with `code`). Only for the
+    /// agent's latest watch, once it's finished.
+    /// Absent while a supervisor runs it, and when none recorded an exit
+    /// (never run, or killed outright: SIGKILL, SIGINT, a crash), so a
+    /// reason is never guessed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_exit: Option<LastExit>,
     /// The position `agents logs <agent> --follow --after` takes to pick up
     /// from this snapshot: never "from now", so a turn that starts or ends
     /// in between is still delivered.
@@ -796,6 +854,18 @@ pub struct AgentStatus {
     /// there's no mainRef here, or no worktree yet.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub code_base: Option<CodeBase>,
+}
+
+/// How an agent's last supervisor ended (`agents status`'s `last_exit`).
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct LastExit {
+    pub supervisor_id: String,
+    pub reason: supervise::registry::ExitReason,
+    /// The failure's diagnostic code, with `failed` only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    /// When it exited (RFC 3339).
+    pub at: String,
 }
 
 /// How a worker's branch stands against the code base it follows.
@@ -807,6 +877,28 @@ pub struct CodeBase {
     pub ahead: u64,
     /// Commits on mainRef that the worker's branch lacks.
     pub behind: u64,
+}
+
+/// One warning per agent whose turns inherit the launcher's whole
+/// environment: `env.inherit: true`, or run by a live supervisor from a
+/// build before 0.7.2 (`untracked`). By name.
+fn inherit_warnings(agents: &[AgentStatus], untracked: &[String]) -> Vec<String> {
+    let mut warnings: Vec<String> = agents
+        .iter()
+        .filter(|a| a.env_mode == EnvMode::Inherit)
+        .map(|a| {
+            format!(
+                "agent {} has env.inherit: its turns get the launcher's whole environment, so every credential the launcher's shell exports reaches it; to apply a change, publish it where agents read their config (in checkout mode, run `{BIN} agents edit` in the graph checkout or with `--root` naming it; in ref mode, from any checkout), restart `agents up` (a one-shot `--once` pass keeps the policies it read at start until it ends), then check each agent's `env_mode` and `policy.env.allow` in `agents status --json`, which reads the config from the same place",
+                a.name
+            )
+        })
+        .collect();
+    warnings.extend(untracked.iter().map(|name| {
+        format!(
+            "agent {name} runs in a supervisor not confirmed as 0.7.2 or later (an older build, or one that couldn't register), whose turns may get the launcher's whole environment; restart `agents up` with this build"
+        )
+    }));
+    warnings
 }
 
 fn serialize_status_policy<S: serde::Serializer>(
@@ -837,6 +929,13 @@ pub struct StatusData {
     pub build_warnings: Vec<String>,
     /// Durable watches, including interrupted actors without runtime state.
     pub progress: Vec<ProgressStatus>,
+}
+
+/// `agents list`: the agents the settings define.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct ListData {
+    pub agents: Vec<crate::config_cmd::ListedAgent>,
+    pub config_warnings: Vec<String>,
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
@@ -1027,6 +1126,105 @@ fn config_with(
         );
     }
     Ok(snapshot)
+}
+
+/// The environment an agent's turns start with, as `agents status` and
+/// `doctor` report it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvMode {
+    /// Only the allowlist and the policy's `env.allow`.
+    Allowlist,
+    /// The launcher's whole environment, less provider keys (`env.inherit`).
+    Inherit,
+    /// An interactive receiver: mdkg delivers into a session someone
+    /// started, which has that person's environment.
+    Session,
+}
+
+impl EnvMode {
+    fn of(policy: mdkg_run::env::Mode, interactive: bool) -> Self {
+        match (interactive, policy) {
+            (true, _) => Self::Session,
+            (false, mdkg_run::env::Mode::Allowlist) => Self::Allowlist,
+            (false, mdkg_run::env::Mode::Inherit) => Self::Inherit,
+        }
+    }
+}
+
+/// An agent's name and its environment mode, or why it can't be read.
+pub(crate) type EnvRow = (String, Result<EnvMode, String>);
+
+/// Every agent `agents status` lists, in its order: the config's, then the
+/// saved ones, the receivers' and the ones a live supervisor runs.
+fn agent_names(
+    cfg: &Value,
+    dir: &Path,
+    receiver_common: &Path,
+    supervisors: &[supervise::registry::Found],
+) -> Vec<String> {
+    let mut names = configured(cfg);
+    let others = known(dir)
+        .into_iter()
+        .chain(receiver::route::actors(receiver_common))
+        .chain(
+            supervisors
+                .iter()
+                .filter(|f| f.live)
+                .flat_map(|f| f.record.agents.keys().cloned()),
+        );
+    for k in others {
+        if !names.contains(&k) {
+            names.push(k);
+        }
+    }
+    names
+}
+
+/// Each agent's environment mode, by name (`doctor`), for the same agents
+/// as `agents status`: its policy's `env`, `session` for an interactive
+/// receiver, or why either can't be read. Names only.
+pub(crate) fn env_modes(root: &Path) -> Result<Vec<EnvRow>, GraphError> {
+    let repo = Repo::open(root)?;
+    let snapshot = config(&repo)?;
+    let cfg = &snapshot.effective.values;
+    let dir = state::run_dir(&repo.top).map_err(graph_error)?;
+    let common = mdkg_coord_sqlite::git::common_dir(&repo.top)
+        .map_err(|e| graph_error(mdkg_run::RunError::io("can't find git common dir", e)))?;
+    let (supervisors, _) = supervise::registry::list(&dir).unwrap_or_default();
+    Ok(agent_names(cfg, &dir, &common, &supervisors)
+        .into_iter()
+        .map(|name| {
+            let mode = Policy::for_agent(cfg, &name)
+                .map_err(|e| e.message)
+                .map(|p| {
+                    // As `agents status` does: unreadable receiver
+                    // evidence counts as headless, so the policy's mode
+                    // is reported rather than a misleading "unreadable".
+                    let interactive = receiver::mode(&repo.root, &dir, &name)
+                        .is_ok_and(|m| m == receiver::Mode::Interactive);
+                    EnvMode::of(p.env.mode(), interactive)
+                });
+            (name, mode)
+        })
+        .collect())
+}
+
+/// The agents a live supervisor runs that aren't confirmed to start turns
+/// with the policy's environment (`doctor`; see
+/// [`supervise::registry::unconfirmed_env`]). Names only.
+pub(crate) fn unconfirmed_env(root: &Path) -> Vec<String> {
+    let Ok(repo) = Repo::open(root) else {
+        return Vec::new();
+    };
+    let Ok(dir) = state::run_dir(&repo.top) else {
+        return Vec::new();
+    };
+    let (found, _) = supervise::registry::list(&dir).unwrap_or_default();
+    let processes = mdkg_run::builds::live(&dir)
+        .map(|l| l.processes)
+        .unwrap_or_default();
+    supervise::registry::unconfirmed_env(&found, &processes)
 }
 
 /// The agents the config names, in its order.
@@ -1500,9 +1698,7 @@ fn ready(root: &Path, actor: Option<String>, a: &UpArgs) -> Result<Ready, GraphE
     // Lock acquisition and fingerprints use a stable order. Duplicate names
     // cannot silently share a budget, mail client, or lock.
     names.sort();
-    if names.windows(2).any(|pair| pair[0] == pair[1]) {
-        return Err(bad_agent("launcher", "duplicate selected agent"));
-    }
+    check_selected(&names)?;
     let definitions = supervise::reload::Definitions::new(
         &repo.top,
         &repo.root,
@@ -1725,7 +1921,12 @@ fn ready(root: &Path, actor: Option<String>, a: &UpArgs) -> Result<Ready, GraphE
                 &authority.commit,
             );
             opts.auth = p.policy.auth;
+            opts.env = p.policy.env.clone();
             opts.limit = p.policy.batch_max();
+            opts.digest_budget = match &p.policy.shape {
+                mdkg_run::policy::Shape::Digest { budget } => Some(*budget),
+                _ => None,
+            };
             opts.timeout = p.policy.timeout.or(opts.timeout);
             opts.require_headless = true;
             // Ref mode: workers follow mainRef by notes before each turn
@@ -1774,6 +1975,20 @@ fn ready(root: &Path, actor: Option<String>, a: &UpArgs) -> Result<Ready, GraphE
     })
 }
 
+/// The selected agent names' own checks: each a valid name, none twice.
+/// Pure, so `up` runs them before its first graph pull too.
+fn check_selected(names: &[String]) -> Result<(), GraphError> {
+    for name in names {
+        state::check_name(name).map_err(graph_error)?;
+    }
+    let mut sorted: Vec<&String> = names.iter().collect();
+    sorted.sort();
+    if sorted.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(bad_agent("launcher", "duplicate selected agent"));
+    }
+    Ok(())
+}
+
 fn up(root: &Path, actor: Option<String>, a: &UpArgs) -> u8 {
     // First, so an install while this starts up still restarts it.
     let binary = supervise::reload::binary_at_start();
@@ -1798,6 +2013,45 @@ fn up(root: &Path, actor: Option<String>, a: &UpArgs) -> u8 {
         return failed(e, a.json);
     }
     let token = supervise::reload::ExecToken::inherited().filter(|_| !a.dry_run);
+    // `ready`'s checks of the arguments alone, before the first pull below
+    // can touch the network (DECISION 19 (T1)); it checks them again.
+    if let Err(e) = check_selected(&a.agents) {
+        if let Some(token) = &token {
+            finish_handed_off(root, token, &[], None);
+        }
+        return failed(e, a.json);
+    }
+    // G13 (answer (b)): graph sync's timers, in ref mode, with or without
+    // a remote yet (one configured while `up` runs is picked up, Terra
+    // #18984). The first pull runs here, before `ready` reads the
+    // definitions and policies turns are prepared from. No network sync
+    // starts inside an agent's turn (DECISION 19 (T1)): the syncer starts
+    // only after the outside-turn check `graph sync` and `graph remote
+    // approve` make; inside one, `up` runs without sync and says so once.
+    let sync_graph = (!a.once)
+        .then(|| crate::coord::Repo::open(root).ok())
+        .flatten()
+        .and_then(|repo| {
+            mdkg_graph::graphref::resolve(&repo.top)
+                .ok()
+                .flatten()
+                .map(|g| (repo.top, g))
+        })
+        .filter(|(top, graph)| {
+            match crate::graph::sync::outside_turn(top, graph, "graph.sync_in_turn") {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!(
+                        "agents up: graph sync is off for this run: {}",
+                        mdkg_run::digest::terminal_safe(&e.to_string())
+                    );
+                    false
+                }
+            }
+        });
+    let syncer = sync_graph
+        .as_ref()
+        .map(|(top, graph)| crate::graph::rows::Syncer::start(top, graph, a.json));
     let Ready {
         dir,
         agents,
@@ -1809,14 +2063,14 @@ fn up(root: &Path, actor: Option<String>, a: &UpArgs) -> u8 {
         Ok(r) => r,
         Err(e) => {
             if let Some(token) = &token {
-                finish_handed_off(root, token, &[]);
+                finish_handed_off(root, token, &[], Some(e.diagnostic.code.as_str()));
             }
             return failed(e, a.json);
         }
     };
     if let Some(token) = &token {
         let selected: Vec<String> = agents.iter().map(|s| s.name.clone()).collect();
-        finish_handed_off(root, token, &selected);
+        finish_handed_off(root, token, &selected, None);
     }
     let _process_build = if a.dry_run {
         None
@@ -1866,6 +2120,12 @@ fn up(root: &Path, actor: Option<String>, a: &UpArgs) -> u8 {
                     &mut progress[index],
                 );
                 if let Err(e) = result {
+                    record_exit(
+                        supervisor.as_deref(),
+                        &progress,
+                        ExitReason::Failed,
+                        Some(e.code.as_str()),
+                    );
                     return failed(graph_error(e), a.json);
                 }
                 continue;
@@ -1920,7 +2180,14 @@ fn up(root: &Path, actor: Option<String>, a: &UpArgs) -> u8 {
                 let _ = s.set(&agent.name, supervise::registry::AgentState::Idle);
             }
             if fatal {
-                return failed(graph_error(result.expect_err("fatal turn bridge")), a.json);
+                let e = result.expect_err("fatal turn bridge");
+                record_exit(
+                    supervisor.as_deref(),
+                    &progress,
+                    ExitReason::Failed,
+                    Some(e.code.as_str()),
+                );
+                return failed(graph_error(e), a.json);
             }
             if !a.dry_run {
                 capacity.after(&result, capacity_fresh);
@@ -1933,13 +2200,19 @@ fn up(root: &Path, actor: Option<String>, a: &UpArgs) -> u8 {
             }
             emit_event(&agent.name, &Event::Turn(&result), a.json);
         }
-        if !a.dry_run {
-            for saved in &mut progress {
-                if let Err(e) = saved.finish() {
-                    return failed(graph_error(e), a.json);
-                }
-            }
+        if !a.dry_run
+            && let Some(e) = progress.iter_mut().find_map(|saved| saved.finish().err())
+        {
+            record_exit(
+                supervisor.as_deref(),
+                &progress,
+                ExitReason::Failed,
+                Some(e.code.as_str()),
+            );
+            return failed(graph_error(e), a.json);
         }
+        // The pass ran; a turn that failed is its own last_turn.
+        record_exit(supervisor.as_deref(), &progress, ExitReason::Once, None);
         return exit;
     }
     // Each agent's thread takes its own mail client, by its name.
@@ -1982,26 +2255,34 @@ fn up(root: &Path, actor: Option<String>, a: &UpArgs) -> u8 {
     // its binary is replaced or a newer build moves the store, and stops on
     // SIGTERM: workers finish their turns first (below). A second SIGTERM
     // takes the default action, at once.
-    let term = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    if !a.once {
-        use signal_hook::{consts::SIGTERM, flag};
-        if let Err(e) = flag::register_conditional_default(SIGTERM, term.clone())
-            .and_then(|_| flag::register(SIGTERM, term.clone()))
-        {
-            eprintln!("warning: SIGTERM won't wait for turns to finish: {e}");
-        }
-    }
+    // Registered by main before anything ran (`register_term`), so a
+    // SIGTERM during startup's git (a worker's `git worktree add`) waits
+    // for it instead of killing mdkg under it.
+    let term = term_flag();
     let watch = (!a.once).then(|| supervise::reload::Watch::new(definitions, binary, store));
     let stop = Mutex::new(None::<Stop>);
+    let drained = std::sync::atomic::AtomicBool::new(false);
+    // The control reads the SIGTERM flag itself: once the handler has run,
+    // no worker is admitted to another turn, with no watcher tick between
+    // (decision 01a1a7dc). The exit below reads the flag again for
+    // Stop::Term.
+    if !a.once {
+        control.stop_on(term.clone());
+    }
     let result = std::thread::scope(|s| {
         let watcher = watch.as_ref().map(|watch| {
             s.spawn(|| {
                 let mut ticks = 0;
-                while !control.stopped() {
-                    std::thread::sleep(RELOAD_TICK);
+                loop {
+                    // The SIGTERM flag first: control already reads it, so
+                    // `stopped()` turns true with it, and the stop it asked
+                    // for is named here before the loop ends.
                     let why = if term.load(std::sync::atomic::Ordering::SeqCst) {
                         Some(Stop::Term)
+                    } else if control.stopped() {
+                        break;
                     } else {
+                        std::thread::sleep(RELOAD_TICK);
                         ticks += 1;
                         (ticks % RELOAD_POLL_TICKS == 0)
                             .then(|| watch.changed().map(Stop::Restart))
@@ -2013,15 +2294,35 @@ fn up(root: &Path, actor: Option<String>, a: &UpArgs) -> u8 {
                         }
                         *stop.lock().unwrap_or_else(|e| e.into_inner()) = Some(why);
                         control.request_stop();
+                        break;
                     }
                 }
             })
         });
+        // G13 (answer (b)): graph sync's pull and push timers, with a graph
+        // remote in ref mode only; they push only to an approved, unchanged
+        // destination (graph::rows::Syncer). The first pull finishes before
+        // any turn is admitted, and the timers run until every turn has
+        // drained (Terra #18237).
+        let drained = &drained;
+        let syncer = sync_graph.as_ref().zip(syncer).map(|((top, _), syncer)| {
+            s.spawn(move || {
+                syncer.run(
+                    top,
+                    &|| drained.load(std::sync::atomic::Ordering::SeqCst),
+                    json,
+                )
+            })
+        });
         let result =
             supervise::up_durable(&make, &dir, &agents, &how, &on, &control, &mut progress);
+        drained.store(true, std::sync::atomic::Ordering::SeqCst);
         control.request_stop();
         if let Some(watcher) = watcher {
             let _ = watcher.join();
+        }
+        if let Some(syncer) = syncer {
+            let _ = syncer.join();
         }
         result
     });
@@ -2043,11 +2344,20 @@ fn up(root: &Path, actor: Option<String>, a: &UpArgs) -> u8 {
     let all_stopped = supervisor
         .as_ref()
         .is_some_and(|s| s.stopped().len() == agents.len());
+    let exited = |progress: &[supervise::progress::Locked], reason, code| {
+        record_exit(supervisor.as_deref(), progress, reason, code)
+    };
     match result {
         Ok(_) if all_stopped => {
             if let Err(e) = finish(&mut progress) {
+                exited(
+                    &progress,
+                    ExitReason::Failed,
+                    Some(e.diagnostic.code.as_str()),
+                );
                 return failed(e, json);
             }
+            exited(&progress, ExitReason::Drained, None);
             if !json {
                 eprintln!("agents up: every agent stopped by agents stop");
             }
@@ -2055,8 +2365,14 @@ fn up(root: &Path, actor: Option<String>, a: &UpArgs) -> u8 {
         }
         Ok(_) if stop == Some(Stop::Term) => {
             if let Err(e) = finish(&mut progress) {
+                exited(
+                    &progress,
+                    ExitReason::Failed,
+                    Some(e.diagnostic.code.as_str()),
+                );
                 return failed(e, json);
             }
+            exited(&progress, ExitReason::Signal, None);
             eprintln!("agents up: stopped by SIGTERM; turns finished");
             0
         }
@@ -2067,8 +2383,14 @@ fn up(root: &Path, actor: Option<String>, a: &UpArgs) -> u8 {
                 && !watch.as_ref().is_some_and(|w| w.binary_replaced())
             {
                 if let Err(e) = finish(&mut progress) {
+                    exited(
+                        &progress,
+                        ExitReason::Failed,
+                        Some(e.diagnostic.code.as_str()),
+                    );
                     return failed(e, json);
                 }
+                exited(&progress, ExitReason::Failed, Some("coord.store_failed"));
                 return failed(
                     graph_error(
                         mdkg_run::RunError::failure("coord.store_failed", why.to_string())
@@ -2117,8 +2439,18 @@ fn up(root: &Path, actor: Option<String>, a: &UpArgs) -> u8 {
             // One clear stop, never a retry: a broken install fails the same
             // way again. Finished, so starting it by hand needs no resume.
             if let Err(e) = finish(&mut progress) {
+                exited(
+                    &progress,
+                    ExitReason::Failed,
+                    Some(e.diagnostic.code.as_str()),
+                );
                 return failed(e, json);
             }
+            exited(
+                &progress,
+                ExitReason::Failed,
+                Some(mdkg_run::error::CODE_IO),
+            );
             failed(
                 graph_error(mdkg_run::RunError::io(
                     "can't restart agents up; start it again",
@@ -2128,10 +2460,32 @@ fn up(root: &Path, actor: Option<String>, a: &UpArgs) -> u8 {
             )
         }
         Ok(ran) => {
-            for saved in &mut progress {
-                if let Err(e) = saved.finish() {
-                    return failed(graph_error(e), json);
-                }
+            if let Some(e) = progress.iter_mut().find_map(|saved| saved.finish().err()) {
+                exited(&progress, ExitReason::Failed, Some(e.code.as_str()));
+                return failed(graph_error(e), json);
+            }
+            // Each agent's own end, as its worker noted it (#20977). One
+            // that noted none ended a --once pass, or isn't recorded: its
+            // reason is never guessed. A drained agent was recorded as it
+            // was let go, and its released lock writes nothing here.
+            for (agent, held) in agents.iter().zip(&progress) {
+                let (reason, code) = match control.ended(&agent.name) {
+                    Some(supervise::End::Manual) => (ExitReason::Manual, None),
+                    Some(supervise::End::Cap) => (ExitReason::Cap, None),
+                    Some(supervise::End::ModeChanged) => (ExitReason::ModeChanged, None),
+                    Some(supervise::End::UnknownAgent) => (
+                        ExitReason::Failed,
+                        Some(mdkg_run::error::CODE_UNKNOWN_AGENT),
+                    ),
+                    None if a.once => (ExitReason::Once, None),
+                    None => continue,
+                };
+                record_exit(
+                    supervisor.as_deref(),
+                    std::slice::from_ref(held),
+                    reason,
+                    code,
+                );
             }
             if !json {
                 let total: u64 = ran.iter().sum();
@@ -2139,8 +2493,34 @@ fn up(root: &Path, actor: Option<String>, a: &UpArgs) -> u8 {
             }
             0
         }
-        Err(e) => failed(graph_error(e), json),
+        Err(e) => {
+            exited(&progress, ExitReason::Failed, Some(e.code.as_str()));
+            failed(graph_error(e), json)
+        }
     }
+}
+
+/// Records why this `agents up` ended, kept per agent once its process is
+/// gone (#20587). A failure to record it is a warning.
+fn record_exit(
+    supervisor: Option<&supervise::registry::Registered>,
+    progress: &[supervise::progress::Locked],
+    reason: ExitReason,
+    code: Option<&str>,
+) {
+    let Some(s) = supervisor else { return };
+    for held in progress {
+        if let Err(e) = supervise::registry::record_exit(s.run_dir(), &s.id(), held, reason, code) {
+            exit_warning(&e);
+        }
+    }
+}
+
+fn exit_warning(e: &mdkg_run::RunError) {
+    eprintln!(
+        "warning: can't record why agents up exited: {}",
+        mdkg_run::digest::terminal_safe(&e.message)
+    );
 }
 
 /// Names this supervisor (A7), under the id a re-exec inherited, so
@@ -2203,7 +2583,17 @@ fn register_supervisor(
 /// drained it, so nothing is in flight, and starting it again then needs no
 /// `agents resume`. `keep` are the watches this process continues. One
 /// that's busy, unresolved or not the one handed over is left as it is.
-fn finish_handed_off(root: &Path, token: &supervise::reload::ExecToken, keep: &[String]) {
+///
+/// `failed` is the code of a re-exec that couldn't start: each watch it
+/// finishes here gets a `failed` exit with that code, written under that
+/// watch's progress lock and the supervisor id the re-exec inherited
+/// (#20977). One that's busy (another process holds it) gets none.
+fn finish_handed_off(
+    root: &Path,
+    token: &supervise::reload::ExecToken,
+    keep: &[String],
+    failed: Option<&str>,
+) {
     let Ok(repo) = Repo::open(root) else { return };
     let (Ok(graph), Ok(dir)) = (graph_id(&repo), state::run_dir(&repo.top)) else {
         return;
@@ -2215,15 +2605,25 @@ fn finish_handed_off(root: &Path, token: &supervise::reload::ExecToken, keep: &[
         let Ok(mut saved) = supervise::progress::Locked::open(&dir, graph, agent) else {
             continue;
         };
-        if saved
+        if !saved
             .record()
             .is_some_and(|r| !r.finished && !r.resume_pending && r.watch_id == *watch)
-            && let Err(e) = saved.finish()
         {
+            continue;
+        }
+        if let Err(e) = saved.finish() {
             eprintln!(
                 "warning: {agent}'s watch is left unfinished: {}",
                 mdkg_run::digest::terminal_safe(&e.message)
             );
+            continue;
+        }
+        if let Some(code) = failed
+            && let Some((id, _)) = supervise::registry::inherited()
+            && let Err(e) =
+                supervise::registry::record_exit(&dir, &id, &saved, ExitReason::Failed, Some(code))
+        {
+            exit_warning(&e);
         }
     }
 }
@@ -2496,7 +2896,10 @@ fn emit_event(agent: &str, ev: &Event<'_>, json: bool) {
     }
 }
 
-fn status_report(root: &Path) -> Result<Report<StatusData>, GraphError> {
+/// `probe`: run each agent's harness login check, list the Keychain and
+/// read its billing mark (`auth`, `billing`); without it, nothing but
+/// mdkg's own records and git is read.
+fn status_report(root: &Path, probe: bool) -> Result<Report<StatusData>, GraphError> {
     let repo = Repo::open(root)?;
     // Ref mode: each worker's lag behind mainRef (G15). Settings that
     // can't be read leave it out; status still reports the rest.
@@ -2514,17 +2917,8 @@ fn status_report(root: &Path) -> Result<Report<StatusData>, GraphError> {
     let cfg = &snapshot.effective.values;
     let conf = configured(cfg);
     let mdkg = run::this_binary();
-    let mut names = conf.clone();
     let receiver_common = mdkg_coord_sqlite::git::common_dir(&repo.top)
         .map_err(|e| graph_error(mdkg_run::RunError::io("can't find git common dir", e)))?;
-    for k in known(&dir)
-        .into_iter()
-        .chain(receiver::route::actors(&receiver_common))
-    {
-        if !names.contains(&k) {
-            names.push(k);
-        }
-    }
     let now = state::now_ms();
     // The stream head first: a change after it is in the stream, and one
     // before it is in what's read below.
@@ -2533,17 +2927,14 @@ fn status_report(root: &Path) -> Result<Report<StatusData>, GraphError> {
         .filter(|p| p.exists())
         .and_then(|p| mdkg_coord_sqlite::events::head(&p).ok());
     let (supervisors, _) = supervise::registry::list(&dir).unwrap_or_default();
-    for f in supervisors.iter().filter(|f| f.live) {
-        for agent in f.record.agents.keys() {
-            if !names.contains(agent) {
-                names.push(agent.clone());
-            }
-        }
-    }
+    // For last_exit's watch check; without it, no exit is shown.
+    let graph = graph_id(&repo).ok();
+    let names = agent_names(cfg, &dir, &receiver_common, &supervisors);
     let mut agents = Vec::new();
     for name in names {
         let st = state::load(&dir, &name).ok().flatten();
         let effective = crate::config_cmd::effective_agent(&snapshot, &name);
+        let file_backed = snapshot.definition_names.contains(&name);
         let (policy, problem) = match Policy::for_agent(cfg, &name) {
             Ok(p) => {
                 let problem = p.check_supported(&name).err().map(|e| e.message);
@@ -2576,13 +2967,14 @@ fn status_report(root: &Path) -> Result<Report<StatusData>, GraphError> {
             },
             |s| s.spec.cwd.clone(),
         );
-        let auth = harness.map(|h| {
+        let auth = harness.filter(|_| probe).map(|h| {
             mdkg_run::auth::status(
                 h,
                 &h.program(),
                 &cwd,
                 &policy.auth,
                 &mdkg_run::auth::KeySource::default(),
+                &mdkg_run::env::Environment::new(h, &policy.env),
             )
         });
         // As made, else the config's `allow`, which will make it: a
@@ -2615,6 +3007,7 @@ fn status_report(root: &Path) -> Result<Report<StatusData>, GraphError> {
                 Err(e) => (None, Some(e.message)),
             };
         let billing = harness
+            .filter(|_| probe)
             .and_then(|h| mdkg_run::auth::billing_note(&dir, &name, h, &policy.auth))
             .map(|b| crate::config_cmd::display_text(&b));
         let view = mdkg_run::turn::observe::agent(&dir, &name, &supervisors, !paused.is_empty());
@@ -2630,8 +3023,26 @@ fn status_report(root: &Path) -> Result<Report<StatusData>, GraphError> {
                 behind,
             })
         });
+        // Shown unless a live supervisor runs it, undrained, and only
+        // while its record names the agent's current, finished watch
+        // (#20977): a later run hides an older reason, nothing to clear.
+        let last_exit = (!supervise::registry::holds(&supervisors, &name))
+            .then(|| {
+                let progress = graph
+                    .and_then(|g| supervise::progress::inspect(&dir, g, &name).ok())
+                    .flatten();
+                supervise::registry::current_exit(&dir, &name, progress.as_ref())
+            })
+            .flatten()
+            .map(|e| LastExit {
+                supervisor_id: e.supervisor_id,
+                reason: e.reason,
+                code: e.code,
+                at: supervise::timestamp(e.at_ms),
+            });
         agents.push(AgentStatus {
             code_base,
+            last_exit,
             state: view.state,
             supervisor: view.supervisor,
             current_turn: view.current_turn,
@@ -2641,11 +3052,17 @@ fn status_report(root: &Path) -> Result<Report<StatusData>, GraphError> {
             auth,
             billing,
             configured: conf.contains(&name),
+            file_backed,
             known: st.is_some(),
             harness: st.as_ref().map(|s| s.spec.harness),
             role: st.as_ref().map(|s| s.spec.role),
             cwd: st.as_ref().map(|s| s.spec.cwd.clone()),
             turns: st.as_ref().map_or(0, |s| s.turns),
+            env_mode: EnvMode::of(
+                policy.env.mode(),
+                receiver::mode(&repo.root, &dir, &name)
+                    .is_ok_and(|m| m == receiver::Mode::Interactive),
+            ),
             name,
             policy,
             paused,
@@ -2685,14 +3102,19 @@ fn status_report(root: &Path) -> Result<Report<StatusData>, GraphError> {
             (Vec::new(), vec![diagnostic])
         }
     };
+    let mut config_warnings: Vec<String> = snapshot
+        .warnings
+        .iter()
+        .map(|w| crate::config_cmd::display_text(&w.to_string()))
+        .collect();
+    config_warnings.extend(inherit_warnings(
+        &agents,
+        &supervise::registry::unconfirmed_env(&supervisors, &live.processes),
+    ));
     Ok(Report::ok(StatusData {
         event_cursor,
         agents,
-        config_warnings: snapshot
-            .warnings
-            .iter()
-            .map(|w| crate::config_cmd::display_text(&w.to_string()))
-            .collect(),
+        config_warnings,
         threads,
         receivers,
         processes: live.processes,
@@ -2920,6 +3342,23 @@ pub fn run(root: &Path, actor: Option<String>, c: &AgentsCommand) -> u8 {
         }
         AgentsCommand::Up(a) => up(root, actor, a),
         AgentsCommand::Logs(a) => logs::run(root, a),
+        AgentsCommand::Turns(a) => {
+            let r = turns::report(root, a);
+            output::emit(c.name(), a.json, r, |d| {
+                for t in &d.turns {
+                    println!(
+                        "{} {} {} {}",
+                        t.number,
+                        safe(&t.turn_id),
+                        safe(&t.started),
+                        safe(t.outcome.as_deref().unwrap_or(&t.state))
+                    );
+                }
+                if let Some(n) = d.next_before {
+                    println!("more: --before {n}");
+                }
+            })
+        }
         AgentsCommand::Stop(a) => {
             let r = stop::stop(root, actor, a).unwrap_or_else(Report::failed);
             output::emit(c.name(), a.json, r, |d| {
@@ -2941,10 +3380,56 @@ pub fn run(root: &Path, actor: Option<String>, c: &AgentsCommand) -> u8 {
                 }
             })
         }
-        AgentsCommand::Status { json } => {
+        AgentsCommand::List { json } => {
+            let r = crate::config_cmd::agents(root)
+                .map(|(agents, config_warnings)| {
+                    Report::ok(ListData {
+                        agents,
+                        config_warnings,
+                    })
+                })
+                .map_err(display_error)
+                .unwrap_or_else(Report::failed);
+            output::emit(c.name(), *json, r, |d| {
+                for a in &d.agents {
+                    let layers: Vec<String> = a
+                        .layers
+                        .iter()
+                        .map(|l| {
+                            serde_json::to_value(l)
+                                .ok()
+                                .and_then(|v| v.as_str().map(str::to_owned))
+                                .unwrap_or_default()
+                        })
+                        .collect();
+                    println!(
+                        "{}: defined in {}{}; layers {}{}{}",
+                        safe(&a.name),
+                        serde_json::to_value(a.defined_in)
+                            .ok()
+                            .and_then(|v| v.as_str().map(str::to_owned))
+                            .unwrap_or_default(),
+                        if a.file_backed { " (its own file)" } else { "" },
+                        layers.join(", "),
+                        a.harness
+                            .as_deref()
+                            .map(|h| format!("; harness {}", safe(h)))
+                            .unwrap_or_default(),
+                        a.role
+                            .as_deref()
+                            .map(|r| format!("; role {}", safe(r)))
+                            .unwrap_or_default(),
+                    );
+                }
+                for w in &d.config_warnings {
+                    eprintln!("warning: {}", safe(w));
+                }
+            })
+        }
+        AgentsCommand::Status { json, no_probe } => {
             // D9's output-boundary redaction applies to a failed report, to D6's
             // progress warnings and to D2's receipt warnings alike.
-            let r = match status_report(root).map_err(display_error) {
+            let r = match status_report(root, !*no_probe).map_err(display_error) {
                 Err(e) => Report::failed(e),
                 Ok(mut report) => {
                     // D6's progress problems arrive as warnings inside the report.
@@ -3094,6 +3579,15 @@ pub fn run(root: &Path, actor: Option<String>, c: &AgentsCommand) -> u8 {
                     if let Some(b) = &a.billing {
                         println!("  billing: {}", safe(b));
                     }
+                    println!(
+                        "  environment: {}",
+                        match a.env_mode {
+                            EnvMode::Allowlist => "allowlist",
+                            EnvMode::Inherit =>
+                                "inherit (env.inherit: the launcher's whole environment)",
+                            EnvMode::Session => "session (an interactive receiver's own)",
+                        }
+                    );
                     for t in &a.paused {
                         println!("  paused: {}", safe(t));
                     }
@@ -3180,5 +3674,40 @@ pub fn run(root: &Path, actor: Option<String>, c: &AgentsCommand) -> u8 {
                 }
             })
         }
+    }
+}
+
+static TERM: std::sync::OnceLock<std::sync::Arc<std::sync::atomic::AtomicBool>> =
+    std::sync::OnceLock::new();
+
+fn term_flag() -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+    TERM.get_or_init(Default::default).clone()
+}
+
+/// A continuous `agents up` stops on SIGTERM by draining: its turns finish
+/// first, and a second SIGTERM takes the default action at once. Called by
+/// main before the command does anything, so no git it starts (startup's
+/// included) is left running by a SIGTERM's default action.
+pub(crate) fn register_term() {
+    use signal_hook::{consts::SIGTERM, flag};
+    let term = term_flag();
+    if let Err(e) = flag::register_conditional_default(SIGTERM, term.clone())
+        .and_then(|_| flag::register(SIGTERM, term))
+    {
+        eprintln!("warning: SIGTERM won't wait for turns to finish: {e}");
+    }
+}
+
+#[cfg(test)]
+mod env_mode_tests {
+    use super::EnvMode;
+    use mdkg_run::env::Mode;
+
+    #[test]
+    fn an_interactive_receiver_reports_its_session_whatever_the_policy() {
+        assert_eq!(EnvMode::of(Mode::Allowlist, false), EnvMode::Allowlist);
+        assert_eq!(EnvMode::of(Mode::Inherit, false), EnvMode::Inherit);
+        assert_eq!(EnvMode::of(Mode::Allowlist, true), EnvMode::Session);
+        assert_eq!(EnvMode::of(Mode::Inherit, true), EnvMode::Session);
     }
 }

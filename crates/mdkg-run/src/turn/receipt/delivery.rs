@@ -34,7 +34,7 @@ pub struct DeliveryStatus {
     pub error: Option<String>,
 }
 
-pub(in crate::turn) struct Admission {
+pub(crate) struct Admission {
     id: String,
     agent: String,
     to: String,
@@ -53,7 +53,7 @@ pub(in crate::turn) struct Admission {
 }
 
 impl Admission {
-    pub(in crate::turn) fn capture(
+    pub(crate) fn capture(
         mail: &mut dyn Mail,
         agent: &AgentState,
         opts: &TurnOptions,
@@ -173,7 +173,7 @@ impl Admission {
         Ok((body, data))
     }
 
-    pub(in crate::turn) fn finish(
+    pub(crate) fn finish(
         self,
         mail: &mut dyn Mail,
         dir: &Path,
@@ -263,7 +263,10 @@ impl Admission {
             // error; it is reported only when nothing else was.
             Ok(report) => {
                 let mut cleared = fault::clear(mail, dir, &self.agent, fault::CLEARS_TURN);
-                if report.outcome == crate::Outcome::Replied {
+                if matches!(
+                    report.outcome,
+                    crate::Outcome::Replied | crate::Outcome::NoReply
+                ) {
                     cleared =
                         cleared.and(fault::clear(mail, dir, &self.agent, fault::CLEARS_REPLY));
                 }
@@ -445,7 +448,7 @@ pub fn latest(dir: &Path, agent: &str) -> Result<Option<DeliveryStatus>, RunErro
     }
 }
 
-pub(in crate::turn) fn attach(result: &mut Result<TurnReport, RunError>, status: DeliveryStatus) {
+pub(crate) fn attach(result: &mut Result<TurnReport, RunError>, status: DeliveryStatus) {
     match result {
         Ok(report) => report.receipt = Some(status),
         Err(e) => *e = e.clone().and_hint(diagnostic(&status)),

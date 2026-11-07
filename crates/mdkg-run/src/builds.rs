@@ -672,11 +672,24 @@ mod tests {
         let wrapper = d.0.join("launcher");
         executable(&bin);
         executable(&wrapper);
+        // An in-place, same-size rewrite keeps the inode and size, so only
+        // the times tell it apart. Linux stamps them from a coarse clock, so
+        // a rewrite in the same tick as the file's creation can keep both:
+        // each rewrite here gets a time of its own, as a later upgrade has.
+        let rewrite = |path: &Path, text: &str, secs: u64| {
+            fs::write(path, text).expect("rewrite");
+            let time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+            File::options()
+                .write(true)
+                .open(path)
+                .and_then(|f| f.set_modified(time))
+                .expect("set mtime");
+        };
         let watch = BinaryWatch::new(&bin, &wrapper).expect("watch");
-        fs::write(&wrapper, "#!/bin/sh\nexit 1\n").expect("replace wrapper");
+        rewrite(&wrapper, "#!/bin/sh\nexit 1\n", 1_000_000_000);
         assert!(watch.changed());
         let watch = BinaryWatch::new(&bin, &wrapper).expect("watch");
-        fs::write(&bin, "#!/bin/sh\nexit 2\n").expect("replace payload");
+        rewrite(&bin, "#!/bin/sh\nexit 2\n", 1_000_000_000);
         assert!(watch.changed());
     }
 

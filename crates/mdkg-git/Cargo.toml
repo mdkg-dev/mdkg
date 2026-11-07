@@ -1,6 +1,6 @@
 [package]
 name = "mdkg-git"
-version = "0.7.1"
+version = "0.7.2"
 description = "Hardened Git commands and trusted worktree primitives. Internal to mdkg, no stable API; depend on the mdkg binary"
 edition.workspace = true
 license.workspace = true
@@ -11,7 +11,7 @@ readme = "README.md"
 
 [dependencies]
 # Safe NOFOLLOW/NONBLOCK flags for bounded ref-storage config snapshots.
-rustix.workspace = true
+rustix = { workspace = true, features = ["process"] }
 
 [lints]
 workspace = true

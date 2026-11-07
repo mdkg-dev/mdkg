@@ -40,9 +40,22 @@ pub struct DoctorArgs {
     /// Fail on warnings too.
     #[arg(long)]
     pub strict: bool,
+    /// Run one check only. `store` reads the coordinator store's schema
+    /// and mail schema versions, and whether this build would upgrade it,
+    /// read-only, without upgrading it or reading any other file (no
+    /// config, projection or harness file), so it's cheap to poll.
+    #[arg(long, value_enum, conflicts_with = "repair")]
+    pub only: Option<Only>,
     /// Print JSON.
     #[arg(long)]
     pub json: bool,
+}
+
+/// The checks `--only` runs alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Only {
+    /// The coordinator store's versions.
+    Store,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
@@ -58,7 +71,8 @@ pub enum Status {
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct Check {
     /// The setup component, including `binary`, `path`, `git`, `config`,
-    /// `graph`, `store`, `mirrors`, `mcp`, `agents`, `hooks` or `builds`;
+    /// `graph`, `store`, `mirrors`, `mcp`, `agents`, `env`, `hooks` or
+    /// `builds`;
     /// in ref mode `code_base` and the `graph.*` checks, in checkout mode
     /// `main` and a `graph.ref` warning.
     pub name: String,
@@ -83,7 +97,9 @@ pub struct Check {
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct DoctorData {
     /// The folder checked: the graph found at or above where doctor ran,
-    /// or that folder when there's none.
+    /// or that folder when there's none. With `--only store` it's always
+    /// the folder doctor ran in (or `--root`), whose git repository's
+    /// store is read.
     pub root: String,
     pub checks: Vec<Check>,
     pub errors: usize,
@@ -119,6 +135,17 @@ pub fn find_root(start: &Path) -> PathBuf {
 }
 
 pub fn run(root: &Path, args: &DoctorArgs) -> u8 {
+    let mut legacy = false;
+    let checks = match args.only {
+        Some(Only::Store) => vec![store_check(root)],
+        None => all_checks(root, args, &mut legacy),
+    };
+    report(root, args, checks, legacy)
+}
+
+/// Every check, in order; `legacy` is set when the config has no
+/// projections key (H-M6).
+fn all_checks(root: &Path, args: &DoctorArgs, legacy: &mut bool) -> Vec<Check> {
     let mut checks = vec![binary(), path_check()];
     checks.push(git_check());
     let mode = graph_ref_checks(root, &mut checks);
@@ -140,6 +167,10 @@ pub fn run(root: &Path, args: &DoctorArgs) -> u8 {
                     checks.push(check("mirrors", Status::Skip, "no readable config"));
                 }
             }
+            *legacy = std::fs::read_to_string(root.join(config::CONFIG_PATH))
+                .ok()
+                .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+                .is_some_and(|c| c.is_object() && crate::run::legacy_projections(&c));
             // A config with unreadable projections fails the config check;
             // the checks below then check none.
             Projections::read(root).unwrap_or_else(|_| Projections::none())
@@ -164,6 +195,7 @@ pub fn run(root: &Path, args: &DoctorArgs) -> u8 {
                 Status::Skip,
                 "ref mode: install mirrors the skills from the graph tip",
             ));
+            *legacy = found.config.is_object() && crate::run::legacy_projections(&found.config);
             Projections::from_config(&found.config).unwrap_or_else(|_| Projections::none())
         }
         Mode::Ref(None) => {
@@ -182,13 +214,17 @@ pub fn run(root: &Path, args: &DoctorArgs) -> u8 {
     checks.push(progress_check(root));
     checks.push(faults_check(root));
     checks.push(mcp_check(&files, &projections));
-    checks.push(agents_check(&files, &projections));
-    let hook_graph = match &mode {
+    let ref_graph = match &mode {
         Mode::Ref(Some(found)) => Some(found.as_ref()),
         _ => None,
     };
-    checks.push(hooks_check(&files, &projections, hook_graph));
+    checks.push(agents_check(&files, &projections, ref_graph));
+    checks.push(env_check(root));
+    checks.push(hooks_check(&files, &projections, ref_graph));
+    checks
+}
 
+fn report(root: &Path, args: &DoctorArgs, checks: Vec<Check>, legacy: bool) -> u8 {
     let errors = checks.iter().filter(|c| c.status == Status::Error).count();
     let warnings = checks
         .iter()
@@ -221,6 +257,11 @@ pub fn run(root: &Path, args: &DoctorArgs) -> u8 {
         .collect::<Vec<_>>();
     let strict_failed = errors == 0 && args.strict && warnings > 0;
     let mut diagnostics = diagnostics;
+    // A notice, not a check: it counts toward no warning total, so
+    // `--strict` passes as before (no behaviour change in 0.7.2).
+    if legacy {
+        diagnostics.push(crate::run::legacy_projections_warning());
+    }
     if strict_failed {
         // The output contract makes `ok` false exactly when there's an error.
         diagnostics.push(Diagnostic::error(
@@ -240,6 +281,8 @@ pub fn run(root: &Path, args: &DoctorArgs) -> u8 {
         failure: failed.then_some(ErrorKind::Validation),
     };
     output::emit("doctor", args.json, report, |d| {
+        // One column for every name, however long (e2e UX).
+        let width = d.checks.iter().map(|c| c.name.len()).max().unwrap_or(0);
         for c in &d.checks {
             let mark = match c.status {
                 Status::Ok => "ok  ",
@@ -247,7 +290,11 @@ pub fn run(root: &Path, args: &DoctorArgs) -> u8 {
                 Status::Error => "ERR ",
                 Status::Skip => "skip",
             };
-            println!("{mark} {:<8} {}", c.name, output::shown_path(&c.summary));
+            println!(
+                "{mark} {:<width$} {}",
+                output::shown(&c.name),
+                output::shown_path(&c.summary)
+            );
             if c.name == "builds"
                 && let Some(hint) = &c.hint
             {
@@ -299,10 +346,73 @@ fn graph_worktree_check(root: &Path) -> Check {
             let hint = state.hint();
             check("graph_worktree", Status::Error, state.reason).hint(hint)
         }
-        Ok(None) => check("graph_worktree", Status::Ok, "no frozen graph checkout"),
+        Ok(None) => graph_sync_check(root),
         Err(e) => check("graph_worktree", Status::Error, e.diagnostic.message)
             .hint("inspect the shared graph checkout with git -C .worktrees/graph status"),
     }
+}
+
+/// A graph checkout that can no longer follow main by fast-forward: after
+/// a squash or rebase merge of the graph branch it stays behind for good,
+/// which only install said (e2e UX). Read only: sync's dry run.
+fn graph_sync_check(root: &Path) -> Check {
+    use mdkg_run::install::worktree;
+    let ok = || check("graph_worktree", Status::Ok, "no frozen graph checkout");
+    let Ok(Some(graph)) = worktree::registered_graph_checkout(root) else {
+        return ok();
+    };
+    let main = mdkg_coord_sqlite::git::main_ref(root);
+    match worktree::sync_graph(&graph, &main, true) {
+        Ok(sync)
+            if sync
+                .reason
+                .as_deref()
+                .is_some_and(|r| r.contains("diverged"))
+                && already_merged(&graph, &main) =>
+        {
+            check(
+                "graph_worktree",
+                Status::Warning,
+                format!(
+                    "the graph checkout has diverged from {main}, so it no longer follows \
+                     it (a squash or rebase merge of the graph branch)"
+                ),
+            )
+            // Everything it holds is in main, so moving the branch to main
+            // loses nothing, and --keep refuses if it would; merging main
+            // into it would still not fast-forward.
+            .hint(format!(
+                "{main} already holds its content: move the graph branch to {main} \
+                 (`git -C {} reset --keep {main}`), and merge the graph branch into \
+                 {main} with a merge commit from now on",
+                crate::agents::shell_word(&graph.to_string_lossy())
+            ))
+        }
+        _ => ok(),
+    }
+}
+
+/// Whether merging the graph checkout's HEAD into `main` would change
+/// nothing: its commits are in main by content, not ancestry, as a squash
+/// or rebase merge leaves them. A graph branch with work main lacks yet
+/// is the normal state, not this.
+fn already_merged(graph: &Path, main: &str) -> bool {
+    let run = |args: &[&str]| {
+        mdkg_git::command(graph)
+            .args(args)
+            .run(None)
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    };
+    let merged = run(&["merge-tree", "--write-tree", "--no-messages", main, "HEAD"]);
+    let tree = run(&[
+        "rev-parse",
+        "--verify",
+        "--end-of-options",
+        &format!("{main}^{{tree}}"),
+    ]);
+    matches!((merged, tree), (Some(m), Some(t)) if m.lines().next() == Some(t.as_str()))
 }
 
 fn progress_check(root: &Path) -> Check {
@@ -638,9 +748,9 @@ fn graph_ref_checks(root: &Path, checks: &mut Vec<Check>) -> Mode {
             return Mode::Ref(None);
         }
     };
+    checks.extend([shape_check(&found), remote_check(&found)]);
+    checks.extend(secret_scan_check(&found));
     checks.extend([
-        shape_check(&found),
-        remote_check(&found),
         intents_check(&found),
         cache_check(&found),
         view_check(&found),
@@ -800,13 +910,16 @@ fn shape_check(found: &RefGraph) -> Check {
                 .hint("give each workspace a graph folder of its own, never `.`");
         }
     };
-    let full = match crate::run::setup::full_shape(&found.top, &found.tip, &paths) {
-        Ok(full) => full,
+    use crate::run::setup::Shape;
+    // A full shape found before the walk's budget ran out: the rest of the
+    // tree wasn't checked, which a personal graph warns about rather than
+    // failing on (Terra #14932). Any other remote is refused below anyway.
+    let unchecked = match crate::run::setup::shape(&found.top, &found.tip, &paths) {
+        Ok(Shape::GraphOnly) => return check("graph.shape", Status::Ok, "graph-only"),
+        Ok(Shape::Full) => None,
+        Ok(Shape::FullUnchecked(why)) => Some(why),
         Err(e) => return check("graph.shape", Status::Error, e.diagnostic.message),
     };
-    if !full {
-        return check("graph.shape", Status::Ok, "graph-only");
-    }
     let code_remote = found
         .graph
         .main_ref
@@ -825,11 +938,25 @@ fn shape_check(found: &RefGraph) -> Check {
             ),
         )
         .hint("a remote other than the code's must receive a graph-only ref"),
-        _ => check(
-            "graph.shape",
-            Status::Ok,
-            "full shape (kept for a personal graph)",
-        ),
+        _ => match unchecked {
+            None => check(
+                "graph.shape",
+                Status::Ok,
+                "full shape (kept for a personal graph)",
+            ),
+            Some(why) => check(
+                "graph.shape",
+                Status::Warning,
+                format!(
+                    "full shape (kept for a personal graph), but the rest of the tree wasn't \
+                     checked: {why}"
+                ),
+            )
+            .hint(
+                "doctor checks a graph ref's tree only up to that limit, so a path past it \
+                 wasn't checked; a smaller tree is checked whole",
+            ),
+        },
     }
 }
 
@@ -884,26 +1011,29 @@ fn remote_check(found: &RefGraph) -> Check {
             "give the graph its own ref: `git config mdkg.graph.remoteRef refs/heads/mdkg-graph`",
         );
     }
-    if remote.pinned.is_none() {
-        // No 0.7.1 command approves a destination: nothing is pushed, and
-        // nothing the user does would clear a warning, so it's reported,
-        // not warned (`doctor --strict` passes after personal setup).
-        return check(
-            "graph.remote",
-            Status::Ok,
-            format!(
-                "{} ({}), not approved: nothing is pushed to it (approving a graph remote \
-                 arrives with graph sync in a later release)",
-                remote.name, remote.remote_ref
-            ),
-        )
-        .hint("approving a graph remote arrives with graph sync in a later release");
+    // The guard, the approval (G23) and the last sync (graph::rows).
+    let r = crate::graph::rows::remote_row(&found.top, &found.graph).expect("graph.remote is set");
+    rows_check("graph.remote", r)
+}
+
+/// A graph sync row as a doctor check.
+fn rows_check(name: &str, r: crate::graph::rows::Row) -> Check {
+    use crate::graph::rows::Level;
+    let status = match r.level {
+        Level::Ok => Status::Ok,
+        Level::Warning => Status::Warning,
+        Level::Error => Status::Error,
+    };
+    let c = check(name, status, r.message);
+    match r.hint {
+        Some(h) => c.hint(h),
+        None => c,
     }
-    check(
-        "graph.remote",
-        Status::Ok,
-        format!("{} ({}), approved", remote.name, remote.remote_ref),
-    )
+}
+
+/// `graph.secret_scan`, with a graph remote only: pushes need the scanner.
+fn secret_scan_check(found: &RefGraph) -> Option<Check> {
+    crate::graph::rows::secret_scan_row(&found.graph).map(|r| rows_check("graph.secret_scan", r))
 }
 
 /// `graph.intents`: writes recorded but not yet published.
@@ -1406,7 +1536,7 @@ fn config_check(root: &Path) -> (Check, Option<mdkg_graph::Config>) {
 /// in checkout mode, the graph tip's in ref mode. `committed`, when
 /// known, is the authority the mail settings are read from, and
 /// `unmigrated` the hint for a graph with no `graph_id`.
-fn judge_config(
+pub(crate) fn judge_config(
     loaded: Result<mdkg_graph::Config, mdkg_graph::GraphError>,
     raw: Value,
     committed: Option<Result<Value, mdkg_graph::GraphError>>,
@@ -1591,11 +1721,61 @@ fn parse_label(label: &str) -> Option<(u64, Option<u64>)> {
     Some((schema.parse().ok()?, mail))
 }
 
+/// Whether git has something here to open: a `.git` (folder, file or
+/// link) at or above `root`. Then a failed open is the repository's
+/// failure (a broken config, an old git), never "no repository" (review
+/// of f167c83d). An inherited `GIT_DIR` counts for nothing: hardened git
+/// clears it, so it never names the repository mdkg opens (#20870). A
+/// folder whose `.git` can't be looked up (permission denied) may hold
+/// one, so that counts too: only "not found" is absence (#20928).
+fn git_entry_above(root: &Path) -> bool {
+    root.ancestors()
+        .any(|d| match std::fs::symlink_metadata(d.join(".git")) {
+            Ok(_) => true,
+            Err(e) => !matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ),
+        })
+}
+
 /// The coordinator store, read-only: whether this build reads it as it
 /// is, would upgrade it (copying it first), or refuses it.
 fn store_check(root: &Path) -> Check {
+    // A folder that isn't there (a removed checkout, an unmounted volume)
+    // is a failed read, never "not in a git repository" (#20870).
+    match std::fs::metadata(root) {
+        Ok(m) if m.is_dir() => {}
+        Ok(_) => {
+            return check(
+                "store",
+                Status::Error,
+                format!("can't open {}: not a folder", root.display()),
+            );
+        }
+        Err(e) => {
+            return check(
+                "store",
+                Status::Error,
+                format!("can't open {}: {e}", root.display()),
+            );
+        }
+    }
     let repo = match Repo::open(root) {
         Ok(r) => r,
+        // A repository git finds but can't open (an old git, a moved
+        // worktree, an untrusted folder) is a failed read, never "no
+        // repository" (review of fad81967), as the coordinator sees it.
+        Err(e) if e.diagnostic.code == Code::CoordStoreFailed || git_entry_above(root) => {
+            return check(
+                "store",
+                Status::Error,
+                format!("can't open the repository here: {}", e.diagnostic.message),
+            )
+            .hint(e.diagnostic.hint.clone().unwrap_or_else(|| {
+                "check that git is installed, recent enough and trusts this folder".into()
+            }));
+        }
         Err(_) => {
             return check(
                 "store",
@@ -1678,10 +1858,13 @@ fn store_check(root: &Path) -> Check {
     let have_mail = have_mail.unwrap_or(0);
     let want_mail = want_mail.unwrap_or(0);
     let upgrade = have <= want && have_mail <= want_mail && (have < want || have_mail < want_mail);
+    // A newer store is reported, not failed: its versions are the answer
+    // a client asked for (orchestrator #20626). Commands that use it
+    // still refuse it (coord.store_failed).
     let c = if have > want || have_mail > want_mail {
         check(
             "store",
-            Status::Error,
+            Status::Warning,
             format!("{at}: newer than this build ({build})"),
         )
         .hint("a newer build upgraded this store, so this one refuses it: install that build")
@@ -1698,6 +1881,21 @@ fn store_check(root: &Path) -> Check {
         mail_schema: Some(have_mail),
         upgrade_needed: Some(upgrade),
         ..c
+    }
+}
+
+/// A server command read from a projected config file, as doctor shows
+/// it: `<redacted>` when it looks like a credential (an inline token, a
+/// URL with a password), by the detector mail and the git hook use, or
+/// when it holds whitespace. A command names one program; one with
+/// arguments in it may carry a token no detector knows (`--token
+/// <opaque>`; review of 40fbd146). Checks compare the real value; only
+/// what's shown is redacted.
+fn shown_config_value(value: &str) -> &str {
+    if value.chars().any(char::is_whitespace) || crate::credentials::looks_secret(value) {
+        "<redacted>"
+    } else {
+        value
     }
 }
 
@@ -1733,11 +1931,91 @@ fn mcp_commands(root: &Path) -> Vec<(Harness, &'static str, String)> {
     found
 }
 
+/// Which environment each agent's turns start with, for the agents the
+/// config names, the saved ones and the ones a live supervisor runs: the
+/// allowlist, the launcher's whole environment (`env.inherit: true`,
+/// which warns and names the agent), or an interactive receiver's own
+/// session. A supervisor re-execs once its running turns finish after a
+/// config change, so the configured mode is what runs; one not confirmed
+/// as 0.7.2 or later (0.7.0, 0.7.1, or unregistered) is named, since its
+/// turns may inherit. Names only, never values.
+fn env_check(root: &Path) -> Check {
+    let modes = match crate::agents::env_modes(root) {
+        Ok(modes) => modes,
+        Err(e) => {
+            return check(
+                "env",
+                Status::Skip,
+                format!("agents' config can't be read: {}", e.diagnostic.message),
+            );
+        }
+    };
+    env_judge(&modes, &crate::agents::unconfirmed_env(root))
+}
+
+fn env_judge(modes: &[crate::agents::EnvRow], untracked: &[String]) -> Check {
+    use crate::agents::EnvMode;
+    if modes.is_empty() && untracked.is_empty() {
+        return check("env", Status::Skip, "no agents configured or running");
+    }
+    let names = |keep: &dyn Fn(&Result<EnvMode, String>) -> bool| -> Vec<&str> {
+        modes
+            .iter()
+            .filter(|(_, m)| keep(m))
+            .map(|(n, _)| n.as_str())
+            .collect()
+    };
+    let inherit = names(&|m| matches!(m, Ok(EnvMode::Inherit)));
+    let unreadable = names(&|m| m.is_err());
+    let mut hints = Vec::new();
+    let mut summary = Vec::new();
+    if !inherit.is_empty() {
+        summary.push(format!(
+            "env.inherit gives the launcher's whole environment to {}",
+            inherit.join(", ")
+        ));
+        hints.push(
+            format!("remove env.inherit and name what the agent needs in env.allow (docs/agents.md); to apply a change, publish it where agents read their config (in checkout mode, run `{BIN} agents edit` in the graph checkout or with `--root` naming it; in ref mode, from any checkout), restart `agents up` (a one-shot `--once` pass keeps the policies it read at start until it ends), then check each agent's `env_mode` and `policy.env.allow` in `agents status --json`, which reads the config from the same place"),
+        );
+    }
+    if !untracked.is_empty() {
+        summary.push(format!(
+            "a supervisor not confirmed as 0.7.2 or later (an older build, or one that couldn't register) runs {}, whose turns may inherit the launcher's whole environment",
+            untracked.join(", ")
+        ));
+        hints.push("restart `agents up` with this build".to_string());
+    }
+    if !unreadable.is_empty() {
+        summary.push(format!("policy unreadable for {}", unreadable.join(", ")));
+        hints.push(format!("`{BIN} agents status` names the problem"));
+    }
+    if !summary.is_empty() {
+        return check("env", Status::Warning, summary.join("; ")).hint(hints.join("; "));
+    }
+    let sessions = names(&|m| matches!(m, Ok(EnvMode::Session))).len();
+    let allowlisted = modes.len() - sessions;
+    let mut parts = Vec::new();
+    if allowlisted > 0 {
+        parts.push(format!(
+            "{} on the allowlisted environment",
+            plural(allowlisted, "agent")
+        ));
+    }
+    if sessions > 0 {
+        parts.push(format!(
+            "{} in its own session",
+            plural(sessions, "interactive receiver")
+        ));
+    }
+    check("env", Status::Ok, parts.join(", "))
+}
+
 /// Whether the agents' instructions are this build's: the mdkg-workflow
 /// skill as this build ships it, and, where the agents-md projection is
 /// enabled, AGENTS.md's mdkg block as `install` writes it (for any command
 /// the MCP configs name).
-fn agents_check(root: &Path, projections: &Projections) -> Check {
+/// In ref mode (`graph`) the skill is the graph tip's, never a checkout copy.
+fn agents_check(root: &Path, projections: &Projections, graph: Option<&RefGraph>) -> Check {
     use mdkg_run::install::{BLOCK_END, BLOCK_START, agents_block};
     let mut problems = Vec::new();
     let mut hints = Vec::new();
@@ -1796,24 +2074,75 @@ fn agents_check(root: &Path, projections: &Projections) -> Check {
     }
     // The skill by its version: another build's warns; this build's version
     // with other content is the project's own additions.
-    let skill = root
-        .join(crate::skills::SKILLS_DIR)
-        .join("mdkg-workflow")
-        .join("SKILL.md");
+    let rel = format!("{}/mdkg-workflow/SKILL.md", crate::skills::SKILLS_DIR);
+    // Absent and unreadable are told apart, so neither is called this
+    // build's (Terra #19581).
+    let mut absent = false;
+    let mut not_file = false;
+    let text = match graph {
+        Some(found) => {
+            let text = tip_text(found, &rel, SKILL_CAP);
+            absent = text.is_none() && tip_blob(found, &rel).is_none();
+            text
+        }
+        // The path itself first: a link (even a dangling one) or a folder
+        // there is neither absent nor something `skills add` replaces
+        // (Terra #19637).
+        None => match std::fs::symlink_metadata(root.join(&rel)) {
+            Err(e) => {
+                absent = e.kind() == std::io::ErrorKind::NotFound;
+                None
+            }
+            Ok(m) if !m.is_file() => {
+                not_file = true;
+                None
+            }
+            Ok(_) => std::fs::read_to_string(root.join(&rel)).ok(),
+        },
+    };
+    let where_ = if graph.is_some() {
+        " on the graph ref"
+    } else {
+        ""
+    };
+    if not_file {
+        problems.push(format!(
+            "the mdkg-workflow skill's {rel} is a link or a folder, not a file"
+        ));
+        hints.push(format!(
+            "move the link or folder at {rel} aside and leave that path empty, then `{BIN} skills add mdkg-workflow` adds this build's"
+        ));
+    } else if text.is_none() && !absent {
+        problems.push(format!(
+            "the mdkg-workflow skill{where_} can't be read as text (over {SKILL_CAP} bytes, not UTF-8, or not a file)"
+        ));
+        hints.push(format!("check {rel}{where_}, or take this build's with `{BIN} skills add mdkg-workflow --replace`"));
+    }
     let shipped = skill_version(crate::init::WORKFLOW_SKILL);
     let mut extended = false;
-    if let Ok(t) = std::fs::read_to_string(&skill) {
+    if let Some(t) = text {
         let t = t.replace("\r\n", "\n");
         let found = skill_version(&t);
         if found != shipped {
             problems.push(format!(
-                "the mdkg-workflow skill is version {}, not this build's {}",
+                "the mdkg-workflow skill{} is version {}, not this build's {}",
+                if graph.is_some() {
+                    " on the graph ref"
+                } else {
+                    ""
+                },
                 found.as_deref().unwrap_or("none"),
                 shipped.as_deref().unwrap_or("none")
             ));
-            hints.push(format!(
-                "bring in this build's: remove .mdkg/skills/mdkg-workflow, run `{BIN} skills add mdkg-workflow`, then re-apply the project's own additions"
-            ));
+            hints.push(if graph.is_some() {
+                format!(
+                    "bring in this build's: `{BIN} skills add mdkg-workflow --replace` publishes it to the graph ref (it replaces the project's own additions, so re-apply them after), then `{BIN} install` mirrors it"
+                )
+            } else {
+                format!(
+                    "bring in this build's: `{BIN} skills add mdkg-workflow --replace` (it replaces the project's own additions, so re-apply them after)"
+                )
+            });
         } else if t != crate::init::WORKFLOW_SKILL {
             extended = true;
         }
@@ -1821,7 +2150,9 @@ fn agents_check(root: &Path, projections: &Projections) -> Check {
     if !problems.is_empty() {
         return check("agents", Status::Warning, problems.join("; ")).hint(hints.join("; "));
     }
-    let skill = if extended {
+    let skill = if absent {
+        "there's no mdkg-workflow skill (`skills add mdkg-workflow` adds it)"
+    } else if extended {
         "the mdkg-workflow skill is this build's version, with the project's own changes"
     } else {
         "the mdkg-workflow skill is this build's"
@@ -1856,24 +2187,7 @@ fn hooks_check(root: &Path, projections: &Projections, graph: Option<&RefGraph>)
                 // Preserve the exact bytes, including the final newline:
                 // git_out trims output and cannot judge an exact default.
                 let path = h.adapter().hook_layout().canonical;
-                let object = format!("{}:{path}", found.tip);
-                let small_blob = git_out(&found.top, &["cat-file", "-t", &object]).as_deref()
-                    == Some("blob")
-                    && git_out(&found.top, &["cat-file", "-s", &object])
-                        .and_then(|size| size.parse::<u64>().ok())
-                        .is_some_and(|size| size <= mdkg_run::install::hook_files::HOOK_FILE_CAP);
-                // The tip is immutable: check type and size before
-                // collecting the blob's output in memory.
-                let canonical = small_blob
-                    .then(|| {
-                        mdkg_coord_sqlite::git::command(&found.top)
-                            .args(["show", &object])
-                            .run(None)
-                            .ok()
-                            .filter(|out| out.status.success())
-                            .and_then(|out| String::from_utf8(out.stdout).ok())
-                    })
-                    .flatten();
+                let canonical = tip_text(found, path, mdkg_run::install::hook_files::HOOK_FILE_CAP);
                 mdkg_run::install::hook_files::status_with_canonical(root, *h, canonical.as_deref())
             } else {
                 mdkg_run::install::hook_files::status(root, *h)
@@ -1917,6 +2231,31 @@ fn hooks_check(root: &Path, projections: &Projections, graph: Option<&RefGraph>)
         )
         .hint(format!("run `{BIN} install` to sync them"))
     }
+}
+
+/// The most of a skill's SKILL.md doctor reads from the graph tip.
+const SKILL_CAP: u64 = 1 << 20;
+
+/// The UTF-8 text of `path` on the graph tip, when it is a blob of at most
+/// `cap` bytes. The tip is immutable: its type and size are checked before
+/// the blob's output is collected in memory, and the exact bytes are kept
+/// (`git_out` trims).
+fn tip_text(found: &RefGraph, path: &str, cap: u64) -> Option<String> {
+    let object = format!("{}:{path}", found.tip);
+    let small_blob = git_out(&found.top, &["cat-file", "-t", &object]).as_deref() == Some("blob")
+        && git_out(&found.top, &["cat-file", "-s", &object])
+            .and_then(|size| size.parse::<u64>().ok())
+            .is_some_and(|size| size <= cap);
+    small_blob
+        .then(|| {
+            mdkg_coord_sqlite::git::command(&found.top)
+                .args(["show", &object])
+                .run(None)
+                .ok()
+                .filter(|out| out.status.success())
+                .and_then(|out| String::from_utf8(out.stdout).ok())
+        })
+        .flatten()
 }
 
 /// A skill's `version`, read by the same frontmatter parser `skills`
@@ -1979,7 +2318,12 @@ fn mcp_check(root: &Path, projections: &Projections) -> Check {
                 on_path(c).is_empty()
             }
         })
-        .map(|(_, file, c)| format!("{file} runs `{c}`, which isn't on PATH"))
+        .map(|(_, file, c)| {
+            format!(
+                "{file} runs `{}`, which isn't on PATH",
+                shown_config_value(c)
+            )
+        })
         .collect();
     missing.extend(unsynced);
     if missing.is_empty() {
@@ -2124,5 +2468,67 @@ mod tests {
         assert_eq!(parse_label("2+msg3"), Some((2, Some(3))));
         assert_eq!(parse_label("1"), Some((1, None)));
         assert_eq!(parse_label("x"), None);
+    }
+
+    #[test]
+    fn the_env_check_names_inherited_agents_and_never_values() {
+        use crate::agents::EnvMode;
+        let row = |name: &str, m: Result<EnvMode, String>| (name.to_string(), m);
+        assert_eq!(env_judge(&[], &[]).status, Status::Skip);
+        let ok = env_judge(&[row("a", Ok(EnvMode::Allowlist))], &[]);
+        assert_eq!(ok.status, Status::Ok);
+        assert_eq!(ok.summary, "1 agent on the allowlisted environment");
+        let mixed = env_judge(
+            &[
+                row("a", Ok(EnvMode::Allowlist)),
+                row("r", Ok(EnvMode::Session)),
+            ],
+            &[],
+        );
+        assert_eq!(mixed.status, Status::Ok);
+        assert_eq!(
+            mixed.summary,
+            "1 agent on the allowlisted environment, 1 interactive receiver in its own session"
+        );
+        let warned = env_judge(
+            &[
+                row("a", Ok(EnvMode::Allowlist)),
+                row("b", Ok(EnvMode::Inherit)),
+                row("c", Ok(EnvMode::Inherit)),
+            ],
+            &[],
+        );
+        assert_eq!(warned.status, Status::Warning);
+        assert!(warned.summary.ends_with("to b, c"), "{}", warned.summary);
+        assert!(
+            warned
+                .hint
+                .unwrap()
+                .contains("`policy.env.allow` in `agents status --json`")
+        );
+        let unreadable = env_judge(&[row("d", Err("policy env: bad".into()))], &[]);
+        assert_eq!(unreadable.status, Status::Warning);
+        assert!(unreadable.summary.contains('d'));
+    }
+
+    #[test]
+    fn the_env_check_names_agents_an_older_builds_supervisor_runs() {
+        use crate::agents::EnvMode;
+        // Allowlisted by the config, but run by a supervisor from before
+        // 0.7.2: never counted safe.
+        let old = env_judge(
+            &[("a".to_string(), Ok(EnvMode::Allowlist))],
+            &["a".to_string()],
+        );
+        assert_eq!(old.status, Status::Warning);
+        assert!(
+            old.summary.contains("couldn't register) runs a"),
+            "{}",
+            old.summary
+        );
+        assert!(old.hint.unwrap().contains("restart `agents up`"));
+        // Even with no agent configured or saved here.
+        let alone = env_judge(&[], &["x".to_string()]);
+        assert_eq!(alone.status, Status::Warning);
     }
 }

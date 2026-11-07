@@ -59,7 +59,13 @@ fn version_names_the_commit_it_was_built_from() {
     assert_eq!(data["lease_authority"], 1);
     // A17 capabilities this build ships; never removed within v1.
     let capabilities = data["capabilities"].as_array().expect("capabilities");
-    for shipped in ["channels", "events", "msg.watch", "serve.local"] {
+    for shipped in [
+        "agents.delivery.digest",
+        "channels",
+        "events",
+        "msg.watch",
+        "serve.local",
+    ] {
         assert!(
             capabilities.iter().any(|c| c == shipped),
             "{shipped} missing: {envelope}"
@@ -79,6 +85,16 @@ fn version_names_the_commit_it_was_built_from() {
             "mdkg {} (commit {BUILT_FROM}",
             env!("CARGO_PKG_VERSION")
         )),
+        "{text}"
+    );
+    // The line says "no FIDO2" exactly when mdkg-presence, as Cargo
+    // resolved its features for this build, has no backend
+    // (`mdkg_presence::fido2::BACKEND`, set by the backend module that
+    // compiled). check.sh also runs this test with `mdkg-serve/fido2` on
+    // and the CLI's `fido2` off, and with no FIDO2 at all.
+    assert_eq!(
+        text.contains("; no FIDO2 in this build: "),
+        !mdkg_serve::FIDO2,
         "{text}"
     );
     // The plain command says the same, and needs no graph.

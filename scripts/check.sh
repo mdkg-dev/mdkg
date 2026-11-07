@@ -35,17 +35,33 @@ step() { printf '\n== %s\n' "$1"; }
 
 affected_base=
 affected_main=
+ci_env=0
+ci_mdkg=
+check_usage="Usage: scripts/check.sh [--affected <base-ref> [--main <ref>]]
+       scripts/check.sh --ci-env [--mdkg <absolute path to an mdkg binary>]"
 case $# in
   0) ;;
   1)
     if [[ "$1" == --help ]]; then
-      echo "Usage: scripts/check.sh [--affected <base-ref> [--main <ref>]]"
+      echo "$check_usage"
       echo "Affected mode checks the committed head before/after local tests; restored mid-run edits are not detected."
       echo "Ignored files, including ignored build configuration, are not verified."
       echo "Exit 3 means local checks passed, but selected external/script checks are incomplete."
+      echo "--ci-env runs every check the way public CI does: on a fresh public export of HEAD"
+      echo "(export-public.sh --init, with mdkg-next or mdkg from PATH unless --mdkg names one), with an"
+      echo "empty HOME, no system git config, CI's git identity only in HOME, a fresh target"
+      echo "folder and no other inherited environment. It needs the 0.6.0 oracle and runs only in the"
+      echo "development repository (the public tree has no exporter). docs/releasing.md has the details."
       exit 0
-    fi
-    echo "Usage: scripts/check.sh [--affected <base-ref> [--main <ref>]]" >&2; exit 2 ;;
+    elif [[ "$1" == --ci-env ]]; then
+      ci_env=1
+    else
+      echo "$check_usage" >&2; exit 2
+    fi ;;
+  3)
+    [[ "$1" == --ci-env && "$2" == --mdkg && -n "$3" ]] \
+      || { echo "$check_usage" >&2; exit 2; }
+    ci_env=1 ci_mdkg=$3 ;;
   2)
     [[ "$1" == --affected && -n "$2" ]] || { echo "expected --affected <base-ref>" >&2; exit 2; }
     affected_base=$2 ;;
@@ -55,11 +71,12 @@ case $# in
     [[ "$1" == --affected && -n "$2" && "$3" == --main && -n "$4" ]] \
       || { echo "expected --affected <base-ref> --main <ref>" >&2; exit 2; }
     affected_base=$2 affected_main=$4 ;;
-  *) echo "Usage: scripts/check.sh [--affected <base-ref> [--main <ref>]]" >&2; exit 2 ;;
+  *) echo "$check_usage" >&2; exit 2 ;;
 esac
 
 affected_plan=
 check_tmp=
+ci_tmp=
 cleanup_check() {
   local check_status=$?
   if [[ -n "$affected_plan" ]]; then
@@ -68,9 +85,131 @@ cleanup_check() {
   if [[ -n "$check_tmp" ]]; then
     rm -rf "$check_tmp" || echo "warning: couldn't remove check temp folder: $check_tmp" >&2
   fi
+  if [[ -n "$ci_tmp" ]]; then
+    rm -rf "$ci_tmp" || echo "warning: couldn't remove the CI-like export: $ci_tmp" >&2
+  fi
   exit "$check_status"
 }
 trap cleanup_check EXIT
+
+# --ci-env: the gate before a release candidate (docs/releasing.md). Public
+# CI found failures that no local run had (0.7.1): tests that needed a git
+# identity, read this repository's own .mdkg, or used a shell tool's GNU-
+# or BSD-only form. Each came from the environment, not the code, so this
+# mode rebuilds CI's environment around a fresh public export of HEAD and
+# runs that export's own scripts/check.sh in it:
+# - the tree is `export-public.sh --init` of HEAD, committed once as a new
+#   repository, so its .mdkg is a fresh graph, as the public one is;
+# - HOME is a new, empty folder holding only the .gitconfig CI's
+#   "Configure git" step writes (an identity and init.defaultBranch).
+#   GIT_CONFIG_GLOBAL stays unset, as on CI: a test that moves HOME loses
+#   the identity there too;
+# - GIT_CONFIG_NOSYSTEM=1, and user.useConfigOnly=true through
+#   GIT_CONFIG_COUNT: macOS's git otherwise makes up an identity from the
+#   account and host name where Linux's refuses to commit;
+# - a fresh CARGO_TARGET_DIR inside the export, so nothing compiled
+#   earlier is reused (cargo never rebuilds a registry crate of the same
+#   version);
+# - CARGO_HOME a new folder too, linking only the real one's download
+#   caches and their locks (registry, git): no config.toml (a rustc
+#   wrapper, build flags or [env] CI doesn't have), no credentials, no
+#   installed binaries;
+# - no other inherited variable but RUSTUP_HOME, PATH, the locale and
+#   terminal, and the build and test job counts. `env -i` drops the
+#   rest, credentials included;
+# - the 0.6.0 oracle's two paths, always: CI installs it, so a run
+#   without it would skip checks CI makes.
+# It isolates the environment, not the disk: the tests still run as you,
+# so a test naming an absolute path still reads it.
+# It can't change the operating system: Linux-only failures (clippy's
+# cfg(target_os) code, Linux socket errors) still need ci-remote.sh's
+# Ubuntu leg or public CI.
+if ((ci_env)); then
+  # The public tree ships check.sh but not the exporter: say so before
+  # anything else, since no option makes the mode work there.
+  [[ -f scripts/export-public.sh ]] \
+    || { echo "--ci-env runs in the development repository: this checkout has no scripts/export-public.sh" >&2; exit 2; }
+  if [[ -z "$ci_mdkg" ]]; then
+    # A development checkout's own pinned build comes first; plain `mdkg`
+    # may be an older release whose init writes an older format.
+    ci_mdkg=$(command -v mdkg-next || command -v mdkg) \
+      || { echo "--ci-env needs an mdkg binary for the export's init: pass --mdkg <path>" >&2; exit 2; }
+  fi
+  [[ "$ci_mdkg" == /* ]] || { echo "--mdkg needs an absolute path" >&2; exit 2; }
+  [[ -f "$ci_mdkg" && -x "$ci_mdkg" ]] || { echo "--mdkg isn't an executable file" >&2; exit 2; }
+  [[ -n "${HOME:-}" ]] || { echo "--ci-env needs HOME to find the toolchain" >&2; exit 2; }
+  # CI installs the 0.6.0 oracle; without it the write-command tests skip
+  # their 0.6 compatibility checks, so this mode requires it. Absolute
+  # paths only: the inner run starts in the export, where a relative one
+  # would name nothing and the tests would skip the oracle silently.
+  [[ "$NODE24" == /* && "$MDKG_TS_CLI" == /* ]] \
+    || { echo "--ci-env needs absolute paths in MDKG_NODE24 and MDKG_TS_CLI" >&2; exit 2; }
+  [[ -f "$NODE24" && -x "$NODE24" && -f "$MDKG_TS_CLI" ]] \
+    || { echo "--ci-env needs the 0.6.0 oracle, as CI has: set MDKG_NODE24 to Node 24 and MDKG_TS_CLI to mdkg@0.6.0's dist/cli.js" >&2; exit 2; }
+  ci_head=$(git rev-parse --verify HEAD^{commit})
+  # The rest of this mode's paths come from mktemp: short, under /tmp, so
+  # the tests' Unix socket paths fit (see the tests step below).
+  ci_tmp=$(mktemp -d /tmp/mci.XXXXXX)
+  ci_home="$ci_tmp/home"
+  ci_src="$ci_tmp/src"
+  ci_cargo_real=${CARGO_HOME:-$HOME/.cargo}
+  ci_rustup=${RUSTUP_HOME:-$HOME/.rustup}
+  # The links and the inner run (which starts in the export) need both
+  # homes absolute; a relative one would name a folder that isn't there.
+  [[ "$ci_cargo_real" == /* && "$ci_rustup" == /* ]] \
+    || { echo "--ci-env needs absolute paths in CARGO_HOME, RUSTUP_HOME and HOME" >&2; exit 2; }
+  ci_cargo="$ci_tmp/cargo"
+  mkdir "$ci_home" "$ci_cargo"
+  # Cargo's downloads, shared so this run doesn't fetch every crate again,
+  # with the lock files that guard them, so a build elsewhere and this one
+  # take the same locks. Nothing else of the real Cargo home is linked.
+  for ci_name in registry git .package-cache .package-cache-mutate .global-cache; do
+    if [[ -e "$ci_cargo_real/$ci_name" ]]; then
+      ln -s "$ci_cargo_real/$ci_name" "$ci_cargo/$ci_name"
+    fi
+  done
+  ci_vars=(
+    HOME="$ci_home"
+    PATH="$PATH"
+    CARGO_HOME="$ci_cargo"
+    RUSTUP_HOME="$ci_rustup"
+    CARGO_TARGET_DIR="$ci_src/target"
+    CI=true
+    MDKG_NODE24="$NODE24"
+    MDKG_TS_CLI="$MDKG_TS_CLI"
+    GIT_CONFIG_NOSYSTEM=1
+    GIT_CONFIG_COUNT=1
+    GIT_CONFIG_KEY_0=user.useConfigOnly
+    GIT_CONFIG_VALUE_0=true
+  )
+  for ci_name in USER LOGNAME LANG LC_ALL TERM CARGO_BUILD_JOBS NEXTEST_TEST_THREADS \
+      RUST_TEST_THREADS; do
+    if [[ -n "${!ci_name+x}" ]]; then ci_vars+=("$ci_name=${!ci_name}"); fi
+  done
+  ci_run() { /usr/bin/env -i "${ci_vars[@]}" "$@"; }
+
+  step "CI-like run: export $ci_head"
+  scripts/export-public.sh --rev "$ci_head" --init "$ci_mdkg" "$ci_src"
+  # What CI's "Configure git for the tests' commits" step writes.
+  ci_run "$CHECK_GIT" config --global user.name "mdkg CI"
+  ci_run "$CHECK_GIT" config --global user.email "ci@mdkg.invalid"
+  ci_run "$CHECK_GIT" config --global init.defaultBranch main
+  # build.rs reads the commit for `--version`, as CI's checkout gives it.
+  ci_run "$CHECK_GIT" -C "$ci_src" init -q
+  ci_run "$CHECK_GIT" -C "$ci_src" add -A
+  ci_run "$CHECK_GIT" -C "$ci_src" commit -q -m "CI-like export of $ci_head"
+
+  step "CI-like run: scripts/check.sh in $ci_src"
+  echo "(a fresh build: the first run compiles everything)"
+  ci_status=0
+  (cd "$ci_src" && ci_run /bin/bash scripts/check.sh) || ci_status=$?
+  if ((ci_status)); then
+    step "CI-like run failed (exit $ci_status) on the export of $ci_head"
+  else
+    step "CI-like run passed on the export of $ci_head"
+  fi
+  exit "$ci_status"
+fi
 mode=full
 # This reader never interpolates a target or package into shell source. Cargo
 # receives the exact argv array, and empty selections launch no Cargo process.
@@ -861,6 +1000,130 @@ if failed:
 print("negative kill source check passed")
 PY_KILL
 
+step "test hygiene"
+"$CHECK_PYTHON" -I - <<'PY_HYGIENE'
+"""Catch, by grep, three test habits that passed here and failed on public CI.
+
+Cheap and incomplete by design: `--ci-env` is the real check of each.
+- A git commit with no identity in reach. macOS's git makes one up from
+  the account; Linux's refuses. A Rust file that runs `git commit` must
+  name an identity itself (user.name/user.email, GIT_AUTHOR_*/
+  GIT_COMMITTER_*), unless the baseline below says where it gets one.
+- A path climbing to this repository's own .mdkg. The public export's
+  graph is a fresh `mdkg init`, so a test reading it needs a guard within
+  WINDOW lines: one that prints "skipped", or handles NotFound.
+- `env` with a working-directory option (GNU only; BSD's has none) or
+  running the `command` builtin (BSD's env finds it as /usr/bin/command,
+  GNU's can't).
+"""
+import pathlib
+import re
+import subprocess
+
+WINDOW = 15
+COMMIT = re.compile(r'"commit",\s*"-[a-z-]|\bgit(?:\s+-[cC]\s+\S+)*\s+commit\s+-')
+IDENTITY = re.compile(r"user\.(?:name|email)|GIT_(?:AUTHOR|COMMITTER)_(?:NAME|EMAIL)")
+# Files whose commits get an identity from a helper in another file, or
+# that only print a command for a person to run. New entries need a reason.
+IDENTITY_BASELINE = {
+    "crates/mdkg-cli/src/doctor.rs": "a hint naming the command for the user",
+    "crates/mdkg-cli/src/serve_cli/git_hook.rs": "git_serve::fakes sets GIT_AUTHOR_*",
+    "crates/mdkg-run/src/turn/receipt/tasks/tests.rs": "receipt::tests::Repo sets user.*",
+}
+OWN_GRAPH = re.compile(
+    r'(?:\bjoin|include_str!|include_bytes!)\(\s*"(?:\.\./)+\.mdkg(?:/|")'
+    r'|\bjoin\(\s*"(?:\.\./)*\.\."\s*\)\s*\.join\(\s*"\.mdkg')
+# A variable holding the repository's top (CARGO_MANIFEST_DIR climbed with
+# "..") that a later line joins ".mdkg" onto.
+TOP = re.compile(r'\blet\s+(?:mut\s+)?(\w+)\s*=[^;]*?CARGO_MANIFEST_DIR[^;]*?'
+                 r'\.join\(\s*"\.\.(?:/\.\.)*/?"\s*\)')
+GUARD = re.compile(r"\bskipped\b|\bNotFound\b")
+ENV = re.compile(
+    r"(?<![\w./-])(?:/usr/bin/)?env"
+    r"(?:\s+(?:-[A-Za-z0-9]+|-u\s+\S+|[A-Za-z_][A-Za-z0-9_]*=\S*))*?"
+    r"\s+(?:-[A-Za-z0-9]*C|--chdir\b|command\b)")
+
+
+def problems(path, text):
+    lines = text.splitlines()
+    found = []
+    if path.endswith(".rs"):
+        if path not in IDENTITY_BASELINE and not IDENTITY.search(text):
+            for number, line in enumerate(lines, 1):
+                if COMMIT.search(line):
+                    found.append((number, "commits with no git identity in this file "
+                                  "(CI's Linux git refuses; name one, as -c user.name=…)"))
+                    break
+        tops = sorted({m.group(1) for m in TOP.finditer(text)})
+        joined = re.compile(r"\b(?:%s)\s*\.join\(\s*(?:&?format!\(\s*)?\"\.mdkg"
+                            % "|".join(map(re.escape, tops))) if tops else None
+        for number, line in enumerate(lines, 1):
+            if OWN_GRAPH.search(line) or (joined and joined.search(line)):
+                near = lines[max(0, number - 1 - WINDOW):number + WINDOW]
+                if not any(GUARD.search(other) for other in near):
+                    found.append((number, "reads this repository's own .mdkg with no guard "
+                                  "(print \"skipped\" or handle NotFound: the public "
+                                  "export's graph is fresh)"))
+    for number, line in enumerate(lines, 1):
+        if ENV.search(line):
+            found.append((number, "env's -C/--chdir is GNU-only, and env can't run "
+                          "the `command` builtin on Linux; use git -C or cd"))
+    return found
+
+
+def self_test():
+    commit = 'run(&["commit", "-q", "-m", "x"]);\n'
+    assert problems("a.rs", commit)
+    assert not problems("a.rs", commit + 'run(&["-c", "user.name=T"]);\n')
+    assert not problems("a.rs", '.env("GIT_AUTHOR_NAME", "t");\n' + commit)
+    assert not problems("a.rs", 'format!("git -c user.email=e commit -qm x")\n')
+    assert problems("a.rs", 'format!("cd {d} && git commit -qm x")\n')
+    assert not problems("a.rs", 'assert_eq!(data["commit"], sha);\n("commit", "-") => None,\n')
+    assert not problems("crates/mdkg-cli/src/doctor.rs", commit)
+    climb = 'let s = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.mdkg/templates");\n'
+    assert problems("a.rs", climb)
+    assert not problems("a.rs", climb + 'if !s.is_dir() { eprintln!("skipped: none"); }\n')
+    assert not problems("a.rs", climb + 'Err(e) if e.kind() == ErrorKind::NotFound => {}\n')
+    assert problems("a.rs", 'root.join("../..").join(".mdkg/config.json")\n')
+    top = 'let repo = Path::new(env!("CARGO_MANIFEST_DIR"))\n    .join("../..");\n'
+    assert problems("a.rs", top + 'read(repo.join(format!(".mdkg/t/{k}.md")))\n')
+    assert problems("a.rs", top + 'read(repo.join(".mdkg/config.json"))\n')
+    assert not problems("a.rs", top + 'read(repo.join("Cargo.toml"))\n')
+    assert not problems("a.rs", top + 'if !repo.join(".mdkg").is_dir() {\n'
+                        '    eprintln!("skipped: no graph");\n}\n')
+    assert not problems("a.rs", 'dir.join(".mdkg/config.json")\n"lnk/../.mdkg",\n')
+    assert not problems("a.rs", 'include_str!("../../../conformance/base/.mdkg/config.json")\n')
+    # Spelled ENV here, so this file doesn't match itself.
+    for bad in ['/usr/bin/ENV -C dir git', 'ENV -i PATH="$PATH" -C d x',
+                'git() { ENV -i PATH="$PATH" command git "$@"; }', "ENV command -v x",
+                "ENV --chdir=d x", "ENV -iC d x"]:
+        bad = bad.replace("ENV", "env")
+        assert problems("a.sh", bad + "\n"), bad
+    for good in ['env -i PATH="$PATH" git -C d push', '.env("A", "b")', "printenv -C",
+                 'env!("X")', "BSD env has no `-C`", "my_env command", "cd d && command -v x"]:
+        assert not problems("a.sh", good + "\n"), good
+
+
+self_test()
+listed = subprocess.run(["git", "ls-files", "-z", "--", "crates", "scripts", "conformance"],
+                        check=True, stdout=subprocess.PIPE).stdout
+failed = False
+for raw in listed.split(b"\0"):
+    name = raw.decode("utf-8", "surrogateescape")
+    if pathlib.PurePath(name).suffix not in (".rs", ".sh", ".py", ".mjs", ".js", ".rb"):
+        continue
+    path = pathlib.Path(name)
+    if path.is_symlink() or not path.is_file():
+        continue
+    text = path.read_bytes().decode("utf-8", "replace")
+    for number, message in problems(name, text):
+        print(f"{name!r}:{number}: {message}")
+        failed = True
+if failed:
+    raise SystemExit(1)
+print("test hygiene check passed")
+PY_HYGIENE
+
 step "cargo fmt --check"
 cargo fmt --all --check
 
@@ -869,6 +1132,9 @@ if [[ "$mode" == selective ]]; then
   affected_cargo clippy
 else
   cargo clippy --workspace --all-targets --quiet -- -D warnings
+  # The Linux pip wheels build without FIDO2: lint the stub backend and
+  # the no-FIDO2 hint that only that build compiles.
+  cargo clippy -p mdkg-presence --no-default-features --all-targets --quiet -- -D warnings
 fi
 
 step "tests: nextest, then doctests"
@@ -901,6 +1167,14 @@ else
   tests_failed=0
   cargo nextest run --workspace --no-fail-fast || tests_failed=1
   cargo test --workspace --doc --no-fail-fast || tests_failed=1
+  # The version line's "no FIDO2" follows mdkg-presence's resolved feature,
+  # not the CLI's: feature unification can turn the backend on with the
+  # CLI's `fido2` off. Rebuilds check that build, one with no FIDO2 at all
+  # (the Linux pip wheels' build), and mdkg-presence's backend test there.
+  cargo test -p mdkg -p mdkg-serve --no-default-features --features mdkg-serve/fido2 \
+    --test version --no-fail-fast || tests_failed=1
+  cargo test -p mdkg --no-default-features --test version --no-fail-fast || tests_failed=1
+  cargo test -p mdkg-presence --no-default-features --lib --no-fail-fast fido2:: || tests_failed=1
   if ((tests_failed)); then
     exit 1
   fi
@@ -918,6 +1192,7 @@ step "third-party notices"
 # Every release archive, the npm package and the wheels carry
 # THIRD_PARTY_NOTICES.md; it must match the locked dependencies.
 "$CHECK_PYTHON" -I scripts/third-party-notices.py --check
+"$CHECK_PYTHON" -I scripts/third-party-notices.py --self-test
 
 step "mdkg validate (TypeScript 0.6.0)"
 # A graph `migrate` moved to 0.7.0 names itself in its config; 0.6.0 can't

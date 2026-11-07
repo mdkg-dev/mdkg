@@ -1,6 +1,6 @@
 [package]
 name = "mdkg"
-version = "0.7.1"
+version = "0.7.2"
 description = "Local-first knowledge graph and coordination kernel for humans and coding agents"
 edition.workspace = true
 license.workspace = true
@@ -17,22 +17,22 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
-mdkg-coord = { path = "../mdkg-coord", version = "0.7.1" }
-mdkg-coord-sqlite = { path = "../mdkg-coord-sqlite", version = "0.7.1" }
-mdkg-log = { path = "../mdkg-log", version = "0.7.1" }
-mdkg-format = { path = "../mdkg-format", version = "0.7.1" }
+mdkg-coord = { path = "../mdkg-coord", version = "0.7.2" }
+mdkg-coord-sqlite = { path = "../mdkg-coord-sqlite", version = "0.7.2" }
+mdkg-log = { path = "../mdkg-log", version = "0.7.2" }
+mdkg-format = { path = "../mdkg-format", version = "0.7.2" }
 # The ref-mode probe reads a refused repository's common config through
 # its isolated config parser (orchestrator #11014).
-mdkg-git = { path = "../mdkg-git", version = "0.7.1" }
-mdkg-graph = { path = "../mdkg-graph", version = "0.7.1" }
-mdkg-index = { path = "../mdkg-index", version = "0.7.1" }
+mdkg-git = { path = "../mdkg-git", version = "0.7.2" }
+mdkg-graph = { path = "../mdkg-graph", version = "0.7.2" }
+mdkg-index = { path = "../mdkg-index", version = "0.7.2" }
 # The operation registry, and the backend trait serve runs requests through.
-mdkg-ops = { path = "../mdkg-ops", version = "0.7.1" }
-mdkg-run = { path = "../mdkg-run", version = "0.7.1" }
+mdkg-ops = { path = "../mdkg-ops", version = "0.7.2" }
+mdkg-run = { path = "../mdkg-run", version = "0.7.2" }
 # serve: its lock and state files and the socket's peer checks, and the
 # HTTP/1.1 codec it shares with the client.
-mdkg-serve = { path = "../mdkg-serve", version = "0.7.1" }
-mdkg-wire = { path = "../mdkg-wire", version = "0.7.1" }
+mdkg-serve = { path = "../mdkg-serve", version = "0.7.2", default-features = false }
+mdkg-wire = { path = "../mdkg-wire", version = "0.7.2" }
 # doctor reads the coordinator store's version read-only, never upgrading it;
 # migrate snapshots the store with SQLite's backup API.
 rusqlite.workspace = true
@@ -49,6 +49,13 @@ signal-hook = { version = "=0.3.18", default-features = false }
 toml_edit.workspace = true
 # init mints the graph's graph_id.
 uuid.workspace = true
+
+# FIDO2 person keys, on by default. The Linux PyPI wheels build without it
+# (--no-default-features), so they bundle no system libraries; their
+# --version says so (decided 2026-11-03, #17661).
+[features]
+default = ["fido2"]
+fido2 = ["mdkg-serve/fido2"]
 
 [lints]
 workspace = true

@@ -1101,6 +1101,9 @@ mod tests {
             via: None,
             room: None,
             sent_at: None,
+            digest: String::new(),
+            nodes: Vec::new(),
+            supersedes: Vec::new(),
             parts: Vec::new(),
         }
     }

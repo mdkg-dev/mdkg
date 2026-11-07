@@ -147,7 +147,7 @@
           ]
         },
         "reply": {
-          "description": "A task-only turn's final message, which wasn't imported, or\n`NO_REPLY` from a turn that had nothing to answer.",
+          "description": "A task-only turn's final message, which wasn't imported.",
           "type": [
             "string",
             "null"
@@ -308,9 +308,14 @@
           "const": "idle"
         },
         {
-          "description": "The agent answered its mail: the reply was imported, or it said\n[`crate::digest::NO_REPLY`], so nothing was sent and the mail shown\nwas acked (`reply` is then `NO_REPLY` and there's no `reply_id`).",
+          "description": "The agent answered its mail and the reply was imported (`reply_id`).",
           "type": "string",
           "const": "replied"
+        },
+        {
+          "description": "The agent answered its mail with exactly [`crate::digest::NO_REPLY`],\nor had already answered the newest message during the turn (a\nhandoff or findings to its sender in reply or in its context; its\nfinal message isn't imported as a second reply, #20931):\nthe launcher sent no final reply and acked as answered the shown mail\nstill held and still unacked (the agent's own earlier acks keep their\noutcome; a role lost during the turn leaves its mail unacked), and\nthere's no `reply` and no `reply_id`. A launcher receipt may\nstill go to `reports_to`.",
+          "type": "string",
+          "const": "no_reply"
         },
         {
           "description": "A task-only turn ran; with no message to reply to, nothing was\nimported and the reply is in the report.",
@@ -360,7 +365,7 @@
       ]
     },
     "AgentCommand": {
-      "description": "A process to start for one turn. It runs with the launcher's whole\nenvironment plus `env`.",
+      "description": "A process to start for one turn. It runs with [`Self::environment`]\n(by default the allowlist, [`crate::env`]) plus `env`.",
       "type": "object",
       "properties": {
         "program": {
@@ -376,7 +381,7 @@
           "type": "string"
         },
         "env": {
-          "description": "Variables set on top of the launcher's environment.",
+          "description": "Variables set on top of the environment the turn inherits.",
           "type": "array",
           "items": {
             "type": "array",
@@ -739,12 +744,14 @@
         "coord.sync_failed",
         "coord.path_missing",
         "coord.lease_limit",
+        "coord.merge_conflict",
         "coord.lease_shared",
         "coord.node_done",
         "coord.contains_abandoned",
         "coord.store_failed",
         "coord.store_restored",
         "coord.store_upgraded",
+        "coord.store_weak_sync",
         "coord.authority_failed",
         "coord.authority_remote",
         "coord.authority_note",
@@ -808,6 +815,7 @@
         "run.cwd_outside",
         "install.unmergeable",
         "install.unsupported_layout",
+        "install.legacy_projections",
         "init.exists",
         "doctor.check_failed",
         "doctor.check_warned",
@@ -854,6 +862,7 @@
         "api.replayed",
         "api.graph_unknown",
         "api.actor_not_allowed",
+        "person.proof_required",
         "api.unreachable",
         "api.remote_bound",
         "api.remote_conflict",
@@ -907,6 +916,7 @@
         "graph.shape",
         "graph.remote_invalid",
         "graph.remote_changed",
+        "graph.remote_unapproved",
         "graph.open_changesets",
         "graph.uncommitted",
         "graph.diverged",
@@ -936,6 +946,7 @@
         "graph.unsupported",
         "graph.write_noop",
         "msg.reserved_id",
+        "store.read_only",
         "store.integrity",
         "run.not_logged_in",
         "run.supervisor_exited",
@@ -943,6 +954,7 @@
         "run.loop_paused",
         "run.wrapper_refused",
         "run.no_base",
+        "flow.digest_too_large",
         "entry.verdict_unbacked",
         "entry.fix_absent",
         "msg.review_unranged",

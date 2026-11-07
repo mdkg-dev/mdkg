@@ -39,8 +39,35 @@ if [ -s fake-linger ]; then
   # shellcheck disable=SC2046
   nohup perl -e 'use POSIX; POSIX::setsid(); exec @ARGV' $(cat fake-linger) >/dev/null 2>&1 &
   echo $! > fake-linger.pid
+  # Ready once it has written its log (at most 5 s), so the turn's cleanup
+  # never races its first write.
+  i=0
+  while [ ! -s fake-linger.log ] && [ "$i" -lt 100 ]; do
+    sleep 0.05
+    i=$((i + 1))
+  done
 fi
 echo "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"$session\"}"
+# fake-mode limit-event: only the rejected rate_limit_event says it's the
+# limit; the final result names no limit, and Claude exits 0.
+if [ "$(cat fake-mode 2>/dev/null)" = limit-event ]; then
+  echo "{\"type\":\"rate_limit_event\",\"rate_limit_info\":{\"status\":\"rejected\",\"resetsAt\":1793000000,\"rateLimitType\":\"five_hour\"},\"session_id\":\"$session\"}"
+  echo "{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true,\"result\":\"request failed\",\"session_id\":\"$session\"}"
+  exit 0
+fi
+# fake-mode throttled: a 429 error result that names no limit, with no
+# rejected rate_limit_event: provider throttling, not the usage limit.
+if [ "$(cat fake-mode 2>/dev/null)" = throttled ]; then
+  echo "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":true,\"api_error_status\":429,\"result\":\"API Error: 429\",\"session_id\":\"$session\"}"
+  exit 1
+fi
+# fake-mode limit-weekly: the weekly limit in Claude's current shape: a
+# rejected rate_limit_event (synthetic reset time), then a 429 result.
+if [ "$(cat fake-mode 2>/dev/null)" = limit-weekly ]; then
+  echo "{\"type\":\"rate_limit_event\",\"rate_limit_info\":{\"status\":\"rejected\",\"resetsAt\":1793000000,\"rateLimitType\":\"seven_day\"},\"session_id\":\"$session\"}"
+  echo "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":true,\"api_error_status\":429,\"result\":\"You've hit your weekly limit \u00b7 resets 3pm\",\"session_id\":\"$session\"}"
+  exit 1
+fi
 # fake-mode limit: the subscription's usage limit, unless the turn bills a
 # key through apiKeyHelper (it runs the helper, keeping only the key's
 # length, never the key).
@@ -63,6 +90,9 @@ if [ "$(cat fake-mode 2>/dev/null)" = limit ]; then
     exit 0
   fi
 fi
+# A fake-send file is a command the agent runs during its turn: its own
+# mail, as a handoff by MCP or the CLI would send it.
+[ -s fake-send ] && sh fake-send > "$FAKE_DIR/fake-send.out" 2>&1
 [ "$(cat fake-mode 2>/dev/null)" = slow ] && sleep 1
 case "$(cat fake-mode 2>/dev/null || echo ok)" in
   error) echo "{\"type\":\"result\",\"subtype\":\"error_max_turns\",\"is_error\":true,\"session_id\":\"$session\"}" ;;

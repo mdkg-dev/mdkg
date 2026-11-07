@@ -23,6 +23,10 @@
       "minimum": 0,
       "description": "From 1 within the turn, assigned once when the launcher writes the event, so every reader sees the same seq. Filtered views have gaps. Null only for `agent.state`, which is ephemeral and never a position."
     },
+    "position": {
+      "type": "string",
+      "description": "Opaque: where this event is in the agent's output. Pass it to `agents logs --after` as it is, to resume with the event after this one; a synthesized `turn.ended`'s resumes with the next turn. Absent on `agent.state`, on the `turn.started` sent for a purged turn, and from builds before 0.7.2."
+    },
     "time": {
       "type": "string",
       "description": "RFC 3339 UTC to the millisecond."
@@ -286,6 +290,13 @@
           "type": "string",
           "description": "The harness's tool name; empty when it gave none."
         },
+        "call_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The harness's own id for this tool call: Claude's tool_use id; OpenCode's callID, or its tool part's id when it gives no callID. Within one turn, a tool.started and the tool.ended with the same non-null call_id are one call, even when calls with the same name overlap. Null when the harness gave neither, and absent from output written before 0.7.2: the pairing is then unknown."
+        },
         "summary": {
           "type": "string",
           "description": "A short summary of the tool's input, such as its path; may be empty."
@@ -305,6 +316,13 @@
         },
         "name": {
           "type": "string"
+        },
+        "call_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Within one turn, the call_id of the tool.started this ends; null when the harness gave none, and the pairing is then unknown. Null when the harness gave none; absent from output written before 0.7.2."
         },
         "ok": {
           "type": "boolean"

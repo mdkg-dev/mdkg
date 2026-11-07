@@ -18,10 +18,10 @@
       "expect": [
         {"type": "native"},
         {"type": "text", "data": {"text": "Reading."}},
-        {"type": "tool.started", "data": {"class": "read", "name": "Read", "summary": "/w/src/lib.rs"}},
-        {"type": "tool.ended", "data": {"class": "read", "name": "Read", "ok": true}},
-        {"type": "tool.started", "data": {"class": "edit", "name": "Edit", "summary": "/w/src/lib.rs"}},
-        {"type": "tool.ended", "data": {"class": "edit", "name": "Edit", "ok": false}},
+        {"type": "tool.started", "data": {"class": "read", "name": "Read", "call_id": "t1", "summary": "/w/src/lib.rs"}},
+        {"type": "tool.ended", "data": {"class": "read", "name": "Read", "call_id": "t1", "ok": true}},
+        {"type": "tool.started", "data": {"class": "edit", "name": "Edit", "call_id": "t2", "summary": "/w/src/lib.rs"}},
+        {"type": "tool.ended", "data": {"class": "edit", "name": "Edit", "call_id": "t2", "ok": false}},
         {"type": "status", "data": {"text": "a harness notice"}},
         {"type": "usage", "data": {"input_tokens": 3, "output_tokens": 4, "cache_read_tokens": 5, "total_tokens": null, "cost_usd": 0.25}}
       ]
@@ -57,8 +57,8 @@
       ],
       "expect": [
         {"type": "native"},
-        {"type": "tool.started", "data": {"class": "read", "name": "grep", "summary": "fn main"}},
-        {"type": "tool.ended", "data": {"class": "read", "name": "grep", "ok": true}},
+        {"type": "tool.started", "data": {"class": "read", "name": "grep", "call_id": "c1", "summary": "fn main"}},
+        {"type": "tool.ended", "data": {"class": "read", "name": "grep", "call_id": "c1", "ok": true}},
         {"type": "text", "data": {"text": "found it"}},
         {"type": "usage", "data": {"input_tokens": 10, "output_tokens": 20, "cache_read_tokens": 30, "total_tokens": null, "cost_usd": 0.5}},
         {"type": "error", "data": {"text": "overloaded"}}

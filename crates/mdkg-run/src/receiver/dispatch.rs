@@ -741,7 +741,11 @@ pub fn supervise_durable(
         mdkg_git::fresh_reads();
         supervise::checkpoint(Some(saved), current)?;
         supervise::save_progress(&a.name, current);
-        if supervise::stop_requested() || how.max_turns.is_some_and(|n| current.ran >= n) {
+        if supervise::stop_requested() {
+            return Ok(current.ran);
+        }
+        if how.max_turns.is_some_and(|n| current.ran >= n) {
+            supervise::note_end(supervise::End::Cap);
             return Ok(current.ran);
         }
         let outcome = dispatch_watched(mail, dir, a, saved)?;
@@ -750,6 +754,9 @@ pub fn supervise_durable(
             Ok(report) => {
                 if last.as_ref() != Some(&report) {
                     on(&a.name, Event::Wake(&report));
+                }
+                if report.status == WakeStatus::ModeChanged {
+                    supervise::note_end(supervise::End::ModeChanged);
                 }
                 if report.status == WakeStatus::ModeChanged || how.once {
                     return Ok(current.ran);
@@ -807,7 +814,11 @@ fn supervise_steps(
                 check_inbox: true,
             },
         );
-        if supervise::stop_requested() || how.max_turns.is_some_and(|n| ran >= n) {
+        if supervise::stop_requested() {
+            return ran;
+        }
+        if how.max_turns.is_some_and(|n| ran >= n) {
+            supervise::note_end(supervise::End::Cap);
             return ran;
         }
         // Never stop a step after it has reserved delivery. Drain it and
@@ -827,6 +838,9 @@ fn supervise_steps(
                 );
                 if last.as_ref() != Some(&report) {
                     on(name, Event::Wake(&report));
+                }
+                if report.status == WakeStatus::ModeChanged {
+                    supervise::note_end(supervise::End::ModeChanged);
                 }
                 if report.status == WakeStatus::ModeChanged || how.once {
                     return ran;
@@ -1524,6 +1538,53 @@ exit 0
                 check_inbox: true,
             },
         )]))
+    }
+
+    /// A receiver that returns because its mode changed, or at its cap,
+    /// says so, so its exit names that reason and not an unknown agent
+    /// (#20977).
+    #[test]
+    fn supervise_steps_notes_why_it_returned() {
+        let mut mail = DispatchMail {
+            run: PathBuf::new(),
+            expected_charge: 0,
+            expected_seen: 0,
+            release_fails: false,
+            break_route: false,
+            pending_on_release: false,
+            held: false,
+            releases: 0,
+            claimed_at: Vec::new(),
+            check_release: true,
+            stop_at: None,
+        };
+        let how = Up {
+            pause: Duration::ZERO,
+            ..loop_options()
+        };
+        let control = supervise::Control::default();
+        supervise::with_control(Some(&control), || {
+            supervise::with_agent("worker", || {
+                supervise_steps(&mut mail, "worker", &how, &|_, _| (), |_| {
+                    Ok(Report::new(WakeStatus::ModeChanged))
+                })
+            })
+        });
+        assert_eq!(control.ended("worker"), Some(supervise::End::ModeChanged));
+        let capped = Up {
+            max_turns: Some(0),
+            ..how
+        };
+        let control = supervise::Control::default();
+        supervise::with_control(Some(&control), || {
+            supervise::with_agent("worker", || {
+                supervise_steps(&mut mail, "worker", &capped, &|_, _| (), |_| {
+                    Ok(Report::new(WakeStatus::Queued))
+                })
+            })
+        });
+        assert_eq!(control.ended("worker"), Some(supervise::End::Cap));
+        assert_eq!(control.ended("other"), None);
     }
 
     #[test]

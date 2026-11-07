@@ -1141,15 +1141,22 @@ impl GraphPlan {
                 // info/exclude lives in the common Git directory, outside
                 // both committed trees: a checkout refresh cannot change it.
                 // Compare object IDs, including additions and removals,
-                // rather than worktree bytes or executable-mode changes.
+                // and the entry's type: a regular file and a symlink with
+                // the same blob are read differently (#15041). Executable-
+                // mode changes alone are still ignored, not worktree bytes.
                 let blobs = |revision| -> Result<BTreeMap<_, _>, RunError> {
                     let tree = tree_entries(&self.path, revision, &paths)?;
                     Ok(paths
                         .iter()
                         .filter_map(|path| {
                             let key = path.as_os_str().as_bytes();
-                            tree.get(key)
-                                .map(|entry| (key.to_vec(), entry.object.clone()))
+                            tree.get(key).map(|entry| {
+                                let link = entry.mode == "120000";
+                                (
+                                    key.to_vec(),
+                                    (entry.kind.clone(), link, entry.object.clone()),
+                                )
+                            })
                         })
                         .collect())
                 };
@@ -2436,6 +2443,23 @@ mod tests {
                 command(&root.0, &["commit", "-qm", "modify ignore"]);
                 assert!(plan.would_refresh_ignores(&targets).expect("modification"));
                 plan.create(false).expect("refresh modification");
+                // A regular file turned into a symlink whose target text
+                // is the same bytes: one blob, but read differently
+                // (#15041). Back to a file the same way.
+                let rule = fs::read(&file).expect("rule");
+                let text = String::from_utf8(rule).expect("UTF-8");
+                fs::remove_file(&file).expect("file");
+                std::os::unix::fs::symlink(&text, &file).expect("link");
+                command(&root.0, &["add", path]);
+                command(&root.0, &["commit", "-qm", "ignore file to symlink"]);
+                assert!(plan.would_refresh_ignores(&targets).expect("to a link"));
+                plan.create(false).expect("refresh to a link");
+                fs::remove_file(&file).expect("link");
+                fs::write(&file, &text).expect("file again");
+                command(&root.0, &["add", path]);
+                command(&root.0, &["commit", "-qm", "ignore symlink to file"]);
+                assert!(plan.would_refresh_ignores(&targets).expect("to a file"));
+                plan.create(false).expect("refresh to a file");
                 command(&root.0, &["rm", "-q", path]);
                 command(&root.0, &["commit", "-qm", "remove ignore"]);
                 assert!(plan.would_refresh_ignores(&targets).expect("removal"));

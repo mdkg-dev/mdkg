@@ -124,6 +124,10 @@
           "description": "Named in the config's `agents`.",
           "type": "boolean"
         },
+        "file_backed": {
+          "description": "Defined by its own file, `.mdkg/agents/<name>.json` (then\n`effective` is its layered definition), rather than inline in the\nconfig.",
+          "type": "boolean"
+        },
         "known": {
           "description": "Has saved machine-local runtime state.",
           "type": "boolean"
@@ -161,6 +165,10 @@
         },
         "policy": {
           "$ref": "#/$defs/Policy"
+        },
+        "env_mode": {
+          "description": "Which environment its turns start with: `allowlist`, `inherit`\n(`env.inherit: true`, the launcher's whole environment less provider\nkeys), or `session` for an interactive receiver. Names only, never\nvalues (crate::env in mdkg-run).",
+          "$ref": "#/$defs/EnvMode"
         },
         "paused": {
           "description": "Threads the loop guard pauses now.",
@@ -202,7 +210,7 @@
           }
         },
         "auth": {
-          "description": "The account its turns would bill now, from its harness's own login\ncheck and the Keychain's list (no key is read).",
+          "description": "The account its turns would bill now, from its harness's own login\ncheck and the Keychain's list (no key is read). Absent under\n`--no-probe`.",
           "anyOf": [
             {
               "$ref": "#/$defs/AuthStatus"
@@ -213,7 +221,7 @@
           ]
         },
         "billing": {
-          "description": "The key, offered or marked: after a usage limit, the `agents use-key`\ncommand to bill the next turn on it; a mark waiting for that turn;\nor a mark held because it couldn't be recorded durably.",
+          "description": "The key, offered or marked: after a usage limit, the `agents use-key`\ncommand to bill the next turn on it; a mark waiting for that turn;\nor a mark held because it couldn't be recorded durably. Absent\nunder `--no-probe`.",
           "type": [
             "string",
             "null"
@@ -256,6 +264,17 @@
             }
           ]
         },
+        "last_exit": {
+          "description": "How its last supervisor ended, while none runs it: `reason` is\n`cap` (`--max-turns` reached), `once`, `manual` (a `manual`\ntrigger: a watch runs it no turns), `mode_changed` (its receiver\nchanged mode), `drained` (`agents stop`, as of the drain), `signal`\n(SIGTERM, turns finished) or `failed` (with `code`). Only for the\nagent's latest watch, once it's finished.\nAbsent while a supervisor runs it, and when none recorded an exit\n(never run, or killed outright: SIGKILL, SIGINT, a crash), so a\nreason is never guessed.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LastExit"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "follow_from": {
           "description": "The position `agents logs <agent> --follow --after` takes to pick up\nfrom this snapshot: never \"from now\", so a turn that starts or ends\nin between is still delivered.",
           "type": "string"
@@ -275,9 +294,11 @@
       "required": [
         "name",
         "configured",
+        "file_backed",
         "known",
         "turns",
         "policy",
+        "env_mode",
         "state",
         "supervisor",
         "current_turn",
@@ -412,6 +433,11 @@
           "description": "Which account turns bill ([`crate::auth`]).",
           "$ref": "#/$defs/Auth"
         },
+        "env": {
+          "description": "Which environment turns start with ([`crate::env`]).",
+          "$ref": "#/$defs/Env",
+          "default": {}
+        },
         "later": {
           "description": "Later kinds of `loop_guard`, `concurrency` and `timeout`, whose\n0.7.0 values have no room for one: kept here, so `agents status`\nshows them and an agent's own value can replace a default's.",
           "type": "array",
@@ -429,7 +455,8 @@
         "timeout",
         "retry",
         "budget",
-        "auth"
+        "auth",
+        "env"
       ]
     },
     "Trigger": {
@@ -515,6 +542,25 @@
           "required": [
             "kind",
             "max"
+          ]
+        },
+        {
+          "description": "A computed view over all unacknowledged mail.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "digest"
+            },
+            "budget": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "kind",
+            "budget"
           ]
         },
         {
@@ -634,6 +680,46 @@
       "type": "string",
       "enum": [
         "subscription"
+      ]
+    },
+    "Env": {
+      "description": "Which environment an agent's turns start with ([`crate::env`]): the\nallowlist plus `allow`'s names, or with `inherit: true` the launcher's\nwhole environment less provider keys. Names only: a value is never\nstored in config.",
+      "type": "object",
+      "properties": {
+        "allow": {
+          "description": "Variable names a turn inherits besides the allowlist; a final `*`\nis a prefix, which never admits a credential-shaped name.\n`agents.defaults` and the agent's own policy add to each other.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "inherit": {
+          "description": "`true` inherits the launcher's whole environment, warned on every\nturn. Unset is `false`.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      }
+    },
+    "EnvMode": {
+      "description": "The environment an agent's turns start with, as `agents status` and\n`doctor` report it.",
+      "oneOf": [
+        {
+          "description": "Only the allowlist and the policy's `env.allow`.",
+          "type": "string",
+          "const": "allowlist"
+        },
+        {
+          "description": "The launcher's whole environment, less provider keys (`env.inherit`).",
+          "type": "string",
+          "const": "inherit"
+        },
+        {
+          "description": "An interactive receiver: mdkg delivers into a session someone\nstarted, which has that person's environment.",
+          "type": "string",
+          "const": "session"
+        }
       ]
     },
     "DeliveryStatus": {
@@ -823,7 +909,7 @@
           "minimum": 0
         },
         "outcome": {
-          "description": "`replied`, `ran`, `idle`, `dry_run`, `failed`, `interrupted` or\n`not_started`; an open set.",
+          "description": "`replied`, `no_reply`, `ran`, `idle`, `dry_run`, `failed`,\n`interrupted` or `not_started`; an open set.",
           "type": [
             "string",
             "null"
@@ -841,6 +927,74 @@
         "number",
         "outcome",
         "ended_at"
+      ]
+    },
+    "LastExit": {
+      "description": "How an agent's last supervisor ended (`agents status`'s `last_exit`).",
+      "type": "object",
+      "properties": {
+        "supervisor_id": {
+          "type": "string"
+        },
+        "reason": {
+          "$ref": "#/$defs/ExitReason"
+        },
+        "code": {
+          "description": "The failure's diagnostic code, with `failed` only.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "at": {
+          "description": "When it exited (RFC 3339).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "supervisor_id",
+        "reason",
+        "at"
+      ]
+    },
+    "ExitReason": {
+      "description": "Why a supervisor ended, kept per agent once its process is gone, so a\nclient that doesn't hold its output can still tell.",
+      "oneOf": [
+        {
+          "description": "It ran its `--max-turns`.",
+          "type": "string",
+          "const": "cap"
+        },
+        {
+          "description": "Its trigger is `manual`: a watch runs it no turns.",
+          "type": "string",
+          "const": "manual"
+        },
+        {
+          "description": "Its receiver mode changed (interactive to headless or back): start\nit again to run it in its new mode.",
+          "type": "string",
+          "const": "mode_changed"
+        },
+        {
+          "description": "`--once`: what was waiting ran.",
+          "type": "string",
+          "const": "once"
+        },
+        {
+          "description": "Drained by `agents stop`.",
+          "type": "string",
+          "const": "drained"
+        },
+        {
+          "description": "Stopped by SIGTERM, its turns finished.",
+          "type": "string",
+          "const": "signal"
+        },
+        {
+          "description": "It failed; `code` says why.",
+          "type": "string",
+          "const": "failed"
+        }
       ]
     },
     "CodeBase": {
@@ -1569,12 +1723,14 @@
         "coord.sync_failed",
         "coord.path_missing",
         "coord.lease_limit",
+        "coord.merge_conflict",
         "coord.lease_shared",
         "coord.node_done",
         "coord.contains_abandoned",
         "coord.store_failed",
         "coord.store_restored",
         "coord.store_upgraded",
+        "coord.store_weak_sync",
         "coord.authority_failed",
         "coord.authority_remote",
         "coord.authority_note",
@@ -1638,6 +1794,7 @@
         "run.cwd_outside",
         "install.unmergeable",
         "install.unsupported_layout",
+        "install.legacy_projections",
         "init.exists",
         "doctor.check_failed",
         "doctor.check_warned",
@@ -1684,6 +1841,7 @@
         "api.replayed",
         "api.graph_unknown",
         "api.actor_not_allowed",
+        "person.proof_required",
         "api.unreachable",
         "api.remote_bound",
         "api.remote_conflict",
@@ -1737,6 +1895,7 @@
         "graph.shape",
         "graph.remote_invalid",
         "graph.remote_changed",
+        "graph.remote_unapproved",
         "graph.open_changesets",
         "graph.uncommitted",
         "graph.diverged",
@@ -1766,6 +1925,7 @@
         "graph.unsupported",
         "graph.write_noop",
         "msg.reserved_id",
+        "store.read_only",
         "store.integrity",
         "run.not_logged_in",
         "run.supervisor_exited",
@@ -1773,6 +1933,7 @@
         "run.loop_paused",
         "run.wrapper_refused",
         "run.no_base",
+        "flow.digest_too_large",
         "entry.verdict_unbacked",
         "entry.fix_absent",
         "msg.review_unranged",

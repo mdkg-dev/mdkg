@@ -893,11 +893,9 @@ fn rust_a_crate_selects_itself_and_its_dependents() {
             "selective",
             vec!["checks-fx", "cli-fx", "core-fx"],
         ),
-        (
-            "crates/cli/tests/it.rs",
-            "selective",
-            vec!["checks-fx", "cli-fx"],
-        ),
+        // A test file only its own target reaches is in no library, so
+        // no dependent runs (0.7.2).
+        ("crates/cli/tests/it.rs", "selective", vec!["cli-fx"]),
         ("crates/checks/src/lib.rs", "selective", vec!["checks-fx"]),
         // Global: features unify across the workspace.
         ("crates/lone/Cargo.toml", "full", vec![]),
@@ -1274,10 +1272,13 @@ fn a_target_outside_its_crate_claims_its_folder() {
     let head = commit(&s.0, "change the shared module");
     let (_, v) = affected(&s.0, &["--base", &format!("{head}^")]);
     assert_eq!(v["data"]["mode"], "selective", "{v}");
+    // Only the shared test's tree reaches the module (0.7.2), so neither
+    // core-fx's dependents nor its other targets run.
     assert_eq!(
         v["data"]["selected"]["rust"],
-        serde_json::json!(["checks-fx", "cli-fx", "core-fx"])
+        serde_json::json!(["core-fx"])
     );
+    assert_eq!(plan(&v), [scope("core-fx", "test", "shared")], "{v}");
 }
 
 #[test]
@@ -2406,33 +2407,28 @@ fn rust_target_whole_crate_fallback_dominates_default_scopes_across_paths() {
 }
 
 #[test]
-fn rust_target_stale_names_and_missing_libraries_fail_closed() {
+fn rust_target_rules_naming_a_missing_package_fail_closed() {
     if !have("cargo") {
         eprintln!("skipped: cargo isn't on PATH");
         return;
     }
-    for target in [
-        serde_json::json!({"package":"core-fx", "test":"missing"}),
-        serde_json::json!({"package":"missing", "lib":true}),
-        serde_json::json!({"package":"core-fx", "lib":true}),
+    let (s, _) = rust_target_repo();
+    let path = s.0.join(".mdkg/config.json");
+    let cfg: Value = serde_json::from_str(&fs::read_to_string(&path).expect("target fixture"))
+        .expect("target fixture");
+    // Alone, and beside a target that resolves.
+    for targets in [
+        serde_json::json!([{"package":"missing", "lib":true}]),
+        serde_json::json!([
+            {"package":"core-fx", "test":"behavior"},
+            {"package":"cli-fz", "test":"smoke"}
+        ]),
     ] {
-        let (s, _) = rust_target_repo();
-        // The final case has a binary, but no library.
-        if target.get("lib").is_some() && target["package"] == "core-fx" {
-            git(
-                &s.0,
-                &["mv", "crates/core/src/lib.rs", "crates/core/src/main.rs"],
-            );
-            write(&s.0, "crates/core/src/main.rs", "fn main() {}\n");
-        }
-        let path = s.0.join(".mdkg/config.json");
-        let mut cfg: Value =
-            serde_json::from_str(&fs::read_to_string(&path).expect("target fixture"))
-                .expect("target fixture");
-        cfg["affected"]["rules"][1]["select"]["rust_targets"] = serde_json::json!([target]);
-        fs::write(path, cfg.to_string()).expect("target fixture");
-        let base = commit(&s.0, "stale target rule");
-        write(&s.0, "docs/new.md", "docs\n");
+        let mut cfg = cfg.clone();
+        cfg["affected"]["rules"][1]["select"]["rust_targets"] = targets;
+        fs::write(&path, cfg.to_string()).expect("target fixture");
+        let base = commit(&s.0, "stale package rule");
+        write(&s.0, "docs/new.md", &format!("docs {base}\n"));
         commit(&s.0, "docs change");
         let (exit, v) = affected_targets(&s.0, &["--base", &base]);
         assert_ne!(exit, 0, "{v}");
@@ -2440,6 +2436,644 @@ fn rust_target_stale_names_and_missing_libraries_fail_closed() {
         assert!(v.get("data").is_none(), "{v}");
         assert_eq!(v["diagnostics"][0]["code"], "config.invalid");
     }
+}
+
+/// The shared config can name a test target that an older head predates
+/// (0.7.2: tests/read_only.rs, named before every head had it). Each
+/// missing target is skipped with a warning; a rule with none left runs its
+/// packages whole; a head that has the target uses it.
+#[test]
+fn rust_target_rules_skip_targets_an_older_head_lacks() {
+    if !have("cargo") {
+        eprintln!("skipped: cargo isn't on PATH");
+        return;
+    }
+    let (s, _) = rust_target_repo();
+    let path = s.0.join(".mdkg/config.json");
+    let mut cfg: Value = serde_json::from_str(&fs::read_to_string(&path).expect("target fixture"))
+        .expect("target fixture");
+    cfg["affected"]["rules"][0]["select"]["rust_targets"]
+        .as_array_mut()
+        .expect("target fixture")
+        .push(serde_json::json!({"package": "cli-fx", "test": "read_only"}));
+    cfg["affected"]["rules"][1]["select"]["rust_targets"] =
+        serde_json::json!([{"package": "cli-fx", "test": "read_only"}]);
+    fs::write(path, cfg.to_string()).expect("target fixture");
+    let base = commit(&s.0, "rules name a newer target");
+    write(&s.0, "crates/core/src/lib.rs", "pub fn f() -> u8 { 2 }\n");
+    write(&s.0, "docs/new.md", "docs\n");
+    let old_head = commit(&s.0, "core and docs change, before read_only exists");
+
+    let (exit, v) = affected_targets(&s.0, &["--base", &base, "--head", &old_head]);
+    assert_eq!(exit, 0, "{v}");
+    assert_eq!(v["data"]["mode"], "selective", "{v}");
+    let targets = v["data"]["selected"]["rust_targets"]
+        .as_array()
+        .expect("target fixture");
+    let mut seen: Vec<(String, String, String)> = targets
+        .iter()
+        .map(|t| {
+            (
+                t["package"].as_str().expect("a package").to_string(),
+                t["kind"].as_str().expect("a kind").to_string(),
+                t["name"].as_str().unwrap_or("").to_string(),
+            )
+        })
+        .collect();
+    seen.sort();
+    // rule 0 keeps its three real targets; rule 1 has none, so cli-fx runs
+    // whole, which subsumes cli-fx's smoke scope.
+    assert_eq!(
+        seen,
+        [
+            ("checks-fx".into(), "lib".into(), String::new()),
+            ("cli-fx".into(), "package".into(), String::new()),
+            ("core-fx".into(), "test".into(), "behavior".into()),
+        ],
+        "{v}"
+    );
+    let warnings = v["data"]["warnings"].as_array().expect("target fixture");
+    let about = |p: &str| {
+        warnings
+            .iter()
+            .find(|w| w["path"] == p)
+            .unwrap_or_else(|| panic!("no warning for {p}: {v}"))["detail"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let core = about("crates/core/src/lib.rs");
+    assert!(
+        core.contains("affected.rules[0] names Rust target cli-fx test read_only"),
+        "{core}"
+    );
+    assert!(core.contains("other targets still run"), "{core}");
+    let docs = about("docs/new.md");
+    assert!(docs.contains("affected.rules[1]"), "{docs}");
+    assert!(docs.contains("whole tests run"), "{docs}");
+    assert!(
+        warnings
+            .iter()
+            .all(|w| w["packages"] == serde_json::json!(["cli-fx"])),
+        "{v}"
+    );
+
+    // The newer head has the target: no warning, and the scope is used.
+    write(
+        &s.0,
+        "crates/cli/tests/read_only.rs",
+        "#[test] fn works() {}\n",
+    );
+    let newer = commit(&s.0, "add read_only");
+    write(&s.0, "crates/core/src/lib.rs", "pub fn f() -> u8 { 3 }\n");
+    write(&s.0, "docs/new.md", "more docs\n");
+    commit(&s.0, "core and docs change, with read_only");
+    let (exit, v) = affected_targets(&s.0, &["--base", &newer]);
+    assert_eq!(exit, 0, "{v}");
+    assert_eq!(v["data"]["mode"], "selective", "{v}");
+    assert_eq!(v["data"]["warnings"], serde_json::json!([]), "{v}");
+    let targets = v["data"]["selected"]["rust_targets"]
+        .as_array()
+        .expect("target fixture");
+    assert!(
+        targets
+            .iter()
+            .any(|t| t["package"] == "cli-fx" && t["name"] == "read_only"),
+        "{v}"
+    );
+    assert!(targets.iter().all(|t| t["kind"] != "package"), "{v}");
+}
+
+/// An uncertain tree may reach a `.rs` file outside its root's folder: a
+/// computed include in tests/deep/main.rs climbs to tests/support.
+#[test]
+fn an_uncertain_tree_may_reach_files_outside_its_folder() {
+    if !have("cargo") {
+        eprintln!("skipped: cargo isn't on PATH");
+        return;
+    }
+    let (s, _) = rust_target_repo();
+    let d = &s.0;
+    write(d, "crates/cli/tests/support/shared.rs", "pub fn s() {}\n");
+    write(
+        d,
+        "crates/cli/tests/direct.rs",
+        "#[path = \"support/shared.rs\"]\nmod shared;\n#[test] fn t() { shared::s() }\n",
+    );
+    write(
+        d,
+        "crates/cli/tests/deep/main.rs",
+        "include!(concat!(\"../support/\", \"shared.rs\"));\n#[test] fn t() { s() }\n",
+    );
+    let base = commit(d, "a computed include");
+    write(d, "crates/cli/tests/support/shared.rs", "pub fn s() { }\n");
+    commit(d, "change shared");
+    let (exit, v) = affected_targets(d, &["--base", &base]);
+    assert_eq!(exit, 0, "{v}");
+    assert_eq!(v["data"]["mode"], "selective", "{v}");
+    assert_eq!(
+        plan(&v),
+        [
+            scope("cli-fx", "test", "deep"),
+            scope("cli-fx", "test", "direct")
+        ],
+        "{v}"
+    );
+}
+
+/// `include!` reads code from a file of any name, and the includes inside
+/// it are followed too.
+#[test]
+fn includes_inside_a_non_rs_included_file_are_followed() {
+    if !have("cargo") {
+        eprintln!("skipped: cargo isn't on PATH");
+        return;
+    }
+    let (s, _) = rust_target_repo();
+    let d = &s.0;
+    write(d, "crates/cli/tests/common/shared.rs", "pub fn s() {}\n");
+    write(
+        d,
+        "crates/cli/tests/common/wrapper.inc",
+        "include!(\"shared.rs\");\n",
+    );
+    write(
+        d,
+        "crates/cli/tests/wrap.rs",
+        "include!(\"common/wrapper.inc\");\n#[test] fn t() { s() }\n",
+    );
+    write(
+        d,
+        "crates/cli/tests/direct.rs",
+        "#[path = \"common/shared.rs\"]\nmod shared;\n#[test] fn t() { shared::s() }\n",
+    );
+    let base = commit(d, "a wrapped include");
+    write(d, "crates/cli/tests/common/shared.rs", "pub fn s() { }\n");
+    commit(d, "change shared");
+    let (exit, v) = affected_targets(d, &["--base", &base]);
+    assert_eq!(exit, 0, "{v}");
+    assert_eq!(v["data"]["mode"], "selective", "{v}");
+    assert_eq!(
+        plan(&v),
+        [
+            scope("cli-fx", "test", "direct"),
+            scope("cli-fx", "test", "wrap")
+        ],
+        "{v}"
+    );
+}
+
+/// A `#[path]` spelled in another case opens the tracked file on a
+/// case-insensitive volume. Module trees accept only exact tracked
+/// spellings, so `b`'s tree is uncertain, which selects it on every host.
+#[test]
+fn a_path_in_another_case_still_selects_its_target() {
+    if !have("cargo") {
+        eprintln!("skipped: cargo isn't on PATH");
+        return;
+    }
+    let (s, _) = rust_target_repo();
+    let d = &s.0;
+    write(
+        d,
+        "crates/cli/tests/a.rs",
+        "pub fn a() {}\n#[test] fn t() {}\n",
+    );
+    write(
+        d,
+        "crates/cli/tests/b.rs",
+        "#[path = \"A.rs\"]\nmod a;\n#[test] fn t() { a::a() }\n",
+    );
+    let base = commit(d, "a path in another case");
+    write(
+        d,
+        "crates/cli/tests/a.rs",
+        "pub fn a() { }\n#[test] fn t() {}\n",
+    );
+    commit(d, "change a");
+    let (exit, v) = affected_targets(d, &["--base", &base]);
+    assert_eq!(exit, 0, "{v}");
+    assert_eq!(v["data"]["mode"], "selective", "{v}");
+    assert_eq!(
+        plan(&v),
+        [scope("cli-fx", "test", "a"), scope("cli-fx", "test", "b")],
+        "{v}"
+    );
+}
+
+/// Another Unicode form of a tracked name (NFD for a tracked NFC one)
+/// opens on macOS; an include spelled for one host may not open on another.
+/// Neither is an exact tracked spelling, so either tree is uncertain and
+/// its test is selected wherever the plan is made.
+#[test]
+fn other_spellings_and_cfg_includes_still_select_their_targets() {
+    if !have("cargo") {
+        eprintln!("skipped: cargo isn't on PATH");
+        return;
+    }
+    let (s, _) = rust_target_repo();
+    let d = &s.0;
+    let nfc = "caf\u{e9}";
+    let nfd = "cafe\u{301}";
+    write(
+        d,
+        &format!("crates/cli/tests/common/{nfc}.rs"),
+        "pub fn c() {}\n",
+    );
+    write(
+        d,
+        "crates/cli/tests/composed.rs",
+        &format!("#[path = \"common/{nfc}.rs\"]\nmod c;\n#[test] fn t() {{ c::c() }}\n"),
+    );
+    write(
+        d,
+        "crates/cli/tests/decomposed.rs",
+        &format!("#[path = \"common/{nfd}.rs\"]\nmod c;\n#[test] fn t() {{ c::c() }}\n"),
+    );
+    write(d, "crates/cli/tests/common/shared.rs", "pub fn s() {}\n");
+    write(
+        d,
+        "crates/cli/tests/common/wrapper.inc",
+        "include!(\"shared.rs\");\n",
+    );
+    write(
+        d,
+        "crates/cli/tests/wrap.rs",
+        "#[cfg(target_os = \"macos\")]\ninclude!(\"common/WRAPPER.inc\");\n#[test] fn t() {}\n",
+    );
+    write(
+        d,
+        "crates/cli/tests/direct.rs",
+        "#[path = \"common/shared.rs\"]\nmod shared;\n#[test] fn t() { shared::s() }\n",
+    );
+    let base = commit(d, "other spellings");
+    let tracked = git(
+        d,
+        &[
+            "-c",
+            "core.quotepath=off",
+            "ls-files",
+            "crates/cli/tests/common",
+        ],
+    );
+    assert!(
+        tracked.contains(nfc) && !tracked.contains(nfd),
+        "git keeps the NFC spelling: {tracked}"
+    );
+
+    write(
+        d,
+        &format!("crates/cli/tests/common/{nfc}.rs"),
+        "pub fn c() { }\n",
+    );
+    let mid = commit(d, "change the helper");
+    let (exit, v) = affected_targets(d, &["--base", &base, "--head", &mid]);
+    assert_eq!(exit, 0, "{v}");
+    assert_eq!(v["data"]["mode"], "selective", "{v}");
+    let p = plan(&v);
+    for t in ["composed", "decomposed"] {
+        assert!(p.contains(&scope("cli-fx", "test", t)), "{t}: {v}");
+    }
+
+    write(d, "crates/cli/tests/common/shared.rs", "pub fn s() { }\n");
+    commit(d, "change shared");
+    let (exit, v) = affected_targets(d, &["--base", &mid]);
+    assert_eq!(exit, 0, "{v}");
+    let p = plan(&v);
+    for t in ["direct", "wrap"] {
+        assert!(p.contains(&scope("cli-fx", "test", t)), "{t}: {v}");
+    }
+}
+
+/// A non-`.rs` file another crate's test includes under another spelling:
+/// that test's tree is uncertain, so its crate runs whole too. And a
+/// `#[path]` file owns its own folder, as rustc reads it, so a `mod` in it
+/// isn't satisfied by a same-named file in the folder named after it.
+#[test]
+fn other_spellings_of_includes_and_path_file_children_still_select() {
+    if !have("cargo") {
+        eprintln!("skipped: cargo isn't on PATH");
+        return;
+    }
+    let (s, _) = rust_target_repo();
+    let d = &s.0;
+    write(d, "crates/cli/tests/common/data.inc", "1\n");
+    write(
+        d,
+        "crates/core/tests/behavior.rs",
+        "const D: u8 = include!(\"../../cli/tests/common/DATA.inc\");\n#[test] fn works() {}\n",
+    );
+    write(
+        d,
+        "crates/cli/tests/wrap.rs",
+        "#[path = \"common/setup.rs\"]\nmod setup;\n#[test] fn t() {}\n",
+    );
+    write(
+        d,
+        "crates/cli/tests/common/setup.rs",
+        "#[cfg(target_os = \"macos\")]\nmod item;\n",
+    );
+    write(d, "crates/cli/tests/common/ITEM.rs", "pub fn i() {}\n");
+    write(
+        d,
+        "crates/cli/tests/common/setup/item.rs",
+        "pub fn other() {}\n",
+    );
+    write(
+        d,
+        "crates/cli/tests/direct.rs",
+        "#[path = \"common/ITEM.rs\"]\nmod item;\n#[test] fn t() { item::i() }\n",
+    );
+    let base = commit(d, "other spellings");
+
+    write(d, "crates/cli/tests/common/data.inc", "2\n");
+    let mid = commit(d, "change the data");
+    let (exit, v) = affected_targets(d, &["--base", &base, "--head", &mid]);
+    assert_eq!(exit, 0, "{v}");
+    assert!(plan(&v).contains(&scope("core-fx", "package", "")), "{v}");
+
+    write(d, "crates/cli/tests/common/ITEM.rs", "pub fn i() { }\n");
+    commit(d, "change the item");
+    let (exit, v) = affected_targets(d, &["--base", &mid]);
+    assert_eq!(exit, 0, "{v}");
+    let p = plan(&v);
+    for t in ["direct", "wrap"] {
+        assert!(p.contains(&scope("cli-fx", "test", t)), "{t}: {v}");
+    }
+}
+
+/// A warning's detail can carry text from a module tree, such as a file
+/// name: text output escapes its terminal controls.
+#[test]
+fn text_warnings_escape_terminal_controls() {
+    if !have("cargo") {
+        eprintln!("skipped: cargo isn't on PATH");
+        return;
+    }
+    let (s, _) = rust_target_repo();
+    let d = &s.0;
+    // The library includes a file that declares a module, so its tree is
+    // uncertain, and the reason names the included file.
+    write(
+        d,
+        "crates/core/src/lib.rs",
+        "include!(\"x\u{1b}[31m.rs\");\npub fn f() -> u8 { 1 }\n",
+    );
+    write(d, "crates/core/src/x\u{1b}[31m.rs", "mod m;\n");
+    write(d, "crates/core/src/x\u{1b}[31m/m.rs", "\n");
+    let base = commit(d, "an uncertain library tree");
+    write(d, "crates/core/src/extra.rs", "// changed\n");
+    commit(d, "change extra");
+    let (_, v) = affected_targets(d, &["--base", &base]);
+    let w = warning_for(&v, "crates/core/src/extra.rs");
+    assert!(w.contains("may reach it"), "{w}");
+    assert!(w.contains('\u{1b}'), "{w:?}");
+    let out = isolated(Command::new(env!("CARGO_BIN_EXE_mdkg")).current_dir(d))
+        .args(["affected", "--targets", "--base", &base])
+        .output()
+        .expect("run");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("warning: crates/core/src/extra.rs:"),
+        "{text}"
+    );
+    assert!(!text.contains('\u{1b}'), "{text:?}");
+    assert!(text.contains("\\u{1b}"), "{text}");
+}
+
+/// A missing target named by the rule for a rename's old path is reported
+/// against that old path, not the destination that didn't trigger it.
+#[test]
+fn a_missing_target_from_a_renames_old_side_names_the_old_path() {
+    if !have("cargo") {
+        eprintln!("skipped: cargo isn't on PATH");
+        return;
+    }
+    let (s, _) = rust_target_repo();
+    let path = s.0.join(".mdkg/config.json");
+    let mut cfg: Value = serde_json::from_str(&fs::read_to_string(&path).expect("target fixture"))
+        .expect("target fixture");
+    cfg["affected"]["rules"][1]["select"]["rust_targets"]
+        .as_array_mut()
+        .expect("target fixture")
+        .push(serde_json::json!({"package": "cli-fx", "test": "read_only"}));
+    cfg["affected"]["rules"]
+        .as_array_mut()
+        .expect("target fixture")
+        .push(
+            serde_json::json!({"paths": ["notes/**"], "select": {"rust_targets": [
+                {"package": "core-fx", "test": "behavior"}
+            ]}}),
+        );
+    fs::write(path, cfg.to_string()).expect("target fixture");
+    write(
+        &s.0,
+        "docs/old.md",
+        "a long enough note to keep its rename\n",
+    );
+    let base = commit(&s.0, "rules name a newer target, and a note");
+    fs::create_dir_all(s.0.join("notes")).expect("target fixture");
+    fs::rename(s.0.join("docs/old.md"), s.0.join("notes/old.md")).expect("target fixture");
+    commit(&s.0, "move the note");
+
+    let (exit, v) = affected_targets(&s.0, &["--base", &base]);
+    assert_eq!(exit, 0, "{v}");
+    assert_eq!(v["data"]["mode"], "selective", "{v}");
+    assert_eq!(v["data"]["paths"][0]["status"], "R", "{v}");
+    let warnings = v["data"]["warnings"].as_array().expect("target fixture");
+    assert_eq!(warnings.len(), 1, "{v}");
+    assert_eq!(warnings[0]["path"], "docs/old.md", "{v}");
+    assert!(
+        warnings[0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("affected.rules[1] names Rust target cli-fx test read_only"),
+        "{v}"
+    );
+}
+
+/// The scopes a selective plan runs, as (package, kind, name).
+fn plan(v: &Value) -> Vec<(String, String, String)> {
+    let mut seen: Vec<(String, String, String)> = v["data"]["selected"]["rust_targets"]
+        .as_array()
+        .expect("a plan")
+        .iter()
+        .map(|t| {
+            (
+                t["package"].as_str().expect("a package").to_string(),
+                t["kind"].as_str().expect("a kind").to_string(),
+                t["name"].as_str().unwrap_or("").to_string(),
+            )
+        })
+        .collect();
+    seen.sort();
+    seen
+}
+
+fn scope(package: &str, kind: &str, name: &str) -> (String, String, String) {
+    (package.into(), kind.into(), name.into())
+}
+
+/// The one warning about `path`.
+fn warning_for(v: &Value, path: &str) -> String {
+    v["data"]["warnings"]
+        .as_array()
+        .expect("warnings")
+        .iter()
+        .find(|w| w["path"] == path)
+        .unwrap_or_else(|| panic!("no warning for {path}: {v}"))["detail"]
+        .as_str()
+        .expect("a detail")
+        .to_string()
+}
+
+/// 0.7.2 (e-affected): a changed `.rs` file that only integration tests'
+/// module trees reach selects those tests, read from the head's `mod`,
+/// `#[path]` and `include!` lines, with no rule; across crates too, and
+/// with no dependent crate. What can't be derived soundly keeps the
+/// whole-crate fallback, and the warning says why.
+#[test]
+fn rust_test_files_select_the_tests_whose_module_trees_reach_them() {
+    if !have("cargo") {
+        eprintln!("skipped: cargo isn't on PATH");
+        return;
+    }
+    let (s, _) = rust_target_repo();
+    let d = &s.0;
+    write(
+        d,
+        "crates/cli/tests/common/mod.rs",
+        "pub mod temp;\npub fn h() {}\n",
+    );
+    write(d, "crates/cli/tests/common/temp.rs", "pub fn t() {}\n");
+    write(
+        d,
+        "crates/cli/tests/uses.rs",
+        "// mod commented_out;\nmod common;\n#[test] fn t() { common::h() }\n",
+    );
+    write(
+        d,
+        "crates/cli/tests/pathed.rs",
+        "#[path = \"common/temp.rs\"]\nmod temp;\n#[test] fn t() { temp::t() }\n",
+    );
+    write(d, "crates/cli/tests/alone.rs", "#[test] fn t() {}\n");
+    write(
+        d,
+        "crates/cli/tests/reads.rs",
+        "const D: &str = include_str!(\"fixtures/data.json\");\n#[test] fn t() { assert!(!D.is_empty()) }\n",
+    );
+    write(d, "crates/cli/tests/fixtures/data.json", "{}\n");
+    // Another crate's test reaching into cli's test folder.
+    write(
+        d,
+        "crates/core/tests/behavior.rs",
+        "#[path = \"../../cli/tests/common/temp.rs\"]\nmod cross;\n#[test] fn works() { cross::t() }\n",
+    );
+    commit(d, "test files");
+
+    // Each change is planned against the commit before it.
+    let run = |path: &str, text: Option<&str>| -> Value {
+        let base = git(d, &["rev-parse", "HEAD"]);
+        match text {
+            Some(t) => write(d, path, t),
+            None => {
+                fs::remove_file(d.join(path)).expect("remove");
+            }
+        }
+        let head = commit(d, &format!("change {path}"));
+        let (exit, v) = affected_targets(d, &["--base", &base, "--head", &head]);
+        assert_eq!(exit, 0, "{v}");
+        assert_eq!(v["data"]["mode"], "selective", "{v}");
+        v
+    };
+
+    // A test target's own root: that target only.
+    let v = run("crates/cli/tests/alone.rs", Some("#[test] fn t2() {}\n"));
+    assert_eq!(plan(&v), [scope("cli-fx", "test", "alone")], "{v}");
+    assert_eq!(v["data"]["warnings"], serde_json::json!([]), "{v}");
+    assert_eq!(v["data"]["selected"]["rust"], serde_json::json!(["cli-fx"]));
+
+    // A shared helper: every test whose tree reaches it, in both crates,
+    // through mod, a nested mod and #[path].
+    let v = run("crates/cli/tests/common/temp.rs", Some("pub fn t() { }\n"));
+    assert_eq!(
+        plan(&v),
+        [
+            scope("cli-fx", "test", "pathed"),
+            scope("cli-fx", "test", "uses"),
+            scope("core-fx", "test", "behavior"),
+        ],
+        "{v}"
+    );
+    assert_eq!(v["data"]["warnings"], serde_json::json!([]), "{v}");
+    let v = run(
+        "crates/cli/tests/common/mod.rs",
+        Some("pub mod temp;\npub fn h() { }\n"),
+    );
+    assert_eq!(plan(&v), [scope("cli-fx", "test", "uses")], "{v}");
+
+    // Not a .rs file: whole crates (checks-fx dev-depends on cli-fx).
+    let whole_cli = [
+        scope("checks-fx", "package", ""),
+        scope("cli-fx", "package", ""),
+    ];
+    let v = run("crates/cli/tests/fixtures/data.json", Some("{\"a\": 1}\n"));
+    assert_eq!(plan(&v), whole_cli, "{v}");
+    let w = warning_for(&v, "crates/cli/tests/fixtures/data.json");
+    assert!(w.contains("isn't a .rs file"), "{w}");
+
+    // A .rs file no tree reaches.
+    let v = run(
+        "crates/cli/tests/helpers/unused.rs",
+        Some("pub fn u() {}\n"),
+    );
+    assert_eq!(plan(&v), whole_cli, "{v}");
+    let w = warning_for(&v, "crates/cli/tests/helpers/unused.rs");
+    assert!(w.contains("no target's module tree reaches it"), "{w}");
+
+    // A library module: the library reaches it, so the crate and its
+    // dependents run whole.
+    write(
+        d,
+        "crates/core/src/lib.rs",
+        "mod extra;\npub fn f() -> u8 { 1 }\n",
+    );
+    commit(d, "declare extra");
+    let v = run("crates/core/src/extra.rs", Some("// changed\n"));
+    assert_eq!(
+        plan(&v),
+        [
+            scope("checks-fx", "package", ""),
+            scope("cli-fx", "package", ""),
+            scope("core-fx", "package", ""),
+        ],
+        "{v}"
+    );
+    let w = warning_for(&v, "crates/core/src/extra.rs");
+    assert!(w.contains("core-fx's library reaches it"), "{w}");
+
+    // A tree it can't read soundly may reach any .rs file.
+    write(
+        d,
+        "crates/cli/tests/made.rs",
+        "macro_rules! m { ($n:ident) => { mod $n; } }\n#[test] fn t() {}\n",
+    );
+    commit(d, "a macro-made module");
+    let v = run("crates/cli/tests/alone.rs", Some("#[test] fn t3() {}\n"));
+    assert_eq!(
+        plan(&v),
+        [
+            scope("cli-fx", "test", "alone"),
+            scope("cli-fx", "test", "made")
+        ],
+        "{v}"
+    );
+
+    // A deletion: whole crates.
+    let v = run("crates/cli/tests/alone.rs", None);
+    assert_eq!(plan(&v), whole_cli, "{v}");
+    let w = warning_for(&v, "crates/cli/tests/alone.rs");
+    assert!(w.contains("deleted"), "{w}");
 }
 
 #[test]
@@ -3449,4 +4083,256 @@ fn every_workspace_source_file_has_test_target_rules() {
         problems.join("\n")
     );
     assert_eq!(v["data"]["mode"], "selective", "{v}");
+}
+
+/// `affected --json` with the snapshot's places set by environment.
+fn affected_in(dir: &Path, base: &str, env: &[(&str, &Path)], unset: &[&str]) -> Value {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_mdkg"));
+    isolated(cmd.current_dir(dir)).args(["affected", "--base", base, "--json"]);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    for k in unset {
+        cmd.env_remove(k);
+    }
+    let out = cmd.output().expect("run mdkg");
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "not JSON ({e}): {}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    });
+    common::conforms("affected", &v);
+    v
+}
+
+/// A read-only sandbox's temporary folder: the snapshot moves to the
+/// user cache, then to `$CARGO_TARGET_DIR`, and says where; with no place
+/// at all the run is full and names each one.
+#[cfg(unix)]
+#[test]
+fn a_read_only_temp_folder_moves_the_snapshot_and_says_where() {
+    if !have("cargo") {
+        eprintln!("skipped: cargo isn't on PATH");
+        return;
+    }
+    let (s, base) = rust_repo();
+    write(&s.0, "crates/core/src/lib.rs", "pub fn f() -> u8 { 2 }\n");
+    commit(&s.0, "change core");
+    let places = scratch();
+    // A file where the folder should be: nothing can be made in it, root
+    // included, as nothing can in a read-only sandbox's.
+    let locked = places.0.join("locked");
+    fs::write(&locked, "a file, not a folder\n").unwrap();
+    let cache = places.0.join("cache");
+    let target = places.0.join("target");
+    let want = ["checks-fx", "cli-fx", "core-fx"];
+    let rust = |v: &Value| -> Vec<String> {
+        v["data"]["selected"]["rust"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c.as_str().unwrap().to_string())
+            .collect()
+    };
+
+    // Writable temp: no fallback, and nothing skipped.
+    let v = affected_in(&s.0, &base, &[], &[]);
+    assert_eq!(v["data"]["snapshot"]["place"], "temp", "{v}");
+    assert_eq!(v["data"]["snapshot"]["skipped"], serde_json::json!([]));
+    assert_eq!(rust(&v), want);
+
+    // Temp refused: the user cache.
+    let v = affected_in(
+        &s.0,
+        &base,
+        &[("TMPDIR", &locked), ("XDG_CACHE_HOME", &cache)],
+        &["CARGO_TARGET_DIR"],
+    );
+    assert_eq!(v["data"]["mode"], "selective", "{v}");
+    assert_eq!(v["data"]["snapshot"]["place"], "user_cache", "{v}");
+    assert_eq!(v["data"]["snapshot"]["skipped"][0]["place"], "temp");
+    assert_eq!(rust(&v), want);
+    // The snapshot itself went away; its parent stays for the next run.
+    assert_eq!(
+        fs::read_dir(cache.join("mdkg/affected")).unwrap().count(),
+        0
+    );
+
+    // Temp and cache refused: the reviewer's build folder.
+    let v = affected_in(
+        &s.0,
+        &base,
+        &[
+            ("TMPDIR", &locked),
+            ("XDG_CACHE_HOME", &locked),
+            ("CARGO_TARGET_DIR", &target),
+        ],
+        &[],
+    );
+    assert_eq!(v["data"]["mode"], "selective", "{v}");
+    assert_eq!(v["data"]["snapshot"]["place"], "cargo_target_dir", "{v}");
+    assert_eq!(rust(&v), want);
+    assert!(target.join("mdkg-affected").is_dir());
+
+    // Nowhere: full, never silently.
+    let v = affected_in(
+        &s.0,
+        &base,
+        &[("TMPDIR", &locked), ("XDG_CACHE_HOME", &locked)],
+        &["CARGO_TARGET_DIR"],
+    );
+    assert_eq!(v["data"]["mode"], "full", "{v}");
+    assert_eq!(v["data"]["snapshot"]["place"], Value::Null, "{v}");
+    assert_eq!(
+        v["data"]["snapshot"]["skipped"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["place"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["temp", "user_cache", "cargo_target_dir"]
+    );
+    let failed = v["data"]["reasons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["code"] == "adapter_failed")
+        .expect("adapter_failed");
+    let detail = failed["detail"].as_str().unwrap();
+    assert!(
+        detail.starts_with("no folder could hold the head's snapshot"),
+        "{detail}"
+    );
+    assert_eq!(v["data"]["snapshot"]["error"], detail);
+
+    // Under --targets the failure names every place too.
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_mdkg"));
+    isolated(cmd.current_dir(&s.0))
+        .args(["affected", "--base", &base, "--targets", "--json"])
+        .env("TMPDIR", &locked)
+        .env("XDG_CACHE_HOME", &locked)
+        .env_remove("CARGO_TARGET_DIR");
+    let out = cmd.output().expect("run mdkg");
+    let v: Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(v["ok"], false, "{v}");
+    let message = v["diagnostics"].to_string();
+    assert!(
+        message.contains("the committed snapshot could not be created: no folder could hold"),
+        "{message}"
+    );
+    assert!(
+        message.contains("the user cache: can't create"),
+        "{message}"
+    );
+}
+
+/// A head the snapshot refuses before trying any place: no place, nothing
+/// skipped, and the error says why.
+#[cfg(unix)]
+#[test]
+fn a_refused_tree_says_why_without_blaming_a_place() {
+    if !have("cargo") {
+        eprintln!("skipped: cargo isn't on PATH");
+        return;
+    }
+    let (s, base) = rust_repo();
+    std::os::unix::fs::symlink("lib.rs", s.0.join("crates/core/src/alias.rs")).unwrap();
+    commit(&s.0, "a symlink");
+    let v = affected_in(&s.0, &base, &[], &[]);
+    assert_eq!(v["data"]["mode"], "full", "{v}");
+    assert_eq!(v["data"]["snapshot"]["place"], Value::Null, "{v}");
+    assert_eq!(v["data"]["snapshot"]["skipped"], serde_json::json!([]));
+    let error = v["data"]["snapshot"]["error"].as_str().expect("error");
+    assert!(error.contains("symlink"), "{error}");
+}
+
+/// Every Rust target this repository's own `affected` rules name exists in
+/// its workspace. `affected` skips a target the planned head lacks (an
+/// older head than the shared config), so a stale name in the rules, left
+/// after a test is renamed, would otherwise only warn and drop that test.
+#[test]
+fn every_rule_target_of_this_repository_exists_at_its_head() {
+    if !have("cargo") {
+        eprintln!("skipped: cargo isn't on PATH");
+        return;
+    }
+    let top = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .unwrap();
+    if !top.join(".git").exists() || !top.join(".mdkg/config.json").is_file() {
+        eprintln!("skipped: not run from the mdkg repository");
+        return;
+    }
+    let config: Value =
+        serde_json::from_slice(&fs::read(top.join(".mdkg/config.json")).unwrap()).unwrap();
+    let Some(rules) = config["affected"]["rules"].as_array() else {
+        eprintln!("skipped: this repository's .mdkg/config.json has no `affected` rules");
+        return;
+    };
+    let out = Command::new("cargo")
+        .current_dir(&top)
+        .args([
+            "metadata",
+            "--no-deps",
+            "--offline",
+            "--format-version",
+            "1",
+        ])
+        .output()
+        .expect("cargo metadata runs");
+    assert!(
+        out.status.success(),
+        "cargo metadata: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let meta: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let mut have_targets = std::collections::BTreeSet::new();
+    for package in meta["packages"].as_array().unwrap() {
+        let name = package["name"].as_str().unwrap();
+        for target in package["targets"].as_array().unwrap() {
+            for kind in target["kind"].as_array().unwrap() {
+                let kind = match kind.as_str().unwrap() {
+                    "test" => "test",
+                    "bin" => "bin",
+                    "lib" | "rlib" | "dylib" | "staticlib" | "cdylib" | "proc-macro" => "lib",
+                    _ => continue,
+                };
+                let target = if kind == "lib" {
+                    String::new()
+                } else {
+                    target["name"].as_str().unwrap().to_string()
+                };
+                have_targets.insert((name.to_string(), kind, target));
+            }
+        }
+    }
+    let mut missing = Vec::new();
+    for (i, rule) in rules.iter().enumerate() {
+        let Some(targets) = rule["select"]["rust_targets"].as_array() else {
+            continue;
+        };
+        for t in targets {
+            let package = t["package"].as_str().unwrap().to_string();
+            let want = if let Some(test) = t["test"].as_str() {
+                (package, "test", test.to_string())
+            } else if let Some(bin) = t["bin"].as_str() {
+                (package, "bin", bin.to_string())
+            } else {
+                assert_eq!(t["lib"], true, "affected.rules[{i}]: {t}");
+                (package, "lib", String::new())
+            };
+            if !have_targets.contains(&want) {
+                missing.push(format!("affected.rules[{i}]: {t}"));
+            }
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "rule targets this workspace doesn't have; rename or remove them in \
+         .mdkg/config.json's `affected` section:\n{}",
+        missing.join("\n")
+    );
 }

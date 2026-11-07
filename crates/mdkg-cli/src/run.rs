@@ -139,13 +139,15 @@ fn options_with_config(
 ) -> Result<TurnOptions, GraphError> {
     refuse_main_root(repo)?;
     mdkg_run::orchestration::agent::check_execution(config, &a.agent).map_err(graph_error)?;
+    let policy = mdkg_run::policy::Policy::for_agent(config, &a.agent).map_err(graph_error)?;
     Ok(TurnOptions {
         names: Names::from_config(config).map_err(graph_error)?,
         // A person's run bills as the agent's policy says too: its
         // subscription, and the key only where the config allows it.
-        auth: mdkg_run::policy::Policy::for_agent(config, &a.agent)
-            .map_err(graph_error)?
-            .auth,
+        auth: policy.auth,
+        // Its turns' environment: the allowlist unless its policy says
+        // otherwise (mdkg_run::env).
+        env: policy.env,
         // The operator's standing instructions come on every turn, a
         // manual passes as well as automatic watches.
         instructions: crate::agents::instructions(
@@ -374,20 +376,16 @@ pub(crate) fn server_binary(flag: Option<&Path>) -> Result<PathBuf, GraphError> 
     Ok(program)
 }
 
-/// A replied turn's outcome: the reply sent, or, with none, that the
-/// agent answered NO_REPLY and the launcher sent no final reply (e2e
-/// B17). It claims no more: the agent may have mailed a reply itself
-/// (`msg send`, `channel_post`), a receipt may still go to `reports_to`,
-/// and mail in a role lost during the turn stays unacked (reviews of
-/// c7e7d609 and 7697bd1a).
-fn replied(reply_id: Option<&str>, shown: usize) -> String {
-    match reply_id {
-        Some(id) => format!("replied {id} to {shown} message(s)"),
-        None => format!(
-            "answered {} to {shown} message(s); the launcher sent no final reply",
-            mdkg_run::digest::NO_REPLY
-        ),
-    }
+/// A NO_REPLY turn's outcome: the agent answered NO_REPLY and the
+/// launcher sent no final reply (e2e B17). It claims no more: the agent may
+/// have mailed a reply itself (`msg send`, `channel_post`), a receipt may
+/// still go to `reports_to`, and mail in a role lost during the turn stays
+/// unacked (reviews of c7e7d609 and 7697bd1a).
+fn no_reply(shown: usize) -> String {
+    format!(
+        "answered {} to {shown} message(s); the launcher sent no final reply",
+        mdkg_run::digest::NO_REPLY
+    )
 }
 
 pub(crate) fn print_turn(r: &TurnReport) {
@@ -415,7 +413,12 @@ pub(crate) fn print_turn(r: &TurnReport) {
     let safe = mdkg_run::digest::terminal_safe;
     let what = match r.outcome {
         Outcome::Idle => "idle: no unacked mail".to_string(),
-        Outcome::Replied => replied(r.reply_id.as_deref(), r.shown.len()),
+        Outcome::Replied => format!(
+            "replied {} to {} message(s)",
+            r.reply_id.as_deref().unwrap_or("?"),
+            r.shown.len()
+        ),
+        Outcome::NoReply => no_reply(r.shown.len()),
         Outcome::Ran => "ran; nothing to reply to".into(),
         Outcome::DryRun => "dry run".into(),
     };
@@ -485,10 +488,7 @@ pub(crate) fn print_turn(r: &TurnReport) {
         }
         println!("usage: {}", parts.join(", "));
     }
-    // A NO_REPLY turn's reply is the outcome line above, not text to show.
-    if let Some(reply) = &r.reply
-        && !(r.outcome == Outcome::Replied && r.reply_id.is_none())
-    {
+    if let Some(reply) = &r.reply {
         println!("{}", safe(reply));
     }
     if let Some(cmd) = &r.command {
@@ -1318,6 +1318,22 @@ fn preview_setup_projections(
     Ok(())
 }
 
+/// What install would do to the skill mirrors of the ref-mode clone at
+/// `top`, from its graph cache `cache`, for the projections listed at the
+/// tip and with the setup's own keep rule: the plan install itself runs,
+/// for `skills validate` (f-adopt #15953).
+pub(crate) fn skill_mirror_plan(
+    top: &Path,
+    cache: &Path,
+) -> Result<mdkg_run::install::SkillPreview, GraphError> {
+    let graph = mdkg_graph::graphref::resolve(top)
+        .map_err(|e| crate::coord::graph_git::graph_error(e.code, e.message))?;
+    let professional = setup::inferred(top, graph.as_ref()) == setup::Setup::Professional;
+    let projections = mdkg_run::projection::Projections::read(cache).map_err(graph_error)?;
+    let keep = |path: &Path| !professional || professional_keeps(top, path);
+    mdkg_run::install::preview_skill_mirrors(cache, top, &projections, &keep).map_err(graph_error)
+}
+
 /// The professional setup leaves tracked, linked and unrepresentable
 /// paths alone. Both setup preflight and the eventual sync use this rule.
 fn professional_keeps(top: &Path, path: &Path) -> bool {
@@ -1548,7 +1564,12 @@ fn projections(
         }
     }
     let mut changes = Vec::new();
-    if (!enable.is_empty() || !disable.is_empty()) && next.names() != listed.names() {
+    // A changed list is published; so is an unchanged one that the config
+    // doesn't list yet, as checkout mode writes it, so `install --enable`
+    // records the legacy default (review of f7a84daf).
+    if (!enable.is_empty() || !disable.is_empty())
+        && (next.names() != listed.names() || !listed.declared())
+    {
         let new = mdkg_run::projection::set_in_config(&text, &next.names()).ok_or_else(|| {
             GraphError::failure(Code::ConfigInvalid, ".mdkg/config.json isn't a JSON object")
         })?;
@@ -1718,7 +1739,7 @@ fn projections(
             .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
             .and_then(|v| mdkg_run::projection::Projections::from_config(&v).ok());
             if now.as_ref().map(|p| p.names()) != Some(next.names()) {
-                return Err(GraphError::failure(
+                return Err(GraphError::conflict(
                     Code::GraphWriteStale,
                     "the graph's projection list changed while install published to it",
                 )
@@ -2607,9 +2628,88 @@ fn check_cwd(repo: &Repo, agent: &mdkg_run::AgentState) -> Result<(), GraphError
     Ok(())
 }
 
+/// Whether a parsed `.mdkg/config.json` has no `projections` key, so
+/// install writes [`mdkg_run::projection::LEGACY`] (H-M6). An unreadable
+/// list is the config check's to report, not this.
+pub(crate) fn legacy_projections(config: &serde_json::Value) -> bool {
+    mdkg_run::projection::Projections::from_config(config).is_ok_and(|p| !p.declared())
+}
+
+/// The warning `install` and `doctor` give a config with no `projections`
+/// key. It changes nothing: the default is still written in 0.7.2.
+pub(crate) fn legacy_projections_warning() -> Diagnostic {
+    Diagnostic::warning(
+        Code::InstallLegacyProjections,
+        format!(
+            "{} has no `{}` key, so install uses the legacy default list ({}); \
+             in 0.7.3 a config without the key lists none of them",
+            mdkg_graph::config::CONFIG_PATH,
+            mdkg_run::projection::KEY,
+            mdkg_run::projection::LEGACY.join(", "),
+        ),
+    )
+    .with_hint(format!(
+        "to keep them, set the key to today's list with the committed-config writer, then \
+         run install: {}. In checkout mode, run it where the committed config is read \
+         (config set names that checkout); other checkouts see it once the graph's commit \
+         settles on main. If the checkout where the config is read already lists \
+         projections, leave it: it reaches this checkout when it settles",
+        legacy_projections_command(),
+    ))
+}
+
+/// The command the hint names (orchestrator #20070): `config set` publishes
+/// on the graph ref in ref mode and commits where the committed config is
+/// read in checkout mode, writes no projection file (so a setup's
+/// AGENTS.md is left alone), and leaves no dirty config to freeze a later
+/// graph write.
+pub(crate) fn legacy_projections_command() -> String {
+    format!(
+        "`{BIN} config set {} '{}'`",
+        mdkg_run::projection::KEY,
+        serde_json::json!(mdkg_run::projection::LEGACY),
+    )
+}
+
+/// Whether `--enable` or `--disable` names a projection: only then does
+/// install write the key (`--enable ""` writes none).
+fn lists_projections(list: Option<&str>) -> bool {
+    list.is_some_and(|l| mdkg_run::projection::names(l).is_ok_and(|n| !n.is_empty()))
+}
+
+/// The config a finished install read: the graph ref's tip in ref mode,
+/// the checkout's otherwise. `None` when it can't be read.
+fn installed_config(root: &Path, choice: &InstallArgs) -> Option<serde_json::Value> {
+    let text = if installs_ref_mode(root, choice) {
+        let top = crate::coord::graph_git::git::toplevel(root).ok()?;
+        let graph = mdkg_graph::graphref::resolve(&top).ok()??;
+        git_stdout(
+            &top,
+            &[
+                "show",
+                &format!("{}:{}", graph.name, mdkg_graph::config::CONFIG_PATH),
+            ],
+        )?
+    } else {
+        std::fs::read_to_string(root.join(mdkg_graph::config::CONFIG_PATH)).ok()?
+    };
+    serde_json::from_str(&text).ok()
+}
+
 pub fn install(root: &Path, actor: Option<String>, choice: &InstallArgs) -> u8 {
     let json = choice.json;
-    let r = install_report(root, actor, choice).map_or_else(Report::failed, Report::ok);
+    let mut r = install_report(root, actor, choice).map_or_else(Report::failed, Report::ok);
+    // Only a plain install writes the legacy default: undo, the rollback to
+    // checkout mode and a changed list (which writes the key) don't.
+    if r.failure.is_none()
+        && !choice.undo
+        && !choice.checkout_mode
+        && !lists_projections(choice.enable.as_deref())
+        && !lists_projections(choice.disable.as_deref())
+        && installed_config(root, choice).is_some_and(|c| legacy_projections(&c))
+    {
+        r.diagnostics.push(legacy_projections_warning());
+    }
     // Paths and notes carry file names anyone may have chosen: no escape
     // sequence reaches the terminal (lease-guard, 2026-10-22).
     // Line breaks too: one could start a forged `note:` line (round 6).
@@ -2641,9 +2741,8 @@ mod tests {
 
     #[test]
     fn a_no_reply_turn_names_no_reply_id() {
-        assert_eq!(replied(Some("01abc"), 2), "replied 01abc to 2 message(s)");
         assert_eq!(
-            replied(None, 1),
+            no_reply(1),
             "answered NO_REPLY to 1 message(s); the launcher sent no final reply"
         );
     }

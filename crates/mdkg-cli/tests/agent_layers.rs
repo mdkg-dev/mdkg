@@ -276,6 +276,237 @@ fn optional_only_agents_are_shown_as_inactive_and_not_admitted() {
     assert!(status["data"]["agents"].as_array().unwrap().is_empty());
 }
 
+/// `agents list` names each agent with the layer that defines it and every
+/// layer that sets its fields, for each harness, and reads no state.
+#[test]
+fn agents_list_names_each_agent_with_its_layers() {
+    for harness in ["codex", "claude", "opencode"] {
+        let f = Fixture::new();
+        f.ok(&[
+            "agents",
+            "add",
+            "worker",
+            "--harness",
+            harness,
+            "--role",
+            "worker",
+        ]);
+        // The same field in several layers: each layer still counts, though
+        // only the highest one's value wins (Terra #20933).
+        f.optional(
+            &json!({"agents":{"from_user":{"role":"reviewer","harness":"codex"},
+                              "worker":{"role":"worker"}}}),
+            &json!({"agents":{"worker":{"instructions":"Local standing instruction"},
+                              "from_user":{"role":"worker"},
+                              "from_local":{"role":"worker","harness":"claude"}}}),
+        );
+        let list = f.ok(&["agents", "list"]);
+        let agents = list["data"]["agents"].as_array().unwrap();
+        let entry = |name: &str| {
+            agents
+                .iter()
+                .find(|a| a["name"] == name)
+                .unwrap_or_else(|| panic!("{name} listed: {list}"))
+        };
+        let worker = entry("worker");
+        assert_eq!(worker["defined_in"], "project", "{list}");
+        assert_eq!(worker["file_backed"], true);
+        assert_eq!(
+            worker["layers"],
+            json!(["user", "project", "local"]),
+            "{list}"
+        );
+        assert_eq!(worker["harness"], harness);
+        assert_eq!(worker["role"], "worker");
+        let from_user = entry("from_user");
+        assert_eq!(from_user["defined_in"], "user", "{list}");
+        assert_eq!(from_user["file_backed"], false);
+        assert_eq!(from_user["layers"], json!(["user", "local"]), "{list}");
+        let from_local = entry("from_local");
+        assert_eq!(from_local["defined_in"], "local", "{list}");
+        assert_eq!(from_local["layers"], json!(["local"]));
+        assert_eq!(agents.len(), 3, "{list}");
+        // Text names the same agents.
+        let out = f
+            .command(env!("CARGO_BIN_EXE_mdkg"), &f.graph)
+            .args(["--as", "fixture", "agents", "list"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let text = String::from_utf8(out.stdout).unwrap();
+        assert!(
+            text.contains("worker: defined in project (its own file)"),
+            "{text}"
+        );
+        // An uncommitted, malformed checkout config doesn't stop it: it
+        // reads the committed settings, as `config show` does.
+        let config = f.graph.join(".mdkg/config.json");
+        let committed = fs::read(&config).unwrap();
+        fs::write(&config, "{").unwrap();
+        let again = f.ok(&["agents", "list"]);
+        assert_eq!(again["data"]["agents"], list["data"]["agents"]);
+        fs::write(&config, committed).unwrap();
+    }
+    // With no project, the user layer's agents are still listed.
+    let f = Fixture::new();
+    f.optional(
+        &json!({"agents":{"from_user":{"role":"reviewer"}}}),
+        &json!({}),
+    );
+    let bare = f.dir.join("bare");
+    fs::create_dir_all(&bare).unwrap();
+    let out = f.cli(&bare, &["agents", "list"]);
+    assert!(out.status.success(), "{out:?}");
+    let list: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(list["data"]["agents"][0]["name"], "from_user", "{list}");
+    assert_eq!(list["data"]["agents"][0]["defined_in"], "user");
+}
+
+/// Credential-shaped names are listed under distinct numbered names, never
+/// raw, and never the name of a real agent already called like a label.
+#[test]
+fn agents_list_numbers_hidden_credential_shaped_names_apart() {
+    let f = Fixture::new();
+    let first = concat!("https://someone:SYNTHETIC_FIRST", "@example.test/a");
+    let second = concat!("https://someone:SYNTHETIC_SECOND", "@example.test/b");
+    // A real agent already named like a label, too (Terra #20956).
+    f.optional(
+        &json!({"agents":{first:{"role":"reviewer"}, "[redacted key 1]":{"role":"lead"}}}),
+        &json!({"agents":{second:{"role":"worker"}}}),
+    );
+    let out = f.cli(&f.graph, &["agents", "list"]);
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(out.status.success(), "{out:?}");
+    assert!(!text.contains("SYNTHETIC_"), "{text}");
+    let list: Value = serde_json::from_str(&text).unwrap();
+    let agents = list["data"]["agents"].as_array().unwrap();
+    let mut names: Vec<&str> = agents.iter().map(|a| a["name"].as_str().unwrap()).collect();
+    names.sort();
+    names.dedup();
+    assert_eq!(names.len(), 3, "{list}");
+    assert!(
+        names.iter().all(|n| n.starts_with("[redacted key ")),
+        "{list}"
+    );
+    // The real one keeps its own entry; the hidden ones keep theirs.
+    let real = agents
+        .iter()
+        .find(|a| a["name"] == "[redacted key 1]")
+        .unwrap();
+    assert_eq!(real["role"], "lead", "{list}");
+    assert_eq!(real["defined_in"], "user");
+    let local = agents.iter().find(|a| a["defined_in"] == "local").unwrap();
+    assert_eq!(local["role"], "[redacted]", "{list}");
+    assert_ne!(local["name"], "[redacted key 1]", "{list}");
+}
+
+/// Two credential-shaped names the shown tree lacks (a local `agents: null`
+/// hides them) are listed under distinct numbered names, never raw.
+#[test]
+fn agents_list_numbers_names_a_local_null_hides_apart() {
+    let f = Fixture::new();
+    let first = concat!("https://someone:SYNTHETIC_FIRST", "@example.test/a");
+    let second = concat!("https://someone:SYNTHETIC_SECOND", "@example.test/b");
+    f.optional(
+        &json!({"agents":{first:{"role":"reviewer"}, second:{"role":"worker"}}}),
+        &json!({"agents": null}),
+    );
+    let out = f.cli(&f.graph, &["agents", "list"]);
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(out.status.success(), "{out:?}");
+    assert!(!text.contains("SYNTHETIC_"), "{text}");
+    let list: Value = serde_json::from_str(&text).unwrap();
+    let mut names: Vec<&str> = list["data"]["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["name"].as_str().unwrap())
+        .collect();
+    names.sort();
+    assert_eq!(names.len(), 2, "{list}");
+    assert_ne!(names[0], names[1], "{list}");
+    assert!(
+        names.iter().all(|n| n.starts_with("[redacted key ")),
+        "{list}"
+    );
+}
+
+/// Terra #20956/#20965: a project `agents: null` hides the user's agent
+/// named `[redacted key 1]`, and a local credential-shaped name recreates
+/// the map. The labels stay distinct and the hidden user entry keeps its own
+/// role (none, since it's masked), never the local entry's.
+#[test]
+fn agents_list_keeps_a_hidden_label_shaped_name_apart_from_a_local_secret() {
+    let f = Fixture::new();
+    let path = f.graph.join(".mdkg/config.json");
+    let mut project: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    project["agents"] = Value::Null;
+    f.write(&path, &project);
+    f.git(&f.graph, &["add", ".mdkg/config.json"]);
+    f.git(&f.graph, &["commit", "-qm", "project agents null"]);
+    let secret = concat!("https://someone:SYNTHETIC_LOCAL", "@example.test/c");
+    f.optional(
+        &json!({"agents":{"[redacted key 1]":{"role":"lead"}}}),
+        &json!({"agents":{secret:{"role":"worker"}}}),
+    );
+    let out = f.cli(&f.graph, &["agents", "list"]);
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(out.status.success(), "{out:?}");
+    assert!(!text.contains("SYNTHETIC_"), "{text}");
+    let list: Value = serde_json::from_str(&text).unwrap();
+    let agents = list["data"]["agents"].as_array().unwrap();
+    assert_eq!(agents.len(), 2, "{list}");
+    assert_ne!(agents[0]["name"], agents[1]["name"], "{list}");
+    let user = agents.iter().find(|a| a["defined_in"] == "user").unwrap();
+    assert_eq!(user["name"], "[redacted key 1]", "{list}");
+    // Masked by the project's null, it shows no role, and not the local one.
+    assert!(user.get("role").is_none(), "{list}");
+    assert_eq!(user["layers"], json!(["user"]), "{list}");
+    let local = agents.iter().find(|a| a["defined_in"] == "local").unwrap();
+    assert_ne!(local["name"], "[redacted key 1]", "{list}");
+    assert_eq!(local["role"], "[redacted]", "{list}");
+}
+
+/// A `null` removes an agent rather than defining it (Opus #21026): the
+/// layer that sets it isn't in `layers`, the agent it masks is listed with
+/// no harness or role, and a name only a `null` gives isn't listed.
+#[test]
+fn agents_list_does_not_count_a_null_entry_as_a_layer() {
+    let f = Fixture::new();
+    f.optional(
+        &json!({"agents":{"from_user":{"role":"reviewer"}}}),
+        &json!({"agents":{"from_user": null, "ghost": null}}),
+    );
+    let list = f.ok(&["agents", "list"]);
+    let agents = list["data"]["agents"].as_array().unwrap();
+    assert_eq!(agents.len(), 1, "{list}");
+    let entry = &agents[0];
+    assert_eq!(entry["name"], "from_user", "{list}");
+    assert_eq!(entry["defined_in"], "user", "{list}");
+    assert_eq!(entry["layers"], json!(["user"]), "{list}");
+    assert!(entry.get("role").is_none(), "{list}");
+    assert!(entry.get("harness").is_none(), "{list}");
+    // The same for a committed project entry that is `null` (Opus #21038):
+    // alone it lists nothing, and masking a user agent it adds no layer.
+    let f = Fixture::new();
+    let path = f.graph.join(".mdkg/config.json");
+    let mut project: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    project["agents"] = json!({"ghost": null, "from_user": null});
+    f.write(&path, &project);
+    f.git(&f.graph, &["add", ".mdkg/config.json"]);
+    f.git(&f.graph, &["commit", "-qm", "project null entries"]);
+    // The user entry sets no committed field: a role over the project's
+    // `null` is an authority override, refused as before.
+    f.optional(&json!({"agents":{"from_user":{}}}), &json!({}));
+    let list = f.ok(&["agents", "list"]);
+    let agents = list["data"]["agents"].as_array().unwrap();
+    assert_eq!(agents.len(), 1, "{list}");
+    assert_eq!(agents[0]["name"], "from_user", "{list}");
+    assert_eq!(agents[0]["defined_in"], "user", "{list}");
+    assert_eq!(agents[0]["layers"], json!(["user"]), "{list}");
+    assert!(agents[0].get("role").is_none(), "{list}");
+}
+
 #[test]
 fn legacy_agent_ignores_optional_values_until_migrated_and_management_keeps_authored_values() {
     let f = Fixture::new();

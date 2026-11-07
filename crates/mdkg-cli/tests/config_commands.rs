@@ -874,6 +874,71 @@ fn display_redacts_recognizable_credentials_under_ordinary_keys() {
     assert_eq!(snapshot(&f.dir), before);
 }
 
+/// A key that itself looks like a credential is shown renamed, with
+/// everything under it hidden, in both formats; `origins` and `redacted`
+/// name the renamed pointers, and a key already named like a renamed one
+/// keeps its own entry (hidden for its name, which holds "key").
+#[test]
+fn display_renames_keys_that_look_like_credentials() {
+    let f = Fixture::new();
+    f.project();
+    let url_key = concat!("https://someone:SYNTHETIC_KEY_PASS", "@example.test/x");
+    let header_key = concat!("Authorization: Bearer SYNTHETIC_", "HEADER_KEY");
+    f.write(
+        "home/.config/mdkg/config.json",
+        &json!({
+            "mirrors": {
+                url_key: {"note": "plain", "list": ["also plain"]},
+                header_key: "plain value",
+                "[redacted key 1]": "visible collision",
+                "ordinary": "visible"
+            }
+        }),
+    );
+    let before = snapshot(&f.dir);
+    for args in [&["config", "show", "--json"][..], &["config", "show"][..]] {
+        let out = f.output(args);
+        assert!(out.status.success(), "{out:?}");
+        let text = String::from_utf8(out.stdout).unwrap();
+        assert!(!text.contains("SYNTHETIC_"), "{text}");
+        assert!(text.contains("visible"), "{text}");
+    }
+    let data = &f.show()["data"];
+    let mirrors = data["values"]["mirrors"].as_object().unwrap();
+    assert_eq!(mirrors["ordinary"], "visible");
+    // The two renamed keys skip the name the object already had.
+    let mut keys: Vec<&String> = mirrors.keys().collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        [
+            "[redacted key 1]",
+            "[redacted key 2]",
+            "[redacted key 3]",
+            "ordinary"
+        ],
+        "{mirrors:?}"
+    );
+    assert!(
+        ["[redacted key 2]", "[redacted key 3]"]
+            .iter()
+            .any(|k| mirrors[*k]["note"] == "[redacted]"),
+        "{mirrors:?}"
+    );
+    // Every leaf under a renamed key is hidden and listed.
+    let redacted = data["redacted"].as_array().unwrap();
+    for pointer in redacted {
+        let pointer = pointer.as_str().unwrap();
+        assert_eq!(data["values"].pointer(pointer).unwrap(), "[redacted]");
+    }
+    assert_eq!(redacted.len(), 4, "{redacted:?}");
+    for pointer in data["origins"].as_object().unwrap().keys() {
+        assert!(!pointer.contains("SYNTHETIC_"), "{pointer}");
+        assert!(data["values"].pointer(pointer).is_some(), "{pointer}");
+    }
+    assert_eq!(snapshot(&f.dir), before);
+}
+
 #[test]
 fn display_does_not_exempt_malformed_structural_entries_from_redaction() {
     let f = Fixture::new();
@@ -1810,6 +1875,13 @@ fn setup_refuses_a_registered_root_folder_ref_mode_doesnt_read() {
             .contains("--checkout-mode"),
         "{v}"
     );
+    assert!(
+        d["hint"]
+            .as_str()
+            .expect("hint")
+            .contains(&format!("`git config --unset {dir_key}`")),
+        "{v}"
+    );
     let local = fs::read_to_string(f.root.join(".git/config")).expect("git config");
     assert!(!local.contains("ref = "), "still in checkout mode: {local}");
 }
@@ -1832,6 +1904,7 @@ fn doctor_gives_migrates_guidance_for_a_branch_cut_before_main_migrated() {
     let hint = check["hint"].as_str().unwrap_or_else(|| panic!("{check}"));
     assert!(hint.contains("already migrated"), "{check}");
     assert!(hint.contains("merge main into this branch"), "{check}");
+    assert!(!hint.contains("0.7.2 migrates"), "{check}");
     // With no migrated main, `migrate` is the way on.
     f.git(&["branch", "-q", "-f", "main", "old"]);
     let check = f.doctor_config();

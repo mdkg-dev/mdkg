@@ -493,6 +493,10 @@ pub(super) static OPS: &[OpSpec] = &[
     )
     .tools(&["inbox_wait"])
     .coordinator(),
+    // The A30 digest as a computed read of the caller's own unacked mail
+    // (edd-01a1878e). The serve route is a 0.7.3 residual, so it has no route
+    // and no MCP tool yet.
+    read("msg.digest", &["msg", "digest"], None, "mdkg.msg.digest.v1"),
     write(
         "msg.ack",
         &["msg", "ack"],
@@ -511,6 +515,10 @@ pub(super) static OPS: &[OpSpec] = &[
     .capability("msg.watch")
     .coordinator(),
     write("msg.import", &["msg", "import"], None, "mdkg.msg.import.v1").class(Class::Launcher),
+    // A person's read across mailboxes, outside agent turns (edd-01a1a1f1
+    // L2, L8): not served until person-signed requests are, and no MCP
+    // tool, since MCP serves agents.
+    read("msg.list", &["msg", "list"], None, "mdkg.msg.list.v1").class(Class::Operator),
     read(
         "msg.decisions",
         &["msg", "decisions"],
@@ -556,6 +564,21 @@ pub(super) static OPS: &[OpSpec] = &[
         &["agents", "status"],
         get("/v1/agents"),
         "mdkg.agents.status.v1",
+    ),
+    // The agents the settings define, with their layers. Settings only:
+    // no probe, no saved state. Not routed yet.
+    read(
+        "agents.list",
+        &["agents", "list"],
+        None,
+        "mdkg.agents.list.v1",
+    ),
+    // An agent's turns, newest first, paged. Not routed yet.
+    read(
+        "agents.turns",
+        &["agents", "turns"],
+        None,
+        "mdkg.agents.turns.v1",
     ),
     // A turn's output (A11, A18). Not routed yet: its events' position is
     // `seq` within the turn, and the stream adapter's SSE ids are a
@@ -680,6 +703,22 @@ pub(super) static NOT_OPS: &[NotOp] = &[
     NotOp::new(
         &["remote"],
         "networked serve, parked unwired until the later design (dec-01a18dd9)",
+    ),
+    NotOp::new(
+        &["graph", "remote"],
+        "a person's approval of a push destination, outside any agent turn (G23)",
+    ),
+    NotOp::new(
+        &["graph", "sync"],
+        "network git with graph.remote, run from the checkout it's started in",
+    ),
+    NotOp::new(
+        &["graph", "conflicts"],
+        "graph sync's conflict list, read where sync runs",
+    ),
+    NotOp::new(
+        &["graph", "resolve"],
+        "settles a graph sync conflict in the checkout sync runs from",
     ),
     NotOp::new(&["git-serve"], "sshd's forced command between machines"),
     NotOp::new(&["git-hook"], "what the hooks git-serve installs run"),

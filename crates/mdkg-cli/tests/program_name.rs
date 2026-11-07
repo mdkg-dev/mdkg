@@ -250,10 +250,7 @@ fn no_hint_writes_a_literal_mdkg_command() {
             "mdkg-cli/src/init.rs",
             "add it later with\\n`mdkg skills add",
         ),
-        (
-            "mdkg-cli/src/init.rs",
-            "in ref mode `mdkg skills add` refuses",
-        ),
+        ("mdkg-cli/src/init.rs", "enabled (`mdkg install --enable"),
         // The AGENTS.md block install writes: the public command on PATH.
         (
             "mdkg-run/src/install.rs",

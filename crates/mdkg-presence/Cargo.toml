@@ -1,6 +1,6 @@
 [package]
 name = "mdkg-presence"
-version = "0.7.1"
+version = "0.7.2"
 description = "Person keys that need their person present: the Secure Enclave and FIDO2 (the serve edd, S41). Internal to mdkg, no stable API; depend on the mdkg binary"
 edition.workspace = true
 license.workspace = true
@@ -10,11 +10,11 @@ homepage.workspace = true
 readme = "README.md"
 
 [dependencies]
-mdkg-format = { path = "../mdkg-format", version = "0.7.1" }
-mdkg-ops = { path = "../mdkg-ops", version = "0.7.1" }
+mdkg-format = { path = "../mdkg-format", version = "0.7.2" }
+mdkg-ops = { path = "../mdkg-ops", version = "0.7.2" }
 # wire's shared encodings: fingerprints, the pairing codes, the FIDO2
 # assertion format and the person-grade types (#6731).
-mdkg-wire = { path = "../mdkg-wire", version = "0.7.1" }
+mdkg-wire = { path = "../mdkg-wire", version = "0.7.2" }
 base64.workspace = true
 ring.workspace = true
 rustls-pki-types.workspace = true
@@ -34,8 +34,15 @@ nix.workspace = true
 # its hidapi builds against libudev, found by pkg-config: building needs
 # pkg-config and libudev-dev. musl builds go without (no static libudev for
 # musl; decided 2026-11-03): their FIDO2 backend refuses with api.unsupported.
+# The `fido2` feature (default) brings it in; a build without it has no FIDO2
+# transport either, as the Linux PyPI wheels are (decided 2026-11-03, #17661),
+# so no wheel carries libudev or the system libraries it links.
 [target.'cfg(any(target_os = "macos", all(target_os = "linux", not(target_env = "musl"))))'.dependencies]
-ctap-hid-fido2.workspace = true
+ctap-hid-fido2 = { workspace = true, optional = true }
+
+[features]
+default = ["fido2"]
+fido2 = ["dep:ctap-hid-fido2"]
 
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework.workspace = true

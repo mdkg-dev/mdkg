@@ -284,13 +284,13 @@ fn rewrite(path: &Path, lines: &[Line]) -> std::io::Result<()> {
     write
 }
 
-/// The launcher process a start line names: this one.
+/// The launcher process a start line names: this one. Its host is read
+/// afresh, so a renamed host is recorded by its new name.
 pub fn launcher() -> (String, u32, Option<String>) {
-    static THIS: std::sync::OnceLock<(String, Option<String>)> = std::sync::OnceLock::new();
+    static STARTED: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     let pid = std::process::id();
-    let (host, started) =
-        THIS.get_or_init(|| (super::this_host(), super::started(pid).ok().flatten()));
-    (host.clone(), pid, started.clone())
+    let started = STARTED.get_or_init(|| super::started(pid).ok().flatten());
+    (super::this_host().unwrap_or_default(), pid, started.clone())
 }
 
 /// A turn's state, derived from its evidence (A7 step 4).
@@ -298,7 +298,7 @@ pub fn launcher() -> (String, u32, Option<String>) {
 pub struct Derived {
     /// `running`, `ended` or `interrupted`.
     pub state: &'static str,
-    /// Once it isn't running: `replied`, `ran`, `idle`, `dry_run`,
+    /// Once it isn't running: `replied`, `no_reply`, `ran`, `idle`, `dry_run`,
     /// `failed`, `interrupted` or `not_started`.
     pub outcome: Option<String>,
     pub ended_at: Option<String>,
@@ -330,11 +330,15 @@ pub fn receipt_outcome(path: &Path) -> Option<String> {
     }
 }
 
-/// Whether the turn the start line names may still be running. A
+/// Whether the turn the start line names may still be running, for
+/// [`finalize_orphans`] alone, which runs under the agent's exclusive turn
+/// lease: no other launcher can run one of its turns then, so a supervisor
+/// record that doesn't show the agent running is enough to close it. A
 /// supervisor lives across many turns and agents, so its process being
 /// alive isn't enough: its record must still be live, be that process,
 /// and show the agent running. A launcher with no supervisor (a plain
-/// `run`) counts while its process is alive.
+/// `run`) counts while its process is alive. Readers without the lease
+/// use [`launcher_alive`].
 pub fn turn_running(run_dir: &Path, agent: &str, start: &Start) -> bool {
     let Some(id) = &start.supervisor_id else {
         return launcher_alive(start);
@@ -351,13 +355,19 @@ pub fn turn_running(run_dir: &Path, agent: &str, start: &Start) -> bool {
     }) && launcher_alive(start)
 }
 
-/// Whether the launcher the start line names is alive: the same host, and
-/// that pid running with the start time it recorded. A `ps` that can't
-/// answer never proves it gone.
+/// Whether the launcher the start line names is alive: its pid running
+/// here with the start time it recorded, or, with none recorded, its pid
+/// running. A `ps` that can't answer never proves it gone. The host isn't
+/// compared (decision of 2026-11-04, Terra #18919): a host renamed during
+/// the turn keeps its launcher alive, and a launcher on another host is
+/// gone here unless a local process has its pid and start time.
+///
+/// This is the one rule for whether a turn with no terminal evidence
+/// (receipt, end line, journal `turn.ended`) is still running, for every
+/// reader: `agents status`, `agents turns` and `agents logs`. A supervisor
+/// record that doesn't show the agent running doesn't end a turn whose
+/// launcher lives, since a failed write leaves the record behind.
 pub fn launcher_alive(start: &Start) -> bool {
-    if start.host != super::this_host() {
-        return false;
-    }
     match super::started(start.pid) {
         Ok(Some(now)) => start.pid_started_at.as_deref().is_none_or(|s| s == now),
         Ok(None) => false,
@@ -484,8 +494,9 @@ pub(crate) mod tests {
             started_at: "2026-10-30T12:00:00.000Z".into(),
             supervisor_id: None,
             host: "h".into(),
+            // pid 1 runs, but never with this start time: a gone launcher.
             pid: 1,
-            pid_started_at: None,
+            pid_started_at: Some("never".into()),
         })
     }
 
@@ -682,6 +693,77 @@ pub(crate) mod tests {
         );
     }
 
+    /// The one rule for readers (review of ade58853): with no terminal
+    /// evidence, a turn whose launcher lives is running, whatever its
+    /// supervisor record says, and only a launcher proven gone ends it.
+    #[test]
+    fn readers_end_a_turn_only_when_its_launcher_is_proven_gone() {
+        let (_s, run) = scratch();
+        let reg = crate::supervise::registry::Registered::register(&run, &["a".into()], None, None)
+            .unwrap()
+            .unwrap();
+        let (host, pid, pid_started_at) = launcher();
+        let s = Start {
+            turn_id: "01a18cb6-0000-7000-8000-000000000004".into(),
+            number: 1,
+            files: "turn-1".into(),
+            started_at: String::new(),
+            supervisor_id: Some(reg.id()),
+            host: host.clone(),
+            pid,
+            pid_started_at,
+        };
+        let entry = |s: &Start| Entry {
+            start: s.clone(),
+            end: None,
+        };
+        // The agent idle in the record (a failed Running write), its
+        // launcher alive: running.
+        let d = derive(&run, "a", &entry(&s), None, launcher_alive);
+        assert_eq!((d.state, d.outcome), ("running", None));
+        // Another host recorded (this one renamed mid-turn, or none read):
+        // the pid and its start time decide, and they match.
+        for other in [String::new(), format!("{host}-renamed")] {
+            let renamed = Start {
+                host: other,
+                ..s.clone()
+            };
+            assert!(launcher_alive(&renamed));
+            let d = derive(&run, "a", &entry(&renamed), None, launcher_alive);
+            assert_eq!(d.state, "running");
+        }
+        // The same pid with another start time: gone.
+        let reused = Start {
+            pid_started_at: Some("Thu Jan  1 00:00:00 1970".into()),
+            ..s.clone()
+        };
+        assert!(!launcher_alive(&reused));
+        // A pid that isn't running: gone.
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead = child.id();
+        child.wait().unwrap();
+        let gone = Start {
+            pid: dead,
+            pid_started_at: None,
+            ..s.clone()
+        };
+        assert!(!launcher_alive(&gone));
+    }
+
+    /// The host name is `uname -n`'s, read on each call (review of
+    /// 0e53de0a): no `uname` binary to find, and no name kept from before a
+    /// rename.
+    #[test]
+    fn this_host_is_uname_n_read_each_time() {
+        let out = std::process::Command::new("uname")
+            .arg("-n")
+            .output()
+            .unwrap();
+        let want = String::from_utf8(out.stdout).unwrap().trim().to_string();
+        assert_eq!(crate::turn::this_host().as_deref(), Some(want.as_str()));
+        assert_eq!(launcher().0, want);
+    }
+
     #[test]
     fn finalizing_leaves_another_launchers_live_turn_open_for_its_own_end() {
         let (_s, run) = scratch();
@@ -696,7 +778,7 @@ pub(crate) mod tests {
             files: "turn-1".into(),
             started_at: String::new(),
             supervisor_id: None,
-            host: crate::turn::this_host(),
+            host: crate::turn::this_host().expect("this host"),
             pid,
             pid_started_at: crate::turn::started(pid).unwrap(),
         };

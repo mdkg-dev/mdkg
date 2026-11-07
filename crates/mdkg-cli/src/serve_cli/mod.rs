@@ -270,7 +270,7 @@ fn not_built(c: &ServeCommand) -> u8 {
         Code::ApiUnsupported,
         format!("`{name}` isn't built in this version of mdkg"),
     )
-    .with_hint("serve and its commands arrive in a later 0.7.1 build");
+    .with_hint("serve and its commands arrive in a later release");
     let report: output::Report<()> = output::Report {
         data: None,
         diagnostics: vec![d],

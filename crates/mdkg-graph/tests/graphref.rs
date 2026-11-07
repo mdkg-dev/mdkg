@@ -169,6 +169,7 @@ fn keys_come_from_the_common_config_file_only() {
         &graphref::Destination {
             fetch: vec!["example.invalid/me/graph".into()],
             push: vec!["example.invalid/me/graph".into()],
+            ..Default::default()
         },
     )
     .expect("pin");
@@ -3265,4 +3266,44 @@ fn writers_are_fenced_by_folders_recorded_after_they_open() {
         })
         .expect_err("the root's folder changed");
     assert_eq!(err.code(), "graph.identity_mismatch", "{err}");
+}
+
+/// e-gitcache: the graph ref's tip is resolved once per process, and a
+/// tip kept never outlives a change to the ref by another git (a commit,
+/// a reset, a delete, a symbolic ref) in the same process.
+#[test]
+fn a_kept_graph_tip_never_outlives_a_ref_change() {
+    let repo = Repo::new();
+    let graph = graphref::resolve(&repo.0)
+        .expect("resolve")
+        .expect("ref mode");
+    let first = graphref::tip(&repo.0, &graph).expect("tip");
+    assert_eq!(first, repo.git(&["rev-parse", GRAPH]));
+    let before = mdkg_git::git_runs();
+    assert_eq!(graphref::tip(&repo.0, &graph).expect("kept"), first);
+    assert_eq!(mdkg_git::git_runs(), before, "kept: no git runs");
+    let next = repo.git(&[
+        "commit-tree",
+        "-p",
+        &first,
+        "-m",
+        "next",
+        &format!("{first}^{{tree}}"),
+    ]);
+    repo.git(&["update-ref", GRAPH, &next]);
+    assert_eq!(graphref::tip(&repo.0, &graph).expect("moved"), next);
+    repo.git(&["update-ref", GRAPH, &first]);
+    assert_eq!(graphref::tip(&repo.0, &graph).expect("reset"), first);
+    repo.git(&["pack-refs", "--all"]);
+    assert_eq!(graphref::tip(&repo.0, &graph).expect("packed"), first);
+    repo.git(&["update-ref", "-d", GRAPH]);
+    assert_eq!(
+        graphref::tip(&repo.0, &graph).expect_err("deleted").code,
+        "graph.ref_missing"
+    );
+    repo.git(&["symbolic-ref", GRAPH, "refs/heads/trunk"]);
+    assert_eq!(
+        graphref::tip(&repo.0, &graph).expect_err("symbolic").code,
+        "graph.ref_invalid"
+    );
 }

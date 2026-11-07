@@ -64,6 +64,11 @@ impl DigestCache {
     /// its folder is missing, it isn't a database, or it has a newer layout
     /// than this build's (left untouched).
     pub(crate) fn open(path: &Path) -> Option<Self> {
+        // `--read-only` writes nothing beside the store either: an
+        // existing cache is read, and a missing one means hashing again.
+        if crate::store::store_writes_forbidden() {
+            return Self::open_read_only(path);
+        }
         let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
             | OpenFlags::SQLITE_OPEN_CREATE
             | OpenFlags::SQLITE_OPEN_NO_MUTEX;

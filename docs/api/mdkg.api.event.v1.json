@@ -84,7 +84,7 @@
     "durable",
     "data"
   ],
-  "$comment": "For `mdkg.stream.error`, data is {diagnostics, head}; for `mdkg.stream.heartbeat`, {head}; for `mdkg.record.appended`, {kind, record}.",
+  "$comment": "For `mdkg.stream.error`, data is {diagnostics, head}; for `mdkg.stream.heartbeat`, {head}; for `mdkg.graph.head_changed`, {graph, head} (the graph id and the commit the head names, or head null while it names none); for `mdkg.record.appended`, {kind, record}.",
   "allOf": [
     {
       "if": {

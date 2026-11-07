@@ -14,7 +14,7 @@
 //! | Field | 0.7.0 | Later (accepted now, refused until built) |
 //! |---|---|---|
 //! | `trigger` | `mail`, or `manual` (a named `agents up --once` wakes it) | `schedule`, `claim`, `file-change` |
-//! | `shape` | `batch`: one run shows the unacked mail, up to `max` (20), and replies once | `until-done`, `per-message` |
+//! | `shape` | `batch` (default), or `digest` with a rendered byte budget | `until-done`, `per-message` |
 //! | `session` | `resume` (`--fresh` starts over) | `fresh-each-turn`, `resume-until` |
 //! | `loop_guard` | on: 10 automatic turns per thread per hour, then the thread pauses until a person runs the agent or the hour cools down; `false` turns it off | per-thread budgets |
 //! | `concurrency` | unset: no cap; a number caps this supervisor's turns at once | per-role, per-harness caps |
@@ -68,6 +68,10 @@ pub enum Shape {
     Batch {
         max: usize,
     },
+    /// A computed view over all unacknowledged mail.
+    Digest {
+        budget: usize,
+    },
     Later(Later),
 }
 
@@ -109,6 +113,33 @@ pub struct Auth {
     pub api_key_fallback: bool,
 }
 
+/// Which environment an agent's turns start with ([`crate::env`]): the
+/// allowlist plus `allow`'s names, or with `inherit: true` the launcher's
+/// whole environment less provider keys. Names only: a value is never
+/// stored in config.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, schemars::JsonSchema)]
+pub struct Env {
+    /// Variable names a turn inherits besides the allowlist; a final `*`
+    /// is a prefix, which never admits a credential-shaped name.
+    /// `agents.defaults` and the agent's own policy add to each other.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow: Vec<String>,
+    /// `true` inherits the launcher's whole environment, warned on every
+    /// turn. Unset is `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inherit: Option<bool>,
+}
+
+impl Env {
+    pub fn mode(&self) -> crate::env::Mode {
+        if self.inherit == Some(true) {
+            crate::env::Mode::Inherit
+        } else {
+            crate::env::Mode::Allowlist
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Prefer {
@@ -136,6 +167,9 @@ pub struct Policy {
     pub budget: Option<Later>,
     /// Which account turns bill ([`crate::auth`]).
     pub auth: Auth,
+    /// Which environment turns start with ([`crate::env`]).
+    #[serde(default)]
+    pub env: Env,
     /// Later kinds of `loop_guard`, `concurrency` and `timeout`, whose
     /// 0.7.0 values have no room for one: kept here, so `agents status`
     /// shows them and an agent's own value can replace a default's.
@@ -151,6 +185,8 @@ pub const LOOP_GUARD: LoopGuard = LoopGuard {
 
 /// The most messages a batch shows by default.
 pub const BATCH_MAX: usize = 20;
+/// Default rendered digest budget, in bytes.
+pub const DIGEST_BUDGET: usize = 48 * 1024;
 
 impl Default for Policy {
     /// 0.7.0's defaults: only the loop guard is on.
@@ -165,6 +201,7 @@ impl Default for Policy {
             retry: Retry::None,
             budget: None,
             auth: Auth::default(),
+            env: Env::default(),
             later: Vec::new(),
         }
     }
@@ -189,6 +226,7 @@ mod opt_secs {
 
 const FIELDS: &[&str] = &[
     "auth",
+    "env",
     "trigger",
     "shape",
     "session",
@@ -266,6 +304,48 @@ fn count(field: &str, v: &Value) -> Result<usize, RunError> {
         .ok_or_else(|| bad(field, "must be a whole number above 0"))
 }
 
+/// `base` with the `env` object `v` over it: `allow` adds its names to
+/// `base`'s, and a set `inherit` replaces `base`'s.
+fn env(base: &Env, v: &Value) -> Result<Env, RunError> {
+    const SHAPE: &str =
+        "must be an object: {\"allow\": [\"NAME\", \"PREFIX_*\"], \"inherit\": false}";
+    let Value::Object(o) = v else {
+        return Err(bad("env", SHAPE));
+    };
+    if let Some(k) = o.keys().find(|k| *k != "allow" && *k != "inherit") {
+        return Err(bad("env", format!("no setting {k:?}")));
+    }
+    let mut out = base.clone();
+    match o.get("allow") {
+        None | Some(Value::Null) => {}
+        Some(Value::Array(names)) => {
+            for name in names {
+                // A malformed entry isn't quoted back: it may be a
+                // `NAME=value` with a secret in it.
+                let Some(name) = name.as_str().filter(|n| crate::env::valid_entry(n)) else {
+                    return Err(bad(
+                        "env.allow",
+                        "each entry must be a variable name, or a name prefix ending in `*`; names only, never values",
+                    ));
+                };
+                if let Some(why) = crate::env::refused_entry(name) {
+                    return Err(bad("env.allow", format!("{name} {why}")));
+                }
+                if !out.allow.iter().any(|n| n == name) {
+                    out.allow.push(name.to_string());
+                }
+            }
+        }
+        Some(_) => return Err(bad("env.allow", "must be a list of variable names")),
+    }
+    match o.get("inherit") {
+        None | Some(Value::Null) => {}
+        Some(Value::Bool(b)) => out.inherit = Some(*b),
+        Some(_) => return Err(bad("env.inherit", "must be true or false")),
+    }
+    Ok(out)
+}
+
 impl Policy {
     /// This policy with the fields `o` sets put over it.
     pub fn apply(mut self, o: &Map<String, Value>) -> Result<Self, RunError> {
@@ -288,6 +368,7 @@ impl Policy {
                     "timeout" => self.timeout = d.timeout,
                     "retry" => self.retry = d.retry,
                     "auth" => self.auth = d.auth,
+                    "env" => self.env = d.env,
                     _ => self.budget = d.budget,
                 }
                 continue;
@@ -311,6 +392,14 @@ impl Policy {
                                 None => BATCH_MAX,
                             };
                             Shape::Batch { max }
+                        }
+                        "digest" => {
+                            only(field, s, &["budget"])?;
+                            let budget = match s.and_then(|s| s.get("budget")) {
+                                Some(v) => count("shape.budget", v)?,
+                                None => DIGEST_BUDGET,
+                            };
+                            Shape::Digest { budget }
                         }
                         k => Shape::Later(later(field, k, v)?),
                     };
@@ -409,6 +498,7 @@ impl Policy {
                         }
                     };
                 }
+                "env" => self.env = env(&self.env, v)?,
                 "retry" => {
                     let (kind, s) = kind_of(field, v)?;
                     self.retry = match kind {
@@ -499,7 +589,7 @@ impl Policy {
     pub fn batch_max(&self) -> usize {
         match self.shape {
             Shape::Batch { max } => max,
-            Shape::Later(_) => BATCH_MAX,
+            Shape::Digest { .. } | Shape::Later(_) => BATCH_MAX,
         }
     }
 }
@@ -508,6 +598,34 @@ impl Policy {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn digest_is_opt_in_and_has_a_configurable_budget() {
+        let batch = Policy::for_agent(&json!({}), "a").unwrap();
+        assert_eq!(batch.shape, Shape::Batch { max: BATCH_MAX });
+        let digest =
+            Policy::for_agent(&json!({"agents":{"a":{"policy":{"shape":"digest"}}}}), "a").unwrap();
+        assert_eq!(
+            digest.shape,
+            Shape::Digest {
+                budget: DIGEST_BUDGET
+            }
+        );
+        assert!(digest.check_supported("a").is_ok());
+        let custom = Policy::for_agent(
+            &json!({"agents":{"a":{"policy":{"shape":{"kind":"digest","budget":1024}}}}}),
+            "a",
+        )
+        .unwrap();
+        assert_eq!(custom.shape, Shape::Digest { budget: 1024 });
+        assert!(
+            Policy::for_agent(
+                &json!({"agents":{"a":{"policy":{"shape":{"kind":"digest","budget":0}}}}}),
+                "a"
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn the_0_7_0_defaults_have_only_the_loop_guard_on() {
@@ -671,5 +789,56 @@ mod tests {
         assert_eq!(guard(json!("on")).expect("on"), Some(LOOP_GUARD));
         assert_eq!(guard(json!("off")).expect("off"), None);
         assert!(guard(json!("sometimes")).is_err());
+    }
+
+    #[test]
+    fn env_is_the_allowlist_unless_set_and_allow_adds_across_layers() {
+        use crate::env::Mode;
+        let p = Policy::for_agent(&json!({}), "a").expect("defaults");
+        assert_eq!(p.env, Env::default());
+        assert_eq!(p.env.mode(), Mode::Allowlist);
+        let cfg = json!({"agents": {
+            "defaults": {"env": {"allow": ["GITHUB_TOKEN", "TOOL_*"]}},
+            "a": {"policy": {"env": {"allow": ["TOOL_*", "DATABASE_URL"], "inherit": true}}},
+            "b": {"policy": {"env": null}},
+        }});
+        let a = Policy::for_agent(&cfg, "a").expect("a");
+        assert_eq!(a.env.allow, ["GITHUB_TOKEN", "TOOL_*", "DATABASE_URL"]);
+        assert_eq!(a.env.mode(), Mode::Inherit);
+        // null puts the default back, the defaults' names too.
+        assert_eq!(Policy::for_agent(&cfg, "b").expect("b").env, Env::default());
+        let inherit_off = json!({"agents": {
+            "defaults": {"env": {"inherit": true}},
+            "c": {"policy": {"env": {"inherit": false}}},
+        }});
+        let c = Policy::for_agent(&inherit_off, "c").expect("c");
+        assert_eq!(c.env.mode(), Mode::Allowlist);
+    }
+
+    #[test]
+    fn env_refuses_values_keys_and_unknown_settings_without_echoing_them() {
+        let refused = |env: Value| {
+            Policy::for_agent(&json!({"agents": {"defaults": {"env": env}}}), "a")
+                .expect_err("refused")
+                .message
+        };
+        let value = concat!("FAKE_TOKEN=", "not-a-secret");
+        let m = refused(json!({"allow": [value]}));
+        assert!(!m.contains("not-a-secret"), "{m}");
+        assert!(m.contains("names only"), "{m}");
+        for bad in [
+            json!({"allow": "PATH"}),
+            json!({"allow": [1]}),
+            json!({"allow": ["*"]}),
+            json!({"inherit": "yes"}),
+            json!({"pass": ["PATH"]}),
+            json!(["PATH"]),
+        ] {
+            refused(bad);
+        }
+        let m = refused(json!({"allow": ["ANTHROPIC_API_KEY"]}));
+        assert!(m.contains("provider key"), "{m}");
+        let m = refused(json!({"allow": ["MDKG_TRUSTED_WORKTREE"]}));
+        assert!(m.contains("only by the launcher"), "{m}");
     }
 }

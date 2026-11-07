@@ -247,6 +247,20 @@ fn init_graph_only_writes_the_config_and_readme() {
     let (code, v) = json(&dir, &["skills", "add", "mdkg-workflow", "--json"]);
     assert_eq!(code, 1, "{v}");
     assert_eq!(codes(&v), ["skill.exists"]);
+    // Unless --replace asks for the shipped copy: replaced and mirrored.
+    let (code, v) = json(
+        &dir,
+        &["skills", "add", "mdkg-workflow", "--replace", "--json"],
+    );
+    assert_eq!(code, 0, "{v}");
+    common::conforms("skills.add", &v);
+    assert_eq!(v["data"]["action"], "replaced", "{v}");
+    let shipped = std::fs::read(dir.join(".mdkg/skills/mdkg-workflow/SKILL.md")).expect("skill");
+    assert!(!String::from_utf8_lossy(&shipped).contains("description: ours"));
+    assert_eq!(
+        std::fs::read(dir.join(".agents/skills/mdkg-workflow/SKILL.md")).expect("mirror"),
+        shipped
+    );
     let (code, v) = json(&dir, &["skills", "add", "something-else", "--json"]);
     assert_eq!(code, 3, "{v}");
     assert_eq!(codes(&v), ["skill.not_found"]);
@@ -794,6 +808,10 @@ fn init_new_validate_local_work_keeps_the_task_out_of_the_checkout() {
     let real = std::fs::canonicalize(&file).expect("the task's file");
     assert!(real.starts_with(&common), "{}", real.display());
     assert!(!dir.join(".mdkg/work").exists(), "{v}");
+    // As text, the path outside the checkout says it's local work (e2e UX).
+    let out = run(&dir, &["new", "task", "Another one"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains(" (local work at "), "{text}");
     assert_git_clean(&dir);
     let (code, v) = json(&dir, &["validate", "--json"]);
     assert_eq!(code, 0, "{v}");
@@ -809,6 +827,30 @@ fn init_new_validate_local_work_keeps_the_task_out_of_the_checkout() {
     let text = std::fs::read_to_string(&file).expect("the task's file");
     assert!(text.lines().any(|l| l == "status: done"), "{text}");
     assert_git_clean(&dir);
+}
+
+/// A git folder inside the checkout (`git init --separate-git-dir`) gives
+/// local work a relative path; `new` still labels it (Terra #17973).
+#[test]
+fn new_labels_local_work_under_a_separate_git_dir_in_the_checkout() {
+    let dir = temp("separate-git-dir", false);
+    let ok = Command::new("git")
+        .args(["init", "-q", "--separate-git-dir", "repository-data"])
+        .current_dir(&dir)
+        .status()
+        .expect("git init")
+        .success();
+    assert!(ok);
+    json(&dir, &["init", "--work", "local", "--json"]);
+    std::fs::write(dir.join(".gitignore"), "/repository-data\n").expect("ignore");
+    commit_all(&dir);
+    let (code, v) = json(&dir, &["new", "task", "Local here", "--json"]);
+    assert_eq!(code, 0, "{v}");
+    let path = v["data"]["node"]["path"].as_str().expect("path");
+    assert!(path.starts_with("repository-data/"), "{v}");
+    let out = run(&dir, &["new", "task", "Another one"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains(" (local work at repository-data/"), "{text}");
 }
 
 /// Where a node's file is: `show` gives its path from the graph root
@@ -1085,6 +1127,16 @@ fn doctor_passes_a_fresh_graph() {
     assert_eq!(status_of(&v, "config"), "ok", "{v}");
 }
 
+fn git_out(dir: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("git");
+    assert!(out.status.success(), "git {args:?}");
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+}
+
 fn git(dir: &Path, args: &[&str]) {
     let ok = Command::new("git")
         .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
@@ -1256,6 +1308,133 @@ fn personal_doctor_checks_invalid_paths_after_an_outside_entry() {
         "full shape (kept for a personal graph)",
         "{v}"
     );
+}
+
+/// A personal full shape whose remaining tree passes the walk's entry
+/// limit warns (and fails `--strict`), with the code's remote; another
+/// remote is still an error (Terra #14932, #18260). It lowers the limit
+/// with MDKG_SHAPE_ENTRY_LIMIT, which only a debug build reads, so a
+/// release-profile run skips it (Terra #20014); the shipped limit is
+/// pinned by the bin's the_shipped_shape_entry_limit_is_100_000.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs a debug build's MDKG_SHAPE_ENTRY_LIMIT"
+)]
+fn personal_doctor_warns_when_a_full_shape_passes_the_walk_budget() {
+    let dir = nested_graph_shape(false);
+    let graph = "refs/heads/mdkg-graph";
+    let remote = dir.join("origin.git");
+    git(
+        &dir,
+        &["remote", "add", "origin", remote.to_str().expect("path")],
+    );
+    git(&dir, &["config", "mdkg.graph.remote", "origin"]);
+    // Doctor runs with this build first on PATH, so its `path` check is
+    // ok, and with the remote approved and synced --strict passes before
+    // the big tree (Terra #18403). After it, the shape warns, and so does
+    // graph.remote for the commit not pushed yet.
+    let bin_dir = Path::new(BIN).parent().expect("the binary's folder");
+    let path = std::env::join_paths(std::iter::once(bin_dir.to_path_buf()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
+    .expect("PATH");
+    let doctor = |args: &[&str]| {
+        let out = common::without_launcher_env(&mut Command::new(BIN))
+            .args(args)
+            .current_dir(&dir)
+            .env("MDKG_ACTOR", "tester")
+            .env("PATH", &path)
+            // A debug build's lowered walk limit, so the big tree trips it
+            // in seconds (F140); the shipped 100,000 is a unit test.
+            .env("MDKG_SHAPE_ENTRY_LIMIT", "1000")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .output()
+            .expect("run the binary");
+        let v: Value = serde_json::from_slice(&out.stdout).expect("doctor's JSON");
+        (out.status.code().unwrap_or(-1), v)
+    };
+    // A person approves the graph remote and syncs first (0.7.2 graph
+    // sync), so its own row is no warning.
+    git(
+        &dir,
+        &["init", "-q", "--bare", remote.to_str().expect("path")],
+    );
+    let (code, approved) = doctor(&["graph", "remote", "approve", "--json"]);
+    assert_eq!(code, 0, "{approved}");
+    let (code, synced) = doctor(&["graph", "sync", "--json"]);
+    assert_eq!(code, 0, "{synced}");
+    let (code, before) = doctor(&["doctor", "--strict", "--json"]);
+    assert_eq!(status_of(&before, "graph.shape"), "ok", "{before}");
+    assert_eq!(before["data"]["warnings"].as_u64(), Some(0), "{before}");
+    assert_eq!(code, 0, "{before}");
+    let blob = shape_git_input(&dir, &["rev-parse", "HEAD:.mdkg/README.md"], b"");
+    // 12 small trees that a walk expands to 1,024 leaves and over 2,000
+    // entries, past the lowered 1,000-entry limit.
+    let mut big = shape_git_input(
+        &dir,
+        &["mktree", "-z"],
+        format!("100644 blob {blob}\tleaf\0").as_bytes(),
+    );
+    for _ in 0..10 {
+        big = shape_git_input(
+            &dir,
+            &["mktree", "-z"],
+            format!("040000 tree {big}\ta\0040000 tree {big}\tb\0").as_bytes(),
+        );
+    }
+    let mut entries = shape_git_input(&dir, &["ls-tree", "-z", graph], b"").into_bytes();
+    // `README` (outside: the shape is full) sorts before `src`.
+    entries.extend_from_slice(format!("100644 blob {blob}\tREADME\0").as_bytes());
+    entries.extend_from_slice(format!("040000 tree {big}\tsrc\0").as_bytes());
+    let tree = shape_git_input(&dir, &["mktree", "-z"], &entries);
+    let commit = shape_git_input(
+        &dir,
+        &["commit-tree", &tree, "-p", graph, "-m", "a big full shape"],
+        b"",
+    );
+    git(&dir, &["update-ref", graph, &commit]);
+    // --strict fails on the shape's warning alone (Terra #19756), with the
+    // personal remote still configured (Terra #19803): sync.json records
+    // the big commit as synced, so graph.remote has nothing unpushed to
+    // warn about. One doctor run on the big tree: each takes a minute.
+    let state = dir.join(".git/mdkg/graph/sync.json");
+    let mut synced: Value =
+        serde_json::from_slice(&std::fs::read(&state).expect("sync.json")).expect("json");
+    synced["accepted"] = commit.clone().into();
+    std::fs::write(&state, synced.to_string()).expect("sync.json");
+    let (code, v) = doctor(&["doctor", "--strict", "--json"]);
+    assert_eq!(code, 2, "{v}");
+    assert_eq!(status_of(&v, "graph.shape"), "warning", "{v}");
+    assert_eq!(
+        status_of(&v, "graph.remote"),
+        "ok",
+        "origin stays configured: {v}"
+    );
+    assert_eq!(v["data"]["warnings"].as_u64(), Some(1), "{v}");
+    let summary = check_of(&v, "graph.shape")["summary"]
+        .as_str()
+        .expect("summary")
+        .to_owned();
+    assert!(summary.contains("wasn't checked"), "{v}");
+    assert!(summary.contains("limit"), "{v}");
+    let strict = v["diagnostics"]
+        .as_array()
+        .expect("diagnostics")
+        .iter()
+        .find(|d| d["code"] == "doctor.check_failed")
+        .expect("the strict failure");
+    assert_eq!(strict["message"], "--strict: 1 check warned", "{v}");
+    // Another remote than the code's is refused whatever the walk did.
+    let other = dir.join("other.git");
+    git(
+        &dir,
+        &["remote", "add", "other", other.to_str().expect("path")],
+    );
+    git(&dir, &["config", "mdkg.graph.remote", "other"]);
+    let (_, v) = json(&dir, &["doctor", "--json"]);
+    assert_eq!(status_of(&v, "graph.shape"), "error", "{v}");
 }
 
 #[test]
@@ -1582,7 +1761,7 @@ fn doctor_checks_the_agents_instructions_are_this_builds() {
     assert_eq!(status_of(&v, "agents"), "ok", "{v}");
     assert!(v.to_string().contains("own changes"), "{v}");
     // Whitespace the frontmatter parser takes is the same version.
-    let spaced = shipped.replace("version: 0.7.1", "version :  0.7.1");
+    let spaced = shipped.replace("version: 0.7.2", "version :  0.7.2");
     assert_ne!(
         spaced, shipped,
         "the whitespace fixture must change the skill"
@@ -1591,7 +1770,7 @@ fn doctor_checks_the_agents_instructions_are_this_builds() {
     let (_, v) = json(&dir, &["doctor", "--json"]);
     assert_eq!(status_of(&v, "agents"), "ok", "{v}");
     // Another build's skill: bring in this build's.
-    let older = shipped.replace("version: 0.7.1", "version: 0.6.9");
+    let older = shipped.replace("version: 0.7.2", "version: 0.6.9");
     assert_ne!(older, shipped, "the version fixture must change the skill");
     std::fs::write(&skill, older).expect("write");
     let (_, v) = json(&dir, &["doctor", "--json"]);
@@ -1721,6 +1900,12 @@ fn doctor_reads_the_store_without_upgrading_it() {
     );
     let store = dir.join(".git/mdkg/coord.sqlite");
     assert!(store.is_file());
+    let current: String = rusqlite::Connection::open(&store)
+        .expect("open store")
+        .query_row("SELECT value FROM meta WHERE key = 'schema'", [], |r| {
+            r.get(0)
+        })
+        .expect("schema");
     let (_, v) = json(&dir, &["doctor", "--json"]);
     assert_eq!(status_of(&v, "store"), "ok", "{v}");
 
@@ -1738,11 +1923,28 @@ fn doctor_reads_the_store_without_upgrading_it() {
         .count();
     assert_eq!(copies, 0, "doctor took no upgrade copy");
 
-    // A newer one fails: this build would refuse it.
+    // A newer one is a warning with its version (orchestrator #20626):
+    // this build's other commands refuse it, and --strict fails on it.
     set_schema(&store, "99");
     let (code, v) = json(&dir, &["doctor", "--json"]);
-    assert_eq!(status_of(&v, "store"), "error", "{v}");
-    assert_eq!(code, 2);
+    assert_eq!(status_of(&v, "store"), "warning", "{v}");
+    assert_eq!(code, 0, "{v}");
+    let check = v["data"]["checks"]
+        .as_array()
+        .expect("checks")
+        .iter()
+        .find(|c| c["name"] == "store")
+        .expect("store check");
+    assert_eq!(check["store_schema"], 99, "{v}");
+    assert_eq!(check["upgrade_needed"], false, "{v}");
+    // --strict fails on exactly that warning: with the store check alone,
+    // a current store passes it and the newer one doesn't (review of
+    // b2ef39a7).
+    let (code, v) = json(&dir, &["doctor", "--only", "store", "--strict", "--json"]);
+    assert_ne!(code, 0, "--strict fails on the warning: {v}");
+    set_schema(&store, &current);
+    let (code, v) = json(&dir, &["doctor", "--only", "store", "--strict", "--json"]);
+    assert_eq!(code, 0, "a current store passes --strict: {v}");
 }
 
 #[test]
@@ -2290,8 +2492,61 @@ fn skills_add_stopped_after_publishing_mirrors_on_the_next_run() {
     std::fs::write(dir.join(".mdkg/skills/mdkg-workflow/SKILL.md"), &shipped).expect("write");
     let (code, v) = json(&dir, &["skills", "add", "mdkg-workflow", "--json"]);
     assert_eq!(code, 0, "{v}");
-    assert_eq!(v["data"]["action"], "kept");
+    // The copy a stopped run left was never committed: this run commits it
+    // (Terra #19620), so it's this run's addition.
+    assert_eq!(v["data"]["action"], "created", "{v}");
+    assert!(v["data"]["commit"].is_string(), "{v}");
+    assert_eq!(
+        git_out(&dir, &["status", "--porcelain", "--", ".mdkg/skills"]),
+        "",
+        "committed"
+    );
     assert_mirrored(&dir);
+    // A run with the skill already committed changes nothing.
+    let (code, v) = json(&dir, &["skills", "add", "mdkg-workflow", "--json"]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["data"]["action"], "kept", "{v}");
+    assert!(v["data"]["commit"].is_null(), "{v}");
+    // A staged change of the skill is never replaced (Terra #19620).
+    let skill = dir.join(".mdkg/skills/mdkg-workflow/SKILL.md");
+    std::fs::write(
+        &skill,
+        "---\nname: mdkg-workflow\ndescription: staged\n---\n",
+    )
+    .expect("a");
+    git(&dir, &["add", ".mdkg/skills/mdkg-workflow/SKILL.md"]);
+    std::fs::write(
+        &skill,
+        "---\nname: mdkg-workflow\ndescription: later\n---\n",
+    )
+    .expect("b");
+    let (code, v) = json(
+        &dir,
+        &["skills", "add", "mdkg-workflow", "--replace", "--json"],
+    );
+    assert_ne!(code, 0, "{v}");
+    assert!(
+        v["diagnostics"][0]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("staged changes"),
+        "{v}"
+    );
+    assert!(
+        git_out(&dir, &["show", ":.mdkg/skills/mdkg-workflow/SKILL.md"]).contains("staged"),
+        "the staged version is kept"
+    );
+    assert!(
+        std::fs::read_to_string(&skill)
+            .expect("b")
+            .contains("later")
+    );
+    // No stray staging file is left in the skill's folder to be mirrored.
+    let names: Vec<_> = std::fs::read_dir(dir.join(".mdkg/skills/mdkg-workflow"))
+        .expect("folder")
+        .map(|e| e.expect("entry").file_name())
+        .collect();
+    assert_eq!(names, ["SKILL.md"], "{names:?}");
     // And a clean add publishes with one name.
     let dir = temp("skills-add-clean", true);
     json(&dir, &["init", "--graph-only", "--json"]);

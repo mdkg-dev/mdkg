@@ -338,7 +338,7 @@ fn common_value(common: &Path, key: &str) -> Result<Option<String>, ()> {
 }
 
 /// The GitHub protection cache's branch names, or none.
-fn github_protected(common: &Path) -> Vec<String> {
+pub(crate) fn github_protected(common: &Path) -> Vec<String> {
     let file = mdkg_run::hooks::dir(common).join("github-protection.json");
     let Ok(bytes) = mdkg_coord_sqlite::git::read_capped(&file, INPUT_MAX) else {
         return Vec::new();

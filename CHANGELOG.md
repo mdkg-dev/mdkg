@@ -1,5 +1,328 @@
 # Changelog
 
+## 0.7.2
+
+### Security
+
+- **`config show` hides keys that look like credentials.** A key that
+  itself matches the credential rules is shown as `[redacted key <n>]`,
+  with everything under it hidden, in both formats and in `config set`'s
+  `old`, `new` and diff. `origins` and `redacted` name the renamed
+  pointers. docs/format-0.7.md states the guarantee and its limits.
+- **Harness turns start with an allowlisted environment.** A turn, its
+  login check and OpenCode's worker preflight no longer inherit the
+  launcher's whole environment: only what a harness needs (`PATH`, `HOME`,
+  `USER`, `LOGNAME`, `SHELL`, `TMPDIR`, `TERM`, `LANG`, `LC_*`, `TZ`, the
+  XDG folders, git identity and config paths), mdkg's own `MDKG_*`, each
+  harness's own folders (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `OPENCODE_*`,
+  never their token variables) and the names a new policy field,
+  `env.allow`, adds. A supervisor started from a shell no longer hands
+  that shell's credentials to agents. Opt out per agent or for all with
+  `"env": {"inherit": true}`, which warns on every turn; `agents status`
+  (`env_mode`) and `doctor`'s `env` check name inherited-mode agents and
+  agents a supervisor from 0.7.0 or 0.7.1 runs. A shell that rereads your
+  startup files still gets what they export. See
+  [the turn's environment](docs/agents.md#the-turns-environment).
+- **OpenCode turns no longer read Claude Code's files.** Every OpenCode
+  turn mdkg launches sets `OPENCODE_DISABLE_CLAUDE_CODE=1` and
+  `OPENCODE_DISABLE_CLAUDE_CODE_SKILLS=1`, so it no longer finds
+  `CLAUDE.md`, `~/.claude/CLAUDE.md` or `.claude/skills` by itself. A file
+  your own OpenCode config lists in `instructions` still loads. A harness
+  finds only its own memory and instruction files by itself. Claude Code and Codex
+  need no switch. See
+  [harness memory](docs/agents.md#harness-memory).
+
+### New
+
+- **Digest delivery.** Agents can opt in with `--delivery digest`; batch
+  remains the default. Digest turns group unacknowledged mail by node or
+  conversation, putting faults first and otherwise showing newest first
+  within each group. Turns reply to the configured coordinator. `msg digest`
+  computes a view without marking mail shown. `version --json` advertises
+  `agents.delivery.digest`.
+- **A person sends mail as themselves.** `msg send` runs as `human:<name>`
+  (the exact lowercase form, by `--as` or `$MDKG_ACTOR`), of any kind but
+  `decision`, `receipt` and `fault`, from the CLI and serve's local socket,
+  only outside agent turns and only while no person key is enforced in the
+  coordinator (`person.proof_required` once one is). It's unsigned, and its
+  log record carries `person_proof: null`. Loopback and MCP refuse it. Until
+  enforcement is on, any process run outside a turn can send as the person,
+  including one an agent detaches from its turn. See
+  [a person's own mail](docs/delegated-decisions.md#a-persons-own-mail).
+- **`init --setup <personal|professional|local>`.** A repository with no
+  graph can start one on `refs/heads/mdkg-graph` in ref mode in one step,
+  with no commit on any branch and the checkout unchanged. It reuses
+  `install --setup`'s setup rules and keys (`--graph-remote` for
+  professional), and refuses before writing anything when the checkout
+  already has a graph, another worktree of the clone has one, the graph
+  ref exists, or the clone is in ref mode.
+  A failure before the graph ref exists puts the keys back. `init --json`
+  adds `data.setup`.
+- **`install` and `doctor` warn about the legacy projections default.**
+  A `.mdkg/config.json` with no `projections` key gets the legacy default
+  from `install`: the AGENTS.md block, every harness's MCP config and the
+  skill mirrors. In 0.7.3 a config without the key gets none of them. Both
+  commands now warn (`install.legacy_projections`) and name the key: `mdkg
+  config set projections '<today's list>'`, then `install`, keeps them.
+  In ref mode, an `install --enable` or `--disable` that leaves the list as
+  it was now publishes the key too, as checkout mode already wrote it.
+
+- **Graph sync:** in ref mode, the graph ref syncs with `mdkg.graph.remote`.
+  `mdkg graph remote approve`, run by a person outside any agent turn, pins
+  the remote's destination and the git setup a push runs with (ssh
+  command, hooks, credential helpers, as digests, from the system,
+  global, local and worktree config; not `-c` or `GIT_CONFIG_*` settings);
+  nothing is pulled or pushed before that, or after either changes. `mdkg graph sync` pulls and
+  pushes by hand, and `agents up` pulls before its first turn and every 15
+  minutes, and pushes 2 minutes after the last local change. Only
+  `remoteRef` crosses; pushes refuse code destinations, non-graph history
+  on a private remote, and anything the secret scan flags. A conflicting
+  path takes the remote's version and is listed by `mdkg graph conflicts`;
+  `mdkg graph resolve` settles it (`--merge` names which, when a path has
+  several). `--accept-rewrite` adopts a rewritten
+  remote, keeping the local graph under a backup ref. See
+  [syncing with graph.remote](docs/git-graph.md#syncing-with-graphremote).
+- **Secret scan:** some `password`, `passwd` and `token` assignments are
+  refused as credentials, in mail and in graph pushes: those whose value
+  is at least 20 characters with both a letter and a digit (placeholders,
+  expressions and UUIDs excepted). A letters-only value, a quoted value of
+  several words and some structured tokens aren't caught: the scan is a
+  backstop. The same rule applies in git's secret hooks on code commits
+  and pushes, so a code commit holding such an assignment is now refused
+  too.
+- **`agents list`** lists the agents the settings define, each with the
+  layer that defines it, whether it has its own file, every layer whose
+  settings have an entry for it, and its harness and role. It reads settings
+  only, redacted as `config show` redacts them.
+- **`config set` and `config unset`** change one key of the committed
+  project config, in either mode: in ref mode a publish on the graph ref
+  through mdkg's graph writer (pending intent, compare-and-swap, replay),
+  in checkout mode a commit where the committed config is read. They
+  refuse unknown keys, the identity keys, `work.location` (which
+  `work localize` changes) and any value that `validate` and `doctor`
+  would reject, writing nothing. `--dry-run` shows the
+  diff; `--json` gives the old and new values, the commit and the graph
+  ref. This replaces the hand-written git recipe in
+  [changing the committed config](docs/git-graph.md#changing-the-committed-config),
+  which stays only for repairing a config mdkg can't read.
+- **A read-only mail list across mailboxes:** `msg list --json` lists mail
+  of the kinds you name (`--kind fault,review_request`) delivered to any
+  mailbox, to `--to` mailboxes, or to a `--channel`'s current members,
+  with `--from`, `--state unacked|acked|any`, `--after` and `--limit`
+  (at most 200, and under 1 MiB of bodies a page). It opens the store
+  read-only: nothing is acked, marked shown or purged, and a body whose
+  retention is up reads as purged. Only a person runs it
+  (`--as human:<name>`), outside an agent's turn; it has no MCP tool and
+  isn't served. Mail isn't confidential between local actors:
+  `msg watch` already shows every message.
+- **Tool-call ids in turn output:** `tool.started` and `tool.ended` carry
+  `call_id`, the harness's own id for the call (Claude and OpenCode), so
+  overlapping calls of one tool pair up. Null when the harness gives none;
+  Codex turns report no tools. See `mdkg.api.turn_output.v1`.
+- **`agents turns <agent> --json`:** an agent's turns, newest first, with
+  each one's `turn_id`, `number`, `started`, `ended`, `state`, `outcome`
+  and receipt path; `--limit`, `--before` and `--turn <N>`
+  (`mdkg.agents.turns.v1`). Each `agents logs --json` line carries its
+  `position`, which `--after` resumes from.
+- **Graph head events:** `msg watch --json` and `serve`'s `/v1/events`
+  send `mdkg.graph.head_changed` (`{graph, head}`, ephemeral) when they
+  start, naming the graph ref's tip (in checkout mode the worktree's
+  `HEAD`), and each time it changes; `head` is null while it names no
+  commit. The stream reads it about once a second. `status --json` reports the same
+  head in checkout mode too: `graph` is `{ref: null, tip: <HEAD>}` (it
+  had no `graph` there before). See
+  [the API guide](docs/api.md#graph-head-events).
+- **`doctor --only store`:** runs the `store` check alone: the coordinator
+  store's schema and mail schema versions (`store_schema`, `mail_schema`)
+  and whether this build would upgrade it (`upgrade_needed`), read-only,
+  without upgrading the store or reading any config, projection or harness
+  file. It reads the store of the git repository it runs in. A store newer
+  than this build is a warning with its own versions, not an error, in
+  full `doctor` too (`--strict` still fails on it).
+- **`agents status`'s `last_exit`:** how an agent's last `agents up` ended
+  (`cap`, `once`, `manual`, `mode_changed`, `drained`, `signal`, or
+  `failed` with its `code`) stays readable after the process is gone, per
+  agent, for as long as its watch is the agent's latest. It's kept
+  in the run folder (no store change), absent while a supervisor runs the
+  agent, and absent when the supervisor was killed outright, so the reason
+  is never guessed. See
+  [the API guide](docs/api.md).
+- **`agents status --no-probe`:** reports the agents, their effective
+  definitions, which are file-backed (the new `file_backed`), their
+  supervisors and progress, without running any harness login check,
+  Keychain listing or billing read, so a client can poll it. It leaves
+  `auth` and `billing` out. See [the API guide](docs/api.md).
+- **A stable store id:** `status --json` and `config show --json` carry
+  `store_id`, the coordinator store's own id (as `anchor` names it): the
+  same from every worktree and for the store's life; null before the store
+  exists.
+- **A person's client acks the mail it showed:** a client that reads mail
+  itself (`msg list`, or `msg inbox --no-mark`) records what it put in
+  front of the person with `msg inbox --mark-shown <seq>/<digest>/<id>`,
+  then acks by id. Acking by id still refuses mail never marked shown
+  (`msg.not_shown`, whose hint now names the mark). Only that person
+  marks their mail: an agent's read of a person's mailbox no longer
+  counts as shown, and its `--mark-shown` there is refused
+  (`msg.not_holder`). See
+  [the API guide](docs/api.md#mail-across-mailboxes-072).
+
+### Changed
+
+- **`skills add` commits in a git checkout.** In checkout mode it now
+  writes the skill under an exact lease on its `SKILL.md` and commits it on
+  the checkout's branch, as `agents add` commits a definition. A refresh
+  inside the managed `.worktrees/graph` lands on the graph branch instead
+  of leaving that checkout dirty, which froze graph writers and install
+  there. Outside git, or before a branch's first commit, it writes in
+  place as before.
+- **Ref-mode skills.** `skills add` publishes a shipped skill on the graph
+  ref (0.7.1 refused it), and `install` mirrors it from there. The new
+  `skills add --replace` takes the shipped copy over one that differs, in
+  either mode. `doctor`'s `agents` check judges the graph ref's skill in
+  ref mode, never a checkout copy, and its hint names that refresh.
+- **Rolling back from a custom graph ref.** `install --checkout-mode` on a
+  clone whose graph ref isn't `refs/heads/mdkg-graph` now creates
+  `mdkg-graph` at its tip, retargets the records naming the old ref, and
+  goes on as for the default ref, so install's own path makes and
+  registers the graph checkout. If a record it keeps leaves the checkout
+  unregistered, checkout-mode reads refuse with an identity diagnostic and
+  never read it unguarded. 0.7.1 refused this (its Known limits). It
+  refuses before changing anything while `mdkg-graph` holds another commit
+  or is checked out in another worktree, and a rerun finishes a move that
+  stopped part way. See [git-graph](docs/git-graph.md).
+- **Ref mode keeps the repository-root graph at `.mdkg`.** This is now a
+  rule, not a limit that a later version lifts: no mdkg writer records a
+  root `mdkg.graph.<id>.dir`, and a hand-set one is refused with a hint
+  that gives the `git config --unset` command for each key.
+
+### Faster
+
+- **Fewer git processes per command:** a command keeps some of what it
+  reads from git: repository config values (unless the config includes
+  another file), a ref found to name a commit (a missing one is asked
+  again each time), the graph ref's tip, and parsed config snapshots. A
+  kept read is read again when a file it was read from changes, at the
+  next turn or request, or before mdkg writes. Measured on a graph with 50 agents (git processes
+  per command, before and after): `status` 19 and 14, `msg send` 12 and 11,
+  `agents status` 20 and 16, `claim` 21 and 19; with a graph ref, `msg
+  send` 44 and 31.
+- **Fault bookkeeping no longer decodes every stored fault:** on a store
+  holding 2,000 faults from 50 agents, the previously stored faults a
+  fault send looks up and decodes fell from 200 to 1, a resend's from
+  2,202 to 2, and a clear's from 2,004 to 6. SQLite still scans the
+  stored fault bodies to find them.
+
+### Changed from 0.7.1
+
+- **`no_reply` outcome (contract change):** a turn answering mail whose
+  final message is exactly `NO_REPLY` now ends with outcome `no_reply`, not
+  `replied`, in `agents up --json`, the turn index, the journal's
+  `turn.ended` and `agents status`'s `last_turn`. Its report no longer
+  carries `reply: "NO_REPLY"`. For turns run from 0.7.2 on, `replied`
+  always means an imported reply with a `reply_id`; turns recorded earlier
+  keep their `replied`. A task-only turn still ends `ran`. Clients that
+  treated `replied` as "the turn answered" should accept both.
+- **Fewer duplicate replies:** when a turn sends a `handoff` or `findings`
+  answering its newest shown message, its final message is not also imported
+  as a reply. Questions and notes do not count as answers. See the release
+  notes for limits and [the API guide](docs/api.md).
+
+- **Finer `affected` selection for Rust tests:** a changed `.rs` file that
+  only integration tests reach, such as a new `tests/<name>.rs` or a
+  shared helper under `tests/common/`, now selects just the test targets
+  whose module trees reach it, read from the head's `mod`, `#[path]` and
+  `include!` lines, instead of the whole crate and its dependents. What
+  can't be derived soundly still falls back to the whole crate, and the
+  warning says why. A test that reads `.rs` files at run time still needs
+  a rule. See [affected](docs/affected.md).
+- **`affected --targets` and older heads:** a rule naming a Rust test
+  target that the planned head doesn't have (an older head than the shared
+  config) no longer fails with `config.invalid`. The target is skipped with
+  a warning and the rule's other targets still run; with none left, its
+  packages run whole. A package the head lacks still fails closed.
+- **Exit codes (contract):** `entry gate` exits 2 when the gate fails,
+  with the failures in its data and an `entry.gate_failed` error, like the
+  other checks; it exited 0. Its `mdkg serve` read answers 422 instead of
+  200 to match. A ref-mode write the graph moved under
+  (`graph.write_stale`, `graph.write_contended`, such as a stale
+  `node save`) exits 5, a conflict to re-read and retry, instead of 4.
+- **Validation:** `req.missing` warns for a `feat` with no requirement
+  items too, as for a task, bug or spike. A duplicate requirement id's
+  message names the first use by its file line, like the diagnostic's own
+  line.
+- **Doctor:** `graph_worktree` warns when a checkout-mode graph checkout
+  can no longer follow main by fast-forward although main already has its
+  work, as a squash or rebase merge of the graph branch leaves it. `graph.shape`
+  warns, instead of failing, when a personal graph's full shape was found
+  but the tree passed a walk limit before the rest was checked. Check
+  names line up in one column however long they are.
+- **Store creation:** on a file system that refuses the full sync barrier
+  (an SMB mount), creating the coordinator store is refused with the
+  `MDKG_STORE_PLAIN_FSYNC=1` override named; with it, the store is created
+  with a plain fsync and the command warns `coord.store_weak_sync`.
+
+### Fixed
+
+- **Usage limits in their current wording:** Claude's "You've hit your
+  weekly limit" and "<n>-hour limit" (the text of its error result, or
+  an error result after a rejected `rate_limit_event`) and OpenCode's
+  `provider.quota` errors and 429 usage-limit bodies, in both of their forms, are now read as a usage
+  limit, so the turn ends with that reason (Claude's hint also offers
+  `agents use-key`, and names the limit and when it resets). A Claude 429
+  that names no limit is provider throttling: like capacity, it never
+  sets mail aside, and its hint offers no key.
+
+- **Signals reach git:** a SIGTERM or SIGINT to a one-shot command is
+  forwarded to the git processes it started. mdkg waits up to 2 s, kills
+  what's left, and exits by the same signal within 3 s, so none of its
+  git writes lands after mdkg has exited. A running agent turn and
+  `git-serve`'s `git receive-pack` aren't covered and can still write
+  after it (see the release notes' Known limits). See
+  [the API guide](docs/api.md).
+- `doctor` no longer shows an MCP server command it reads from
+  `.mcp.json`, `opencode.json` or `.codex/config.toml` when the command
+  looks like a credential (an inline token, a URL with a password) or
+  holds whitespace (a command line with arguments, which may carry a
+  token in no known shape): it shows `<redacted>` in text and JSON, and
+  still checks the real command.
+- `msg watch` and `msg wait` in ref mode no longer hold the graph lock for
+  as long as they stream or wait: graph writes beside them went on
+  waiting, and a `status` after the graph ref moved failed with
+  `graph.lock_required`.
+- `.git/mdkg` is created 0700 when the search index or `work localize`
+  makes it first: `search` or `pack --query` in a fresh checkout-mode
+  clone made it with the umask's mode.
+- A delegated decision whose grant the machine-local file revokes says so,
+  rather than "has no delegation". A decision sent from a plain shell no
+  longer fails now and then with "cannot inspect launcher turn" when a
+  turn ends during the check.
+- `holds` names the scope when it isn't held (exit 0, as before).
+- A stale `node save` from a copy says to move the edits out first, since
+  `node edit --discard` replaces the copy. `new` labels a local work path.
+- `anchor` in ref mode publishes past a stale earlier anchor at the same
+  record, instead of refusing every rerun.
+- The credential filter no longer refuses a message that quotes a task
+  id's tail on its own; identifiers such as `my-sk-…` pass, while a
+  recognised key shape standing on its own is still refused.
+- `install`'s refresh check counts a `.gitignore` that changes between a
+  file and a symlink as an ignore change.
+
+- **The Linux PyPI wheels don't include FIDO2:** pip wheels on Linux
+  build without FIDO2 person keys (the musl ones never had them), so no
+  wheel needs libudev or bundles a system library (the gnu wheels still
+  link glibc, as manylinux allows), and the PyPI build fails if a wheel
+  bundles one. Their `--version` says there's no FIDO2. Person keys
+  aren't usable from the CLI yet; once they are, FIDO2 keys on Linux need
+  a gnu release archive, Homebrew or `cargo install mdkg`. The other
+  install methods are unchanged.
+
+### Internal
+
+- The agent turn is split into the harness seam's kernel operations
+  (`admit`, `starting`, `spawned`, `output`, `import`, `end`) in
+  `mdkg-run`'s new `seam` module, and the turn's harness-specific choices
+  move behind the harness adapter. No change in behaviour.
+
 ## 0.7.1
 
 ### New

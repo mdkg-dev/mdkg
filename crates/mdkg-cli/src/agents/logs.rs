@@ -131,6 +131,35 @@ fn parse_position(text: &str) -> Result<Position, GraphError> {
     }
 }
 
+/// Where `--after` resumes after a line. Opaque to readers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Resume {
+    /// A journal event: `<turn_id>:<seq>`.
+    Seq,
+    /// A synthesized `turn.ended` (no journal end, or its output purged):
+    /// `<turn_id>:end`, so a resume starts with the next turn and never sees
+    /// it again.
+    End,
+    /// No resume point: `agent.state`, and the synthesized `turn.started`
+    /// of a purged turn, which a resume from the line before replays.
+    None,
+}
+
+/// The event as a line, with its resume position.
+fn with_position(event: &Event, resume: Resume) -> Value {
+    let mut line = serde_json::to_value(event).unwrap_or_default();
+    let turn_id = event.turn.as_deref().and_then(|t| t.rsplit('/').next());
+    let position = match (resume, turn_id, event.seq) {
+        (Resume::Seq, Some(id), Some(seq)) => Some(format!("{id}:{seq}")),
+        (Resume::End, Some(id), _) => Some(format!("{id}:end")),
+        _ => None,
+    };
+    if let (Some(position), Some(obj)) = (position, line.as_object_mut()) {
+        obj.insert("position".into(), Value::String(position));
+    }
+    line
+}
+
 /// The stream: lines written and flushed one at a time. A reader that went
 /// away ends it quietly.
 struct Out {
@@ -141,11 +170,15 @@ struct Out {
 
 impl Out {
     fn send(&mut self, event: &Event) {
+        self.send_at(event, Resume::Seq);
+    }
+
+    fn send_at(&mut self, event: &Event, resume: Resume) {
         if self.closed || (event.kind == "native" && !self.native) {
             return;
         }
         let line = if self.json {
-            serde_json::to_string(event).unwrap_or_default()
+            serde_json::to_string(&with_position(event, resume)).unwrap_or_default()
         } else {
             text_line(event)
         };
@@ -209,9 +242,7 @@ fn agent_state_frame(state: &str) -> Event {
 
 /// The turn's derived end, when its evidence says it's over.
 fn derived_end(dir: &Path, agent: &str, entry: &Entry, events: Option<&[Event]>) -> Option<Value> {
-    let derived = index::derive(dir, agent, entry, events, |s| {
-        index::turn_running(dir, agent, s)
-    });
+    let derived = index::derive(dir, agent, entry, events, index::launcher_alive);
     (derived.state != "running").then(|| json!({"outcome": derived.outcome}))
 }
 
@@ -348,13 +379,22 @@ fn one_turn(
             Ok(Some(first)) => break first,
             Ok(None) => (),
             // A journal that's there but can't be read isn't one not
-            // written yet: never wait on it in silence.
-            Err(e) => {
+            // written yet. Followed, it's read again, as every other read
+            // of a follower is; once, it refuses rather than wait on it in
+            // silence.
+            Err(e) if !a.follow => {
                 return Err(graph_error(mdkg_run::RunError::io(
                     &format!("can't read turn {turn_id}'s output journal"),
                     e,
                 ))
                 .into());
+            }
+            Err(_) => {
+                if out.closed || stop.load(Ordering::SeqCst) {
+                    return Ok(());
+                }
+                std::thread::sleep(poll_interval());
+                continue;
             }
         }
         let unknown = |why: String| -> Refusal {
@@ -376,9 +416,7 @@ fn one_turn(
         };
         // No journal yet is a turn just starting (its index line comes
         // first), or an attempt that never got one: neither was purged.
-        let derived = index::derive(dir, agent, &entry, None, |s| {
-            index::turn_running(dir, agent, s)
-        });
+        let derived = index::derive(dir, agent, &entry, None, index::launcher_alive);
         if derived.state == "running" {
             if !a.follow || out.closed || stop.load(Ordering::SeqCst) {
                 return Ok(());
@@ -414,9 +452,22 @@ fn one_turn(
             && let Some(data) = derived_end(dir, agent, &entry, Some(&seen))
         {
             // Over by its evidence, without a journal end: say so, once.
-            let tail_end = tail.read_new().ok().flatten().unwrap_or_default();
+            // A journal that can't be read just now isn't one with nothing
+            // left: try again rather than end past what it still holds.
+            let Ok(tail_end) = tail.read_new() else {
+                std::thread::sleep(poll_interval());
+                batch = Vec::new();
+                continue;
+            };
+            let tail_end = tail_end.unwrap_or_default();
             if tail_end.is_empty() {
-                out.send(&synthetic(agent, turn_id, last + 1, "turn.ended", data));
+                // Not again for a resume past this turn (`<turn_id>:end`).
+                if after != u64::MAX {
+                    out.send_at(
+                        &synthetic(agent, turn_id, last + 1, "turn.ended", data),
+                        Resume::End,
+                    );
+                }
                 return Ok(());
             }
             batch = tail_end;
@@ -477,33 +528,44 @@ fn follow_agent(
             match index.by_number(number) {
                 Some(entry) => {
                     let mut t = journal::Tail::new(dir, agent, &entry.start.turn_id);
-                    match t.read_new().ok().flatten() {
-                        Some(first) => tail = Some((entry.clone(), t, first)),
-                        None => {
+                    match t.read_new() {
+                        Ok(Some(first)) => tail = Some((entry.clone(), t, first)),
+                        // Unreadable just now is not purged: an end here
+                        // would skip a journal still retained.
+                        Err(_) => {
+                            std::thread::sleep(poll_interval());
+                            continue;
+                        }
+                        Ok(None) => {
                             // Its output is gone: the turn still shows, never
                             // skipped silently.
                             let id = &entry.start.turn_id;
-                            let derived = index::derive(dir, agent, entry, None, |s| {
-                                index::turn_running(dir, agent, s)
-                            });
+                            let derived =
+                                index::derive(dir, agent, entry, None, index::launcher_alive);
                             if derived.state == "running" {
                                 std::thread::sleep(poll_interval());
                                 continue;
                             }
-                            out.send(&synthetic(
-                                agent,
-                                id,
-                                1,
-                                "turn.started",
-                                json!({"turn_id": id, "number": entry.start.number}),
-                            ));
-                            out.send(&synthetic(
-                                agent,
-                                id,
-                                2,
-                                "turn.ended",
-                                json!({"outcome": derived.outcome, "output_gone": true}),
-                            ));
+                            out.send_at(
+                                &synthetic(
+                                    agent,
+                                    id,
+                                    1,
+                                    "turn.started",
+                                    json!({"turn_id": id, "number": entry.start.number}),
+                                ),
+                                Resume::None,
+                            );
+                            out.send_at(
+                                &synthetic(
+                                    agent,
+                                    id,
+                                    2,
+                                    "turn.ended",
+                                    json!({"outcome": derived.outcome, "output_gone": true}),
+                                ),
+                                Resume::End,
+                            );
                             number += 1;
                             after = 0;
                             continue;
@@ -534,7 +596,12 @@ fn follow_agent(
         }
         after = after.max(last);
         if !ended {
-            let more = t.read_new().ok().flatten().unwrap_or_default();
+            // A read that fails is retried, never taken for an empty journal.
+            let Ok(more) = t.read_new() else {
+                std::thread::sleep(poll_interval());
+                continue;
+            };
+            let more = more.unwrap_or_default();
             if !more.is_empty() {
                 *pending = more;
                 continue;
@@ -543,23 +610,25 @@ fn follow_agent(
                 .find(&entry.start.turn_id)
                 .cloned()
                 .unwrap_or(entry.clone());
-            let events = journal::read(dir, agent, &entry.start.turn_id)
-                .ok()
-                .flatten();
+            let Ok(events) = journal::read(dir, agent, &entry.start.turn_id) else {
+                std::thread::sleep(poll_interval());
+                continue;
+            };
             match derived_end(dir, agent, &entry, events.as_deref()) {
                 Some(data) => {
-                    let more = t.read_new().ok().flatten().unwrap_or_default();
+                    let Ok(more) = t.read_new() else {
+                        std::thread::sleep(poll_interval());
+                        continue;
+                    };
+                    let more = more.unwrap_or_default();
                     if !more.is_empty() {
                         *pending = more;
                         continue;
                     }
-                    out.send(&synthetic(
-                        agent,
-                        &entry.start.turn_id,
-                        after + 1,
-                        "turn.ended",
-                        data,
-                    ));
+                    out.send_at(
+                        &synthetic(agent, &entry.start.turn_id, after + 1, "turn.ended", data),
+                        Resume::End,
+                    );
                 }
                 None => {
                     std::thread::sleep(poll_interval());

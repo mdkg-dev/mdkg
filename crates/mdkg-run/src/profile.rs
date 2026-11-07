@@ -55,14 +55,14 @@ impl Role {
     }
 }
 
-/// A process to start for one turn. It runs with the launcher's whole
-/// environment plus `env`.
+/// A process to start for one turn. It runs with [`Self::environment`]
+/// (by default the allowlist, [`crate::env`]) plus `env`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct AgentCommand {
     pub program: PathBuf,
     pub args: Vec<String>,
     pub cwd: PathBuf,
-    /// Variables set on top of the launcher's environment.
+    /// Variables set on top of the environment the turn inherits.
     pub env: Vec<(String, String)>,
     /// Whether the prompt goes on stdin (otherwise it's in `args`).
     pub prompt_on_stdin: bool,
@@ -83,6 +83,12 @@ pub struct AgentCommand {
     #[serde(skip)]
     #[schemars(skip)]
     opencode_worker: bool,
+    /// What the process inherits from the launcher's environment: the
+    /// allowlist for its harness unless the agent's policy says otherwise
+    /// (`crate::turn` sets it from `env` in the policy).
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub environment: crate::env::Environment,
 }
 
 /// The hook-trust decision for one actual Codex worker launch attempt.
@@ -1114,6 +1120,7 @@ pub(crate) fn claude(t: &TurnInput<'_>) -> AgentCommand {
         secret_env: Vec::new(),
         codex_hook_binary: None,
         opencode_worker: false,
+        environment: crate::env::Environment::allowlist(t.harness),
     }
 }
 
@@ -1308,6 +1315,7 @@ pub(crate) fn codex(t: &TurnInput<'_>, shell_binary: Option<&Path>) -> AgentComm
         secret_env,
         codex_hook_binary: (t.role == Role::Worker).then(|| t.mdkg.to_path_buf()),
         opencode_worker: false,
+        environment: crate::env::Environment::allowlist(t.harness),
     }
 }
 
@@ -1496,12 +1504,9 @@ pub(crate) fn opencode_preflight(
     let password = format!("{}{}", uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
     let process = || {
         let mut c = Command::new(&command.program);
-        for key in NOT_INHERITED {
-            c.env_remove(key);
-        }
-        for key in crate::auth::withheld_vars() {
-            c.env_remove(key);
-        }
+        // The worker's own environment (crate::env): the allowlist, or the
+        // launcher's less what no harness inherits.
+        command.environment.apply(&mut c);
         // Match the eventual worker's environment, except for mdkg's
         // overlay. The final worker replaces inherited inline config too;
         // letting it enable build only during this probe would be unsafe.
@@ -1778,8 +1783,20 @@ pub(crate) fn opencode(t: &TurnInput<'_>) -> AgentCommand {
         secret_env: Vec::new(),
         codex_hook_binary: None,
         opencode_worker: t.role == Role::Worker,
+        environment: crate::env::Environment::allowlist(t.harness),
     }
 }
+
+/// What every OpenCode turn sets to `1` so OpenCode reads none of another
+/// harness's files: `OPENCODE_DISABLE_CLAUDE_CODE` (the `.claude` prompt
+/// files and skills, and `~/.claude/CLAUDE.md`) and
+/// `OPENCODE_DISABLE_CLAUDE_CODE_SKILLS` (`.claude/skills`). Both are in
+/// OpenCode's documented CLI environment (opencode.ai/docs/cli) and in the
+/// qualified 2.1.0 build.
+pub const OPENCODE_ISOLATION: &[&str] = &[
+    "OPENCODE_DISABLE_CLAUDE_CODE",
+    "OPENCODE_DISABLE_CLAUDE_CODE_SKILLS",
+];
 
 pub(crate) fn opencode_env(t: &TurnInput<'_>) -> Vec<(String, String)> {
     let mut env = agent_env(t);
@@ -1787,6 +1804,13 @@ pub(crate) fn opencode_env(t: &TurnInput<'_>) -> Vec<(String, String)> {
         "OPENCODE_CONFIG_CONTENT".into(),
         opencode_config(t).to_string(),
     ));
+    // Each harness finds only its own memory and instruction files by
+    // itself (item 34): no CLAUDE.md, ~/.claude/CLAUDE.md or .claude/skills
+    // in an OpenCode turn. Set here, after the allowlist, so neither `env.allow`
+    // nor an inherited value can turn them off.
+    for name in OPENCODE_ISOLATION {
+        env.push((name.to_string(), "1".into()));
+    }
     if t.role == Role::Reviewer {
         // A reviewer's checkout is the author's: its opencode.json isn't
         // loaded, the user's own config is (RC1 security audit SEC7).
@@ -4150,6 +4174,17 @@ esac
         assert_eq!(env("OPENCODE_DISABLE_PROJECT_CONFIG").as_deref(), Some("1"));
         assert_eq!(env("OPENCODE_CONFIG_PROJECT_DISABLE").as_deref(), Some("1"));
         let worker = command(&input(Harness::OpenCode, Role::Worker, None));
+        // Neither role reads another harness's instruction files or skills.
+        for c in [&c, &worker] {
+            // The names themselves, not the production list: an emptied
+            // list mustn't pass (review of 5025da08).
+            for name in [
+                "OPENCODE_DISABLE_CLAUDE_CODE",
+                "OPENCODE_DISABLE_CLAUDE_CODE_SKILLS",
+            ] {
+                assert!(c.env.iter().any(|(k, v)| k == name && v == "1"), "{name}");
+            }
+        }
         assert!(
             !worker
                 .env

@@ -16,7 +16,10 @@ use mdkg_run::{ErrorKind, Harness, Inbox, Mail, Message, Outcome, Role, RunError
 struct FakeMail {
     inbox: Vec<Message>,
     acked: Vec<String>,
+    marked_digest: Vec<String>,
     imports: Vec<(String, String, String, String, Option<String>, String)>,
+    digest_imports: Vec<(String, String, Vec<String>, Vec<String>)>,
+    digest_answers: Vec<Option<String>>,
     claims: Vec<String>,
     releases: Vec<String>,
     held: bool,
@@ -68,6 +71,32 @@ struct FakeMail {
 }
 
 impl Mail for FakeMail {
+    fn digest_inbox_after(
+        &mut self,
+        agent: &str,
+        after: Option<u64>,
+        limit: usize,
+    ) -> Result<Inbox, RunError> {
+        self.inbox_after(agent, after, limit)
+    }
+    fn mark_digest_shown(&mut self, _: &str, messages: &[Message]) -> Result<(), RunError> {
+        self.marked_digest
+            .extend(messages.iter().map(|m| m.message_id.clone()));
+        Ok(())
+    }
+    fn import_digest(&mut self, i: &mdkg_run::mail::DigestImport<'_>) -> Result<String, RunError> {
+        if let Some(e) = &self.import_error {
+            return Err(e.clone());
+        }
+        self.digest_answers.push(i.answer.map(str::to_string));
+        self.digest_imports.push((
+            i.kind.into(),
+            i.to.into(),
+            i.nodes.to_vec(),
+            i.references.to_vec(),
+        ));
+        Ok("digest-reply".into())
+    }
     fn fault_send(
         &mut self,
         fault: &mdkg_run::fault::Fault,
@@ -256,6 +285,9 @@ fn message(id: &str, seq: u64, kind: &str, text: &str) -> Message {
         via: None,
         room: Some("review".into()),
         sent_at: None,
+        digest: String::new(),
+        nodes: Vec::new(),
+        supersedes: Vec::new(),
         parts: vec![serde_json::json!({"kind": "text", "text": text})],
     }
 }
@@ -843,7 +875,13 @@ fn codex_runs_in_the_users_environment_with_its_own_codex_home() {
         inbox: vec![message("m1", 1, "handoff", "x")],
         ..FakeMail::default()
     };
-    turn::turn(&mut mail, &s.dir, &mut agent, &opts("fake-codex.sh")).expect("turn");
+    // Use a known MCP command: PATH is only extended when it resolves.
+    // The host running this test need not have an mdkg binary installed.
+    let options = TurnOptions {
+        mdkg: fixture("fake-codex.sh"),
+        ..opts("fake-codex.sh")
+    };
+    turn::turn(&mut mail, &s.dir, &mut agent, &options).expect("turn");
     let env = s.read("codex.environ");
     // The launcher's environment reaches the agent whole, with no
     // CODEX_HOME of the launcher's own.
@@ -970,6 +1008,132 @@ fn an_opencode_worker_gets_its_permission_config_and_a_session() {
     assert!(cfg["permission"].get("edit").is_none(), "{cfg}");
     assert_eq!(cfg["permission"]["bash"]["mdkg auth *"], "deny");
     assert!(s.read("opencode.args").contains("BEGIN BODY"));
+}
+
+/// 0.7.2: a turn starts with the allowlist, never the launcher's whole
+/// environment. The test re-runs itself with a launcher environment made
+/// up here (nothing in it is real) and runs a worker turn on each harness:
+/// a credential-shaped variable never reaches the agent, each harness still
+/// starts with its login (the fakes report one, and the turn would refuse
+/// without it) and its own config folder, and `env.allow` adds a name.
+#[test]
+fn a_turn_inherits_only_the_allowlist_on_every_harness() {
+    const CHILD: &str = "ENV_ALLOWLIST_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let base = std::env::temp_dir().join(format!("mdkg-run-env-home-{}", uuid::Uuid::now_v7()));
+        fs::create_dir_all(base.join("xdg/opencode")).expect("home");
+        let fake = concat!("not-", "a-secret");
+        let child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "a_turn_inherits_only_the_allowlist_on_every_harness",
+                "--exact",
+                "--test-threads=1",
+            ])
+            .env_clear()
+            .env(CHILD, "1")
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", &base)
+            .env("XDG_CONFIG_HOME", base.join("xdg"))
+            .env("TMPDIR", std::env::temp_dir())
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .env("CLAUDE_CONFIG_DIR", base.join("claude"))
+            .env("CODEX_HOME", base.join("codex"))
+            .env("OPENCODE_CONFIG_DIR", base.join("opencode"))
+            .env("FAKE_TOKEN", fake)
+            .env("OPENCODE_SERVER_PASSWORD", fake)
+            .env("MY_TOOL_HOME", "/tmp/my-tool")
+            .env("UNLISTED", "x")
+            // An inherited value can't turn OpenCode's isolation off.
+            .env("OPENCODE_DISABLE_CLAUDE_CODE", "0")
+            .output()
+            .expect("isolated fixture");
+        let _ = fs::remove_dir_all(&base);
+        // The child's environment is the one made up above, so its output
+        // holds nothing real.
+        assert!(child.status.success(), "{child:?}");
+        assert!(
+            String::from_utf8_lossy(&child.stdout).contains("test result: ok. 1 passed; 0 failed;"),
+            "child did not run: {child:?}"
+        );
+        return;
+    }
+
+    for (h, fake, environ, own, others) in [
+        (
+            Harness::Claude,
+            "fake-claude.sh",
+            "claude.environ",
+            "CLAUDE_CONFIG_DIR",
+            ["CODEX_HOME", "OPENCODE_CONFIG_DIR"],
+        ),
+        (
+            Harness::Codex,
+            "fake-codex.sh",
+            "codex.environ",
+            "CODEX_HOME",
+            ["CLAUDE_CONFIG_DIR", "OPENCODE_CONFIG_DIR"],
+        ),
+        (
+            Harness::OpenCode,
+            "fake-opencode.sh",
+            "opencode.environ",
+            "OPENCODE_CONFIG_DIR",
+            ["CLAUDE_CONFIG_DIR", "CODEX_HOME"],
+        ),
+    ] {
+        let s = Setup::new(&format!("envallow-{}", h.as_str()));
+        let mut agent = s.agent("envw", h, Role::Worker);
+        if h == Harness::OpenCode {
+            agent.spec.model = Some("anthropic/claude-haiku".into());
+        }
+        let mut mail = FakeMail {
+            inbox: vec![message("m1", 1, "note", "hi")],
+            ..FakeMail::default()
+        };
+        let mut o = opts(fake);
+        o.env = mdkg_run::policy::Env {
+            allow: vec!["MY_TOOL_HOME".into()],
+            inherit: None,
+        };
+        turn::turn(&mut mail, &s.dir, &mut agent, &o).expect("turn");
+        let env = s.read(environ);
+        let has = |var: &str| env.lines().any(|l| l.starts_with(&format!("{var}=")));
+        for var in [
+            "PATH",
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "GIT_AUTHOR_NAME",
+            "MY_TOOL_HOME",
+            own,
+        ] {
+            assert!(has(var), "{h:?}: {var} missing:\n{env}");
+        }
+        for var in ["FAKE_TOKEN", "OPENCODE_SERVER_PASSWORD", "UNLISTED", CHILD]
+            .into_iter()
+            .chain(others)
+        {
+            assert!(!has(var), "{h:?}: {var} reached the agent:\n{env}");
+        }
+        if h == Harness::OpenCode {
+            // OpenCode reads no other harness's instruction files or
+            // skills, whatever the launcher had set (item 34).
+            // The names themselves, not the production list (review of
+            // 5025da08); the launcher's =0 must not survive.
+            for name in [
+                "OPENCODE_DISABLE_CLAUDE_CODE",
+                "OPENCODE_DISABLE_CLAUDE_CODE_SKILLS",
+            ] {
+                let last = env.lines().rfind(|l| l.starts_with(&format!("{name}=")));
+                assert_eq!(last, Some(format!("{name}=1").as_str()), "{env}");
+            }
+        }
+        assert_eq!(mail.imports.len(), 1, "{h:?} replied");
+    }
 }
 
 #[test]
@@ -1807,6 +1971,12 @@ fn stopping_an_agent_stops_what_it_started() {
 /// keeps writing its folder for a while.
 #[test]
 fn linger_child() {
+    // Only as that test starts it: with the turn's mark, and the log its
+    // fixture names. A `cargo test` run inside a real turn has the mark
+    // but no log path, so nothing lands in the source tree (#14164).
+    let Some(log) = std::env::var_os("MDKG_TEST_LINGER_LOG") else {
+        return;
+    };
     if std::env::var_os("MDKG_RUN_TURN").is_none() {
         return;
     }
@@ -1814,7 +1984,7 @@ fn linger_child() {
         let mut log = fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open("fake-linger.log")
+            .open(&log)
             .expect("log");
         std::io::Write::write_all(&mut log, b"x\n").expect("w");
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -1831,7 +2001,12 @@ fn nothing_the_agent_left_running_outlives_a_turn_that_went_well() {
     let exe = std::env::current_exe().expect("exe");
     fs::write(
         s.work.join("fake-linger"),
-        format!("{} linger_child --exact --test-threads=1", exe.display()),
+        // Relative to the fake's folder, where the child runs: the fake
+        // splits this line on spaces, and a temp folder may hold one.
+        format!(
+            "env MDKG_TEST_LINGER_LOG=fake-linger.log {} linger_child --exact --test-threads=1",
+            exe.display()
+        ),
     )
     .expect("w");
     let mut agent = s.agent("w", Harness::Claude, Role::Worker);
@@ -1859,6 +2034,7 @@ fn nothing_the_agent_left_running_outlives_a_turn_that_went_well() {
     }
     assert!(!alive(), "the agent's leftover {pid} is still running");
     let before = s.read("fake-linger.log");
+    assert!(!before.is_empty(), "the leftover wrote its log");
     std::thread::sleep(std::time::Duration::from_millis(300));
     assert_eq!(
         s.read("fake-linger.log"),
@@ -3226,6 +3402,85 @@ fn a_usage_limit_offers_the_key_and_only_use_key_bills_it() {
     mail.inbox.push(message("m2", 2, "note", "y"));
     turn::turn(&mut mail, &s.dir, &mut agent, &on).expect_err("limited again");
     assert!(!s.read("claude.args").contains("apiKeyHelper"));
+}
+
+/// Claude's current limit shape (a rejected `rate_limit_event`, then a
+/// 429 result saying "You've hit your weekly limit") is a usage limit, and
+/// the hint says which limit and when it resets.
+#[test]
+fn claudes_weekly_limit_is_a_usage_limit_with_its_reset_time() {
+    let s = Setup::new("limit-weekly");
+    let (_key, keys, helper) = fake_keys(&s);
+    fs::write(s.work.join("fake-mode"), "limit-weekly").expect("w");
+    let mut agent = s.agent("lane", Harness::Claude, Role::Reviewer);
+    let mut mail = FakeMail {
+        inbox: vec![message("m1", 1, "note", "x")],
+        ..FakeMail::default()
+    };
+    let on = with_fallback(opts("fake-claude.sh"), true, keys, &helper);
+    let e = turn::turn(&mut mail, &s.dir, &mut agent, &on).expect_err("limited");
+    let hint = e.hint.unwrap_or_default();
+    assert!(hint.contains("subscription limit reached"), "{hint}");
+    assert!(hint.contains("agents use-key lane"), "{hint}");
+    assert!(
+        hint.contains("(seven_day limit; resets 2026-10-26T"),
+        "{hint}"
+    );
+    assert!(mail.acked.is_empty());
+}
+
+/// A limit only the earlier `rate_limit_event` names, on a turn Claude
+/// ends with exit 0 and a result that isn't a reply, is still a limit, and
+/// never the turn's own failure: however often it repeats, the mail it was
+/// shown is never set aside.
+#[test]
+fn a_zero_exit_limit_named_only_by_its_event_never_sets_mail_aside() {
+    let s = Setup::new("limit-event");
+    let (_key, keys, helper) = fake_keys(&s);
+    fs::write(s.work.join("fake-mode"), "limit-event").expect("w");
+    let mut agent = s.agent("lane", Harness::Claude, Role::Reviewer);
+    let mut mail = FakeMail {
+        inbox: vec![message("m1", 1, "note", "x")],
+        ..FakeMail::default()
+    };
+    let on = with_fallback(opts("fake-claude.sh"), true, keys, &helper);
+    for _ in 0..4 {
+        let e = turn::turn(&mut mail, &s.dir, &mut agent, &on).expect_err("limited");
+        let hint = e.hint.unwrap_or_default();
+        assert!(hint.contains("subscription limit reached"), "{hint}");
+        assert!(
+            hint.contains("(five_hour limit; resets 2026-10-26T"),
+            "{hint}"
+        );
+        assert!(mail.acked.is_empty(), "{:?}", mail.acked);
+        assert_eq!(mdkg_run::state::Shows::load(&s.dir, "lane").count("m1"), 0);
+    }
+}
+
+/// Provider throttling (a 429 that names no limit) is transient: however
+/// often it repeats, the mail it was shown is never set aside, and no key
+/// is offered (orchestrator, under dec-01a18ee0 item 8; review of
+/// d009bf16).
+#[test]
+fn a_throttled_turn_never_sets_mail_aside_or_offers_the_key() {
+    let s = Setup::new("throttled");
+    let (_key, keys, helper) = fake_keys(&s);
+    fs::write(s.work.join("fake-mode"), "throttled").expect("w");
+    let mut agent = s.agent("lane", Harness::Claude, Role::Reviewer);
+    let mut mail = FakeMail {
+        inbox: vec![message("m1", 1, "note", "x")],
+        ..FakeMail::default()
+    };
+    let on = with_fallback(opts("fake-claude.sh"), true, keys, &helper);
+    for _ in 0..4 {
+        let e = turn::turn(&mut mail, &s.dir, &mut agent, &on).expect_err("throttled");
+        let hint = e.hint.unwrap_or_default();
+        assert!(hint.contains("throttled requests (HTTP 429)"), "{hint}");
+        assert!(!hint.contains("use-key"), "{hint}");
+        assert!(!hint.contains("subscription limit"), "{hint}");
+        assert!(mail.acked.is_empty(), "{:?}", mail.acked);
+        assert_eq!(mdkg_run::state::Shows::load(&s.dir, "lane").count("m1"), 0);
+    }
 }
 
 #[test]
@@ -5917,9 +6172,9 @@ fn a_no_reply_turn_sends_nothing_and_acks_what_it_was_shown_for_every_harness() 
             ..FakeMail::default()
         };
         let r = turn::turn(&mut mail, &s.dir, &mut agent, &opts(fake)).expect("turn");
-        assert_eq!(r.outcome, Outcome::Replied, "{harness:?}");
+        assert_eq!(r.outcome, Outcome::NoReply, "{harness:?}");
         assert_eq!(r.reply_id, None, "{harness:?}");
-        assert_eq!(r.reply.as_deref(), Some("NO_REPLY"), "{harness:?}");
+        assert_eq!(r.reply, None, "{harness:?}");
         assert!(mail.imports.is_empty(), "{harness:?}: nothing is sent");
         assert_eq!(mail.acked, ["m1", "m2"], "{harness:?}");
         assert!(
@@ -6492,4 +6747,194 @@ fn a_re_exec_doesnt_block_itself() {
         "{:?}",
         mail.releases
     );
+}
+
+#[test]
+fn digest_turn_groups_and_acks_only_bodies_for_all_harnesses() {
+    for (name, harness, role, fake) in [
+        ("claude", Harness::Claude, Role::Worker, "fake-claude.sh"),
+        ("codex", Harness::Codex, Role::Reviewer, "fake-codex.sh"),
+        (
+            "opencode",
+            Harness::OpenCode,
+            Role::Worker,
+            "fake-opencode.sh",
+        ),
+    ] {
+        let s = Setup::new(&format!("digest-{name}"));
+        let mut agent = s.agent(name, harness, role);
+        if harness == Harness::OpenCode {
+            agent.spec.model = Some("anthropic/claude-haiku".into());
+        }
+        agent.spec.reports_to = "coordinator".into();
+        let mut first = message("m1", 1, "review_request", "small");
+        first.nodes = vec!["task-one".into()];
+        first.context_id = Some("one".into());
+        let mut second = message("m2", 2, "note", &"x".repeat(6000));
+        second.context_id = Some("two".into());
+        let mut mail = FakeMail {
+            inbox: vec![first, second],
+            ..FakeMail::default()
+        };
+        let o = TurnOptions {
+            digest_budget: Some(1000),
+            user_codex_home: Some(s.work.join("fake-codex-home")),
+            ..opts(fake)
+        };
+        let report = turn::turn(&mut mail, &s.dir, &mut agent, &o).expect("digest turn");
+        assert_eq!(report.shown, ["m1"], "{name}");
+        assert_eq!(mail.acked, ["m1"], "{name}");
+        assert_eq!(mail.marked_digest, ["m1"], "{name}");
+        assert_eq!(mail.digest_imports.len(), 1, "{name}");
+        let (kind, to, nodes, refs) = &mail.digest_imports[0];
+        assert_eq!(
+            kind,
+            if role == Role::Worker {
+                "handoff"
+            } else {
+                "findings"
+            }
+        );
+        assert_eq!(to, "coordinator");
+        assert_eq!(nodes, &["task-one"]);
+        assert_eq!(refs, &["m1"]);
+    }
+}
+
+#[test]
+fn a_refused_digest_reply_leaves_shown_mail_unacked() {
+    let s = Setup::new("digest-refused");
+    let mut agent = s.agent("lane", Harness::Claude, Role::Worker);
+    let mut mail = FakeMail {
+        inbox: vec![message("m1", 1, "question", "question")],
+        import_error: Some(RunError::usage("msg.secret_refused", "refused")),
+        ..FakeMail::default()
+    };
+    let o = TurnOptions {
+        digest_budget: Some(4096),
+        ..opts("fake-claude.sh")
+    };
+    let err = turn::turn(&mut mail, &s.dir, &mut agent, &o).expect_err("refused");
+    assert_eq!(err.code, "msg.secret_refused");
+    assert!(mail.acked.is_empty());
+}
+
+#[test]
+fn digest_does_not_answer_a_header_or_unrelated_review_request() {
+    let s = Setup::new("digest-answer");
+    let mut agent = s.agent("lane", Harness::Claude, Role::Worker);
+    agent.spec.reports_to = "coordinator".into();
+    let mut request = message("review", 1, "review_request", "review");
+    request.sender = "another-reviewer".into();
+    request.room = None;
+    let mut header = message("coordinator", 2, "note", &"x".repeat(6000));
+    header.sender = "coordinator".into();
+    header.room = None;
+    let mut mail = FakeMail {
+        inbox: vec![request, header],
+        ..FakeMail::default()
+    };
+    let options = TurnOptions {
+        digest_budget: Some(1000),
+        ..opts("fake-claude.sh")
+    };
+    turn::turn(&mut mail, &s.dir, &mut agent, &options).expect("turn");
+    assert_eq!(mail.digest_answers, [None]);
+    assert_eq!(mail.digest_imports[0].3, ["review"]);
+    assert_eq!(mail.acked, ["review"]);
+}
+
+#[test]
+fn digest_answers_a_shown_message_from_its_destination() {
+    let s = Setup::new("digest-destination");
+    let mut agent = s.agent("lane", Harness::Claude, Role::Worker);
+    agent.spec.reports_to = "coordinator".into();
+    let mut direct = message("direct", 1, "question", "question");
+    direct.sender = "coordinator".into();
+    direct.room = None;
+    let mut request = message("review", 2, "review_request", "review");
+    request.sender = "another-reviewer".into();
+    request.room = None;
+    let mut mail = FakeMail {
+        inbox: vec![direct, request],
+        ..FakeMail::default()
+    };
+    let options = TurnOptions {
+        digest_budget: Some(4096),
+        ..opts("fake-claude.sh")
+    };
+    turn::turn(&mut mail, &s.dir, &mut agent, &options).expect("turn");
+    assert_eq!(mail.digest_answers, [Some("direct".into())]);
+    assert_eq!(mail.digest_imports[0].3, ["review"]);
+}
+
+#[test]
+fn digest_refuses_a_hard_cap_that_cannot_fit_its_oldest_body() {
+    let s = Setup::new("digest-hard-cap");
+    let mut agent = s.agent("lane", Harness::OpenCode, Role::Worker);
+    agent.spec.model = Some("anthropic/claude-haiku".into());
+    let mut mail = FakeMail {
+        inbox: vec![message("old", 1, "note", &"x".repeat(120_000))],
+        ..FakeMail::default()
+    };
+    let options = TurnOptions {
+        digest_budget: Some(48_000),
+        ..opts("fake-opencode.sh")
+    };
+    let error = turn::turn(&mut mail, &s.dir, &mut agent, &options).expect_err("too large");
+    assert_eq!(error.code, "flow.digest_too_large");
+    assert!(mail.acked.is_empty());
+    assert!(mail.digest_imports.is_empty());
+}
+
+#[test]
+fn digest_skips_a_paused_node_and_runs_another() {
+    let s = Setup::new("digest-paused");
+    let mut agent = s.agent("lane", Harness::Claude, Role::Worker);
+    let g = mdkg_run::policy::LoopGuard {
+        turns: 1,
+        window: std::time::Duration::from_secs(3600),
+    };
+    mdkg_run::supervise::Guard::update(&s.dir, "lane", false, |guard| {
+        guard.record(&g, "node:paused", state::now_ms());
+        Ok(())
+    })
+    .unwrap();
+    let mut paused = message("m1", 1, "question", "paused");
+    paused.nodes = vec!["task-paused".into()];
+    let mut active = message("m2", 2, "question", "active");
+    active.nodes = vec!["task-active".into()];
+    let mut mail = FakeMail {
+        inbox: vec![paused, active],
+        ..FakeMail::default()
+    };
+    let opts = TurnOptions {
+        digest_budget: Some(4096),
+        ..guarded("fake-claude.sh", 1)
+    };
+    let r = turn::turn(&mut mail, &s.dir, &mut agent, &opts).expect("turn");
+    assert_eq!(r.shown, ["m2"]);
+    assert_eq!(mail.acked, ["m2"]);
+    assert_eq!(r.paused, ["node:paused"]);
+}
+
+#[test]
+fn digest_reads_past_the_first_inbox_page() {
+    let s = Setup::new("digest-pages");
+    let mut agent = s.agent("lane", Harness::Claude, Role::Worker);
+    let inbox = (1..=25)
+        .map(|n| message(&format!("m{n}"), n, "question", "small"))
+        .collect();
+    let mut mail = FakeMail {
+        inbox,
+        ..FakeMail::default()
+    };
+    let opts = TurnOptions {
+        digest_budget: Some(48000),
+        ..opts("fake-claude.sh")
+    };
+    let r = turn::turn(&mut mail, &s.dir, &mut agent, &opts).expect("turn");
+    assert_eq!(r.shown.len(), 25);
+    assert_eq!(mail.acked.len(), 25);
+    assert_eq!(mail.marked_digest.len(), 25);
 }

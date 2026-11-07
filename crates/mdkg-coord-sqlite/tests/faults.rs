@@ -528,3 +528,167 @@ fn a_fault_records_no_expiry_where_a_note_records_its_kinds() {
     assert_eq!(expiry("fault.e1.r0"), None);
     assert_eq!(expiry("n1"), Some(1 + 3 * 24 * 60 * 60 * 1000));
 }
+
+/// A store holding `agents` × `codes` × `per` fault occurrences, each
+/// superseding the last of its agent and code (so `agents` × `codes` stay
+/// open). Agent `w<a>`'s code `c<k>` clears on `cond<k>`.
+fn history(s: &mut Store, agents: usize, codes: usize, per: usize) -> u64 {
+    let mut now = 0;
+    for round in 0..per {
+        for a in 0..agents {
+            for k in 0..codes {
+                now += 1;
+                let (agent, code) = (format!("w{a}"), format!("c{k}"));
+                let id = format!("h{a}-{k}-{round}");
+                send(s, &id, &agent, &code, &format!("cond{k}"), &["boss"], now);
+            }
+        }
+    }
+    now
+}
+
+/// The fault messages one call reads whole, and how long it took.
+fn reads<T>(f: impl FnOnce() -> T) -> (T, u64, std::time::Duration) {
+    let before = mdkg_coord_sqlite::mail::fault_rows_read();
+    let start = std::time::Instant::now();
+    let out = f();
+    let took = start.elapsed();
+    (
+        out,
+        mdkg_coord_sqlite::mail::fault_rows_read() - before,
+        took,
+    )
+}
+
+/// e-gitcache step 1: what one send, resend and clear read on a store
+/// with 2,000 faults from 50 agents. Run with `--ignored --nocapture`.
+#[test]
+#[ignore = "measurement: prints fault rows read on a 2,000-fault store"]
+fn measure_fault_rows_read_on_a_large_store() {
+    let dir = Scratch::new("measure");
+    let mut s = dir.store();
+    let start = std::time::Instant::now();
+    let now = history(&mut s, 50, 4, 10);
+    eprintln!("2,000 fault sends took {:?}", start.elapsed());
+    let (_, sent, t1) = reads(|| send(&mut s, "new", "w7", "c1", "cond1", &["boss"], now + 1));
+    let (_, resent, t2) = reads(|| send(&mut s, "new", "w7", "c1", "cond1", &["lead"], now + 2));
+    let (_, cleared, t3) = reads(|| s.clear_faults("w7", "cond1", now + 3).unwrap());
+    eprintln!(
+        "fault rows read: send {sent} ({t1:?}), resend {resent} ({t2:?}), clear {cleared} ({t3:?})"
+    );
+}
+
+/// e-gitcache step 3: a send or resend decodes only the faults of the
+/// agent and code in question, and a clear the latest fault of each of the
+/// agent's codes and the copies of each of those whose condition it is
+/// (cleared before or not), however many other faults the store holds. (SQL still reads candidate bodies to pick them out; this counts
+/// decoded messages, not rows SQLite scans.)
+#[test]
+fn the_dedupe_reads_only_the_agent_and_codes_faults() {
+    let dir = Scratch::new("bounded");
+    let mut s = dir.store();
+    let now = history(&mut s, 12, 3, 4);
+    // The open occurrence of w7's c1, superseded.
+    let (sent, n, _) = reads(|| send(&mut s, "new", "w7", "c1", "cond1", &["boss"], now + 1));
+    let FaultSent::Sent { superseded, .. } = &sent else {
+        panic!("{sent:?}");
+    };
+    assert_eq!(superseded, &vec!["fault.h7-1-3.r0".to_string()]);
+    assert_eq!(data(&mut s, "fault.new.r0")["count"], 5);
+    assert_eq!(n, 1, "the one open fault of w7's c1");
+    // Routed again: its copy, and nothing stored after it.
+    let (again, n, _) = reads(|| send(&mut s, "new", "w7", "c1", "cond1", &["lead"], now + 2));
+    assert_eq!(sent_id(&again), "fault.new.r1");
+    assert!(n <= 3, "read {n}");
+    // A clear reads the latest of each of w7's three codes and the copies
+    // of the one it ends.
+    let (cleared, n, _) = reads(|| s.clear_faults("w7", "cond1", now + 3).unwrap());
+    assert_eq!(cleared.len(), 1);
+    assert_eq!(cleared[0].fault_id, "new");
+    assert_eq!(n, 3 + 2, "read {n}");
+    // An earlier occurrence, replaced by a later one, stands where it is,
+    // reading only what was stored after it.
+    let (stood, n, _) = reads(|| send(&mut s, "h7-0-2", "w7", "c0", "cond0", &["third"], now + 4));
+    assert!(matches!(stood, FaultSent::Stood(_)), "{stood:?}");
+    assert!(n <= 3, "read {n}");
+    // The active one follows a changed recipient.
+    let (moved, _, _) = reads(|| send(&mut s, "h7-0-3", "w7", "c0", "cond0", &["third"], now + 5));
+    assert_eq!(sent_id(&moved), "fault.h7-0-3.r1");
+}
+
+/// A fault message whose body is damaged, not an array, or holds parts
+/// that aren't objects is skipped by the dedupe's queries as it was by the
+/// decoding they replace: it never fails a send or clear.
+#[test]
+fn a_damaged_fault_body_is_skipped_not_an_error() {
+    let dir = Scratch::new("damaged");
+    let mut s = dir.store();
+    for (i, id) in ["d1", "d2", "d3", "d4"].iter().enumerate() {
+        send(
+            &mut s,
+            id,
+            "lane",
+            "run.agent_failed",
+            TURN,
+            &["boss"],
+            i as u64 + 1,
+        );
+    }
+    drop(s);
+    let db = rusqlite::Connection::open(dir.0.join("mdkg").join("coord.sqlite")).unwrap();
+    for (id, parts) in [
+        ("fault.d2.r0", "{not json"),
+        ("fault.d3.r0", r#"{"kind": "data"}"#),
+        (
+            "fault.d4.r0",
+            r#"["text", 5, null, [1], {"data": "x"}, {"data": {"schema": 1}}]"#,
+        ),
+    ] {
+        db.execute(
+            "UPDATE msg_bodies SET parts = ?2
+             WHERE seq = (SELECT seq FROM msg_messages WHERE message_id = ?1)",
+            [id, parts],
+        )
+        .unwrap();
+    }
+    drop(db);
+    let mut s = dir.store();
+    // The open d4 copy is no fault to the dedupe now, so d1's count
+    // carries on and only intact faults are superseded.
+    let sent = send(&mut s, "d5", "lane", "run.agent_failed", TURN, &["boss"], 9);
+    let FaultSent::Sent { superseded, .. } = &sent else {
+        panic!("{sent:?}");
+    };
+    assert!(superseded.is_empty(), "{superseded:?}");
+    let cleared = s.clear_faults("lane", TURN, 10).unwrap();
+    assert_eq!(cleared.len(), 1);
+    assert_eq!(cleared[0].fault_id, "d5");
+}
+
+/// Codes sharing a condition (a successful turn ends several): a clear
+/// ends the latest occurrence of each, decoding the latest of every code
+/// and the copies of each it matches; a repeated clear ends nothing again.
+#[test]
+fn a_clear_ends_every_code_sharing_its_condition_once() {
+    let dir = Scratch::new("shared");
+    let mut s = dir.store();
+    send(&mut s, "a1", "lane", "run.agent_failed", TURN, &["boss"], 1);
+    send(&mut s, "b1", "lane", "run.login", TURN, &["boss"], 2);
+    send(&mut s, "c1", "lane", "run.loop_paused", LOOP, &["boss"], 3);
+    send(
+        &mut s,
+        "x1",
+        "other",
+        "run.agent_failed",
+        TURN,
+        &["boss"],
+        4,
+    );
+    let (cleared, n, _) = reads(|| s.clear_faults("lane", TURN, 5).unwrap());
+    let ids: Vec<&str> = cleared.iter().map(|c| c.fault_id.as_str()).collect();
+    assert_eq!(ids, vec!["a1", "b1"]);
+    assert_eq!(n, 3 + 2, "three latest, then one copy of each match");
+    assert_eq!(unacked(&mut s, "boss"), vec!["fault.c1.r0", "fault.x1.r0"]);
+    let (again, _, _) = reads(|| s.clear_faults("lane", TURN, 6).unwrap());
+    assert!(again.is_empty(), "{again:?}");
+}

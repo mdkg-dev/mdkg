@@ -294,6 +294,7 @@ pub(crate) fn callbacks() -> mdkg_run::mail::ReceiptCallbacks {
         fault: crate::msg::deliver_fault,
         clear: crate::msg::clear_faults,
         clears: crate::msg::fault_clears,
+        sent: crate::msg::sent_to,
     }
 }
 

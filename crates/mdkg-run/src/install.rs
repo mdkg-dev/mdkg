@@ -3338,6 +3338,59 @@ pub fn sync_skills(
     })
 }
 
+/// What install would do to the skill mirrors, planned exactly as install
+/// plans them (the same `skills` and managed-list planners) and filtered by
+/// the setup's `keep` rule, with nothing written: `skills validate`'s
+/// verdict in ref mode (f-adopt #15953). `changes` are the mirror files
+/// install would create, update or remove; `left_alone` the planned ones
+/// `keep` leaves (the professional setup's tracked or linked files).
+pub fn preview_skill_mirrors(
+    source: &Path,
+    root: &Path,
+    projections: &Projections,
+    keep: &dyn Fn(&Path) -> bool,
+) -> Result<SkillPreview, RunError> {
+    let mut notes = Vec::new();
+    let mirrors = projections.mirrors();
+    let mut plan = skills(source, root, &mut notes, &mirrors)?;
+    managed_lists(source, root, &mut plan, &mirrors)?;
+    let mut left_alone = Vec::new();
+    plan.retain(|p| {
+        let kept = keep(&p.path);
+        if !kept && p.action != Action::Unchanged {
+            left_alone.push(rel(root, &p.path));
+        }
+        kept
+    });
+    Ok(SkillPreview {
+        changes: plan
+            .iter()
+            .filter(|p| p.action != Action::Unchanged)
+            .map(|p| Change {
+                path: rel(root, &p.path),
+                action: p.action,
+            })
+            .collect(),
+        left_alone,
+        notes,
+        mirrors: mirrors
+            .iter()
+            .map(|m| m.trim_end_matches('/').to_owned())
+            .collect(),
+    })
+}
+
+/// [`preview_skill_mirrors`]'s answer.
+#[derive(Debug, Clone, Default)]
+pub struct SkillPreview {
+    pub changes: Vec<Change>,
+    pub left_alone: Vec<String>,
+    /// The planner's notes, such as the source files it skips.
+    pub notes: Vec<String>,
+    /// The mirror folders planned, relative to the root.
+    pub mirrors: Vec<String>,
+}
+
 /// Plans each mirror's list of the skills mdkg keeps there, as 0.6.0
 /// writes it (`validate` expects it, and it marks which folders are
 /// mdkg's), and the removal of skills the list had whose source is gone.

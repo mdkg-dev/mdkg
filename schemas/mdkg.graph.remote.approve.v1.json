@@ -1,0 +1,524 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "mdkg.graph.remote.approve.v1",
+  "description": "Every command's JSON output.",
+  "type": "object",
+  "properties": {
+    "schema": {
+      "description": "`mdkg.<command>.v<major>`.",
+      "const": "mdkg.graph.remote.approve.v1"
+    },
+    "ok": {
+      "description": "False exactly when there is an error diagnostic; the exit code is\nnon-zero exactly when this is false.",
+      "type": "boolean"
+    },
+    "data": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ApproveData"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "diagnostics": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/DiagnosticOut"
+      }
+    }
+  },
+  "required": [
+    "schema",
+    "ok",
+    "diagnostics"
+  ],
+  "$defs": {
+    "ApproveData": {
+      "description": "`graph remote approve`.",
+      "type": "object",
+      "properties": {
+        "remote": {
+          "type": "string"
+        },
+        "remote_ref": {
+          "type": "string"
+        },
+        "fetch": {
+          "description": "The effective fetch destinations, normalized (host and path).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "push": {
+          "description": "The effective push destinations, normalized.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "code_remote": {
+          "description": "The graph remote is the code's own remote (the personal setup).",
+          "type": "boolean"
+        },
+        "previous": {
+          "description": "What was approved before, when it differs.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pinned": {
+          "description": "Written (false on `--dry-run`).",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "remote",
+        "remote_ref",
+        "fetch",
+        "push",
+        "code_remote",
+        "pinned"
+      ]
+    },
+    "DiagnosticOut": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/Code"
+        },
+        "severity": {
+          "$ref": "#/$defs/SeverityName"
+        },
+        "path": {
+          "description": "Relative to the repository root.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "line": {
+          "description": "1-based.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "node": {
+          "description": "The node's id (`ws:id` outside the root workspace).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message": {
+          "type": "string"
+        },
+        "hint": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "holders": {
+          "description": "The actors it's about (a lease's holders): names other actors\nchose, so data, never part of the message.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "related": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/LocationOut"
+          }
+        }
+      },
+      "required": [
+        "code",
+        "severity",
+        "message"
+      ]
+    },
+    "Code": {
+      "description": "A stable diagnostic code.",
+      "type": "string",
+      "enum": [
+        "usage.invalid_arguments",
+        "api.bad_cursor",
+        "api.cursor_reset",
+        "api.cursor_foreign",
+        "api.cursor_expired",
+        "usage.empty_query",
+        "usage.bad_limit",
+        "usage.unsupported_type",
+        "usage.unknown_field",
+        "usage.unknown_status",
+        "usage.unknown_type",
+        "usage.unknown_changeset",
+        "usage.bad_status",
+        "usage.bad_value",
+        "usage.path_outside_worktree",
+        "config.missing",
+        "config.unreadable",
+        "config.invalid",
+        "config.unknown_workspace",
+        "config.graph_v2_unsupported",
+        "frontmatter.missing_open",
+        "frontmatter.unclosed",
+        "frontmatter.blank_line",
+        "frontmatter.not_key_value",
+        "frontmatter.stray_cr",
+        "frontmatter.invalid_key",
+        "frontmatter.duplicate_key",
+        "frontmatter.empty_value",
+        "frontmatter.bad_list",
+        "frontmatter.empty_list_item",
+        "frontmatter.too_large",
+        "node.unknown_type",
+        "node.bad_id",
+        "node.unknown_key",
+        "node.wrong_kind",
+        "node.empty_field",
+        "node.not_lowercase",
+        "node.bad_date",
+        "node.missing_status",
+        "node.bad_status",
+        "node.status_not_allowed",
+        "node.bad_priority",
+        "node.priority_not_allowed",
+        "node.bad_ref",
+        "node.bad_skill_slug",
+        "node.skills_not_allowed",
+        "node.bad_scope",
+        "node.supersedes_not_allowed",
+        "node.bad_supersedes",
+        "node.bad_identity",
+        "node.identity_unsupported",
+        "node.bad_integer",
+        "node.duplicate_id",
+        "node.bad_legacy_id",
+        "node.duplicate_legacy_id",
+        "node.extension_key_conflict",
+        "node.stale_type",
+        "node.date_only",
+        "node.legacy_extension_key",
+        "node.bad_body_link",
+        "node.not_found",
+        "node.ambiguous",
+        "node.resolved",
+        "node.exists",
+        "node.none_ready",
+        "node.not_work",
+        "node.heading_missing",
+        "node.raw_prompt",
+        "node.raw_payload",
+        "node.raw_secret",
+        "node.legacy_spec_file",
+        "node.legacy_spec_type",
+        "goal.bad_state",
+        "goal.condition_too_long",
+        "goal.bad_scope_ref",
+        "goal.empty_check",
+        "goal.scope_ref_missing",
+        "goal.scope_ref_wrong_type",
+        "goal.active_node_missing",
+        "goal.active_node_wrong_type",
+        "goal.active_node_outside_scope",
+        "goal.multiple_active",
+        "goal.none_active",
+        "goal.not_goal",
+        "edge.missing_target",
+        "edge.prev_next_asymmetric",
+        "edge.cycle",
+        "template.missing",
+        "template.invalid",
+        "template.fallback",
+        "skill.both_files",
+        "skill.missing_file",
+        "skill.legacy_file",
+        "skill.missing_slug",
+        "skill.mirror_missing",
+        "skill.mirror_manifest_missing",
+        "index.limit_exceeded",
+        "io.read_failed",
+        "io.git_failed",
+        "io.write_failed",
+        "coord.lease_held",
+        "coord.cas_failed",
+        "coord.past_deadline",
+        "coord.not_owner",
+        "coord.not_active",
+        "coord.no_lease",
+        "coord.unknown_lease",
+        "coord.unknown_changeset",
+        "coord.already_settled",
+        "coord.out_of_scope",
+        "coord.observation_raced",
+        "coord.key_reused",
+        "coord.duplicate_lease",
+        "coord.sync_needed",
+        "coord.sync_failed",
+        "coord.path_missing",
+        "coord.lease_limit",
+        "coord.merge_conflict",
+        "coord.lease_shared",
+        "coord.node_done",
+        "coord.contains_abandoned",
+        "coord.store_failed",
+        "coord.store_restored",
+        "coord.store_upgraded",
+        "coord.store_weak_sync",
+        "coord.authority_failed",
+        "coord.authority_remote",
+        "coord.authority_note",
+        "coord.authority_ignored",
+        "log.broken",
+        "log.anchor_mismatch",
+        "log.anchor_missing",
+        "log.anchored",
+        "edge.target_not_on_branch",
+        "edge.private_target",
+        "edge.blocks_ancestor",
+        "msg.human_actor",
+        "msg.reserved_actor",
+        "msg.bad_kind",
+        "msg.bad_id",
+        "msg.no_parts",
+        "msg.too_large",
+        "msg.secret_refused",
+        "msg.id_reused",
+        "msg.no_recipients",
+        "msg.unknown_message",
+        "msg.unknown_context",
+        "msg.not_holder",
+        "msg.not_shown",
+        "msg.not_sender",
+        "msg.wait_timeout",
+        "channel.unknown",
+        "channel.exists",
+        "channel.not_member",
+        "channel.human_member",
+        "room.unknown",
+        "room.exists",
+        "room.not_member",
+        "room.human_member",
+        "entry.bad_op",
+        "entry.bad_text",
+        "entry.not_found",
+        "entry.no_node",
+        "entry.bad_transition",
+        "entry.not_allowed",
+        "entry.fix_after_range",
+        "entry.not_covered",
+        "entry.range_mismatch",
+        "entry.unknown_commit",
+        "entry.git",
+        "entry.gate_failed",
+        "ledger.out_of_scope",
+        "mcp.call_timeout",
+        "mcp.cli_failed",
+        "run.unknown_agent",
+        "run.agent_failed",
+        "run.sandbox_mismatch",
+        "run.no_reply",
+        "run.mail_failed",
+        "run.progress_invalid",
+        "run.turn_interrupted",
+        "run.io_failed",
+        "run.unsupported",
+        "run.branch_refused",
+        "run.too_many_failures",
+        "run.cwd_outside",
+        "install.unmergeable",
+        "install.unsupported_layout",
+        "install.legacy_projections",
+        "init.exists",
+        "doctor.check_failed",
+        "doctor.check_warned",
+        "skill.not_found",
+        "skill.invalid",
+        "skill.mirror_drift",
+        "skill.mirror_stale",
+        "skill.mirror_targets_unsupported",
+        "skill.ref_mode",
+        "skill.exists",
+        "init.needs_migrate",
+        "init.conflict",
+        "init.unexplained",
+        "init.graph_fetched",
+        "usage.deprecated",
+        "migrate.plan_mismatch",
+        "migrate.dirty",
+        "migrate.in_progress",
+        "migrate.not_migrated",
+        "migrate.moved_on",
+        "migrate.store_changed",
+        "migrate.unsupported",
+        "migrate.already_migrated",
+        "migrate.step_failed",
+        "api.output_gone",
+        "api.unknown_resource",
+        "api.unsupported",
+        "api.unauthenticated",
+        "api.refused_by_check",
+        "api.serve_running",
+        "api.key_required",
+        "api.key_expired",
+        "api.too_large",
+        "api.rate_limited",
+        "api.origin_refused",
+        "api.draining",
+        "api.check_failed",
+        "api.machine_revoked",
+        "api.machine_pending",
+        "api.enroll_pending",
+        "api.enroll_exists",
+        "api.enroll_changed",
+        "api.clock_skew",
+        "api.replayed",
+        "api.graph_unknown",
+        "api.actor_not_allowed",
+        "person.proof_required",
+        "api.unreachable",
+        "api.remote_bound",
+        "api.remote_conflict",
+        "api.remote_attaching",
+        "api.coordinator_mismatch",
+        "api.shown_mismatch",
+        "run.not_placed",
+        "run.machine_lost",
+        "run.machine_revoked",
+        "run.turn_ended",
+        "run.recovery_failed",
+        "run.push_refused",
+        "run.bad_agent_name",
+        "coord.commit_unknown",
+        "coord.branch_not_pushable",
+        "api.key_skewed",
+        "api.person_unknown",
+        "api.person_signature_required",
+        "run.nothing_to_do",
+        "api.attestation_failed",
+        "api.machine_grade_required",
+        "ledger.block_invalid",
+        "graph.ref_missing",
+        "graph.ref_invalid",
+        "graph.ref_exists",
+        "graph.config_invalid",
+        "graph.identity_mismatch",
+        "graph.checkout_missing",
+        "graph.identity_unrecorded",
+        "graph.identity_unset",
+        "graph.authority_invalid",
+        "graph.lock_required",
+        "graph.write_invalid",
+        "graph.write_stale",
+        "graph.write_contended",
+        "graph.request_reused",
+        "graph.git",
+        "graph.io",
+        "graph.checkout_read",
+        "graph.cache_edit",
+        "graph.session_discarded",
+        "graph.unleased_edit",
+        "graph.intent_stale",
+        "graph.intents",
+        "graph.settled_elsewhere",
+        "graph.import_stale",
+        "graph.import_unfinished_op",
+        "graph.hand_edits",
+        "graph.migrating",
+        "graph.overlapping_workspace",
+        "graph.shape",
+        "graph.remote_invalid",
+        "graph.remote_changed",
+        "graph.remote_unapproved",
+        "graph.open_changesets",
+        "graph.uncommitted",
+        "graph.diverged",
+        "graph.remote_is_code",
+        "graph.remote_rewritten",
+        "graph.remote_unreachable",
+        "graph.remote_auth",
+        "graph.push_refused",
+        "graph.push_large",
+        "graph.secret",
+        "graph.secret_scan_unavailable",
+        "graph.sync_conflict",
+        "graph.sync_contended",
+        "graph.sync_in_turn",
+        "graph.sync_invalid",
+        "graph.publish_disabled",
+        "graph.design_current",
+        "graph.design_drift",
+        "graph.view",
+        "run.authority_override",
+        "coord.abandon_published",
+        "graph.edit_path_unsafe",
+        "graph.edit_copy_kept",
+        "graph.edit_unexcluded",
+        "graph.nothing_to_sync",
+        "graph.no_code_base",
+        "graph.unsupported",
+        "graph.write_noop",
+        "msg.reserved_id",
+        "store.read_only",
+        "store.integrity",
+        "run.not_logged_in",
+        "run.supervisor_exited",
+        "run.mail_set_aside",
+        "run.loop_paused",
+        "run.wrapper_refused",
+        "run.no_base",
+        "flow.digest_too_large",
+        "entry.verdict_unbacked",
+        "entry.fix_absent",
+        "msg.review_unranged",
+        "msg.review_multi_node",
+        "entry.round_unanchored",
+        "entry.ledger_unwritten",
+        "req.missing",
+        "req.bad_line",
+        "req.duplicate_id",
+        "req.not_ears",
+        "req.vague",
+        "req.not_question",
+        "req.bad_relation",
+        "req.relation_on_design"
+      ]
+    },
+    "SeverityName": {
+      "type": "string",
+      "enum": [
+        "error",
+        "warning",
+        "info"
+      ]
+    },
+    "LocationOut": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "line": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "path"
+      ]
+    }
+  }
+}

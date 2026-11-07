@@ -26,7 +26,8 @@ use serde::Deserialize;
 
 use super::MatchKind;
 use super::config::{RustTarget, RustTargetKind};
-use super::select::{Adapter, Mapping, Target};
+use super::modules;
+use super::select::{Adapter, Mapping, Target, TestResolution};
 
 #[derive(Debug, Deserialize)]
 struct Metadata {
@@ -63,9 +64,22 @@ struct MetaDependency {
     path: Option<PathBuf>,
 }
 
+/// One target's crate root, for reading its module tree.
+#[derive(Debug, Clone)]
+struct TargetFile {
+    /// What a rule or a derived selection names it by; `None` for a
+    /// target `cargo test` builds but that has no test scope here (an
+    /// example), or doesn't build (a bench).
+    scope: Option<RustTarget>,
+    /// Its crate root, repository-relative.
+    src: String,
+}
+
 #[derive(Debug, Default)]
 struct Graph {
     test_targets: BTreeSet<RustTarget>,
+    /// Package to its targets' crate roots.
+    roots: BTreeMap<String, Vec<TargetFile>>,
     unsupported_targets: BTreeMap<RustTarget, &'static str>,
     /// Repository-relative member folder to crate name.
     by_dir: BTreeMap<String, String>,
@@ -115,6 +129,10 @@ pub struct RustAdapter {
     /// Every committed manifest, checked before Cargo can follow its paths.
     manifests: Vec<String>,
     graph: Option<Result<Graph, String>>,
+    /// Package to its targets' module trees, read when first needed.
+    trees: BTreeMap<String, Vec<(TargetFile, modules::Tree)>>,
+    /// The head's tracked paths, which module trees match exactly.
+    tracked: BTreeSet<String>,
 }
 
 fn within(dir: &str, path: &str) -> bool {
@@ -141,6 +159,8 @@ impl RustAdapter {
                 .cloned()
                 .collect(),
             graph: None,
+            trees: BTreeMap::new(),
+            tracked: tracked.iter().cloned().collect(),
         })
     }
 
@@ -157,6 +177,110 @@ impl RustAdapter {
                 .get(t)
                 .map(|reason| (t.clone(), *reason))
         }))
+    }
+
+    /// The test targets a `.rs` file needs, read from the module trees of
+    /// every workspace target: each target whose tree reaches it, when all
+    /// of them are integration tests. A file only test targets reach is
+    /// part of no library or binary, so no dependent needs testing. `Err`
+    /// says why whole crates are needed instead, with the packages whose
+    /// other targets reach the file (beside its owners).
+    fn derive(
+        &mut self,
+        path: &str,
+        deleted: bool,
+    ) -> Result<BTreeSet<Target>, (String, BTreeSet<String>)> {
+        let graph = self.graph().map_err(|e| (e, BTreeSet::new()))?;
+        let unsupported = graph.unsupported_targets.clone();
+        let packages: Vec<String> = graph.roots.keys().cloned().collect();
+        let mut out = BTreeSet::new();
+        let mut coarse: Option<String> = None;
+        let mut reaching = BTreeSet::new();
+        for package in packages {
+            for (target, tree) in self.trees_of(&package) {
+                // An uncertain tree may reach any file: a computed include,
+                // `#[path]` or another spelling can name any tracked path,
+                // in or out of its root's folder.
+                let maybe = tree.uncertain.is_some();
+                if !tree.reaches(path) && !maybe {
+                    continue;
+                }
+                match &target.scope {
+                    Some(
+                        scope @ RustTarget {
+                            kind: RustTargetKind::Test(_),
+                            ..
+                        },
+                    ) if !unsupported.contains_key(scope) => {
+                        out.insert(Target::RustTest(scope.clone()));
+                    }
+                    scope => {
+                        reaching.insert(package.clone());
+                        if coarse.is_none() {
+                            let what = match scope {
+                                Some(RustTarget {
+                                    kind: RustTargetKind::Lib,
+                                    ..
+                                }) => format!("{package}'s library"),
+                                Some(RustTarget {
+                                    kind: RustTargetKind::Bin(name),
+                                    ..
+                                }) => format!("{package}'s binary {name}"),
+                                Some(RustTarget {
+                                    kind: RustTargetKind::Test(name),
+                                    ..
+                                }) => format!("{package}'s opt-in test {name}"),
+                                None => format!("{package}'s target {}", target.src),
+                            };
+                            coarse = Some(match &tree.uncertain {
+                                Some(why) if !tree.reaches(path) => {
+                                    format!("{what} may reach it ({why})")
+                                }
+                                _ => format!("{what} reaches it"),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        let late = if !path.ends_with(".rs") {
+            Some("it isn't a .rs file, so a test may read it at run time")
+        } else if deleted {
+            Some("it is deleted, so the head can't show what reached it")
+        } else if out.is_empty() {
+            Some("no target's module tree reaches it, so a test may read it at run time")
+        } else {
+            None
+        };
+        if let Some(why) = coarse.or(late.map(String::from)) {
+            // Whatever reaches it runs whole too: an include_str! from
+            // another crate's tests reads this file.
+            reaching.extend(out.iter().filter_map(|t| match t {
+                Target::RustTest(t) => Some(t.package.clone()),
+                _ => None,
+            }));
+            return Err((why, reaching));
+        }
+        Ok(out)
+    }
+
+    /// A package's targets' module trees, read once.
+    fn trees_of(&mut self, package: &str) -> &Vec<(TargetFile, modules::Tree)> {
+        if !self.trees.contains_key(package) {
+            let roots = match &self.graph {
+                Some(Ok(g)) => g.roots.get(package).cloned().unwrap_or_default(),
+                _ => Vec::new(),
+            };
+            let trees = roots
+                .into_iter()
+                .map(|t| {
+                    let tree = modules::scan(&self.top, &t.src, &self.tracked);
+                    (t, tree)
+                })
+                .collect();
+            self.trees.insert(package.to_string(), trees);
+        }
+        &self.trees[package]
     }
 
     fn graph(&mut self) -> Result<&Graph, String> {
@@ -438,6 +562,10 @@ fn from_metadata(top: &Path, meta: Metadata) -> Result<Graph, String> {
             } else {
                 None
             };
+            let target_scope = kind.clone().map(|kind| RustTarget {
+                package: p.name.clone(),
+                kind,
+            });
             if let Some(kind) = kind {
                 let scope = RustTarget {
                     package: p.name.clone(),
@@ -456,6 +584,14 @@ fn from_metadata(top: &Path, meta: Metadata) -> Result<Graph, String> {
                 }
             }
             let src = relative(top, &target.src_path)?;
+            graph
+                .roots
+                .entry(p.name.clone())
+                .or_default()
+                .push(TargetFile {
+                    scope: target_scope.clone(),
+                    src: src.clone(),
+                });
             let inside = if rel == "." {
                 Some(src.as_str())
             } else {
@@ -555,7 +691,7 @@ impl Adapter for RustAdapter {
         "rust"
     }
 
-    fn map(&mut self, path: &str, _deleted: bool) -> Result<Mapping, String> {
+    fn map(&mut self, path: &str, deleted: bool) -> Result<Mapping, String> {
         let graph = self.graph()?;
         if !path.ends_with(".rs")
             && graph.claims.keys().any(|c| match c {
@@ -573,9 +709,20 @@ impl Adapter for RustAdapter {
         if owners.is_empty() {
             return Ok(Mapping::NotMine);
         }
-        Ok(Mapping::Selects(
-            owners.iter().flat_map(|o| graph.dependents(o)).collect(),
-        ))
+        Ok(match self.derive(path, deleted) {
+            Ok(fine) => Mapping::Selects(fine),
+            Err((why, reaching)) => {
+                let graph = self.graph()?;
+                Mapping::Coarse(
+                    owners
+                        .iter()
+                        .chain(&reaching)
+                        .flat_map(|o| graph.dependents(o))
+                        .collect(),
+                    why,
+                )
+            }
+        })
     }
 
     fn resolve(&mut self, names: &[String]) -> Result<BTreeSet<Target>, String> {
@@ -593,18 +740,17 @@ impl Adapter for RustAdapter {
             .collect()
     }
 
-    fn resolve_tests(&mut self, targets: &[RustTarget]) -> Result<BTreeSet<Target>, String> {
+    fn resolve_tests(&mut self, targets: &[RustTarget]) -> Result<TestResolution, String> {
         let graph = self.graph()?;
-        targets
-            .iter()
-            .map(|target| {
-                if graph.test_targets.contains(target) {
-                    Ok(Target::RustTest(target.clone()))
-                } else {
-                    Err(format!("no workspace test target matches {target:?}"))
-                }
-            })
-            .collect()
+        let mut out = TestResolution::default();
+        for target in targets {
+            if graph.test_targets.contains(target) {
+                out.found.insert(Target::RustTest(target.clone()));
+            } else {
+                out.missing.push(target.clone());
+            }
+        }
+        Ok(out)
     }
 }
 

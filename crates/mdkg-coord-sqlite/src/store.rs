@@ -103,8 +103,13 @@ pub enum StoreError {
     },
     /// A read-only handle cannot roll back a hot SQLite journal.
     ReadRecoveryRequired(rusqlite::Error),
+    /// A reader found no store, and creates none: only a writer does.
+    ReadAbsent,
     /// The record chain can't be written or doesn't verify.
     Log(String),
+    /// This process forbade store writes ([`forbid_store_writes`],
+    /// `--read-only`), and the command needed one: nothing was written.
+    WritesForbidden,
 }
 
 impl fmt::Display for StoreError {
@@ -155,12 +160,18 @@ impl fmt::Display for StoreError {
                 f,
                 "the coordinator store needs an upgrade from {from} to {to}; this read left it unchanged"
             ),
+            // Store errors name no command (#17360): one copied from here
+            // would act on the current folder's repository. The CLI's hint
+            // says what to run and with which --root.
             StoreError::ReadRecoveryRequired(error) => write!(
                 f,
-                "coordinator store needs SQLite journal recovery before this read: {error}; run a writing command such as `{} msg inbox`, then retry the read",
-                mdkg_format::program::BIN
+                "coordinator store needs SQLite journal recovery before this read: {error}; this read left it unchanged"
             ),
+            StoreError::ReadAbsent => {
+                f.write_str("coordinator store is absent, and this read creates none")
+            }
             StoreError::Log(why) => write!(f, "coordinator log: {why}"),
+            StoreError::WritesForbidden => f.write_str(WRITES_FORBIDDEN),
         }
     }
 }
@@ -169,6 +180,9 @@ impl std::error::Error for StoreError {}
 
 impl From<rusqlite::Error> for StoreError {
     fn from(e: rusqlite::Error) -> Self {
+        if is_writes_forbidden(&e) {
+            return StoreError::WritesForbidden;
+        }
         StoreError::Sqlite(e)
     }
 }
@@ -214,6 +228,63 @@ pub fn allow_store_upgrades() {
 /// `--allow-store-upgrade` on to the mdkg processes it starts.
 pub fn store_upgrades_allowed() -> bool {
     UPGRADES_ALLOWED.load(Ordering::SeqCst)
+}
+
+/// What a refused write says, and the marker [`open_durable`] puts in the
+/// SQLite error it returns, so `?` turns it into
+/// [`StoreError::WritesForbidden`].
+const WRITES_FORBIDDEN: &str = "this command would write the coordinator store, and --read-only forbids that; nothing was written";
+
+#[cfg(not(test))]
+static WRITES_FORBIDDEN_HERE: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+thread_local! {
+    static WRITES_FORBIDDEN_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Forbids every coordinator store write for the rest of this process
+/// (`--read-only`): opening a store for writing, creating, upgrading,
+/// recovering, restoring or copying one, and recording an observation are
+/// refused with [`StoreError::WritesForbidden`] before anything is
+/// written. Read-only opens ([`Store::open_read_only`],
+/// [`Store::open_raw_read_only`]) are unaffected; they never checkpoint.
+/// There is no way back: a reader can't turn writes on again.
+pub fn forbid_store_writes() {
+    #[cfg(not(test))]
+    WRITES_FORBIDDEN_HERE.store(true, Ordering::SeqCst);
+    #[cfg(test)]
+    WRITES_FORBIDDEN_HERE.with(|f| f.set(true));
+}
+
+/// Whether [`forbid_store_writes`] was called in this process (in tests,
+/// on this thread).
+pub fn store_writes_forbidden() -> bool {
+    #[cfg(not(test))]
+    return WRITES_FORBIDDEN_HERE.load(Ordering::SeqCst);
+    #[cfg(test)]
+    return WRITES_FORBIDDEN_HERE.with(std::cell::Cell::get);
+}
+
+/// Refuses a store write once [`forbid_store_writes`] was called.
+pub(crate) fn may_write() -> Result<(), StoreError> {
+    if store_writes_forbidden() {
+        Err(StoreError::WritesForbidden)
+    } else {
+        Ok(())
+    }
+}
+
+fn writes_forbidden_error() -> rusqlite::Error {
+    rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_READONLY),
+        Some(WRITES_FORBIDDEN.to_string()),
+    )
+}
+
+fn is_writes_forbidden(e: &rusqlite::Error) -> bool {
+    matches!(e, rusqlite::Error::SqliteFailure(code, Some(message))
+        if code.extended_code == rusqlite::ffi::SQLITE_READONLY && message == WRITES_FORBIDDEN)
 }
 
 impl Upgrade {
@@ -333,9 +404,15 @@ pub struct Store {
     backup: Option<PathBuf>,
     /// Whether that copy settled for a plain fsync ([`PLAIN_FSYNC_ENV`]).
     backup_weak: bool,
+    /// Whether this open created the store and settled for a plain fsync
+    /// there ([`PLAIN_FSYNC_ENV`]).
+    created_weak: bool,
     /// How long an acked `purge_on_ack` body is kept
     /// ([`Store::set_ack_grace_days`]); 0 purges it at the ack.
     pub(crate) ack_grace_ms: u64,
+    /// Mail reads write nothing ([`Store::set_pure_reads`]): always for a
+    /// store opened read-only.
+    pub(crate) pure_reads: bool,
 }
 
 fn journal_seq(tx: &Connection) -> Result<i64, StoreError> {
@@ -682,6 +759,15 @@ fn open_durable_wait(
     flags: OpenFlags,
     wait: Duration,
 ) -> rusqlite::Result<Connection> {
+    // Every writable open of a store file, or of a copy beside it, comes
+    // through here. A private temporary database (the empty path) holds
+    // nothing of the store's.
+    if !flags.contains(OpenFlags::SQLITE_OPEN_READ_ONLY)
+        && !path.as_os_str().is_empty()
+        && store_writes_forbidden()
+    {
+        return Err(writes_forbidden_error());
+    }
     if flags.contains(OpenFlags::SQLITE_OPEN_READ_ONLY) {
         match store_file_present(path) {
             Ok(true) => {}
@@ -801,9 +887,9 @@ fn sync(file: &File, step: &'static str) -> std::io::Result<bool> {
         Err(e) if unsupported(&e) => Err(std::io::Error::new(
             e.kind(),
             format!(
-                "this file system offers no full sync barrier ({e}), so the copy can't be made \
-                 durable; {PLAIN_FSYNC_ENV}=1 accepts a plain fsync, a weaker guarantee the \
-                 store records"
+                "this file system offers no full sync barrier ({e}), so it can't be made \
+                 durable; {PLAIN_FSYNC_ENV}=1 accepts a plain fsync, a weaker guarantee mdkg \
+                 reports"
             ),
         )),
         Err(e) => Err(e),
@@ -896,28 +982,22 @@ fn injected(_step: &'static str) -> Result<(), StoreError> {
 
 /// Makes the store's entry in its folder, and the folder's entry in its
 /// parent (the folder may be new: `open_between` creates it, Terra #16445),
-/// durable.
-fn sync_store_entries(dir: &Path) -> Result<(), StoreError> {
-    sync_entry(dir, "store_folder_sync")?;
+/// durable. Returns whether a sync settled for a plain `fsync`.
+fn sync_store_entries(dir: &Path) -> Result<bool, StoreError> {
+    let mut weak = sync_entry(dir, "store_folder_sync")?;
     if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
-        sync_entry(parent, "store_parent_sync")?;
+        weak |= sync_entry(parent, "store_parent_sync")?;
     }
-    Ok(())
+    Ok(weak)
 }
 
-/// Syncs one folder; a test's injected failure replaces the sync's own
-/// result, so a caller that dropped the result would be caught.
-fn sync_entry(dir: &Path, step: &'static str) -> Result<(), StoreError> {
-    let result = File::open(dir).and_then(|folder| folder.sync_all());
-    #[cfg(test)]
-    let result = if FAIL_AT.with(|f| f.get()) == Some(step) {
-        Err(std::io::Error::other(format!("injected failure at {step}")))
-    } else {
-        result
-    };
-    #[cfg(not(test))]
-    let _ = step;
-    Ok(result?)
+/// Syncs one folder with the full barrier, as [`sync`] does: where the
+/// file system refuses it (an SMB mount's `F_FULLFSYNC`), only
+/// [`PLAIN_FSYNC_ENV`] settles for a plain `fsync`, and says so (Terra
+/// #16506). A test's injected failure replaces the sync's own result, so
+/// a caller that dropped the result would be caught.
+fn sync_entry(dir: &Path, step: &'static str) -> Result<bool, StoreError> {
+    Ok(File::open(dir).and_then(|folder| sync(&folder, step))?)
 }
 
 #[cfg(test)]
@@ -1091,6 +1171,7 @@ fn back_up_noting(
     from: &str,
     to: &str,
 ) -> Result<(PathBuf, bool), StoreError> {
+    may_write()?;
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let fail = |e: &dyn fmt::Display| StoreError::Backup(e.to_string());
     let of = std::fs::canonicalize(path).map_err(|e| fail(&e))?;
@@ -1192,6 +1273,7 @@ fn back_up_noting(
 /// so `store snapshots` lists it and `store restore` takes it (`migrate`
 /// takes one before it changes anything).
 pub fn snapshot(path: &Path, label: &str) -> Result<PathBuf, StoreError> {
+    may_write()?;
     let bad = |c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '+');
     if label.is_empty() || label.chars().any(bad) {
         return Err(StoreError::Backup(format!(
@@ -1349,6 +1431,7 @@ fn restore_checked(
     expected_head: Option<&str>,
     after_switch: impl FnOnce(),
 ) -> Result<Restored, StoreError> {
+    may_write()?;
     let refuse = |why: String| StoreError::Restore(why);
     let of = std::fs::canonicalize(path).map_err(|e| refuse(format!("{}: {e}", path.display())))?;
     let source = open_durable(copy, OpenFlags::SQLITE_OPEN_READ_ONLY)
@@ -1619,6 +1702,7 @@ impl Store {
         path: &Path,
         observation: &Observation,
     ) -> Result<Option<&'static str>, StoreError> {
+        may_write()?;
         let attempt = || -> Result<Option<&'static str>, StoreError> {
             let mut conn = Connection::open_with_flags(
                 path,
@@ -1734,7 +1818,9 @@ impl Store {
             ttl,
             backup: None,
             backup_weak: false,
+            created_weak: false,
             ack_grace_ms: 0,
+            pure_reads: true,
         }))
     }
 
@@ -1742,7 +1828,10 @@ impl Store {
     /// committed in one private rollback-mode database. Concurrent creators
     /// publish without replacing each other's stores; unpublished crash debris
     /// is private and is never opened as the coordinator.
-    fn create_if_missing(path: &Path, ttl: Ms) -> Result<(), StoreError> {
+    /// Returns whether this open created the store with a plain `fsync`
+    /// only ([`PLAIN_FSYNC_ENV`]), a weaker guarantee than the full barrier.
+    fn create_if_missing(path: &Path, ttl: Ms) -> Result<bool, StoreError> {
+        may_write()?;
         let dir = path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
@@ -1750,8 +1839,10 @@ impl Store {
         if path.try_exists()? {
             // A store found published may follow a creation whose entry
             // syncs failed: they are made durable again before any write is
-            // acknowledged (Terra #16575). Idempotent.
-            return sync_store_entries(dir);
+            // acknowledged (Terra #16575). Idempotent. Only a creation
+            // reports a weaker barrier: this open made nothing.
+            sync_store_entries(dir)?;
+            return Ok(false);
         }
         let staging = dir.join(format!(".mdkg-store-{}", mdkg_format::Uuid7::now()));
         let mut folder = std::fs::DirBuilder::new();
@@ -1771,7 +1862,7 @@ impl Store {
                 .mode(0o600)
                 .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32);
         }
-        let result = (|| -> Result<(), StoreError> {
+        let result = (|| -> Result<bool, StoreError> {
             drop(options.open(&temporary)?);
             injected("creation_file")?;
             let mut conn = open_durable(&temporary, OpenFlags::default())?;
@@ -1781,7 +1872,9 @@ impl Store {
             let mut committing = false;
             Self::finish_open(tx, path, ttl, false, &mut committing)?;
             conn.close().map_err(|(_, error)| error)?;
-            File::open(&temporary)?.sync_all()?;
+            // The full barrier, or with the override a plain fsync, which
+            // the open reports (Terra #16506).
+            let weak = sync(&File::open(&temporary)?, "creation_sync")?;
             match rustix::fs::renameat_with(
                 rustix::fs::CWD,
                 &temporary,
@@ -1793,7 +1886,7 @@ impl Store {
                 Err(error) => return Err(std::io::Error::from(error).into()),
             }
             injected("creation_published")?;
-            sync_store_entries(dir)
+            Ok(sync_store_entries(dir)? | weak)
         })();
         let _ = std::fs::remove_dir_all(&staging);
         result
@@ -1821,6 +1914,8 @@ impl Store {
         upgrade: Upgrade,
         between: impl FnOnce(),
     ) -> Result<Self, StoreError> {
+        // Before the folder or the store is made.
+        may_write()?;
         if let Some(dir) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
             // Folders made here are the owner's only, as the store files
             // are (e2e N4); an existing folder keeps its mode.
@@ -1833,7 +1928,7 @@ impl Store {
             }
             folder.create(dir)?;
         }
-        Self::create_if_missing(path, ttl)?;
+        let created_weak = Self::create_if_missing(path, ttl)?;
         let refuse = upgrade == Upgrade::Refuse;
         // Refused before anything is written, and before this handle
         // touches the store: its close could checkpoint a WAL another
@@ -1922,7 +2017,9 @@ impl Store {
                 ttl,
                 backup,
                 backup_weak: weak,
+                created_weak,
                 ack_grace_ms: 0,
+                pure_reads: false,
             }),
             Err(e) => {
                 // The copy goes only when the upgrade failed before its
@@ -2055,6 +2152,13 @@ impl Store {
     /// `meta.upgrade_barrier`).
     pub fn backup_weak(&self) -> bool {
         self.backup_weak
+    }
+
+    /// Whether this open created the store with a plain `fsync` only, where
+    /// the file system refused the full barrier and [`PLAIN_FSYNC_ENV`]
+    /// accepted the weaker guarantee (Terra #16506).
+    pub fn created_weak(&self) -> bool {
+        self.created_weak
     }
 
     /// Opens the store a repository's worktrees share.
@@ -3087,6 +3191,90 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// `--read-only` (forbid_store_writes): every way this crate writes a
+    /// store is refused before it writes, a missing store's folder isn't
+    /// made, and read-only opens still work. The store's bytes and its
+    /// WAL's content are unchanged.
+    #[test]
+    fn forbidden_writes_are_refused_before_anything_is_written() {
+        let dir =
+            std::env::temp_dir().join(format!("mdkg-forbid-writes-{}", mdkg_format::Uuid7::now()));
+        let path = dir.join("mdkg").join("coord.sqlite");
+        let mut writer = Store::open_with(&path, 100, Upgrade::Allow).unwrap();
+        writer
+            .execute(&Command::Register {
+                leaf: Scope::new("work/a"),
+                content: "work/a@0".into(),
+            })
+            .unwrap();
+        drop(writer);
+        let bytes = || {
+            let mut wal = path.as_os_str().to_owned();
+            wal.push("-wal");
+            (
+                std::fs::read(&path).unwrap(),
+                std::fs::read(&wal).unwrap_or_default(),
+            )
+        };
+        let before = bytes();
+        assert!(!store_writes_forbidden());
+        forbid_store_writes();
+        assert!(store_writes_forbidden());
+        let forbidden = |result: Result<(), StoreError>| {
+            assert!(
+                matches!(result, Err(StoreError::WritesForbidden)),
+                "{result:?}"
+            );
+        };
+        for upgrade in [Upgrade::Allow, Upgrade::Refuse] {
+            forbidden(Store::open_with(&path, 100, upgrade).map(drop));
+        }
+        let elsewhere = dir.join("other").join("coord.sqlite");
+        forbidden(Store::open_with(&elsewhere, 100, Upgrade::Allow).map(drop));
+        assert!(!dir.join("other").exists(), "no folder made");
+        forbidden(Store::try_record_observation(&path, &Observation::default()).map(drop));
+        forbidden(snapshot(&path, "manual").map(drop));
+        forbidden(restore(&path, &path).map(drop));
+        forbidden(
+            open_durable(&path, OpenFlags::default())
+                .map(drop)
+                .map_err(StoreError::from),
+        );
+        forbidden(
+            open_durable(&path, OpenFlags::SQLITE_OPEN_READ_WRITE)
+                .map(drop)
+                .map_err(StoreError::from),
+        );
+        assert!(
+            StoreError::WritesForbidden
+                .to_string()
+                .contains("--read-only")
+        );
+        let reader = Store::open_read_only(&path).unwrap().unwrap();
+        assert!(
+            reader
+                .coordinator()
+                .unwrap()
+                .leaf(&Scope::new("work/a"))
+                .is_some()
+        );
+        drop(reader);
+        assert!(stored_label(&path).unwrap().is_some());
+        assert!(bytes() == before, "the store is unchanged");
+        let names: Vec<_> = std::fs::read_dir(dir.join("mdkg"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| {
+                !matches!(
+                    n.as_str(),
+                    "coord.sqlite" | "coord.sqlite-wal" | "coord.sqlite-shm"
+                )
+            })
+            .collect();
+        assert!(names.is_empty(), "no copies or staging: {names:?}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn read_only_zero_byte_store_preserves_every_sidecar() {
         let dir =
@@ -3417,7 +3605,8 @@ mod tests {
             matches!(error, StoreError::ReadRecoveryRequired(_)),
             "{error}"
         );
-        assert!(error.to_string().contains("msg inbox"));
+        // Store errors name no command; the CLI's hint does (#17360).
+        assert!(!error.to_string().contains("msg inbox"), "{error}");
         assert!(matches!(
             crate::events::head(&crashed).unwrap_err(),
             StoreError::ReadRecoveryRequired(_)
@@ -3977,6 +4166,46 @@ mod tests {
     fn schema_at(path: &Path) -> String {
         let conn = Connection::open(path).expect("conn");
         meta(&conn, "schema").expect("meta").unwrap_or_default()
+    }
+
+    /// First creation on a file system with no full barrier (an SMB
+    /// mount's F_FULLFSYNC): refused with the override named, nothing
+    /// published; with the override, created and reported weak, once
+    /// (Terra #16506).
+    #[test]
+    fn a_first_store_without_a_full_barrier_needs_the_override_and_says_so() {
+        let dir = std::env::temp_dir().join(format!(
+            "mdkg-store-create-barrier-{}",
+            mdkg_format::Uuid7::now()
+        ));
+        std::fs::create_dir(&dir).expect("dir");
+        let path = dir.join(".git/mdkg/coord.sqlite");
+        NO_BARRIER.with(|f| f.set(true));
+        let refused = Store::open_with(&path, 1_000, Upgrade::Refuse);
+        NO_BARRIER.with(|f| f.set(false));
+        let Err(error) = refused else {
+            panic!("no barrier and no override is refused")
+        };
+        let text = error.to_string();
+        assert!(text.contains(PLAIN_FSYNC_ENV), "{text}");
+        assert!(text.contains("creation_sync"), "{text}");
+        assert!(!path.exists(), "nothing published");
+        NO_BARRIER.with(|f| f.set(true));
+        PLAIN_FSYNC.with(|f| f.set(true));
+        let created = Store::open_with(&path, 1_000, Upgrade::Refuse);
+        PLAIN_FSYNC.with(|f| f.set(false));
+        NO_BARRIER.with(|f| f.set(false));
+        let created = created.expect("created with the override");
+        assert!(created.created_weak());
+        drop(created);
+        let again = Store::open_with(&path, 1_000, Upgrade::Refuse).expect("reopen");
+        assert!(!again.created_weak(), "only the creating open reports it");
+        drop(again);
+        let full = dir.join("full/coord.sqlite");
+        let strong = Store::open_with(&full, 1_000, Upgrade::Refuse).expect("full barrier");
+        assert!(!strong.created_weak());
+        drop(strong);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -59,9 +59,18 @@ fn main() {
         None => "unknown",
     };
     let built = built();
-    let line = |commit: &str, dirty: &str| {
+    // A build without a FIDO2 backend (the Linux pip wheels, the musl
+    // builds) says so, and where FIDO2 person keys are (decided 2026-11-03,
+    // #17661). Whether it has one is mdkg-presence's resolved feature, not
+    // this crate's (feature unification can turn it on without ours), so
+    // both lines are emitted and `version.rs` picks by `mdkg_serve::FIDO2`.
+    // `cargo install` on musl (Alpine) builds another musl binary, so the
+    // advice names the platforms, not only the install methods.
+    const NO_FIDO2: &str = "; no FIDO2 in this build: use a build for glibc Linux or macOS \
+         (a gnu release archive, Homebrew, or cargo install there)";
+    let line = |commit: &str, dirty: &str, fido2: &str| {
         format!(
-            "{version} (commit {commit}{}, built {built})",
+            "{version} (commit {commit}{}, built {built}{fido2})",
             match dirty {
                 "true" => ", dirty",
                 "unknown" => ", dirty unknown",
@@ -78,14 +87,16 @@ fn main() {
     println!("cargo:rustc-env=MDKG_BUILD_COMMIT={commit}");
     println!("cargo:rustc-env=MDKG_BUILD_DIRTY={dirty}");
     println!("cargo:rustc-env=MDKG_BUILD_DATE={built}");
-    println!(
-        "cargo:rustc-env=MDKG_BUILD_VERSION={}",
-        line(&commit, dirty)
-    );
-    println!(
-        "cargo:rustc-env=MDKG_BUILD_VERSION_ELSEWHERE={}",
-        line("unknown", "unknown")
-    );
+    for (suffix, fido2) in [("", ""), ("_NO_FIDO2", NO_FIDO2)] {
+        println!(
+            "cargo:rustc-env=MDKG_BUILD_VERSION{suffix}={}",
+            line(&commit, dirty, fido2)
+        );
+        println!(
+            "cargo:rustc-env=MDKG_BUILD_VERSION_ELSEWHERE{suffix}={}",
+            line("unknown", "unknown", fido2)
+        );
+    }
 }
 
 /// The worktree the crate is built in, as git places it.

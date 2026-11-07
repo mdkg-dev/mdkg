@@ -5,7 +5,8 @@
 //!   (the keychain), Codex's (ChatGPT, in CODEX_HOME), OpenCode's own
 //!   configured auth. The provider key variables in [`KEY_VARS`] never
 //!   reach an agent, so a stray key in the launcher's shell can't switch a
-//!   turn to API billing. The rest of the environment passes through.
+//!   turn to API billing, whatever the agent's environment mode
+//!   ([`crate::env`]).
 //! - **A key only by the user's choice.** Nothing bills the key on its own
 //!   (decided 2026-10-29): `mdkg agents use-key <agent>` bills the agent's
 //!   next turn, one, on it, where `auth.api_key_fallback` allows that. A
@@ -174,7 +175,9 @@ pub fn withheld(name: &std::ffi::OsStr) -> bool {
 /// skips hooks), the host's session ids and messaging socket and token,
 /// its account identity, its effort and its SDK-host switches (spike,
 /// 2026-10-25). The user's own login (`CLAUDE_CODE_OAUTH_TOKEN`) and
-/// general settings (`MCP_*`, `DISABLE_*`) stay.
+/// general settings (`MCP_*`, `DISABLE_*`) aren't withheld here; since
+/// 0.7.2 they reach a turn only when its `env.allow` names them or
+/// `env.inherit` is on ([`crate::env`]).
 pub const HOST_SESSION_VARS: &[&str] = &[
     "CLAUDECODE",
     "CLAUDE_CODE_SIMPLE",
@@ -450,23 +453,24 @@ pub fn login_command(h: Harness) -> &'static str {
 /// Asks the harness whether it's logged in (`claude auth status --json`,
 /// `codex login status`), through its adapter, which reads the answer from
 /// [`login_probe`]. Prints nothing it says.
-pub fn login(h: Harness, program: &Path, cwd: &Path) -> Login {
-    h.adapter().login(program, cwd)
+pub fn login(h: Harness, program: &Path, cwd: &Path, env: &crate::env::Environment) -> Login {
+    h.adapter().login(program, cwd, env)
 }
 
 /// Runs a harness's login check, `program args`, as an agent would start
-/// it: in the agent's folder and with no key variables, so a stray key
-/// doesn't count as a login. `None` when it can't run or finish in time.
+/// it: in the agent's folder and with the agent's environment
+/// ([`crate::env`]), never a key variable, so a stray key doesn't count as
+/// a login and a login the allowlist hides doesn't either. `None` when it
+/// can't run or finish in time.
 pub(crate) fn login_probe(
     program: &Path,
     cwd: &Path,
     args: &[&str],
+    env: &crate::env::Environment,
 ) -> Option<std::process::Output> {
     let mut cmd = Command::new(program);
     cmd.current_dir(cwd);
-    for k in withheld_vars() {
-        cmd.env_remove(k);
-    }
+    env.apply(&mut cmd);
     cmd.stdin(std::process::Stdio::null());
     cmd.args(args);
     bounded(&mut cmd).ok()
@@ -487,8 +491,14 @@ pub enum Billing {
 /// mark is consumed bills it (crate::turn). 0.7.0's fallback to the key for
 /// a harness that isn't logged in, or that bills a key of its own, is gone
 /// (decided 2026-10-29), and no setting bills the key on every turn.
-pub fn choose(h: Harness, program: &Path, cwd: &Path, agent: &str) -> Result<Billing, RunError> {
-    let login = login(h, program, cwd);
+pub fn choose(
+    h: Harness,
+    program: &Path,
+    cwd: &Path,
+    agent: &str,
+    env: &crate::env::Environment,
+) -> Result<Billing, RunError> {
+    let login = login(h, program, cwd, env);
     match &login {
         Login::In {
             subscription: true, ..
@@ -1292,10 +1302,16 @@ pub fn usage_limited(text: &str) -> bool {
         "usage limit",
         "usage_limit",
         "hit your limit",
+        "hit your weekly limit",
         "out of extra usage",
     ]
     .iter()
     .any(|p| t.contains(p))
+        || t.match_indices("hit your ").any(|(i, p)| {
+            let rest = &t[i + p.len()..];
+            let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+            digits > 0 && rest[digits..].starts_with("-hour limit")
+        })
 }
 
 /// Whether text says the model is at capacity: the provider turned the
@@ -1371,10 +1387,11 @@ pub fn status(
     cwd: &Path,
     policy: &crate::policy::Auth,
     keys: &KeySource,
+    env: &crate::env::Environment,
 ) -> AuthStatus {
     let service = keychain_service(h);
     let key_in_keychain = service.is_some_and(|s| keys.has(s));
-    let (source, method) = match login(h, program, cwd) {
+    let (source, method) = match login(h, program, cwd, env) {
         Login::In {
             method,
             subscription: true,
@@ -1829,6 +1846,123 @@ mod tests {
         assert!(!usage_limit_error(
             Harness::OpenCode,
             "{\"code\":\"usage_limit_reached\"}"
+        ));
+    }
+
+    /// Claude's and OpenCode's current limit shapes (synthetic values).
+    #[test]
+    fn current_claude_and_opencode_limit_shapes_are_recognized() {
+        let claude = |l: &str| usage_limit_error(Harness::Claude, l);
+        assert!(claude(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1793000000,"rateLimitType":"five_hour"}}"#
+        ));
+        assert!(!claude(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1793000000}}"#
+        ));
+        // A 429 alone may be request-rate throttling (review of 0f0a8dcb).
+        assert!(!claude(
+            r#"{"type":"result","is_error":true,"api_error_status":429,"result":"x"}"#
+        ));
+        assert!(!claude(
+            r#"{"type":"result","is_error":false,"api_error_status":429,"result":"x"}"#
+        ));
+        for text in [
+            r"You've hit your weekly limit \u00b7 resets 3pm",
+            r"You\u2019ve hit your 5-hour limit \u00b7 resets 9am",
+        ] {
+            let result = format!(r#"{{"type":"result","is_error":true,"result":"{text}"}}"#);
+            assert!(claude(&result), "{result}");
+        }
+        assert!(claude("You've hit your 24-hour limit · resets 1am"));
+        assert!(!claude("You've hit your -hour limit"));
+        assert!(!claude(
+            r#"{"type":"assistant","text":"You've hit your weekly limit"}"#
+        ));
+        assert!(usage_limited("You've hit your weekly limit · resets 3pm"));
+        assert!(usage_limited("you've hit your 5-hour limit"));
+        assert!(!usage_limited("hit your 5 hour target"));
+        let reset = |l: &str| Harness::Claude.adapter().usage_limit_reset(l);
+        assert_eq!(
+            reset(
+                r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1793000000,"rateLimitType":"seven_day"}}"#
+            ),
+            Some((1793000000, Some("seven_day".into())))
+        );
+        assert_eq!(
+            reset(
+                r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1}}"#
+            ),
+            None
+        );
+        for h in [Harness::Codex, Harness::OpenCode] {
+            assert_eq!(
+                h.adapter().usage_limit_reset(r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1}}"#),
+                None
+            );
+        }
+        // The whole stream: an error result counts after a rejection, or
+        // with the limit wording; a 429 alone doesn't.
+        let stream = |lines: &[&str]| {
+            let lines: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+            Harness::Claude.adapter().usage_limit_in(&lines)
+        };
+        let rejected = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1793000000}}"#;
+        let throttled = r#"{"type":"result","is_error":true,"api_error_status":429,"result":"x"}"#;
+        let other = r#"{"type":"result","is_error":true,"result":"some other failure"}"#;
+        let worded = r#"{"type":"result","is_error":true,"result":"You've hit your weekly limit"}"#;
+        let ok = r#"{"type":"result","is_error":false,"result":"done"}"#;
+        assert!(stream(&[rejected, throttled]));
+        assert!(stream(&[worded]));
+        assert!(stream(&[rejected]), "a stream cut off at the rejection");
+        assert!(!stream(&[throttled]), "a 429 with no rejection");
+        assert!(
+            stream(&[rejected, other]),
+            "an error after a rejection (review of 94ff686f)"
+        );
+        assert!(!stream(&[rejected, ok]));
+        assert!(!stream(&[other]), "an error with no rejection or wording");
+        assert!(!stream(&[]));
+        // Throttling: a 429 error result with no limit named.
+        let throttled_in = |h: Harness, lines: &[&str]| {
+            let lines: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+            h.adapter().throttled_in(&lines)
+        };
+        assert!(throttled_in(Harness::Claude, &[throttled]));
+        assert!(!throttled_in(Harness::Claude, &[rejected, throttled]));
+        assert!(!throttled_in(Harness::Claude, &[worded]));
+        assert!(!throttled_in(Harness::Claude, &[other]));
+        assert!(!throttled_in(Harness::Claude, &[throttled, ok]));
+        for h in [Harness::Codex, Harness::OpenCode] {
+            assert!(!throttled_in(h, &[throttled]));
+        }
+        let opencode = |l: &str| usage_limit_error(Harness::OpenCode, l);
+        // Its quota form, by type, and by status with each body (an
+        // object, or the JSON text of one).
+        assert!(opencode(
+            r#"{"type":"error","error":{"type":"provider.quota","status":429,"response":{"body":{}}}}"#
+        ));
+        assert!(opencode(
+            r#"{"type":"error","error":{"type":"provider.other","status":429,"response":{"body":{"type":"FreeUsageLimitError"}}}}"#
+        ));
+        assert!(opencode(
+            r#"{"type":"error","error":{"status":429,"response":{"body":"{\"type\":\"GoUsageLimitError\",\"message\":\"x\"}"}}}"#
+        ));
+        // Its API-error form, the message under error.data.message.
+        assert!(opencode(
+            r#"{"type":"error","error":{"name":"APIError","data":{"message":"{\"type\":\"FreeUsageLimitError\"}","statusCode":429}}}"#
+        ));
+        assert!(opencode(
+            r#"{"type":"error","error":{"name":"APIError","data":{"message":"GoUsageLimitError: quota used","statusCode":429}}}"#
+        ));
+        // Not a limit: another 429 body, another status, another event.
+        assert!(!opencode(
+            r#"{"type":"error","error":{"status":429,"response":{"body":{"type":"RateLimitError"}}}}"#
+        ));
+        assert!(!opencode(
+            r#"{"type":"error","error":{"status":500,"response":{"body":{"type":"FreeUsageLimitError"}}}}"#
+        ));
+        assert!(!opencode(
+            r#"{"type":"text","part":{"text":"FreeUsageLimitError"}}"#
         ));
     }
 

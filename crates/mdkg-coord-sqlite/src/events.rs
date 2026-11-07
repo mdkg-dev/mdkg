@@ -254,16 +254,7 @@ pub struct Reader {
 }
 
 fn read_only(path: &Path) -> Result<Connection, StoreError> {
-    store::Store::open_read_only_connection(path)?.ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!(
-                "coordinator store is absent; run a writing command such as `{} msg inbox` to initialize it",
-                mdkg_format::program::BIN
-            ),
-        )
-        .into()
-    })
+    store::Store::open_read_only_connection(path)?.ok_or(StoreError::ReadAbsent)
 }
 
 /// A read-only head query for consumers which already own their resource
@@ -1175,11 +1166,9 @@ mod tests {
             };
             let before = snapshot();
             let absent = |error: StoreError| {
-                assert!(
-                    matches!(&error, StoreError::Io(e) if e.kind() == std::io::ErrorKind::NotFound),
-                    "{kind}: {error}"
-                );
-                assert!(error.to_string().contains("msg inbox"), "{error}");
+                assert!(matches!(&error, StoreError::ReadAbsent), "{kind}: {error}");
+                // Store errors name no command; the CLI's hint does (#17360).
+                assert!(!error.to_string().contains("msg inbox"), "{error}");
             };
             absent(head(&f.path()).unwrap_err());
             for error in [
