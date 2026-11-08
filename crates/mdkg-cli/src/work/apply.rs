@@ -324,6 +324,7 @@ fn take(
                     now: now_ms(),
                     request: None,
                     node: key,
+                    branch: None,
                 })
                 .map_err(store_error)?
             {

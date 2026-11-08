@@ -19,8 +19,11 @@
 //!
 //! The answers are checked as properties, so the test keeps passing as this
 //! repository's own graph changes. Missing goal and decision context is
-//! seeded along with two practice tasks, so an empty exported graph also
-//! provides the context and ready work the recovery exercises.
+//! seeded, so an empty exported graph also provides it. The work both agents
+//! pick, claim and finish is a chain of practice tasks the test creates
+//! itself, reached by `next <start>`: this repository's own ready work may
+//! have a gate that refuses `done`, so the agents never take it. A planted
+//! top-priority item with an open requirement proves that.
 //!
 //! Work that was never `done` lives only on its branch: a claim records no
 //! version, so mdkg can't point a fresh agent at the dead agent's
@@ -114,6 +117,84 @@ fn migrated(repo: &Path) -> bool {
     let text = fs::read_to_string(repo.join(".mdkg/config.json")).expect("config");
     let config: Value = serde_json::from_str(&text).expect("config JSON");
     config.get("graph_id").is_some()
+}
+
+/// The practice work: two ready tasks chained after a finished start node,
+/// so `next <start>` offers only them, never this repository's own work.
+/// Returns the start node's id.
+fn practice_chain(repo: &Path) -> String {
+    let created = |title: &str, status: &str| -> (String, PathBuf) {
+        let out = ok(
+            repo,
+            "setup",
+            0,
+            &["new", "task", title, "--status", status],
+        );
+        let node = &out["data"]["node"];
+        let id = node["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("a new node: {out}"));
+        let path = node["path"]
+            .as_str()
+            .unwrap_or_else(|| panic!("its path: {out}"));
+        (id.to_string(), repo.join(path))
+    };
+    let start = created("Recovery practice start", "done");
+    let one = created("Recovery practice one", "todo");
+    let two = created("Recovery practice two", "todo");
+    // `new` takes an edge only to a node that already points back, so the
+    // chain's edges are written into the front matter afterwards.
+    set_field(&start.1, "next", &one.0);
+    set_field(&one.1, "prev", &start.0);
+    set_field(&one.1, "next", &two.0);
+    set_field(&two.1, "prev", &one.0);
+    start.0
+}
+
+/// Sets `key: value` in a node file's front matter, replacing the key's line
+/// or adding one before the closing `---`.
+fn set_field(path: &Path, key: &str, value: &str) {
+    let text = fs::read_to_string(path).expect("read node");
+    let body_at = text[4..].find("\n---\n").expect("front matter") + 4;
+    let (front, body) = text.split_at(body_at);
+    let line = format!("{key}: {value}");
+    let prefix = format!("{key}:");
+    let mut lines: Vec<String> = front.lines().map(String::from).collect();
+    match lines.iter_mut().find(|l| l.starts_with(&prefix)) {
+        Some(l) => *l = line,
+        None => lines.push(line),
+    }
+    fs::write(path, format!("{}{body}", lines.join("\n"))).expect("write node");
+}
+
+/// A ready top-priority item whose open requirement makes its gate refuse
+/// `done`, as live work in this repository's graph may. Returns its id.
+fn plant_gated_item(repo: &Path) -> String {
+    let out = ok(
+        repo,
+        "setup",
+        0,
+        &[
+            "new",
+            "task",
+            "Recovery gated item",
+            "--status",
+            "todo",
+            "--priority",
+            "0",
+        ],
+    );
+    let node = &out["data"]["node"];
+    let id = node["id"].as_str().expect("a new node").to_string();
+    let path = repo.join(node["path"].as_str().expect("its path"));
+    let text = fs::read_to_string(&path).expect("read");
+    let requirement = "- R1: The gated item shall stay unfinished. (verify: none)\n";
+    let text = match text.split_once("# Requirements\n") {
+        Some((head, tail)) => format!("{head}# Requirements\n\n{requirement}{tail}"),
+        None => format!("{text}\n# Requirements\n\n{requirement}"),
+    };
+    fs::write(&path, text).expect("write");
+    id
 }
 
 /// A public export starts with an empty graph. Supply only missing context
@@ -254,16 +335,17 @@ fn recover(dir: Scratch, repo: PathBuf) {
         sh(&repo, &["switch", "-q", "main"]);
     }
     seed_context(&repo);
-    for title in ["Recovery practice one", "Recovery practice two"] {
-        ok(
-            &repo,
-            "setup",
-            0,
-            &["new", "task", title, "--status", "todo"],
-        );
-    }
+    let start = practice_chain(&repo);
+    let gated = plant_gated_item(&repo);
     sh(&repo, &["add", "."]);
     sh(&repo, &["commit", "-q", "-m", "practice tasks"]);
+    // The planted item's gate refuses `done`, as a live node's may.
+    let (code, gate) = run(&repo, "setup", 0, &["entry", "gate", &gated]);
+    assert_eq!(
+        (code, &gate["data"]["ok"]),
+        (2, &Value::Bool(false)),
+        "{gate}"
+    );
     let dead = dir.0.join("wt-dead");
     let fresh = dir.0.join("wt-fresh");
     sh(
@@ -280,14 +362,16 @@ fn recover(dir: Scratch, repo: PathBuf) {
     );
 
     // The agent that will die finishes one item on its branch (unmerged)…
-    let first = ok(&dead, "dead", 0, &["next"]);
+    let first = ok(&dead, "dead", 0, &["next", &start]);
     let finished = first["data"]["node"]["id"]
         .as_str()
         .expect("a ready item")
         .to_string();
+    assert_ne!(finished, gated);
+    ok(&dead, "dead", 1, &["claim", &finished]);
     ok(&dead, "dead", 1, &["done", &finished]);
     // …then claims the next one, edits it, commits, and dies before `done`.
-    let second = ok(&dead, "dead", 2, &["next"]);
+    let second = ok(&dead, "dead", 2, &["next", &start]);
     let abandoned = second["data"]["node"]["id"]
         .as_str()
         .expect("a second item")
@@ -399,7 +483,7 @@ fn recover(dir: Scratch, repo: PathBuf) {
 
     // The next safe action: a ready item nobody holds. The abandoned item is
     // ready again; the finished one is not.
-    let next = ok(&fresh, "fresh", later, &["next"]);
+    let next = ok(&fresh, "fresh", later, &["next", &start]);
     let picked = next["data"]["node"]["id"]
         .as_str()
         .expect("next")
@@ -408,6 +492,7 @@ fn recover(dir: Scratch, repo: PathBuf) {
         picked, finished,
         "the dead agent's finished item isn't offered again"
     );
+    assert_eq!(picked, abandoned, "the abandoned item is offered again");
     let shown = ok(
         &fresh,
         "fresh",

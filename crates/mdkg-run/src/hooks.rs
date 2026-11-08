@@ -592,6 +592,7 @@ impl Owner {
             host: self.host.clone(),
             pid: self.pid,
             started: self.started.clone(),
+            boot_id: String::new(),
         })
     }
 }

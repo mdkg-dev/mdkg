@@ -533,6 +533,13 @@ fn supervise(
         checkpoint(saved.as_deref_mut(), current)?;
         save_progress(name, current);
         record_state(name, registry::AgentState::Idle, on);
+        // A lease the last turn couldn't give back goes now, before this
+        // supervisor waits or ends, and is tried again while it waits
+        // (friction 148).
+        let left = turn::release_left(mail, dir, name).unwrap_or_else(|e| {
+            on(name, Event::Trouble(&e));
+            true
+        });
         if stop_requested() {
             return Ok(ran);
         }
@@ -679,6 +686,11 @@ fn supervise(
         }
         let after = agent.cursor.max(seen);
         let wait = cooldown.map_or(how.wait_secs, |c| how.wait_secs.min(c.as_secs().max(1)));
+        let wait = if left {
+            wait.min(turn::RELEASE_RETRY_SECS)
+        } else {
+            wait
+        };
         let waited = if opts.digest_budget.is_some() {
             mail.wait_digest(name, after, wait_secs(wait))
         } else {

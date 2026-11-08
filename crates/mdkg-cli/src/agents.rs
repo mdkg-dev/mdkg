@@ -295,6 +295,7 @@ fn record_definition(
                 now,
                 request: None,
                 node: None,
+                branch: None,
             })
         });
         if capped {
@@ -846,6 +847,12 @@ pub struct AgentStatus {
     /// reason is never guessed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_exit: Option<LastExit>,
+    /// The turn lease a turn couldn't give back as it ended (its release
+    /// failed, as a busy store's `coord.store_failed` does): it may still
+    /// be held, so the next turn's start releases it first. Absent once a
+    /// turn holds the lease again.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_lease_unreleased: Option<TurnLeaseUnreleased>,
     /// The position `agents logs <agent> --follow --after` takes to pick up
     /// from this snapshot: never "from now", so a turn that starts or ends
     /// in between is still delivered.
@@ -865,6 +872,17 @@ pub struct LastExit {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
     /// When it exited (RFC 3339).
+    pub at: String,
+}
+
+/// A turn lease release that failed (`agents status`'s
+/// `turn_lease_unreleased`).
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct TurnLeaseUnreleased {
+    /// The failed release's diagnostic code.
+    pub code: String,
+    pub message: String,
+    /// When the release failed (RFC 3339).
     pub at: String,
 }
 
@@ -3040,9 +3058,16 @@ fn status_report(root: &Path, probe: bool) -> Result<Report<StatusData>, GraphEr
                 code: e.code,
                 at: supervise::timestamp(e.at_ms),
             });
+        let turn_lease_unreleased =
+            mdkg_run::state::read_release_failure(&dir, &name).map(|f| TurnLeaseUnreleased {
+                code: crate::config_cmd::display_text(&f.code),
+                message: crate::config_cmd::display_text(&f.message),
+                at: supervise::timestamp(f.at_ms),
+            });
         agents.push(AgentStatus {
             code_base,
             last_exit,
+            turn_lease_unreleased,
             state: view.state,
             supervisor: view.supervisor,
             current_turn: view.current_turn,
@@ -3436,6 +3461,27 @@ pub fn run(root: &Path, actor: Option<String>, c: &AgentsCommand) -> u8 {
                     for diagnostic in &mut report.diagnostics {
                         redact_diagnostic(diagnostic);
                     }
+                    let unreleased = report
+                        .data
+                        .iter()
+                        .flat_map(|data| data.agents.iter())
+                        .filter_map(|agent| {
+                            let u = agent.turn_lease_unreleased.as_ref()?;
+                            Some(
+                                Diagnostic::new(
+                                    Code::RunMailFailed,
+                                    Severity::Warning,
+                                    format!(
+                                        "{}: its turn lease wasn't released as a turn ended ({}, at {}): {}",
+                                        agent.name, u.code, u.at, u.message
+                                    ),
+                                )
+                                .with_hint(
+                                    "the next turn's start releases it first; until then it may block a turn",
+                                ),
+                            )
+                        })
+                        .collect::<Vec<_>>();
                     let diagnostics: Vec<_> = report
                         .data
                         .iter()
@@ -3457,6 +3503,7 @@ pub fn run(root: &Path, actor: Option<String>, c: &AgentsCommand) -> u8 {
                                 },
                             )
                         })
+                        .chain(unreleased)
                         .map(|mut diagnostic| {
                             redact_diagnostic(&mut diagnostic);
                             diagnostic

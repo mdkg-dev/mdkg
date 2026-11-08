@@ -12,7 +12,7 @@
     "limits": {"max_files": 100000, "max_file_bytes": 8388608, "max_total_bytes": 536870912, "max_depth": 64}
   },
   "customization": {"skill_mirrors": {"targets": [".agents/skills", ".claude/skills"]}},
-  "coordination": {"leases": {"default": "exclusive", "paths": [], "unleased": "warn"}},
+  "coordination": {"leases": {"default": "exclusive", "paths": [], "unleased": "warn", "scope": "repository"}},
   "orchestration": {"branch": "agent/{agent}", "worktree": ".worktrees/{agent}"},
   "agents": {"defaults": {
     "trigger": "mail",

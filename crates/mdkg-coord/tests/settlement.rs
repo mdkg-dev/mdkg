@@ -270,6 +270,7 @@ fn replaying_commands_rebuilds_identical_state() {
             now: 0,
             request: None,
             node: None,
+            branch: None,
         },
         Command::Commit {
             owner: "a".into(),
@@ -286,6 +287,7 @@ fn replaying_commands_rebuilds_identical_state() {
             now: 2,
             request: None,
             node: None,
+            branch: None,
         },
         Command::ObserveMain {
             observation: Observation {

@@ -270,6 +270,7 @@ fn anchor_text_counts_actors_and_json_keeps_the_complete_list() {
                     now: 1,
                     request: None,
                     node: None,
+                    branch: None,
                 })
                 .unwrap();
             let mdkg_coord::Outcome::Lease { lease } = outcome else {

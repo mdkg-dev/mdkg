@@ -1,6 +1,6 @@
 [package]
 name = "mdkg-graph"
-version = "0.7.2"
+version = "0.7.3"
 description = "Load, index, query and validate mdkg graphs. Internal to mdkg, no stable API; depend on the mdkg binary"
 edition.workspace = true
 license.workspace = true
@@ -11,8 +11,8 @@ readme = "README.md"
 
 [dependencies]
 # Read immutable graph objects through the shared hardened Git boundary.
-mdkg-git = { path = "../mdkg-git", version = "0.7.2" }
-mdkg-format = { path = "../mdkg-format", version = "0.7.2", features = ["settings-fs"] }
+mdkg-git = { path = "../mdkg-git", version = "0.7.3" }
+mdkg-format = { path = "../mdkg-format", version = "0.7.3", features = ["settings-fs"] }
 serde_json.workspace = true
 # Graph sync pins git setup as digests, never values (Terra #18946).
 sha2.workspace = true

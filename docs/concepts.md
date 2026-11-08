@@ -281,6 +281,24 @@ and a lease on a folder around it (`docs` around a shared
 they block it. Globs are relative to the graph root, so `Cargo.toml`
 names only the root's. Node files are always exclusive.
 
+Leases hold a path on every branch by default, so two worktrees contend
+for a file even when they work on unrelated branches. A repository can
+scope path leases by branch instead: `"scope": "branch"` under
+`coordination.leases` in the committed config, or `git config
+mdkg.leaseScope branch` in the repository's own git config, which
+changes no tracked file and wins over the committed setting (`repository`
+sets the default back). A claim then records the branch its worktree has
+checked out, and leases on two different branches never block each
+other: the second claim succeeds and warns `coord.lease_other_branch`
+with the others' names, `status` shows each lease's branch, and the
+`coord.merge_conflict` check above runs against them as it does for
+shared leases. Leases on the same branch contend as before. Node files,
+roles, turns, anything in a graph folder and a claim from a detached
+checkout still hold on every branch, and a lease holds only in a
+checkout of its branch: a worktree switched to another branch claims
+again. Leases granted before the setting changed keep holding on every
+branch until they end.
+
 `mdkg release <path>` gives one lease up early, and `mdkg done` (below)
 releases its node's lease. A file lease protects uncommitted edits only,
 so once Ada has committed her work, `mdkg release --all` gives up every

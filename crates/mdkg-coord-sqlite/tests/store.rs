@@ -50,6 +50,7 @@ fn claim(owner: &str, scope: &str, now: u64) -> Command {
         now,
         request: None,
         node: None,
+        branch: None,
     }
 }
 
@@ -454,7 +455,7 @@ fn a_schema_1_store_upgrades_in_place_and_others_are_refused() {
     store.execute(&claim("x", "w/a", 0)).unwrap();
     let before = store.coordinator().unwrap();
     drop(store);
-    assert_eq!(schema_of(&dir.db()), "4");
+    assert_eq!(schema_of(&dir.db()), "5");
 
     // A store as a pre-mode binary left it: schema "1", leases without a
     // mode field.
@@ -499,12 +500,12 @@ fn a_schema_1_store_upgrades_in_place_and_others_are_refused() {
     assert_eq!(store.coordinator().unwrap(), before);
     store.verify().unwrap();
     drop(store);
-    assert_eq!(schema_of(&dir.db()), "4", "upgraded in place");
+    assert_eq!(schema_of(&dir.db()), "5", "upgraded in place");
 
-    set_schema(&dir.db(), "5");
+    set_schema(&dir.db(), "6");
     assert!(matches!(
         allowing(&dir.db(), 100),
-        Err(StoreError::Schema(v)) if v == "5"
+        Err(StoreError::Schema(v)) if v == "6"
     ));
     // Review round 3 of 1bca39d: a value no build wrote is damage, not a
     // newer build's store.
@@ -524,15 +525,66 @@ fn a_handle_opened_before_an_upgrade_refuses_to_write() {
     let dir = Scratch::new("schema-race");
     let mut store = allowing(&dir.db(), 100).unwrap();
     store.execute(&register("w/a")).unwrap();
-    set_schema(&dir.db(), "5");
+    set_schema(&dir.db(), "6");
     assert!(matches!(
         store.execute(&claim("x", "w/a", 0)),
-        Err(StoreError::Schema(v)) if v == "5"
+        Err(StoreError::Schema(v)) if v == "6"
     ));
     assert!(matches!(store.coordinator(), Err(StoreError::Schema(_))));
     assert!(matches!(store.rebuild(), Err(StoreError::Schema(_))));
     assert!(matches!(store.replay(), Err(StoreError::Schema(_))));
     assert!(matches!(store.journal(), Err(StoreError::Schema(_))));
+}
+
+/// Leases may name a branch since schema "5": a "4" store, as a build
+/// before branches left it, upgrades in place, copied first. Its leases
+/// name no branch, so they keep holding on every branch, and its chain
+/// goes on. A build that refuses upgrades leaves it alone, and an older
+/// build meets a "5" store as one past its own schema (the refusal
+/// `a_handle_opened_before_an_upgrade_refuses_to_write` and the ledger's
+/// `a_store_past_this_builds_schema_is_refused_as_newer` show).
+#[test]
+fn a_schema_4_store_upgrades_to_5_and_its_leases_hold_on_every_branch() {
+    let dir = Scratch::new("schema-5");
+    let mut store = allowing(&dir.db(), 100).unwrap();
+    store.execute(&claim("x", "src/lib.rs", 0)).unwrap();
+    let before = store.coordinator().unwrap();
+    drop(store);
+    set_schema(&dir.db(), "4");
+    match Store::open_with(&dir.db(), 100, Upgrade::Refuse) {
+        Err(StoreError::UpgradeRefused { from, to }) => {
+            assert_eq!((from.as_str(), to.as_str()), ("4+msg5", "5+msg5"));
+        }
+        Err(other) => panic!("refused for another reason: {other}"),
+        Ok(_) => panic!("a refusing build upgraded the store"),
+    }
+    assert_eq!(schema_of(&dir.db()), "4");
+    assert!(copies_of(&dir.db()).is_empty());
+
+    let mut store = allowing(&dir.db(), 100).unwrap();
+    assert_eq!(schema_of(&dir.db()), "5");
+    assert_eq!(
+        copies_of(&dir.db()),
+        ["coord.sqlite.pre-4+msg5-to-5+msg5.sqlite"]
+    );
+    assert_eq!(store.coordinator().unwrap(), before);
+    store.verify_log().expect("the chain goes on");
+    // The old lease holds on every branch: a claim on a branch is refused.
+    let branched = Command::Claim {
+        owner: "y".into(),
+        scope: Scope::new("src/lib.rs"),
+        mode: mdkg_coord::Mode::Exclusive,
+        now: 1,
+        request: None,
+        node: None,
+        branch: Some("feature".into()),
+    };
+    assert!(matches!(
+        store.execute(&branched).unwrap(),
+        Outcome::Refused {
+            error: Error::Held(_)
+        }
+    ));
 }
 
 fn meta_of(db: &std::path::Path, key: &str) -> Option<String> {
@@ -563,7 +615,7 @@ fn an_upgrade_copies_the_store_first_or_not_at_all() {
     let before = schema_1_store(&dir);
     let copy = dir
         .db()
-        .with_file_name("coord.sqlite.pre-1+msg5-to-4+msg5.sqlite");
+        .with_file_name("coord.sqlite.pre-1+msg5-to-5+msg5.sqlite");
 
     // The copy can't be written (its folder takes no new files, while a
     // held connection keeps the WAL the store itself writes to): nothing
@@ -590,7 +642,7 @@ fn an_upgrade_copies_the_store_first_or_not_at_all() {
     assert_eq!(store.backup(), Some(copy.as_path()));
     assert_eq!(store.coordinator().unwrap(), before);
     drop(store);
-    assert_eq!(schema_of(&dir.db()), "4");
+    assert_eq!(schema_of(&dir.db()), "5");
     assert_eq!(schema_of(&copy), "1", "the copy is the store as it was");
     assert_eq!(
         meta_of(&copy, "backup_of").as_deref(),
@@ -627,7 +679,7 @@ fn a_restore_lands_whole_and_refuses_what_it_cant_trust() {
         "{refused:?}"
     );
     drop(held);
-    assert_eq!(schema_of(&dir.db()), "4");
+    assert_eq!(schema_of(&dir.db()), "5");
 
     // A WAL left behind with a write in it, and nothing holding it.
     let db = dir.db();
@@ -653,7 +705,7 @@ fn a_restore_lands_whole_and_refuses_what_it_cant_trust() {
     let restored = mdkg_coord_sqlite::restore(&dir.db(), &copy).unwrap();
     assert_eq!(
         (restored.replaced.as_str(), restored.restored.as_str()),
-        ("4+msg5", "1+msg5")
+        ("5+msg5", "1+msg5")
     );
     assert!(!wal.exists(), "no WAL left behind");
     assert_eq!(schema_of(&dir.db()), "1");
@@ -694,7 +746,7 @@ fn a_restore_lands_whole_and_refuses_what_it_cant_trust() {
         matches!(&refused, Err(StoreError::Restore(m)) if m.contains("isn't a copy")),
         "{refused:?}"
     );
-    assert_eq!(schema_of(&dir.db()), "4", "none of them changed the store");
+    assert_eq!(schema_of(&dir.db()), "5", "none of them changed the store");
 }
 
 fn copies_of(db: &std::path::Path) -> Vec<String> {
@@ -725,7 +777,7 @@ fn every_upgrade_copies_and_a_failed_one_leaves_nothing() {
     assert!(
         store
             .backup()
-            .is_some_and(|b| b.ends_with("coord.sqlite.pre-4+msg2-to-4+msg5.sqlite")),
+            .is_some_and(|b| b.ends_with("coord.sqlite.pre-5+msg2-to-5+msg5.sqlite")),
         "{:?}",
         store.backup()
     );
@@ -755,7 +807,7 @@ fn every_upgrade_copies_and_a_failed_one_leaves_nothing() {
     assert!(
         store
             .backup()
-            .is_some_and(|b| b.ends_with("coord.sqlite.pre-4-to-4+msg5.sqlite")),
+            .is_some_and(|b| b.ends_with("coord.sqlite.pre-5-to-5+msg5.sqlite")),
         "{:?}",
         store.backup()
     );
@@ -763,10 +815,10 @@ fn every_upgrade_copies_and_a_failed_one_leaves_nothing() {
     // Listing reads a copy without leaving a WAL beside it.
     let listed = mdkg_coord_sqlite::backups(&dir.db()).unwrap();
     assert_eq!(listed.len(), 1);
-    assert_eq!(listed[0].schema.as_deref(), Some("4"));
+    assert_eq!(listed[0].schema.as_deref(), Some("5"));
     assert_eq!(
         copies_of(&dir.db()),
-        vec!["coord.sqlite.pre-4-to-4+msg5.sqlite"]
+        vec!["coord.sqlite.pre-5-to-5+msg5.sqlite"]
     );
 
     // The upgrade fails after the copy (a damaged ttl): nothing is left,
@@ -875,14 +927,14 @@ fn a_build_folder_binary_refuses_to_upgrade_a_store() {
     // A new store is no upgrade.
     let fresh = Scratch::new("guard-new");
     drop(Store::open(&fresh.db(), 100).expect("a new store"));
-    assert_eq!(schema_of(&fresh.db()), "4");
+    assert_eq!(schema_of(&fresh.db()), "5");
 
     let dir = Scratch::new("guard");
     let before = schema_1_store(&dir);
     for _ in 0..2 {
         match Store::open(&dir.db(), 100) {
             Err(StoreError::UpgradeRefused { from, to }) => {
-                assert_eq!((from.as_str(), to.as_str()), ("1+msg5", "4+msg5"));
+                assert_eq!((from.as_str(), to.as_str()), ("1+msg5", "5+msg5"));
             }
             other => panic!("not refused: {other:?}"),
         }

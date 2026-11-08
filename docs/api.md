@@ -2,7 +2,7 @@
 
 **Status: draft.** This guide describes the API mdkg is building towards. The
 CLI's `--json` output is the contract today. The CLI seams and local
-`mdkg serve` ship in 0.7.1; the networked serve design is deferred to 0.7.2.
+`mdkg serve` ship in 0.7.1; the networked serve design is deferred to a later release.
 The [local API guide](serve.md) names the operations available now; other
 resource designs below remain a roadmap.
 
@@ -97,8 +97,13 @@ oldest first, at most 200 messages (`--limit`, default 50) and under
   their mail: an agent may read a person's mailbox (`msg inbox --mailbox
   human:<name>`, or `msg wait`), but its read marks nothing shown, and
   its `--mark-shown` there is refused with `msg.not_holder`.
-- Only a person runs it (`--as human:<name>` or `$MDKG_ACTOR`), outside
-  an agent's turn (`api.actor_not_allowed` otherwise). Which person may
+- Only a person runs it (`--as human:<name>` or `$MDKG_ACTOR`;
+  `api.actor_not_allowed` otherwise), outside an agent's turn: not under
+  the turn mark, not as a live turn's actor and not as a descendant of a
+  live turn's launcher. A turn some other process launched doesn't refuse
+  it, even one working in the same checkout. The live-turn guard's refusal
+  is `run.turn_active`, for `msg list` and a person's `msg send` alike:
+  retry it from the person's own shell, or once the turn ends. Which person may
   see which channel is for software above mdkg to decide. It has no MCP
   tool and isn't served by `mdkg serve` until person-signed requests are.
 - Its rows are `msg inbox`'s message records, and it returns
@@ -264,7 +269,7 @@ The default private Unix socket uses local file permissions for
 authentication. Optional loopback-only TCP uses a token file and refuses
 browser requests. See the [local API](serve.md) for the supported paths
 and limits. Networked TLS, signed requests and machine enrolment (A15, A16)
-are deferred to 0.7.2; they are not the 0.7.1 loopback transport.
+are deferred to a later release; they are not the loopback transport.
 
 ## Channels
 

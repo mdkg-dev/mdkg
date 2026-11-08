@@ -1378,6 +1378,9 @@ mod sc56 {
                 .env("GIT_CONFIG_GLOBAL", "/dev/null")
                 .env("GIT_SSH_COMMAND", &self.ssh)
                 .env("GIT_SSH_VARIANT", "simple")
+                // The ssh here is the fixture's local command, so allow
+                // exactly that transport, whatever the runner allows.
+                .env("GIT_ALLOW_PROTOCOL", "ssh")
                 .output()
                 .expect("git client")
         }

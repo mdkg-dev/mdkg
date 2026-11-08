@@ -4336,3 +4336,123 @@ fn every_rule_target_of_this_repository_exists_at_its_head() {
         missing.join("\n")
     );
 }
+
+/// The watch tests check every message and channel record `msg` emits
+/// against the resource schemas in docs/api, so a change to the code that
+/// emits those records, or to any of those schemas, selects them. A field
+/// added to message records without its schema once reached main because
+/// only the msg tests ran. The turn-output schema also selects the two
+/// tests that read it. Runs this repository's own `affected` rules on a
+/// copy of its workspace, one change at a time.
+#[test]
+fn record_output_and_api_schema_changes_select_the_watch_tests() {
+    if !have("cargo") {
+        eprintln!("skipped: cargo isn't on PATH");
+        return;
+    }
+    let top = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .unwrap();
+    if !top.join(".git").exists() || !top.join(".mdkg/config.json").is_file() {
+        eprintln!("skipped: not run from the mdkg repository");
+        return;
+    }
+    let config: Value =
+        serde_json::from_slice(&fs::read(top.join(".mdkg/config.json")).unwrap()).unwrap();
+    if config.get("affected").is_none() {
+        eprintln!("skipped: this repository's .mdkg/config.json has no `affected` rules");
+        return;
+    }
+    let tracked = git(
+        &top,
+        &[
+            "ls-files",
+            "-z",
+            "--",
+            "Cargo.toml",
+            "Cargo.lock",
+            "rust-toolchain.toml",
+            "crates",
+            "docs/api",
+        ],
+    );
+    let (s, _) = repo();
+    for path in tracked.split('\0').filter(|p| !p.is_empty()) {
+        let from = top.join(path);
+        // A file deleted in the checkout but not yet in the index.
+        if !from.is_file() {
+            continue;
+        }
+        let to = s.0.join(path);
+        fs::create_dir_all(to.parent().unwrap()).unwrap();
+        fs::copy(&from, &to).unwrap();
+    }
+    let fixture = s.0.join(".mdkg/config.json");
+    let mut cfg: Value = serde_json::from_slice(&fs::read(&fixture).unwrap()).unwrap();
+    cfg["affected"] = config["affected"].clone();
+    fs::write(&fixture, cfg.to_string()).unwrap();
+    let mut base = commit(&s.0, "the workspace and its rules");
+
+    let watch = ("test", "watch");
+    let only_watch = [watch];
+    let turn_output = [watch, ("test", "agents"), ("test", "turn_output")];
+    let mut cases: Vec<(&str, &[(&str, &str)])> = vec![
+        // Message and channel records, and `msg --json` output.
+        ("crates/mdkg-cli/src/msg.rs", &only_watch),
+        // The watch stream itself.
+        ("crates/mdkg-cli/src/msg/watch.rs", &only_watch),
+    ];
+    // Every tracked resource schema, so narrowing the docs/api rule to a
+    // few of them fails here.
+    let schemas: Vec<&str> = tracked
+        .split('\0')
+        .filter(|p| p.starts_with("docs/api/") && p.ends_with(".json"))
+        .collect();
+    assert!(
+        schemas.contains(&"docs/api/mdkg.api.message.v1.json")
+            && schemas.contains(&"docs/api/mdkg.api.turn_output.v1.json"),
+        "docs/api's schemas aren't tracked: {schemas:?}"
+    );
+    for path in schemas {
+        if path == "docs/api/mdkg.api.turn_output.v1.json" {
+            cases.push((path, &turn_output));
+        } else {
+            cases.push((path, &only_watch));
+        }
+    }
+    for (path, want) in cases {
+        let file = s.0.join(path);
+        assert!(file.is_file(), "{path} isn't in this workspace");
+        let mut text = fs::read(&file).unwrap();
+        // Trailing whitespace keeps a JSON schema valid and Rust source
+        // building; only the path matters to `affected`.
+        text.extend_from_slice(b"\n");
+        fs::write(&file, text).unwrap();
+        let head = commit(&s.0, &format!("change {path}"));
+        let (_, v) = affected_targets(&s.0, &["--base", &base]);
+        assert_eq!(v["ok"], true, "{path}: {v}");
+        assert_eq!(v["data"]["mode"], "selective", "{path}: {v}");
+        let selected: Vec<(String, String)> = v["data"]["selected"]["rust_targets"]
+            .as_array()
+            .expect("rust_targets")
+            .iter()
+            .filter(|t| t["package"] == "mdkg")
+            .map(|t| {
+                (
+                    t["kind"].as_str().unwrap().to_string(),
+                    t["name"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        for (kind, name) in want.iter() {
+            assert!(
+                selected.iter().any(|(k, n)| k == kind && n == name),
+                "a change to {path} doesn't select mdkg's {kind} {name}: \
+                 add it to that path's rule in .mdkg/config.json's `affected` \
+                 section; selected: {selected:?}"
+            );
+        }
+        base = head;
+    }
+}

@@ -430,6 +430,7 @@ pub fn seed_import_history(path: &std::path::Path, history: &Value) {
             now: 1000,
             request: None,
             node: None,
+            branch: None,
         })
         .expect("fixture journal seed");
     let record = &history["import"]["record"];

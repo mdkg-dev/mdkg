@@ -1285,6 +1285,42 @@ pub(crate) fn exclude(top: &Path, common: &Path, line: &str) -> Result<bool, Gra
     Ok(true)
 }
 
+/// Ref mode's rule for `.worktrees/`, before a worktree is made in
+/// `holder`'s `.worktrees/` (the checkout that will hold it): a line in the
+/// common `info/exclude` through [`exclude`], so no tracked file changes.
+/// Checkout mode keeps the primary checkout's `.gitignore` line instead
+/// (`mdkg_run::install::worktree::ignore_worktrees`). A rule git already
+/// applies in `holder` is left as it is, so an existing `.gitignore` line
+/// is never rewritten. A `.gitignore` negation outranks `info/exclude`, so
+/// when git still wouldn't ignore `.worktrees/` after the line is added,
+/// this refuses: the worktree would show as untracked. A `.worktrees`
+/// link is left to go ahead, since git can't say for a path under one.
+pub(crate) fn exclude_worktrees(holder: &Path, common: &Path) -> Result<(), GraphError> {
+    let line = mdkg_run::install::worktree::IGNORE;
+    exclude(holder, common, line)?;
+    // Git matches no path under a link, so for a `.worktrees` that is
+    // one it can't answer: that layout goes ahead as before.
+    let linked = std::fs::symlink_metadata(holder.join(".worktrees"))
+        .is_ok_and(|m| m.file_type().is_symlink());
+    if linked || excluded(holder, line)? {
+        return Ok(());
+    }
+    // Git names no rule here: a folder-only pattern matches nothing until
+    // the folder exists.
+    Err(GraphError::failure(
+        mdkg_format::Code::InstallUnmergeable,
+        format!(
+            "git wouldn't ignore {} even with {line} in info/exclude (a .gitignore rule \
+             re-includes it, and a .gitignore outranks info/exclude), so a worktree made \
+             there would show as untracked",
+            holder.join(".worktrees").display()
+        ),
+    )
+    .with_hint(
+        "remove the .gitignore rule that re-includes .worktrees/, then run the command again",
+    ))
+}
+
 /// Moves the clone to the graph ref, or brings a ref-mode clone's setup up
 /// to date. The caller holds the clone's turns.
 /// 0.7.1's ref mode reads the repository-root graph from `.mdkg` only, so
@@ -1667,7 +1703,7 @@ pub(crate) fn setup(
         }
     }
     if choice.view {
-        notes.push(view(top, &name)?);
+        notes.push(view(top, &common_dir, &name)?);
     }
     Ok(Done {
         setup,
@@ -1683,12 +1719,11 @@ fn short(sha: &str) -> &str {
 
 /// `--view`: `.worktrees/graph`, detached at the graph tip, read-only by
 /// convention (G6); refreshed when it's clean.
-fn view(top: &Path, name: &str) -> Result<String, GraphError> {
+fn view(top: &Path, common_dir: &Path, name: &str) -> Result<String, GraphError> {
     let path = top.join(".worktrees/graph");
     let shown = path.display().to_string();
     if !path.join(".git").exists() {
-        mdkg_run::install::worktree::ignore_worktrees(top, false)
-            .map_err(crate::run::graph_error)?;
+        exclude_worktrees(top, common_dir)?;
         git_ok(
             top,
             &["worktree", "add", "--detach", &path.to_string_lossy(), name],

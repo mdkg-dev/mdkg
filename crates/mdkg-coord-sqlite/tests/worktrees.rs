@@ -71,6 +71,7 @@ fn claim(owner: &str, path: &str, now: u64) -> Command {
         now,
         request: None,
         node: None,
+        branch: None,
     }
 }
 

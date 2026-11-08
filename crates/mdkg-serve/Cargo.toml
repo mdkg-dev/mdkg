@@ -1,6 +1,6 @@
 [package]
 name = "mdkg-serve"
-version = "0.7.2"
+version = "0.7.3"
 description = "mdkg serve: the coordinator's listeners, request authentication, enrolment endpoints and event fan-out. Internal to mdkg, no stable API; depend on the mdkg binary"
 edition.workspace = true
 license.workspace = true
@@ -10,17 +10,17 @@ homepage.workspace = true
 readme = "README.md"
 
 [dependencies]
-mdkg-format = { path = "../mdkg-format", version = "0.7.2" }
-mdkg-git = { path = "../mdkg-git", version = "0.7.2" }
-mdkg-graph = { path = "../mdkg-graph", version = "0.7.2" }
-mdkg-ops = { path = "../mdkg-ops", version = "0.7.2" }
+mdkg-format = { path = "../mdkg-format", version = "0.7.3" }
+mdkg-git = { path = "../mdkg-git", version = "0.7.3" }
+mdkg-graph = { path = "../mdkg-graph", version = "0.7.3" }
+mdkg-ops = { path = "../mdkg-ops", version = "0.7.3" }
 # The pairing code, fingerprints and the proof of possession (decided
 # 2026-10-29; orchestrator #8168).
-mdkg-wire = { path = "../mdkg-wire", version = "0.7.2" }
+mdkg-wire = { path = "../mdkg-wire", version = "0.7.3" }
 # One attestation adapter, from person-keys' outcome to serve-store's
 # approval check (#10686 item 4; orchestrator, 2026-10-30).
-mdkg-coord-sqlite = { path = "../mdkg-coord-sqlite", version = "0.7.2" }
-mdkg-presence = { path = "../mdkg-presence", version = "0.7.2", default-features = false }
+mdkg-coord-sqlite = { path = "../mdkg-coord-sqlite", version = "0.7.3" }
+mdkg-presence = { path = "../mdkg-presence", version = "0.7.3", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

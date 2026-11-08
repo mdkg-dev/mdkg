@@ -37,6 +37,7 @@ pub fn native(name: &str) -> Option<EventName> {
         "pre-push" => Some(EventName::GitPrePush),
         "pre-merge-commit" => Some(EventName::GitPreMergeCommit),
         "reference-transaction" => Some(EventName::GitReferenceTransaction),
+        "post-commit" => Some(EventName::GitPostCommit),
         _ => None,
     }
 }
@@ -1433,6 +1434,8 @@ fn evaluate(rules: &[Rule], e: &HookEvent, c: &Git<'_>) -> Decision {
                 None,
             ),
             "builtin:lease.staged" if !c.has_graph => None,
+            "builtin:lease.committed" if !c.has_graph => None,
+            "builtin:lease.committed" => committed(c.root, c.actor),
             "builtin:git.graph_path" if !c.has_graph => graph_path_at(e.actor.kind, c.top, None),
             "builtin:lease.staged" => match staged_paths(c.top) {
                 Some(paths) => staged(e.actor.kind, &paths, &live::Entries(c.live)),
@@ -1456,6 +1459,26 @@ fn evaluate(rules: &[Rule], e: &HookEvent, c: &Git<'_>) -> Decision {
         }
     }
     rules::combine(said)
+}
+
+/// `lease.committed` after a commit at `root`: releases the path leases
+/// `release --committed` would (nothing uncommitted, and touched by a
+/// commit of this worktree's since the claim), when `actor` is the one
+/// this worktree is named after; nobody else's. It names what it
+/// released. A failure says nothing: the leases lapse as before.
+fn committed(root: &Path, actor: &str) -> Option<(Verdict, String, &'static str)> {
+    let released = crate::coord::release_after_commit(root, actor).ok()?;
+    if released.is_empty() {
+        return None;
+    }
+    Some((
+        Verdict::Context,
+        format!(
+            "mdkg released the leases this commit settled: {}",
+            super::printable(&released.join(", "))
+        ),
+        "hook.lease_committed.released",
+    ))
 }
 
 /// `git.graph_path` for the commit being made at `top`. Only in ref mode:

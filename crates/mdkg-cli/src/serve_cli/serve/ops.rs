@@ -8,7 +8,7 @@
 //!
 //! - **Refused before the backend:** a route no operation has, a
 //!   host-class operation (the router), a stream other than
-//!   `/v1/events` (none is served in 0.7.2), and on loopback a person's
+//!   `/v1/events` (none is served in 0.7.3), and on loopback a person's
 //!   ledger operation (below).
 //! - **Refused by the backend:** any class but `any` (operator, host and
 //!   decision operations), a decision post, a ledger `decide` or
@@ -124,7 +124,7 @@ impl Ops {
             }
         };
         if op.kind == Kind::Stream {
-            return unsupported("this stream isn't served in 0.7.2; GET /v1/events is");
+            return unsupported("this stream isn't served in 0.7.3; GET /v1/events is");
         }
         let given = match self.arguments(op, req) {
             Ok(given) => given,

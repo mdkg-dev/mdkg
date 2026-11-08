@@ -109,6 +109,9 @@ pub const CODE_MAIL_FAILED: &str = "run.mail_failed";
 pub const CODE_IO: &str = "run.io_failed";
 /// A harness and role combination v0.1 doesn't run.
 pub const CODE_UNSUPPORTED: &str = "run.unsupported";
+/// A turn refused before the harness ran: the harness isn't signed in, or
+/// only with an API key, and nothing marked the turn to bill mdkg's key.
+pub const CODE_LOGIN_REQUIRED: &str = "run.login_required";
 /// A worker's turn left its branch, or would commit to a protected one.
 pub const CODE_BRANCH: &str = "run.branch_refused";
 /// `--watch` stopped after failed turns in a row; the mail waits for a

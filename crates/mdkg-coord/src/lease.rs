@@ -118,6 +118,32 @@ pub struct Lease {
     /// is held under this id whatever path another worktree gives it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node: Option<String>,
+    /// The branch the lease holds its scope on, when the claimant asked
+    /// for a branch-scoped lease: it then never blocks, nor is blocked by,
+    /// a lease that names another branch. `None` holds the scope on every
+    /// branch, as every lease did before this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+}
+
+impl Lease {
+    /// Whether this lease and one on `branch` hold their scopes on two
+    /// different branches, so neither blocks the other.
+    pub fn on_other_branch(&self, branch: Option<&str>) -> bool {
+        on_other_branches(self.branch.as_deref(), branch)
+    }
+
+    /// Whether this lease holds its scope for a checkout on `branch`
+    /// (`None`: detached): a lease on every branch always does, one on a
+    /// branch only there.
+    pub fn holds_on(&self, branch: Option<&str>) -> bool {
+        self.branch.is_none() || self.branch.as_deref() == branch
+    }
+}
+
+/// Whether two leases' branches are named and differ.
+pub fn on_other_branches(a: Option<&str>, b: Option<&str>) -> bool {
+    matches!((a, b), (Some(a), Some(b)) if a != b)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -359,16 +385,18 @@ impl Coordinator {
             .filter(move |l| l.confirmed && l.status == Status::Active && l.scope.overlaps(scope))
     }
 
-    /// Holders overlapping `scope` that a new lease in `mode` can't be
-    /// active beside: every holder for an exclusive claim, and exclusive
-    /// holders for a shared one.
+    /// Holders overlapping `scope` that a new lease in `mode` on `branch`
+    /// can't be active beside: every holder for an exclusive claim, and
+    /// exclusive holders for a shared one, except a holder on another
+    /// branch (both named).
     pub fn blockers<'a>(
         &'a self,
         scope: &'a Scope,
         mode: Mode,
+        branch: Option<&'a str>,
     ) -> impl Iterator<Item = &'a Lease> + 'a {
         self.holders(scope)
-            .filter(move |l| !mode.coexists_with(l.mode))
+            .filter(move |l| !mode.coexists_with(l.mode) && !l.on_other_branch(branch))
     }
 
     /// Takes the events recorded since the last drain.
@@ -512,6 +540,23 @@ impl Coordinator {
         now: Ms,
         request: Option<Request>,
     ) -> Result<LeaseId, Error> {
+        self.claim_on_branch(owner, scope, mode, node, None, now, request)
+    }
+
+    /// [`Self::claim_node`] for a lease that holds `scope` on `branch`
+    /// only, when given: one on another branch neither blocks it nor is
+    /// blocked by it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn claim_on_branch(
+        &mut self,
+        owner: &str,
+        scope: &Scope,
+        mode: Mode,
+        node: Option<&str>,
+        branch: Option<&str>,
+        now: Ms,
+        request: Option<Request>,
+    ) -> Result<LeaseId, Error> {
         if let Some(req) = &request
             && let Some(recorded) = self.requests.get(&req.key)
             && now <= recorded.valid_until
@@ -523,7 +568,7 @@ impl Coordinator {
         }
         let base = self.snapshot(scope);
         let id = self.fresh_id();
-        let held = self.blockers(scope, mode).next().is_some()
+        let held = self.blockers(scope, mode, branch).next().is_some()
             || node.is_some_and(|qid| self.node_holder(qid).is_some_and(|l| l.scope != *scope));
         let lease = Lease {
             id: id.clone(),
@@ -545,6 +590,7 @@ impl Coordinator {
             local_id: None,
             changeset: None,
             node: node.map(str::to_string),
+            branch: branch.map(str::to_string),
         };
         let kind = if held {
             EventKind::Conflict
@@ -733,7 +779,11 @@ impl Coordinator {
         if now >= lease.deadline {
             lease.status = Status::Expired;
             self.emit(EventKind::Expire, &lease, COORDINATOR, now);
-        } else if self.blockers(&lease.scope, lease.mode).next().is_some() {
+        } else if self
+            .blockers(&lease.scope, lease.mode, lease.branch.as_deref())
+            .next()
+            .is_some()
+        {
             lease.status = Status::Conflict;
             lease.reason = Some(ConflictReason::Held);
             self.emit(EventKind::Conflict, &lease, COORDINATOR, now);
@@ -851,6 +901,7 @@ impl Agent {
                 local_id: None,
                 changeset: None,
                 node: None,
+                branch: None,
             },
         );
         Ok(id)

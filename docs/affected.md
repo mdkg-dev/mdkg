@@ -72,7 +72,7 @@ workspace. Then:
 - Run the Rust plan, `data.selected.rust_targets[].cargo_args`
   (deduplicated), not `cargo test -p` on each of `data.selected.rust`:
   that list names the packages for older consumers, and a target rule can
-  select one test of a package. A prose edit under `.mdkg/` selects only
+  select one test of a package. A prose edit under `docs/` selects only
   `--test commands_doc --test schemas` of `mdkg` here, although `rust`
   says `mdkg`. Text output prints the plan as `cargo:` lines.
 - Run tests with `TMPDIR` reached through a symlink, as
@@ -445,11 +445,14 @@ coverage, and so do mdkg's shared test helpers
 (`crates/mdkg-cli/tests/common/`). A new integration test file needs no
 rule, since its targets are derived. The binary's credential check
 (`no_tracked_line_looks_like_a_credential_on_its_own`) reads every tracked
-file at run time, so no selection promises to run it for a given change:
+file at run time, so no selection promises to run it for every change:
 it's a gate of the full check (`scripts/check.sh` and each wave), as the
 leak scan is. A newly added module without a rule warns and falls
-back; add its integration coverage to the rules as the module grows. Docs and
-node changes select `commands_doc` and `schemas`; `docs/concepts.md` and
+back; add its integration coverage to the rules as the module grows. Docs
+changes select `commands_doc` and `schemas`. Changes under `.mdkg/` (nodes,
+skills, agents) select those two and also the tests that read this
+repository's own graph: `recovery`, `setup` and the `mdkg` binary target,
+which holds the credential check. `docs/concepts.md` and
 local templates also select the graph `format07` target, which checks the
 generated headings table and template behavior. Local templates additionally
 select `affected`, whose private fixture uses the configured active set's

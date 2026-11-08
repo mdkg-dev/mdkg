@@ -353,6 +353,13 @@ pub struct LeaseRecord {
     /// The process's start time as `ps` prints it, so a reused pid isn't
     /// mistaken for the holder.
     pub started: String,
+    /// The boot the process ran in (`kern.bootsessionuuid` on macOS,
+    /// `/proc/sys/kernel/random/boot_id` on Linux), so a holder from an
+    /// earlier boot is known gone, and one from this boot is known to be
+    /// on this machine even after its host name changed. Empty when it
+    /// couldn't be read, and in an older build's record.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub boot_id: String,
 }
 
 pub fn lease_record_path(dir: &Path, name: &str) -> PathBuf {
@@ -426,6 +433,92 @@ pub fn remove_lease_record(dir: &Path, name: &str, holder: &str) {
     if own {
         let _ = fs::remove_file(path);
     }
+}
+
+/// A turn lease its holder couldn't give back as its turn ended: the
+/// coordinator's release failed (a busy store: `coord.store_failed`), so
+/// the lease may still be held. The holder record stays beside it, so the
+/// next claim can release it ([`crate::turn::claim_turn`]); `agents
+/// status` shows it until a turn holds the lease again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseFailure {
+    pub holder: String,
+    /// The failed release's diagnostic code.
+    pub code: String,
+    pub message: String,
+    pub at_ms: u64,
+}
+
+pub fn release_failure_path(dir: &Path, name: &str) -> PathBuf {
+    dir.join(format!("{}.release-failed", file_name(name)))
+}
+
+/// The turn lease release that failed last for `name`, if one is recorded.
+pub fn read_release_failure(dir: &Path, name: &str) -> Option<ReleaseFailure> {
+    mdkg_coord_sqlite::git::read_capped(&release_failure_path(dir, name), 65536)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+}
+
+/// Records `failure`, whole. Caller holds [`lock_lease_record`].
+pub fn write_release_failure(
+    dir: &Path,
+    name: &str,
+    failure: &ReleaseFailure,
+) -> std::io::Result<()> {
+    let path = release_failure_path(dir, name);
+    let tmp = path.with_extension("release-failed.tmp");
+    let mut file = fs::File::create(&tmp)?;
+    std::io::Write::write_all(&mut file, &serde_json::to_vec(failure)?)?;
+    file.sync_all()?;
+    fs::rename(&tmp, path)
+}
+
+/// Clears the recorded failure. Caller holds [`lock_lease_record`].
+pub fn clear_release_failure(dir: &Path, name: &str) {
+    let _ = fs::remove_file(release_failure_path(dir, name));
+}
+
+/// An agent's clean path leases that weren't given back as its turn
+/// ended: the `release --clean` that follows every turn failed (a busy
+/// store's `coord.store_failed`). The supervisor tries it again between
+/// turns ([`crate::turn::release_left`]), and the next turn's end does
+/// too; either one that succeeds clears it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CleanFailure {
+    /// The agent's worktree, where the release runs as the agent.
+    pub top: PathBuf,
+    /// The failed release's diagnostic code.
+    pub code: String,
+    pub message: String,
+    pub at_ms: u64,
+}
+
+pub fn clean_failure_path(dir: &Path, name: &str) -> PathBuf {
+    dir.join(format!("{}.clean-failed", file_name(name)))
+}
+
+/// The clean release that failed last for `name`, if one is recorded.
+pub fn read_clean_failure(dir: &Path, name: &str) -> Option<CleanFailure> {
+    mdkg_coord_sqlite::git::read_capped(&clean_failure_path(dir, name), 65536)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+}
+
+/// Records `failure`, whole. One launcher runs an agent's turns (its turn
+/// lease), so no lock is needed.
+pub fn write_clean_failure(dir: &Path, name: &str, failure: &CleanFailure) -> std::io::Result<()> {
+    let path = clean_failure_path(dir, name);
+    let tmp = path.with_extension("clean-failed.tmp");
+    let mut file = fs::File::create(&tmp)?;
+    std::io::Write::write_all(&mut file, &serde_json::to_vec(failure)?)?;
+    file.sync_all()?;
+    fs::rename(&tmp, path)
+}
+
+/// Clears the recorded clean release failure.
+pub fn clear_clean_failure(dir: &Path, name: &str) {
+    let _ = fs::remove_file(clean_failure_path(dir, name));
 }
 
 /// How many turns showed a message to the agent without acking it
@@ -1562,7 +1655,8 @@ mod tests {
     #[test]
     fn a_holder_ps_cant_be_asked_about_is_never_gone() {
         // A recorded start time must remain protected when inspection fails.
-        // This assertion runs even when the sandbox denies every ps call.
+        // This assertion runs even when the sandbox denies every ps call;
+        // the `kill(pid, 0)` fallback can't ask about a pid past i32 either.
         let mut r = crate::turn::lease_record("launcher@run-x".into());
         r.started = "Thu Jan  1 00:00:00 1970".into();
         r.pid = u32::MAX;

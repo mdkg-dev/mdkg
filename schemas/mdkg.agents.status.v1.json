@@ -275,6 +275,17 @@
             }
           ]
         },
+        "turn_lease_unreleased": {
+          "description": "The turn lease a turn couldn't give back as it ended (its release\nfailed, as a busy store's `coord.store_failed` does): it may still\nbe held, so the next turn's start releases it first. Absent once a\nturn holds the lease again.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TurnLeaseUnreleased"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "follow_from": {
           "description": "The position `agents logs <agent> --follow --after` takes to pick up\nfrom this snapshot: never \"from now\", so a turn that starts or ends\nin between is still delivered.",
           "type": "string"
@@ -995,6 +1006,28 @@
           "type": "string",
           "const": "failed"
         }
+      ]
+    },
+    "TurnLeaseUnreleased": {
+      "description": "A turn lease release that failed (`agents status`'s\n`turn_lease_unreleased`).",
+      "type": "object",
+      "properties": {
+        "code": {
+          "description": "The failed release's diagnostic code.",
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "at": {
+          "description": "When the release failed (RFC 3339).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "message",
+        "at"
       ]
     },
     "CodeBase": {
@@ -1725,6 +1758,7 @@
         "coord.lease_limit",
         "coord.merge_conflict",
         "coord.lease_shared",
+        "coord.lease_other_branch",
         "coord.node_done",
         "coord.contains_abandoned",
         "coord.store_failed",
@@ -1932,6 +1966,8 @@
         "run.mail_set_aside",
         "run.loop_paused",
         "run.wrapper_refused",
+        "run.login_required",
+        "run.turn_active",
         "run.no_base",
         "flow.digest_too_large",
         "entry.verdict_unbacked",

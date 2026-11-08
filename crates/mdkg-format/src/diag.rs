@@ -170,6 +170,7 @@ codes! {
     CoordLeaseLimit => "coord.lease_limit", "The actor already holds the most leases one actor may; it releases some first.";
     CoordMergeConflict => "coord.merge_conflict", "A co-holder's branch conflicts with yours (by git merge-tree, committed work only) in files under your shared lease; advisory, nothing is refused.";
     CoordLeaseShared => "coord.lease_shared", "Other actors hold shared leases overlapping yours.";
+    CoordLeaseOtherBranch => "coord.lease_other_branch", "Other actors hold leases overlapping yours on other branches; the merge settles it.";
     CoordNodeDone => "coord.node_done", "The claimed node is already done.";
     CoordContainsAbandoned => "coord.contains_abandoned", "A changeset's commit contains abandoned work, which would reach main with it.";
     CoordStoreFailed => "coord.store_failed", "The coordinator store can't be opened or read.";
@@ -247,7 +248,7 @@ codes! {
     RunCwdOutside => "run.cwd_outside", "An agent's folder must be one of the repository's worktrees.";
     InstallUnmergeable => "install.unmergeable", "A config file can't be merged safely, so install left it alone.";
     InstallUnsupportedLayout => "install.unsupported_layout", "install needs the graph at the top of its worktree.";
-    InstallLegacyProjections => "install.legacy_projections", "The config has no projections key, so install uses the legacy default list; in 0.7.3 a config without the key lists none.";
+    InstallLegacyProjections => "install.legacy_projections", "The config has no projections key, so install uses the legacy default list; in 0.7.4 a config without the key lists none.";
     InitExists => "init.exists", "The folder already has an mdkg graph (.mdkg/config.json).";
     DoctorCheckFailed => "doctor.check_failed", "A doctor check failed; its record in the output says which and why.";
     DoctorCheckWarned => "doctor.check_warned", "A doctor check found something to look at; its record says what.";
@@ -396,6 +397,10 @@ codes! {
     // The launch wrapper (API v1 A19).
     RunWrapperRefused => "run.wrapper_refused", "The launch wrapper refused the turn (exit 125) before starting the harness; the agent isn't run again.";
     // The base resolver (edd graph-ref-authority, L5b).
+    // A turn refused before it ran for want of a sign-in (0.7.3).
+    RunLoginRequired => "run.login_required", "The agent's harness has no usable sign-in, so its turn was refused before the harness ran.";
+    // A person's msg list or msg send refused by the live-turn guard (0.7.3).
+    RunTurnActive => "run.turn_active", "A person's mail command was refused because it runs inside an agent's turn, or the live-turn records couldn't be checked; run it from your own shell, or retry once the turn ends.";
     RunNoBase => "run.no_base", "No commit to start a worker's worktree from: the code base is unborn, or no base, mainRef or checkout branch names one.";
     FlowDigestTooLarge => "flow.digest_too_large", "The digest exceeds the harness prompt cap, so no turn was admitted.";
     // mdkg flow (edd-01a1878e), a-flow's codes.

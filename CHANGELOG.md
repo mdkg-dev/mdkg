@@ -1,5 +1,82 @@
 # Changelog
 
+## 0.7.3
+
+### Upgrading from 0.7.2
+
+- **The coordinator store moves from schema 4 to 5.** The first 0.7.3
+  command that opens a repository's store upgrades it, after copying it
+  beside it. After that, 0.7.2 and older builds refuse the store, so
+  replace every mdkg binary that uses the repository first. `store
+  restore <copy>` brings the copy back.
+- **`hooks:git` adds `post-commit`.** An existing install gets it at its
+  next `mdkg install`.
+
+### New
+
+- **Path leases can be scoped by branch (opt-in).** Set `git config
+  mdkg.leaseScope branch` for one clone, or `"scope": "branch"` under
+  `coordination.leases` in the committed config. Leases on two different
+  branches then never block each other. The second claim warns
+  `coord.lease_other_branch`, and `status` shows each lease's branch.
+  `repository` stays the default. Lease records gain `branch`, which is
+  null when the lease holds on every branch. See
+  [concepts](docs/concepts.md).
+- **A commit gives back the path leases it settled.** With `hooks:git`,
+  git's `post-commit` runs the new `lease.committed` rule, which
+  releases leases as `release --committed` does. It never stops a commit.
+- **`msg thread --json` gives each body as one `text` string,** so a
+  reader no longer parses the boundary lines. It's absent once the body
+  is purged. The message API schema declares it.
+
+### Changed
+
+- **A turn refused for a missing login is recorded and reported.** It
+  fails with `run.login_required`, and `agents status` shows it as the
+  last turn, `failed`. The agent's `reports_to` gets a fault that names
+  the harness and its login command. The mail stays unacked, so the first
+  turn after the login takes it.
+- **Only a turn this process descends from refuses a person's `msg
+  list`, as for `msg send`.** A turn that another process launched no
+  longer refuses it, even in the same checkout. The live-turn guard now
+  refuses both commands with its own code, `run.turn_active`, instead of
+  `api.actor_not_allowed`.
+- **A turn's mail comes from its `reports_to` first.** The launcher
+  delivers that sender's mail first. Each other sender follows, ordered by
+  its newest message, and each sender's mail comes newest first. It used
+  to come oldest first. Digest delivery puts `reports_to`'s groups first.
+- **In ref mode, worktrees keep `.worktrees/` out of git through
+  `.git/info/exclude`,** not the tracked `.gitignore`. Adding a worker
+  or running `install --view` changes no tracked file. Checkout mode is
+  unchanged.
+
+### Fixed
+
+- A turn lease whose end-of-turn release failed (`coord.store_failed`)
+  no longer blocks the agent's turns until it expires. The supervisor
+  gives it back between turns, and the next turn releases it first. Until
+  then, `agents status` shows `turn_lease_unreleased` and warns.
+- Path leases that the end-of-turn `release --clean` couldn't release on
+  a busy store are retried between turns and at the next turn's end.
+- A turn lease whose process has exited is reclaimed after a reboot.
+  Renaming the machine no longer keeps it held, unless the machine also
+  restarted since. The lease's record now carries the boot's id.
+
+### Internal
+
+- `affected` selects the tests that read the repository's own graph for
+  changes under `.mdkg/`. check.sh's affected mode allows git's local
+  `file` transport. Load-sensitive test binaries get more room, and the
+  agents tests leave no supervisor running.
+
+### Not in 0.7.3
+
+- The projections default is unchanged. A config with no `projections`
+  key still gets the legacy list from `install`. The change to none is
+  planned for 0.7.4.
+- Writes to authority fields from inside an agent's turn aren't refused
+  yet. That's planned for 0.7.4.
+
 ## 0.7.2
 
 ### Security

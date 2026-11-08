@@ -819,7 +819,7 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "mdkg"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "clap",
  "mdkg-coord",
@@ -845,7 +845,7 @@ dependencies = [
 
 [[package]]
 name = "mdkg-coord"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "mdkg-format",
  "mdkg-log",
@@ -856,7 +856,7 @@ dependencies = [
 
 [[package]]
 name = "mdkg-coord-sqlite"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "mdkg-coord",
  "mdkg-format",
@@ -869,7 +869,7 @@ dependencies = [
 
 [[package]]
 name = "mdkg-format"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "proptest",
  "rustix",
@@ -881,14 +881,14 @@ dependencies = [
 
 [[package]]
 name = "mdkg-git"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "rustix",
 ]
 
 [[package]]
 name = "mdkg-graph"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "mdkg-format",
  "mdkg-git",
@@ -899,7 +899,7 @@ dependencies = [
 
 [[package]]
 name = "mdkg-index"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "mdkg-format",
  "mdkg-graph",
@@ -911,7 +911,7 @@ dependencies = [
 
 [[package]]
 name = "mdkg-log"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "mdkg-format",
  "proptest",
@@ -921,7 +921,7 @@ dependencies = [
 
 [[package]]
 name = "mdkg-ops"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "mdkg-coord-sqlite",
  "mdkg-format",
@@ -933,7 +933,7 @@ dependencies = [
 
 [[package]]
 name = "mdkg-presence"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "base64 0.22.1",
  "ctap-hid-fido2",
@@ -953,7 +953,7 @@ dependencies = [
 
 [[package]]
 name = "mdkg-run"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "mdkg-coord-sqlite",
  "mdkg-format",
@@ -970,7 +970,7 @@ dependencies = [
 
 [[package]]
 name = "mdkg-serve"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "mdkg-coord-sqlite",
  "mdkg-format",
@@ -988,7 +988,7 @@ dependencies = [
 
 [[package]]
 name = "mdkg-wire"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "ed25519-dalek",
  "httparse",

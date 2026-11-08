@@ -3458,3 +3458,74 @@ fn an_unbound_codex_session_runs_tools_that_write_nothing() {
     assert_eq!(code, 2, "{err}");
     assert!(err.contains("binding"), "{err}");
 }
+
+/// R2 of the 0.7.3 lease work: an agent's commit gives back the path
+/// leases it settled (`lease.committed`, git's post-commit), as `release
+/// --committed` would: only in the worktree named after the actor, and
+/// never a lease whose file still has uncommitted work.
+#[test]
+fn a_commit_releases_the_leases_it_settled() {
+    let (dir, repo) = repo();
+    mdkg_run::install::hook_files::git_install(&repo, env!("CARGO_BIN_EXE_mdkg")).expect("install");
+    let wt = dir.0.join("agent-a");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "lane-a",
+            wt.to_str().expect("utf8"),
+        ],
+    );
+    let held = |who: &str| -> Vec<String> {
+        let v = mdkg(&wt, who, &["status", "--mine"]);
+        v["data"]["leases"]
+            .as_array()
+            .expect("leases")
+            .iter()
+            .filter(|l| l["owner"] == who)
+            .map(|l| l["scope"].as_str().expect("scope").to_string())
+            .collect()
+    };
+    mdkg(&wt, "agent-a", &["claim", "src/lib.rs"]);
+    mdkg(&wt, "agent-a", &["claim", "--new", "src/two.rs"]);
+    fs::write(wt.join("src/lib.rs"), "// lib, edited\n").expect("edit");
+    fs::write(wt.join("src/two.rs"), "// not committed yet\n").expect("new");
+    git(&wt, &["add", "src/lib.rs"]);
+    let (code, err) = git_as(&wt, Some("agent-a"), &["commit", "-qm", "lib"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        err.contains("released the leases this commit settled: src/lib.rs"),
+        "{err}"
+    );
+    // The uncommitted file keeps its lease.
+    assert_eq!(held("agent-a"), ["src/two.rs"]);
+
+    // An amend settles only what it changed: src/lib.rs, claimed again
+    // for upcoming work, is carried over unchanged and keeps its lease.
+    mdkg(&wt, "agent-a", &["claim", "src/lib.rs"]);
+    git(&wt, &["add", "src/two.rs"]);
+    let (code, err) = git_as(
+        &wt,
+        Some("agent-a"),
+        &["commit", "-q", "--amend", "--no-edit"],
+    );
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        err.contains("released the leases this commit settled: src/two.rs"),
+        "{err}"
+    );
+    assert_eq!(held("agent-a"), ["src/lib.rs"]);
+    mdkg(&wt, "agent-a", &["release", "src/lib.rs"]);
+
+    // In a worktree named after someone else, nothing is released.
+    mdkg(&repo, "agent-b", &["claim", "src/lib.rs"]);
+    fs::write(repo.join("src/lib.rs"), "// lib, b\n").expect("edit");
+    git(&repo, &["add", "src/lib.rs"]);
+    let (code, err) = git_as(&repo, Some("agent-b"), &["commit", "-qm", "b"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(!err.contains("released the leases"), "{err}");
+    assert_eq!(held("agent-b"), ["src/lib.rs"]);
+}

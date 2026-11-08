@@ -73,11 +73,15 @@ pub enum EventName {
     /// The git adapter's event, when git has prepared a ref update.
     #[serde(rename = "git.reference-transaction")]
     GitReferenceTransaction,
+    /// The git adapter's event, after a commit was made (it can't stop
+    /// one).
+    #[serde(rename = "git.post-commit")]
+    GitPostCommit,
 }
 
 impl EventName {
     #[cfg(test)]
-    pub const ALL: [EventName; 10] = [
+    pub const ALL: [EventName; 11] = [
         EventName::SessionStart,
         EventName::PromptSubmit,
         EventName::ToolBefore,
@@ -88,6 +92,7 @@ impl EventName {
         EventName::GitPrePush,
         EventName::GitPreMergeCommit,
         EventName::GitReferenceTransaction,
+        EventName::GitPostCommit,
     ];
 
     /// Whether only git's own hooks deliver it, never an agent harness.
@@ -98,6 +103,7 @@ impl EventName {
                 | EventName::GitPrePush
                 | EventName::GitPreMergeCommit
                 | EventName::GitReferenceTransaction
+                | EventName::GitPostCommit
         )
     }
 
@@ -113,6 +119,7 @@ impl EventName {
             EventName::GitPrePush => "git.pre-push",
             EventName::GitPreMergeCommit => "git.pre-merge-commit",
             EventName::GitReferenceTransaction => "git.reference-transaction",
+            EventName::GitPostCommit => "git.post-commit",
         }
     }
 }

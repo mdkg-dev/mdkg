@@ -662,7 +662,9 @@ if [[ -n "$affected_base" ]]; then
   for check_git_name in ${!GIT_@}; do unset "$check_git_name"; done
   PATH=$(affected_cargo path)
   export PATH GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_OPTIONAL_LOCKS=0
-  export GIT_NO_LAZY_FETCH=1 GIT_NO_REPLACE_OBJECTS=1 GIT_ALLOW_PROTOCOL= GIT_TERMINAL_PROMPT=0
+  # Only the local `file` transport: the selected tests clone and fetch
+  # fixture repositories on disk, and every network transport stays refused.
+  export GIT_NO_LAZY_FETCH=1 GIT_NO_REPLACE_OBJECTS=1 GIT_ALLOW_PROTOCOL=file GIT_TERMINAL_PROMPT=0
   affected_cargo clean
   : "${MDKG_BIN:?set MDKG_BIN to the pinned mdkg executable for --affected}"
   affected_plan=$(mktemp "/tmp/mdkg-check-affected.XXXXXX")

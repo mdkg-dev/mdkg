@@ -505,7 +505,7 @@ pub fn choose(
         }
         | Login::Own => Ok(Billing::Subscription),
         Login::Out | Login::In { .. } => Err(RunError::usage(
-            CODE_UNSUPPORTED,
+            crate::error::CODE_LOGIN_REQUIRED,
             match &login {
                 Login::In { method, .. } => format!(
                     "{} is logged in with {method}, an API key rather than a subscription, \

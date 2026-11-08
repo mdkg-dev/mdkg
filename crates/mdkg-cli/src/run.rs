@@ -541,10 +541,11 @@ fn give_worktree(
     })?;
     // The code base workers start from: in ref mode the configured
     // mainRef (or `$MDKG_MAIN_REF`), possibly none; in checkout mode the
-    // branch work settles on, as before.
-    let main = match mdkg_graph::graphref::resolve(&repo.top) {
-        Ok(Some(graph)) => graph.main_ref_base,
-        Ok(None) => Some(crate::coord::main_ref(&repo.top)),
+    // branch work settles on, as before. Ref mode also keeps `.worktrees/`
+    // out of git in the clone's `info/exclude`, not the tracked `.gitignore`.
+    let (main, ref_common) = match mdkg_graph::graphref::resolve(&repo.top) {
+        Ok(Some(graph)) => (graph.main_ref_base, Some(graph.common)),
+        Ok(None) => (Some(crate::coord::main_ref(&repo.top)), None),
         Err(e) => {
             return Err(GraphError::usage(
                 Code::parse(e.code).unwrap_or(Code::RunCwdOutside),
@@ -557,7 +558,7 @@ fn give_worktree(
         dependencies: &[],
         main_ref: main.as_deref(),
     };
-    // Init leaves .gitignore alone; worktree creation owns this opt-in.
+    // Init leaves the ignore rule alone; worktree creation owns this opt-in.
     let (planned, _) = turn::plan_agent_worktree_from(
         &common,
         &a.agent,
@@ -567,7 +568,20 @@ fn give_worktree(
     )
     .map_err(graph_error)?;
     if !planned.exists() {
-        mdkg_run::install::worktree::ignore_worktrees(&repo.top, a.dry_run).map_err(graph_error)?;
+        match &ref_common {
+            // Workers' worktrees are made in the primary checkout, so git
+            // is asked there, whichever checkout runs this. A dry run
+            // writes nothing.
+            Some(common) if !a.dry_run => {
+                let primary = mdkg_run::install::worktree::primary_checkout(&repo.top)
+                    .map_err(graph_error)?
+                    .unwrap_or_else(|| repo.top.clone());
+                setup::exclude_worktrees(&primary, common)?;
+            }
+            Some(_) => {}
+            None => mdkg_run::install::worktree::ignore_worktrees(&repo.top, a.dry_run)
+                .map_err(graph_error)?,
+        }
     }
     // Only a real creation records a base: a dry run's plan (and
     // `agents up`'s preview) may differ from what the creation finds.
@@ -2636,13 +2650,13 @@ pub(crate) fn legacy_projections(config: &serde_json::Value) -> bool {
 }
 
 /// The warning `install` and `doctor` give a config with no `projections`
-/// key. It changes nothing: the default is still written in 0.7.2.
+/// key. It changes nothing: the default is still written in 0.7.3.
 pub(crate) fn legacy_projections_warning() -> Diagnostic {
     Diagnostic::warning(
         Code::InstallLegacyProjections,
         format!(
             "{} has no `{}` key, so install uses the legacy default list ({}); \
-             in 0.7.3 a config without the key lists none of them",
+             in 0.7.4 a config without the key lists none of them",
             mdkg_graph::config::CONFIG_PATH,
             mdkg_run::projection::KEY,
             mdkg_run::projection::LEGACY.join(", "),

@@ -428,7 +428,7 @@ Agents can't commit to graph files by hand: with the git hooks
 installed, that commit is refused (`git.graph_path`). An agent can run
 `mdkg config set` and `config unset`, as it can run `agents edit`: the
 change goes through mdkg's own writer and takes effect at once.
-0.7.3 is planned to refuse writes to authority fields (env, sandbox,
+A later release is planned to refuse writes to authority fields (env, sandbox,
 approvals) from inside an agent's turn, through `config set`, `config
 unset` and `agents edit`. The one exception is the orchestrator role,
 and only under an explicit delegation the person records.

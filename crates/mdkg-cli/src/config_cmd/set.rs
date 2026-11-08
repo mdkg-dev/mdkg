@@ -871,6 +871,7 @@ fn record(
                 now,
                 request: None,
                 node: None,
+                branch: None,
             })
         });
         if capped {

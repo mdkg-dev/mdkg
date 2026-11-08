@@ -101,6 +101,11 @@ impl Scratch {
     /// `agents up <agent> --once --json` as the launcher, with every
     /// harness's fake: exit code, events, stderr.
     fn try_up(&self, agent: &str) -> (i32, Vec<Value>, String) {
+        self.try_up_in(&self.repo(), agent)
+    }
+
+    /// [`Scratch::try_up`], run from `dir`.
+    fn try_up_in(&self, dir: &Path, agent: &str) -> (i32, Vec<Value>, String) {
         let fake = |name: &str| {
             Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../mdkg-run/tests/fixtures")
@@ -109,7 +114,7 @@ impl Scratch {
         fs::create_dir_all(self.0.join("home/.codex")).expect("codex home");
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_mdkg"));
         self.isolated(&mut cmd)
-            .current_dir(self.repo())
+            .current_dir(dir)
             .env("MDKG_RUN_CLAUDE", fake("fake-claude.sh"))
             .env("MDKG_RUN_CODEX", fake("fake-codex.sh"))
             .env("MDKG_RUN_OPENCODE", fake("fake-opencode.sh"))
@@ -473,9 +478,104 @@ fn agents_up_from_the_primary_checkout_on_every_harness() {
         assert!(replied(&events), "{harness}: {events:?}");
         let state = saved_state(&s, &agent);
         assert_eq!(state["work_base"]["commit"], trunk.as_str(), "{state}");
+        // The worker's worktree changed no tracked file: `.worktrees/` is
+        // kept out of git by the clone's info/exclude, not a .gitignore.
+        assert!(!s.repo().join(".gitignore").exists(), "{harness}");
+        assert_eq!(s.git(&["status", "--porcelain"]), "", "{harness}");
+        assert_eq!(excluded_worktrees(&s), 1, "{harness}");
     }
     assert!(!s.repo().join(".worktrees/graph").exists());
     assert!(!s.repo().join(".mdkg").exists());
+}
+
+/// How many times the common info/exclude holds the `/.worktrees/` line.
+fn excluded_worktrees(s: &Scratch) -> usize {
+    fs::read_to_string(s.repo().join(".git/info/exclude"))
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| *l == "/.worktrees/")
+        .count()
+}
+
+/// An existing tracked `.gitignore` entry for `.worktrees/` is left exactly
+/// as it is in ref mode, and nothing is added beside it.
+#[test]
+fn an_existing_gitignore_entry_for_worktrees_is_left_as_it_is() {
+    let s = Scratch::new();
+    s.ref_mode();
+    let text = "target\n.worktrees/";
+    fs::write(s.repo().join(".gitignore"), text).expect("gitignore");
+    s.git(&["add", ".gitignore"]);
+    s.git(&["commit", "-q", "-m", "ignore"]);
+    worker_with_mail(&s);
+    assert!(replied(&s.up("w")));
+    assert!(s.repo().join(".worktrees/w").is_dir());
+    assert_eq!(
+        fs::read_to_string(s.repo().join(".gitignore")).expect("read"),
+        text
+    );
+    assert_eq!(s.git(&["status", "--porcelain"]), "");
+    assert_eq!(excluded_worktrees(&s), 0);
+}
+
+/// A tracked `.gitignore` negation outranks info/exclude, so in ref mode a
+/// worker's worktree that git would still show is refused before it's
+/// made, and the tracked file is left alone.
+#[test]
+fn a_gitignore_negation_of_worktrees_refuses_the_worktree() {
+    let s = Scratch::new();
+    s.ref_mode();
+    let text = "!/.worktrees/\n";
+    fs::write(s.repo().join(".gitignore"), text).expect("gitignore");
+    s.git(&["add", ".gitignore"]);
+    s.git(&["commit", "-q", "-m", "negation"]);
+    worker_with_mail(&s);
+    let (code, events, err) = s.try_up("w");
+    let all = format!("{events:?}{err}");
+    assert!(all.contains("install.unmergeable"), "{code}: {all}");
+    assert!(all.contains("re-includes"), "{all}");
+    assert!(!s.repo().join(".worktrees/w").exists(), "{all}");
+    assert_eq!(
+        fs::read_to_string(s.repo().join(".gitignore")).expect("read"),
+        text
+    );
+    assert_eq!(s.git(&["status", "--porcelain"]), "");
+}
+
+/// The launcher run from a linked checkout whose `.gitignore` already
+/// ignores `.worktrees/` still asks git in the primary checkout, where the
+/// worker's worktree is made: it's excluded there, and nothing shows.
+#[test]
+fn a_worker_started_from_a_linked_checkout_is_excluded_in_the_primary() {
+    let s = Scratch::new();
+    s.ref_mode();
+    let linked = s.0.join("linked");
+    s.git(&[
+        "worktree",
+        "add",
+        "-q",
+        "-b",
+        "side",
+        &linked.to_string_lossy(),
+    ]);
+    fs::write(linked.join(".gitignore"), ".worktrees/\n").expect("gitignore");
+    let git_linked = |args: &[&str]| {
+        let out = s
+            .isolated(Command::new("git").arg("-C").arg(&linked).args(args))
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "{args:?}");
+    };
+    git_linked(&["add", ".gitignore"]);
+    git_linked(&["commit", "-q", "-m", "ignore on side"]);
+    worker_with_mail(&s);
+    let (code, events, err) = s.try_up_in(&linked, "w");
+    assert_eq!(code, 0, "{events:?}\n{err}");
+    assert!(replied(&events), "{events:?}");
+    assert!(s.repo().join(".worktrees/w").is_dir());
+    assert!(!s.repo().join(".gitignore").exists());
+    assert_eq!(s.git(&["status", "--porcelain"]), "");
+    assert_eq!(excluded_worktrees(&s), 1);
 }
 
 /// C1: an unborn code base refuses a worker's turn with `run.no_base`

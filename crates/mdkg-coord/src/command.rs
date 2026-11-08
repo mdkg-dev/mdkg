@@ -29,6 +29,9 @@ pub enum Command {
         /// may hold that node under any path (a renamed copy included).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         node: Option<String>,
+        /// The branch a branch-scoped lease holds its scope on.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch: Option<String>,
     },
     Heartbeat {
         owner: String,
@@ -137,8 +140,17 @@ impl Coordinator {
                 now,
                 request,
                 node,
+                branch,
             } => outcome(
-                self.claim_node(owner, scope, *mode, node.as_deref(), *now, request.clone()),
+                self.claim_on_branch(
+                    owner,
+                    scope,
+                    *mode,
+                    node.as_deref(),
+                    branch.as_deref(),
+                    *now,
+                    request.clone(),
+                ),
                 |lease| Outcome::Lease { lease },
             ),
             Command::Heartbeat { owner, lease, now } => {

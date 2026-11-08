@@ -1480,6 +1480,7 @@ fn actor_mail_snapshots_match_role_history_at_their_opaque_cursor() {
                     now: 10,
                     request: None,
                     node: None,
+                    branch: None,
                 })
                 .unwrap()
             {

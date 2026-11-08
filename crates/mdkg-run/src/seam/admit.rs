@@ -368,22 +368,20 @@ pub(crate) fn admit(
         (a, b) => a.or(b).map(String::from),
     };
     // One conversation per turn: one unacked message's context, and in it
-    // only that message's sender (in its room, for a room post). The
-    // agent's `reports_to` goes first: its oldest message on the page
-    // loaded (`limit`, after the set-aside and loop-guard refills) is taken
-    // before older mail from anyone else, and with none the oldest message
-    // is (dec-01a18ee0 item 14). Its mail behind a full page of others
-    // waits; a sender-filtered read that marks only what's shown is 0.7.2. The reply goes to that sender, and only those
-    // messages are acked; the rest comes in later turns, each taking the
-    // next by the same order. Anyone can join a context, so a later
+    // only that message's sender (in its room, for a room post). The mail
+    // is delivered in [`delivery_order`]: the agent's `reports_to` first,
+    // then the rest, newest first within each sender, so the lead is
+    // `reports_to`'s newest message on the page loaded (`limit`, after the
+    // set-aside and loop-guard refills), or with none the newest message
+    // (dec-01a18ee0 item 14; friction cluster C1). Its mail behind a
+    // full page of others waits; a sender-filtered read that marks only
+    // what's shown is later work. The reply goes to that sender, and only
+    // those messages are acked; the rest comes in later turns, each taking
+    // the next by the same order. Anyone can join a context, so a later
     // sender's note in it can't divert the first sender's reply or mark
     // its request answered (audit, 2026-10-22).
-    let lead = inbox
-        .messages
-        .iter()
-        .find(|m| m.sender == agent.spec.reports_to)
-        .or(inbox.messages.first())
-        .map(conversation);
+    crate::turn::delivery_order(&mut inbox.messages, &agent.spec.reports_to);
+    let lead = inbox.messages.first().map(conversation);
     if let Some(key) = lead.filter(|_| opts.digest_budget.is_none()) {
         let before = inbox.messages.len();
         inbox.messages.retain(|m| conversation(m) == key);
@@ -630,7 +628,12 @@ pub(crate) fn admit(
                     }
                 })
         });
-        let mail_base = inbox.messages.iter().rev().find_map(base_sha);
+        let mail_base = inbox
+            .messages
+            .iter()
+            .filter_map(|m| base_sha(m).map(|b| (m.seq, b)))
+            .max_by_key(|(seq, _)| *seq)
+            .map(|(_, b)| b);
         reviewer_rules(
             &common,
             &pin.top,
@@ -736,7 +739,7 @@ pub(crate) fn admit(
         &inbox.messages,
         !worker,
     );
-    let newest = inbox.messages.last();
+    let newest = crate::turn::newest_of(&inbox.messages);
     let reply_kind = opts.reply_kind.clone().or_else(|| {
         if opts.digest_budget.is_some() {
             Some(if worker { "handoff" } else { "findings" }.to_string())
@@ -797,29 +800,33 @@ pub(crate) fn admit(
         let hard = prompt_max
             .unwrap_or(usize::MAX)
             .saturating_sub(prefix.len());
-        let view =
-            crate::digest_view::compute(&inbox.messages, budget.saturating_sub(prefix.len()), hard)
-                .map_err(|code| {
-                    if !opts.dry_run {
-                        let mut fault = crate::fault::Fault::new(
-                            &name,
-                            code,
-                            &format!("{}:{}", inbox.messages.len(), hard),
-                            vec![agent.spec.reports_to.clone()],
-                            "the agent's next turn is admitted",
-                            format!(
-                                "{} messages exceed the digest prompt cap",
-                                inbox.messages.len()
-                            ),
-                        );
-                        fault.worktree = crate::fault::Worktree::of(&agent.spec.cwd);
-                        let _ = crate::fault::deliver(mail, dir, &fault);
-                    }
-                    RunError::failure(
-                        code,
-                        "the digest exceeds the harness prompt cap; no turn was admitted",
-                    )
-                })?;
+        let view = crate::digest_view::compute_for(
+            &inbox.messages,
+            Some(&agent.spec.reports_to),
+            budget.saturating_sub(prefix.len()),
+            hard,
+        )
+        .map_err(|code| {
+            if !opts.dry_run {
+                let mut fault = crate::fault::Fault::new(
+                    &name,
+                    code,
+                    &format!("{}:{}", inbox.messages.len(), hard),
+                    vec![agent.spec.reports_to.clone()],
+                    "the agent's next turn is admitted",
+                    format!(
+                        "{} messages exceed the digest prompt cap",
+                        inbox.messages.len()
+                    ),
+                );
+                fault.worktree = crate::fault::Worktree::of(&agent.spec.cwd);
+                let _ = crate::fault::deliver(mail, dir, &fault);
+            }
+            RunError::failure(
+                code,
+                "the digest exceeds the harness prompt cap; no turn was admitted",
+            )
+        })?;
         prefix.push_str(&view.text);
         (prefix, view.bodies, view.nodes, view.references)
     } else {

@@ -576,6 +576,7 @@ fn an_older_changeset_of_yours_is_no_proof_this_version_is_recorded() {
                 now: 1,
                 request: None,
                 node: None,
+                branch: None,
             })
             .expect("claim")
         {

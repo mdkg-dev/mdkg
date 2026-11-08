@@ -943,6 +943,7 @@ fn status_defers_a_bound_tip_that_predates_the_coordinator_snapshot() {
             now: 0,
             request: None,
             node: None,
+            branch: None,
         })
         .unwrap()
     {

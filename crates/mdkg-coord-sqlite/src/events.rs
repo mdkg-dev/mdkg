@@ -1261,6 +1261,7 @@ mod tests {
                 valid_until: 1000,
             }),
             node: None,
+            branch: None,
         }
     }
     fn id(outcome: Outcome) -> LeaseId {

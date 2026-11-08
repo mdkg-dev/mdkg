@@ -115,6 +115,15 @@ chooses checkout mode or ref mode. Lay the checkouts out like this:
   worktree would be made (an existing one is still reused). `mdkg init`
   won't write such a pattern, and `mdkg doctor` warns about one. A worker
   works only on the branch its pattern names.
+- Making the first worktree keeps `.worktrees/` out of git. In checkout
+  mode mdkg adds `/.worktrees/` to the main checkout's `.gitignore`. In ref
+  mode it adds the line to the clone's shared `.git/info/exclude` instead,
+  so adding a worker, or `install --view`, changes no tracked file. Where
+  git already ignores `.worktrees/`, such as through an existing
+  `.gitignore` line, mdkg leaves that rule as it is and adds nothing. A
+  `.gitignore` rule that re-includes `.worktrees/` outranks
+  `info/exclude`, so in ref mode mdkg then refuses to make the worktree
+  (`install.unmergeable`) until that rule is removed.
 - Never put a worktree inside a worker's worktree.
 - Reviewers can't write, so they may share any checkout.
 
@@ -559,8 +568,13 @@ them in `env.allow` or set `env.inherit`, so before a
 release is qualified its `scripts/opencode-catalog-env.py` output joins
 the union (a test checks every name on it is withheld or kept on purpose).
 
-A harness that isn't logged in refuses the turn, naming its login
-command and `mdkg agents use-key <agent>`. The login check runs in the
+A harness that isn't logged in refuses the turn (`run.login_required`),
+naming its login command and `mdkg agents use-key <agent>`. The refused
+turn is still recorded, so `mdkg agents status` shows it as the last
+turn, `failed`. The agent's `reports_to` gets a `run.login_required`
+fault whose suggestion names the harness and its login command. The mail
+stays unacked, and the first turn after the login takes it. The login
+check runs in the
 environment the turn will, so a login that only a variable outside the
 allowlist provides (`CLAUDE_CODE_OAUTH_TOKEN`, say) counts only when
 `env.allow` names it.
@@ -1488,7 +1502,7 @@ three harnesses.
 | before a tool | `PreToolUse` | `PreToolUse` | `tool.execute.before` | `tool.before` |
 | stop | `Stop` | `Stop` | `session.execution.succeeded` | `turn.stop` |
 | idle wait | `idle` (the async Stop entry) | none | `idle` | `session.idle` |
-| git | | | | `pre-commit`, `pre-push` (`--harness git`) |
+| git | | | | `pre-commit`, `pre-push`, `post-commit` (`--harness git`) |
 
 The built-in rules, and who they apply to:
 
@@ -1501,6 +1515,7 @@ The built-in rules, and who they apply to:
 | `lease.audit` | `turn.stop` | agents | blocks once per set of files changed without a lease |
 | `lease.done` | `turn.stop` | agents | blocks once while path leases are held after `done` |
 | `lease.staged` | `git.pre-commit` | agents; people | refuses an agent's commit of an unleased staged file (a link by its own path); warns a person |
+| `lease.committed` | `git.post-commit` | everyone | releases the path leases the commit settled, as `release --committed` does: only the leases of the actor the worktree is named after, with nothing uncommitted and touched by one of the worktree's own commits since the claim. It names what it released. It can't stop a commit, and if it fails, the leases lapse as before |
 | `git.protect` | `tool.before` (a git push), `git.pre-push` | agents | refuses a push to a protected branch, and any force push |
 | `secret.scan` | `tool.before` (a git commit or push), `git.pre-commit`, `git.pre-push` | everyone | refuses a credential-shaped string in what's committed or pushed, naming the commit and path but never the match, and refuses when the scan can't run. It uses the mail filter's detector, and reads every file as text, binary ones included. A file larger than 16 MiB isn't scanned: it passes with a warning that names it |
 
@@ -1513,6 +1528,12 @@ whose built-in input repair renames a model's `bash` call to `shell`
 before any plugin sees it), so `git.protect` sees an
 agent's `git push` before it runs. A shell command the plugin can't check
 still runs; an edit it can't check is refused.
+
+Where a repository scopes path leases by branch (`git config
+mdkg.leaseScope branch`, or `coordination.leases.scope`; see
+[concepts](concepts.md)), `lease.edit`, `lease.audit` and `lease.staged`
+count a branch-held lease only in a worktree that has its branch checked
+out, so a worktree switched to another branch claims its files again.
 
 When several rules answer, the most severe wins (deny, then block, then
 context), and their texts join in the order above. A refusal says what to
@@ -1688,7 +1709,7 @@ no projections.
 `hooks:git` changes every commit and push in the checkout, so it's its own
 step (`mdkg install --enable hooks:git`). Install points `core.hooksPath`
 at mdkg's folder in the git common dir, shared by every worktree. Its
-`pre-commit` and `pre-push` run the rules and then the hook of the folder
+`pre-commit`, `pre-push` and `post-commit` run the rules and then the hook of the folder
 `core.hooksPath` named before (git's default `hooks/` folder, or husky's),
 and every other hook found there gets a shim that runs it, so no hook stops
 running and none is moved or replaced. A hook added to the old folder later
@@ -1956,8 +1977,8 @@ home. An offline pass is not a live qualification receipt.
 - **The live model returns `429 FreeUsageLimitError`:** the Zen free quota
   is exhausted. Retry when it is available; a provider error remains a
   nonzero check result and qualifies none of the uncompleted scenarios.
-- **"isn't logged in"** means the harness has no login to bill the turn
-  to. Run its login command once: `claude auth login`, `codex login` or
+- **"isn't logged in"** (`run.login_required`) means the harness has no
+  login to bill the turn to. Run its login command once: `claude auth login`, `codex login` or
   `opencode auth login`. For Claude or Codex, you can instead bill one
   turn on your API key with `mdkg agents use-key <agent>`, once
   `auth.api_key_fallback` is on in the agent's policy and a key is in the

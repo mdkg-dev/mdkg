@@ -103,11 +103,18 @@
           ]
         },
         "shared_with": {
-          "description": "Owners of other active leases overlapping a shared one.",
+          "description": "Owners of other active leases overlapping a shared one, or one\nheld on a branch (theirs on other branches).",
           "type": "array",
           "items": {
             "type": "string"
           }
+        },
+        "branch": {
+          "description": "The branch a path lease holds its scope on, where the repository\nscopes path leases by branch; absent for one held on every branch.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "changeset": {
           "type": [

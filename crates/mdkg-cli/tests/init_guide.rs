@@ -6,6 +6,27 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// How long one test's scripts may run, all together, before the test calls
+/// the running one hung and kills its group. A hang guard, not a speed check:
+/// the agent setup test's two recipes take 25-35 s together in a full check,
+/// but under a heavier load one recipe ran past the old 60 s per-script limit
+/// and failed the check. The budget is the whole test's, not each script's,
+/// so it ends under nextest's 6-minute kill for this binary
+/// (.config/nextest.toml): a real hang ends here, where the script's group
+/// is killed, rather than in nextest's kill, which can't reach that group.
+const HANG_LIMIT: Duration = Duration::from_secs(300);
+
+thread_local! {
+    /// The test's [`HANG_LIMIT`] deadline, set by its first script. Each
+    /// test runs on a thread of its own (in a process of its own under
+    /// nextest), so its scripts share one budget.
+    static DEADLINE: Instant = Instant::now() + HANG_LIMIT;
+}
+
+fn deadline() -> Instant {
+    DEADLINE.with(|deadline| *deadline)
+}
+
 struct Scratch(PathBuf);
 
 impl Drop for Scratch {
@@ -46,7 +67,8 @@ fn fixture(name: &str) -> (Scratch, std::ffi::OsString) {
 }
 
 /// Runs `script` with `sh -c` in `at`, isolated from the user's config,
-/// within 60 seconds; its exit status and combined output.
+/// within what's left of the test's [`HANG_LIMIT`]; its exit status and
+/// combined output.
 fn sh(
     scratch: &Scratch,
     path: &std::ffi::OsStr,
@@ -81,12 +103,15 @@ fn sh(
             .spawn()
             .expect("run script"),
     );
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = deadline();
     let status = loop {
         if let Some(status) = child.0.try_wait().expect("poll script") {
             break status;
         }
-        assert!(Instant::now() < deadline, "script exceeded 60 seconds");
+        assert!(
+            Instant::now() < deadline,
+            "the test's scripts exceeded {HANG_LIMIT:?}"
+        );
         std::thread::sleep(Duration::from_millis(20));
     };
     let output = format!(
@@ -708,12 +733,15 @@ fn documented_agent_setup_commits_the_definition_and_runs_from_the_graph_checkou
                 .spawn()
                 .expect("run recipe"),
         );
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = deadline();
         let status = loop {
             if let Some(status) = child.0.try_wait().expect("poll recipe") {
                 break status;
             }
-            assert!(Instant::now() < deadline, "recipe exceeded 60 seconds");
+            assert!(
+                Instant::now() < deadline,
+                "the test's recipes exceeded {HANG_LIMIT:?}"
+            );
             std::thread::sleep(Duration::from_millis(20));
         };
         let output = format!(

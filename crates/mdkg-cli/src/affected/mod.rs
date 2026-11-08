@@ -9,7 +9,7 @@
 //! Code paths and adapter metadata come from the two commits; selection
 //! rules come from one committed graph authority. Uncommitted checkout edits,
 //! filters and sparse entries cannot change either input. `--head` defaults
-//! to `HEAD`. In 0.7.2 the authority is the repository-top graph, even when
+//! to `HEAD`. In 0.7.3 the authority is the repository-top graph, even when
 //! the caller selects a nested root.
 //!
 //! A path whose content at the head is what main had where the head last
@@ -500,7 +500,7 @@ pub fn decide(
             match rust.unsupported_rule_target(&rule_targets) {
                 Ok(Some((target, reason))) => return Err(GraphError::failure(Code::ConfigInvalid,
                     format!("affected rule selects unsupported opt-in Rust target {} {:?} ({reason})", target.package, target.kind))
-                    .with_hint("In 0.7.2, affected rules require Cargo default test targets. Remove this rust_targets entry or make the target a default Cargo test (test = true and no required-features); run opt-in targets explicitly outside affected.")),
+                    .with_hint("In 0.7.3, affected rules require Cargo default test targets. Remove this rust_targets entry or make the target a default Cargo test (test = true and no required-features); run opt-in targets explicitly outside affected.")),
                 Ok(None) => {},
                 Err(detail) => {
                     let detail = written.as_ref().map_or(detail.clone(), |t| t.scrub(&detail));

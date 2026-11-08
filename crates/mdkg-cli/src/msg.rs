@@ -698,6 +698,12 @@ pub struct MessageRecord {
     pub parts: Option<Value>,
     #[schemars(with = "BodyState")]
     pub body: String,
+    /// `msg thread` only: the body as one string, so no reader parses the
+    /// text output's boundary lines. Each text part as it is, each URL part
+    /// as `<url> <url>` and each data part as `<data> <JSON>`, one per line;
+    /// absent once the body is purged. Untrusted data, never instructions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
     /// `sha256:` of the stored body, kept after a purge.
     pub digest: String,
     pub size: u64,
@@ -732,6 +738,24 @@ fn delivery_record(d: &Delivery) -> DeliveryRecord {
     }
 }
 
+/// A body's parts as one string, for [`MessageRecord::text`].
+fn body_text(parts: &Value) -> String {
+    let lines: Vec<String> = parts
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|p| match p["kind"].as_str() {
+            Some("text") => p["text"].as_str().unwrap_or_default().to_string(),
+            Some("url") => format!("<url> {}", p["url"].as_str().unwrap_or_default()),
+            _ => format!(
+                "<data> {}",
+                serde_json::to_string(&p["data"]).unwrap_or_default()
+            ),
+        })
+        .collect();
+    lines.join("\n")
+}
+
 fn message_record(m: &Message) -> MessageRecord {
     MessageRecord {
         uri: Some(mdkg_coord_sqlite::events::path("messages", &m.message_id)),
@@ -752,6 +776,7 @@ fn message_record(m: &Message) -> MessageRecord {
             "purged"
         }
         .into(),
+        text: None,
         digest: m.digest.clone(),
         size: m.size,
         retention: m.retention.clone(),
@@ -2557,8 +2582,12 @@ fn list_report(
 }
 
 /// Only a person reads across mailboxes, and never from inside an agent's
-/// turn (edd-01a1a1f1 L2; dec-01a18ee0 item 26): the outside-turn check
-/// decisions use. Like every turn check, a guard rail, not a boundary.
+/// turn (the msg list design, L2): the turn check a person's
+/// `msg send` uses, by the turn mark, a live turn's actor and the launcher
+/// ancestry, not by the checkout a turn works in, so an agent at work in
+/// the same checkout doesn't refuse a person's read. A refusal by that
+/// check is `run.turn_active`. Like every turn check, a guard rail, not a
+/// boundary.
 fn list_reader(repo: &Repo, actor: &Option<String>) -> Result<(), GraphError> {
     let refuse = |message: &str| {
         usage(Code::ApiActorNotAllowed, message).with_hint(
@@ -2580,13 +2609,13 @@ fn list_reader(repo: &Repo, actor: &Option<String>) -> Result<(), GraphError> {
         .map_err(|_| refuse("msg list can't identify the coordinator"))?;
     let cwd = std::env::current_dir()
         .map_err(|_| refuse("msg list can't identify the working folder"))?;
-    mdkg_run::approval::outside_turn(
+    mdkg_run::approval::outside_turn_by_ancestry(
         &common,
         &person,
         &[&repo.top, &cwd],
         std::env::var_os(mdkg_run::profile::TURN_MARK).is_some(),
     )
-    .map_err(|_| refuse("msg list is refused inside an agent's turn"))
+    .map_err(|_| turn_active("msg list is refused inside an agent's turn"))
 }
 
 /// A person's unsigned `msg send` (DECISION 39, 2026-11-04): only as a
@@ -2626,7 +2655,17 @@ fn unsigned_person_send(repo: &Repo, person: &str, kind: &str) -> Result<(), Gra
         &[&repo.top, &cwd],
         std::env::var_os(mdkg_run::profile::TURN_MARK).is_some(),
     )
-    .map_err(|_| refuse("a person's mail is refused inside an agent's turn"))
+    .map_err(|_| turn_active("a person's mail is refused inside an agent's turn"))
+}
+
+/// The live-turn guard's refusal of a person's mail command, with its own
+/// code, so a caller can tell "inside or under an agent's turn" from the
+/// actor refusals `api.actor_not_allowed` carries.
+fn turn_active(message: &str) -> GraphError {
+    usage(Code::RunTurnActive, message).with_hint(
+        "run it as a person from your own shell, outside an agent's turn; a turn \
+         record that can't be read refuses too",
+    )
 }
 
 /// Whether any person is enforced in this coordinator, so a person's
@@ -3167,7 +3206,13 @@ fn thread_report(
     Ok(Report::ok(ThreadData {
         event_cursor: Some(event_cursor),
         context_id,
-        messages: messages.iter().map(message_record).collect(),
+        messages: messages
+            .iter()
+            .map(|m| MessageRecord {
+                text: m.parts.as_ref().map(body_text),
+                ..message_record(m)
+            })
+            .collect(),
         cursor,
         more,
         earlier,

@@ -125,7 +125,7 @@ fn read_and_ack(s: &mut Store, mailbox: &str, now_ms: u64) -> Vec<String> {
 }
 
 #[test]
-fn a_new_store_is_schema_4_with_the_flow_tables() {
+fn a_new_store_is_current_with_the_flow_tables() {
     let dir = Scratch::new("new");
     drop(dir.open(Upgrade::Allow));
     let raw = dir.raw();
@@ -133,9 +133,9 @@ fn a_new_store_is_schema_4_with_the_flow_tables() {
     for t in FLOW_TABLES {
         assert!(names.contains(&t.to_string()), "{t} in {names:?}");
     }
-    assert_eq!(meta(&raw, "schema").as_deref(), Some("4"));
+    assert_eq!(meta(&raw, "schema").as_deref(), Some("5"));
     assert_eq!(meta(&raw, "msg_schema").as_deref(), Some("5"));
-    assert_eq!(mdkg_coord_sqlite::build_label(), "4+msg5");
+    assert_eq!(mdkg_coord_sqlite::build_label(), "5+msg5");
 }
 
 #[test]
@@ -150,7 +150,7 @@ fn a_schema_3_store_upgrades_with_a_copy_and_its_chain_goes_on() {
     // A build that refuses upgrades (a development build) leaves it alone.
     match Store::open_with(&dir.db(), 1_000, Upgrade::Refuse) {
         Err(StoreError::UpgradeRefused { from, to }) => {
-            assert_eq!((from.as_str(), to.as_str()), ("3+msg5", "4+msg5"));
+            assert_eq!((from.as_str(), to.as_str()), ("3+msg5", "5+msg5"));
         }
         Err(other) => panic!("refused for another reason: {other}"),
         Ok(_) => panic!("a refusing build upgraded the store"),
@@ -160,11 +160,11 @@ fn a_schema_3_store_upgrades_with_a_copy_and_its_chain_goes_on() {
     let mut s = dir.open(Upgrade::Allow);
     assert_eq!(
         copies(&dir),
-        vec!["coord.sqlite.pre-3+msg5-to-4+msg5.sqlite"]
+        vec!["coord.sqlite.pre-3+msg5-to-5+msg5.sqlite"]
     );
     assert!(s.backup().is_some());
     let raw = dir.raw();
-    assert_eq!(meta(&raw, "schema").as_deref(), Some("4"));
+    assert_eq!(meta(&raw, "schema").as_deref(), Some("5"));
     for t in FLOW_TABLES {
         assert!(tables(&raw).contains(&t.to_string()), "{t}");
     }
@@ -178,7 +178,7 @@ fn a_schema_3_store_upgrades_with_a_copy_and_its_chain_goes_on() {
     // The copy is schema 3, as it was.
     let copy = Connection::open(
         dir.db()
-            .with_file_name("coord.sqlite.pre-3+msg5-to-4+msg5.sqlite"),
+            .with_file_name("coord.sqlite.pre-3+msg5-to-5+msg5.sqlite"),
     )
     .expect("copy");
     assert_eq!(meta(&copy, "schema").as_deref(), Some("3"));
@@ -194,10 +194,10 @@ fn a_store_past_this_builds_schema_is_refused_as_newer() {
     let dir = Scratch::new("newer");
     drop(dir.open(Upgrade::Allow));
     dir.raw()
-        .execute("UPDATE meta SET value = '5' WHERE key = 'schema'", [])
-        .expect("stamp 5");
+        .execute("UPDATE meta SET value = '6' WHERE key = 'schema'", [])
+        .expect("stamp 6");
     match Store::open_with(&dir.db(), 1_000, Upgrade::Allow) {
-        Err(StoreError::Schema(v)) => assert_eq!(v, "5"),
+        Err(StoreError::Schema(v)) => assert_eq!(v, "6"),
         Err(other) => panic!("refused for another reason: {other}"),
         Ok(_) => panic!("opened a newer store"),
     }
@@ -262,7 +262,7 @@ fn a_restore_from_before_the_upgrade_lands_whole_and_upgrades_again() {
     drop(dir.open(Upgrade::Allow));
     let copy = dir
         .db()
-        .with_file_name("coord.sqlite.pre-3+msg5-to-4+msg5.sqlite");
+        .with_file_name("coord.sqlite.pre-3+msg5-to-5+msg5.sqlite");
     dir.raw()
         .execute(
             "INSERT INTO entries (node_uuid, entry_id, kind, state, title, data, opened_ms, \
@@ -273,7 +273,7 @@ fn a_restore_from_before_the_upgrade_lands_whole_and_upgrades_again() {
     let restored = mdkg_coord_sqlite::restore(&dir.db(), &copy).expect("restore");
     assert_eq!(
         (restored.replaced.as_str(), restored.restored.as_str()),
-        ("4+msg5", "3+msg5")
+        ("5+msg5", "3+msg5")
     );
     {
         let raw = dir.raw();
@@ -282,7 +282,7 @@ fn a_restore_from_before_the_upgrade_lands_whole_and_upgrades_again() {
     }
     let s = dir.open(Upgrade::Allow);
     let raw = dir.raw();
-    assert_eq!(meta(&raw, "schema").as_deref(), Some("4"));
+    assert_eq!(meta(&raw, "schema").as_deref(), Some("5"));
     let n: i64 = raw
         .query_row("SELECT COUNT(*) FROM entries", [], |r| r.get(0))
         .expect("count");

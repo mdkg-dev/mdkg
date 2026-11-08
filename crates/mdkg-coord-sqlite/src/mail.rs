@@ -2409,6 +2409,7 @@ mod snapshot_clock_tests {
                     now: 0,
                     request: None,
                     node: None,
+                    branch: None,
                 })
                 .unwrap();
             let ttl_view = matches!(view, "context" | "number" | "channel");

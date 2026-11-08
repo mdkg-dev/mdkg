@@ -253,7 +253,7 @@ fn only_a_person_outside_an_agent_turn_lists() {
     }
     // A person inside an agent's turn (the launcher's turn mark; the same
     // for Claude, Codex and OpenCode turns, since the check doesn't depend
-    // on the harness) is refused too.
+    // on the harness) is refused by the live-turn guard, with its own code.
     let before = store_files(&repo);
     let (code, out) = run_env(
         &repo,
@@ -261,17 +261,17 @@ fn only_a_person_outside_an_agent_turn_lists() {
         &[("MDKG_RUN_TURN", "1")],
         &["msg", "list"],
     );
-    assert_eq!((code, code_of(&out).as_str()), (1, "api.actor_not_allowed"));
+    assert_eq!((code, code_of(&out).as_str()), (1, "run.turn_active"));
     assert!(out["data"].is_null());
     assert_eq!(store_files(&repo), before);
     // A person under a live launcher turn with no mark (edd test plan
-    // item 9; the records the decision checks read), each way the check
-    // finds one.
+    // item 9): the rule a person's `msg send` uses, the turn's actor and
+    // the launcher ancestry, never the checkout the turn works in.
     let refused = |cwd: &Path, why: &str| {
         let (code, out) = run_in(cwd, &repo, "human:nick", &[], &["msg", "list"]);
         assert_eq!(
             (code, code_of(&out).as_str()),
-            (1, "api.actor_not_allowed"),
+            (1, "run.turn_active"),
             "{why}: {out}"
         );
         assert!(out["data"].is_null(), "{why}: {out}");
@@ -280,15 +280,20 @@ fn only_a_person_outside_an_agent_turn_lists() {
     let lists = |cwd: &Path, why: &str| {
         let (code, out) = run_in(cwd, &repo, "human:nick", &[], &["msg", "list"]);
         assert_eq!(code, 0, "{why}: {out}");
+        assert_eq!(ids(&out), ["q1"], "{why}: {out}");
     };
     let unrelated = Reaped(Command::new("sleep").arg("120").spawn().expect("sleep"));
-    // 1. A turn in the worktree the list targets, whoever launched it.
+    // 1. A turn another process launched, working in the checkout the
+    // list targets and runs in: an agent at work there doesn't hold up a
+    // person's read.
     let turn = live_turn(&repo, &repo, "lane-x", unrelated.id());
-    refused(&repo, "a turn in the targeted worktree");
+    lists(
+        &repo,
+        "a turn in the same checkout that didn't launch this process",
+    );
     drop(turn);
-    lists(&repo, "with the turn ended, the person lists");
-    // 2. Ancestry: a turn in another worktree of the repository, launched
-    // by this test process, so the mdkg it runs is the turn's descendant.
+    // 2. Ancestry: a turn launched by this test process, so the mdkg it
+    // runs is the turn's descendant, in another worktree and in this one.
     let wt = repo.parent().expect("scratch").join("wt");
     sh(
         &repo,
@@ -304,17 +309,30 @@ fn only_a_person_outside_an_agent_turn_lists() {
     let turn = live_turn(&repo, &wt, "lane-x", std::process::id());
     refused(&repo, "a descendant of a turn in another worktree");
     drop(turn);
+    let turn = live_turn(&repo, &repo, "lane-x", std::process::id());
+    refused(&repo, "a descendant of a turn in this checkout");
+    drop(turn);
     let turn = live_turn(&repo, &wt, "lane-x", unrelated.id());
     lists(&repo, "a turn elsewhere that didn't launch this process");
     drop(turn);
-    // 3. The working folder: run from another repository where a turn
-    // is live, the list of this one is refused (not only `--root`'s).
+    // 3. The person's own live turn refuses, wherever it works.
+    let turn = live_turn(&repo, &wt, "human:nick", unrelated.id());
+    refused(&repo, "a live turn whose actor is the person");
+    drop(turn);
+    // 4. The working folder's repository is read too: run from another
+    // repository, a descendant of a turn there is refused, and a turn
+    // there that another process launched isn't.
     let other = repo.parent().expect("scratch").join("other");
     fs::create_dir_all(&other).expect("other");
     sh(&other, &["init", "-q", "-b", "main"]);
+    let turn = live_turn(&other, &other, "lane-y", std::process::id());
+    refused(
+        &other,
+        "run from a repository where this process launched a turn",
+    );
+    drop(turn);
     let turn = live_turn(&other, &other, "lane-y", unrelated.id());
-    refused(&other, "run from a repository with a live turn");
-    lists(&repo, "the same list run from this repository");
+    lists(&other, "run from a repository with another process's turn");
     drop(turn);
 }
 

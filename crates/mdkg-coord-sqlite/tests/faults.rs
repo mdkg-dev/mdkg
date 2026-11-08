@@ -692,3 +692,47 @@ fn a_clear_ends_every_code_sharing_its_condition_once() {
     let (again, _, _) = reads(|| s.clear_faults("lane", TURN, 6).unwrap());
     assert!(again.is_empty(), "{again:?}");
 }
+
+/// A reply to the reserved kinds, a fault and a receipt, joins the replied-to
+/// message's thread, as a reply to any other kind does.
+#[test]
+fn a_reply_to_a_fault_or_a_receipt_joins_its_thread() {
+    let dir = Scratch::new("reply-thread");
+    let mut s = dir.store();
+    let fault = sent_id(&send(&mut s, "f1", "lane", "run.x", TURN, &["boss"], 1));
+    let receipt = Outgoing {
+        message_id: "r1".into(),
+        context_id: None,
+        kind: "receipt".into(),
+        sender: FAULT_SENDER.into(),
+        via: None,
+        sender_mailboxes: vec![],
+        to: To::Mailboxes(vec!["boss".into()]),
+        reference_ids: vec![],
+        parts: json!([{"kind": "text", "text": "turn 1 ended"}]),
+        retention: Retention::PurgeOnAck,
+        human_hold_days: 7,
+        now_ms: 2,
+    };
+    s.send(&receipt).expect("receipt");
+    for (n, replied) in [fault.as_str(), "r1"].into_iter().enumerate() {
+        let context = s.message(replied, 0).expect("replied to").context_id;
+        let (reply, _) = s
+            .send(&Outgoing {
+                message_id: format!("re{n}"),
+                context_id: None,
+                kind: "note".into(),
+                sender: "boss".into(),
+                via: None,
+                sender_mailboxes: vec![],
+                to: To::Mailboxes(vec!["lane".into()]),
+                reference_ids: vec![replied.to_string()],
+                parts: json!([{"kind": "text", "text": "seen"}]),
+                retention: Retention::PurgeOnAck,
+                human_hold_days: 7,
+                now_ms: 3 + n as u64,
+            })
+            .expect("reply");
+        assert_eq!(reply.context_id, context, "{replied}");
+    }
+}

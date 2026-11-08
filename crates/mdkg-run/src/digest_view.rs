@@ -44,6 +44,19 @@ fn header(m: &Message) -> String {
 /// Compute a bounded view. The returned body IDs are the only messages the
 /// turn may acknowledge; omitted and header-only messages remain unacked.
 pub fn compute(messages: &[Message], budget: usize, hard_cap: usize) -> Result<View, &'static str> {
+    compute_for(messages, None, budget, hard_cap)
+}
+
+/// [`compute`], delivering `lead`'s mail first (an agent's `reports_to`):
+/// after faults, the groups holding its mail come first, and in a group
+/// its messages come before the rest, each newest first.
+pub fn compute_for(
+    messages: &[Message],
+    lead: Option<&str>,
+    budget: usize,
+    hard_cap: usize,
+) -> Result<View, &'static str> {
+    let led = |i: &usize| lead.is_some_and(|l| messages[*i].sender == l);
     let mut groups: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for (i, m) in messages.iter().enumerate() {
         if m.nodes.is_empty() {
@@ -66,13 +79,22 @@ pub fn compute(messages: &[Message], budget: usize, hard_cap: usize) -> Result<V
         ids.sort_by_key(|i| {
             (
                 messages[*i].kind != "fault",
+                !led(i),
                 std::cmp::Reverse(messages[*i].seq),
             )
         });
     }
+    // Groups holding the lead's mail go by the lead's newest message in
+    // each, so its newer direction comes before its older.
     groups.sort_by_key(|(_, ids)| {
         (
             !ids.iter().any(|i| messages[*i].kind == "fault"),
+            std::cmp::Reverse(
+                ids.iter()
+                    .filter(|i| led(i))
+                    .map(|i| messages[*i].seq)
+                    .max(),
+            ),
             std::cmp::Reverse(ids.iter().map(|i| messages[*i].seq).max().unwrap_or(0)),
         )
     });
@@ -125,9 +147,11 @@ pub fn compute(messages: &[Message], budget: usize, hard_cap: usize) -> Result<V
         }
         out
     };
+    // What the budget reduces first: the lead's mail last.
     let mut order: Vec<_> = (0..messages.len()).collect();
     order.sort_by_key(|i| {
         (
+            led(i),
             if messages[*i].nodes.is_empty() { 0 } else { 1 },
             messages[*i].kind != "note",
             messages[*i].seq,
@@ -216,6 +240,71 @@ mod tests {
         assert!(view.text.contains("superseded retired"));
         assert_eq!(view.bodies, ["m1", "m2", "m3"]);
         assert_eq!(view.nodes, ["task-a"]);
+    }
+
+    #[test]
+    fn the_leads_mail_comes_first_then_the_rest_newest_first() {
+        let from = |id: &str, seq: u64, context: &str, sender: &str| {
+            let mut m = msg(id, seq, None, id);
+            m.context_id = Some(context.into());
+            m.sender = sender.into();
+            m
+        };
+        let messages = [
+            from("o-old", 1, "c1", "orchestrator"),
+            from("a-old", 2, "c2", "alice"),
+            from("b-1", 3, "c3", "bob"),
+            from("a-new", 4, "c2", "alice"),
+            from("o-new", 5, "c1", "orchestrator"),
+            from("m-1", 6, "c1", "mallory"),
+        ];
+        let view = compute_for(&messages, Some("orchestrator"), 4096, 4096).unwrap();
+        // Each body is its id, alone on its line.
+        let at = |id: &str| view.text.find(&format!("\n{id}\n")).unwrap();
+        // orchestrator's conversation first, its mail before mallory's in
+        // it, each newest first; then alice's and bob's, newest first.
+        let order = ["o-new", "o-old", "m-1", "a-new", "a-old", "b-1"];
+        for pair in order.windows(2) {
+            assert!(at(pair[0]) < at(pair[1]), "{pair:?}: {}", view.text);
+        }
+        // Without a lead, each group's newest goes first.
+        let view = compute(&messages, 4096, 4096).unwrap();
+        assert!(view.text.find("\nm-1\n").unwrap() < view.text.find("\no-new\n").unwrap());
+    }
+
+    #[test]
+    fn the_leads_newer_group_comes_first_and_its_bodies_are_kept_longest() {
+        let from = |id: &str, seq: u64, context: &str, sender: &str, text: &str| {
+            let mut m = msg(id, seq, None, text);
+            m.context_id = Some(context.into());
+            m.sender = sender.into();
+            m
+        };
+        // orchestrator at 1 and 3 in different groups; alice's 4 joins the
+        // group of orchestrator's older message.
+        let messages = [
+            from("o-1", 1, "c1", "orchestrator", "o-1"),
+            from("o-3", 3, "c2", "orchestrator", "o-3"),
+            from("a-4", 4, "c1", "alice", "a-4"),
+        ];
+        let view = compute_for(&messages, Some("orchestrator"), 4096, 4096).unwrap();
+        let at = |id: &str| view.text.find(&format!("\n{id}\n")).unwrap();
+        assert!(at("o-3") < at("o-1"), "{}", view.text);
+        // Under a tight budget the other senders' bodies go before the
+        // lead's: bob's oldest stays (the oldest always does), alice's
+        // later note is reduced, and orchestrator's note keeps its body.
+        let long = "x".repeat(400);
+        let messages = [
+            from("b-1", 1, "c1", "bob", "b-1"),
+            from("o-2", 2, "c2", "orchestrator", &long),
+            from("a-3", 3, "c3", "alice", &long),
+        ];
+        let full = compute_for(&messages, Some("orchestrator"), usize::MAX, usize::MAX)
+            .unwrap()
+            .text
+            .len();
+        let view = compute_for(&messages, Some("orchestrator"), full - 300, usize::MAX).unwrap();
+        assert_eq!(view.bodies, ["b-1", "o-2"], "{}", view.text);
     }
 
     #[test]

@@ -177,6 +177,16 @@ impl Fault {
         };
         let suggested = if code == "run.turn_interrupted" {
             format!("{BIN} agents resume {name}")
+        } else if code == crate::error::CODE_LOGIN_REQUIRED {
+            // The sign-in step, named for the harness: the fault's message
+            // is the code's summary only.
+            let harness = agent.spec.harness;
+            format!(
+                "sign {} in for {name}: run `{}` once in the agent's environment, then \
+                 `{BIN} agents status {name}`",
+                harness.as_str(),
+                crate::auth::login_command(harness)
+            )
         } else {
             format!("{BIN} agents status {name}")
         };

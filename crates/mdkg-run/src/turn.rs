@@ -409,6 +409,46 @@ pub(crate) fn this_host() -> Option<String> {
     (!name.is_empty()).then(|| name.to_string())
 }
 
+/// This boot's id, read once per process: `kern.bootsessionuuid` on
+/// macOS (`sysctl` by its absolute path), `/proc/sys/kernel/random/boot_id`
+/// on Linux. A fresh random id at each boot, so it names one boot of one
+/// machine. `None` when it can't be read, which never proves anything.
+pub fn this_boot() -> Option<String> {
+    static BOOT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    BOOT.get_or_init(|| {
+        let id = if cfg!(target_os = "linux") {
+            fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?
+        } else if cfg!(target_os = "macos") {
+            let out = Command::new("/usr/sbin/sysctl")
+                .args(["-n", "kern.bootsessionuuid"])
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .output()
+                .ok()?;
+            if !out.status.success() {
+                return None;
+            }
+            String::from_utf8(out.stdout).ok()?
+        } else {
+            return None;
+        };
+        let id = id.trim();
+        (!id.is_empty()).then(|| id.to_string())
+    })
+    .clone()
+}
+
+/// Whether no process with `pid` runs on this host, by `kill(pid, 0)`'s
+/// `ESRCH`: for when `ps` can't be asked. Any other answer (it runs, or
+/// isn't ours to signal), and a pid that isn't one process's, proves
+/// nothing.
+fn pid_absent(pid: u32) -> bool {
+    i32::try_from(pid)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+        .is_some_and(|p| rustix::process::test_kill_process(p) == Err(rustix::io::Errno::SRCH))
+}
+
 /// A process's start time from `ps`, `None` when it isn't running. An
 /// error when `ps` couldn't be asked (it isn't there, or failed with a
 /// message), which never proves a process gone (review of 08ff0f9). `ps`
@@ -452,6 +492,9 @@ pub(crate) fn claim_turn(
     let _record_lock = state::lock_lease_record(dir, name)?;
     let scope = lease_scope(name);
     let mine = lease_record(mail.holder());
+    // A turn isn't re-entrant, so a lease this launcher's last turn
+    // couldn't give back is released first (friction 148).
+    let left_held = release_left_locked(mail, dir, name, &mine.holder);
     let mail = std::cell::RefCell::new(mail);
     let claimed = claim_recorded(
         dir,
@@ -471,10 +514,18 @@ pub(crate) fn claim_turn(
         },
     )?;
     let Err((e, records)) = claimed else {
+        // Held now, so no earlier turn's lease is left to give back.
+        state::clear_release_failure(dir, name);
         return Ok(());
     };
     if e.code != "coord.lease_held" {
         return Err(e);
+    }
+    if left_held {
+        return Err(e.with_hint(format!(
+            "this launcher's last turn couldn't release its turn lease, and still can't; \
+             it's tried again at the next turn (`{BIN} agents status` shows the failure)"
+        )));
     }
     // `install` holds the turn while it changes the agent's folder
     // (review of d0a0f84).
@@ -571,27 +622,167 @@ pub fn holder_gone_for(r: &state::LeaseRecord, mine: &state::LeaseRecord) -> boo
 
 /// Release only this process's lease and holder record, including after
 /// expiry or takeover. All publishers use the same stable record lock.
+///
+/// A release that fails (a busy store's `coord.store_failed`, after its
+/// own wait) may leave the lease held: the holder record stays, so the next claim (this launcher's, which releases it first, or
+/// another's once this process is gone) can take it, and the failure is
+/// recorded for `agents status` ([`state::ReleaseFailure`], friction 148).
 pub(crate) fn release_turn(mail: &mut dyn Mail, dir: &Path, name: &str) -> Result<(), RunError> {
     let lock = state::lock_lease_record(dir, name);
+    let holder = mail.holder();
+    let scope = lease_scope(name);
+    let released = mail.release(&scope);
     if lock.is_ok() {
-        state::remove_lease_record(dir, name, &mail.holder());
+        match &released {
+            Ok(()) => {
+                state::remove_lease_record(dir, name, &holder);
+                if state::read_release_failure(dir, name).is_some_and(|f| f.holder == holder) {
+                    state::clear_release_failure(dir, name);
+                }
+            }
+            // Only while its record names this holder: after a takeover,
+            // the lease is another's, and nothing is left to give back.
+            Err(e) if records_holder(dir, name, &holder) => {
+                note_release_failure(dir, name, &holder, e);
+            }
+            Err(_) => {}
+        }
     }
-    let released = mail.release(&lease_scope(name));
     lock?;
     released
+}
+
+/// Whether `name`'s holder record names `holder`.
+fn records_holder(dir: &Path, name: &str, holder: &str) -> bool {
+    state::read_lease_record(&state::lease_record_path(dir, name))
+        .is_some_and(|r| r.holder == holder)
+}
+
+/// Whether `name`'s recorded release failure is `holder`'s.
+fn failure_names(dir: &Path, name: &str, holder: &str) -> bool {
+    state::read_release_failure(dir, name).is_some_and(|f| f.holder == holder)
+}
+
+/// Records `e` as `holder`'s failed release of `name`'s turn lease.
+fn note_release_failure(dir: &Path, name: &str, holder: &str, e: &RunError) {
+    let failure = state::ReleaseFailure {
+        holder: holder.to_string(),
+        code: e.code.to_string(),
+        message: e.message.clone(),
+        at_ms: state::now_ms(),
+    };
+    if let Err(w) = state::write_release_failure(dir, name, &failure) {
+        eprintln!("warning: can't record the failed turn lease release: {w}");
+    }
+}
+
+/// How often an idle supervisor tries again to give back a turn lease
+/// its last turn couldn't release ([`release_left`]).
+pub const RELEASE_RETRY_SECS: u64 = 30;
+
+/// Gives back a turn lease `holder`'s last turn couldn't release: its
+/// holder record (or the recorded failure) still names it, so the lease
+/// may still be held as it. Releasing a lease that already ended
+/// succeeds. True while one is still left (the release failed again,
+/// recorded for `agents status`). Caller holds [`state::lock_lease_record`].
+fn release_left_locked(mail: &mut dyn Mail, dir: &Path, name: &str, holder: &str) -> bool {
+    let recorded = records_holder(dir, name, holder);
+    if !recorded && !failure_names(dir, name, holder) {
+        return false;
+    }
+    match mail.release(&lease_scope(name)) {
+        Ok(()) => {
+            state::remove_lease_record(dir, name, holder);
+            state::clear_release_failure(dir, name);
+            false
+        }
+        Err(e) if recorded => {
+            note_release_failure(dir, name, holder, &e);
+            true
+        }
+        // No record names it: the lease is no longer this holder's.
+        Err(_) => {
+            state::clear_release_failure(dir, name);
+            false
+        }
+    }
+}
+
+/// The supervisor's retry between turns: gives back a turn lease this
+/// launcher's last turn couldn't release, so an idle supervisor doesn't
+/// hold it until its next turn or the lease's expiry (friction 148).
+/// True while one is still left.
+/// The agent's clean path leases left after a failed `release --clean`
+/// ([`state::CleanFailure`]) are tried again here too.
+pub fn release_left(mail: &mut dyn Mail, dir: &Path, name: &str) -> Result<bool, RunError> {
+    let clean_left = match state::read_clean_failure(dir, name) {
+        Some(f) => release_clean_noted(mail, dir, name, &f.top),
+        None => false,
+    };
+    let holder = mail.holder();
+    if !records_holder(dir, name, &holder) && !failure_names(dir, name, &holder) {
+        return Ok(clean_left);
+    }
+    let _lock = state::lock_lease_record(dir, name)?;
+    Ok(release_left_locked(mail, dir, name, &holder) || clean_left)
+}
+
+/// Releases `name`'s clean path leases as the agent in its worktree `top`
+/// (`release --clean`). A failure warns and is recorded for
+/// [`release_left`] to try again; a success clears an earlier one. True
+/// while the release is still left.
+pub(crate) fn release_clean_noted(mail: &mut dyn Mail, dir: &Path, name: &str, top: &Path) -> bool {
+    match mail.release_clean(name, top) {
+        Ok(()) => {
+            state::clear_clean_failure(dir, name);
+            false
+        }
+        Err(e) => {
+            eprintln!(
+                "warning: can't release {}'s clean leases: {}",
+                crate::digest::clean(name),
+                crate::digest::terminal_safe(&e.message)
+            );
+            let failure = state::CleanFailure {
+                top: top.to_path_buf(),
+                code: e.code.to_string(),
+                message: e.message.clone(),
+                at_ms: state::now_ms(),
+            };
+            if let Err(w) = state::write_clean_failure(dir, name, &failure) {
+                eprintln!("warning: can't record the failed clean lease release: {w}");
+            }
+            true
+        }
+    }
 }
 
 /// What a holder of an agent's turn lease that isn't a launcher (`install`)
 /// has in its name: `<actor>@install-<pid>`.
 pub const INSTALL_HOLDER: &str = "@install-";
 
-/// Whether the process a lease record names is gone: on this host, and its
-/// pid isn't running or runs with another start time. An unknown start
-/// time never proves it gone.
+/// Whether the process a lease record names is gone. It's on this machine
+/// when its boot is this one (whatever the host is called now), or when
+/// it names this host; a holder elsewhere is never gone. Then it's gone
+/// when it ran in another boot of this host (every process ended at the
+/// reboot), or its pid isn't running or runs with another start time.
+/// When `ps` can't be asked, `kill(pid, 0)` finding no such process still
+/// proves it gone; nothing else does.
 pub fn holder_gone(r: &state::LeaseRecord) -> bool {
-    !r.started.is_empty()
-        && this_host().is_some_and(|h| h == r.host)
-        && matches!(started(r.pid), Ok(now) if now.as_deref() != Some(r.started.as_str()))
+    let boot = this_boot();
+    let this_boot_here = !r.boot_id.is_empty() && boot.as_deref() == Some(r.boot_id.as_str());
+    let named_here = this_host().is_some_and(|h| h == r.host);
+    if !this_boot_here && !named_here {
+        return false;
+    }
+    if !this_boot_here && !r.boot_id.is_empty() && boot.is_some() {
+        return true;
+    }
+    match started(r.pid) {
+        Ok(None) => true,
+        Ok(Some(now)) => !r.started.is_empty() && now != r.started,
+        Err(_) => pid_absent(r.pid),
+    }
 }
 
 /// How the hint of a turn refused because `install` holds it starts.
@@ -614,6 +805,7 @@ pub fn lease_record(holder: String) -> state::LeaseRecord {
         host: this_host().unwrap_or_default(),
         pid,
         started: started(pid).ok().flatten().unwrap_or_default(),
+        boot_id: this_boot().unwrap_or_default(),
     }
 }
 
@@ -694,7 +886,7 @@ pub(crate) fn render_turn_prompt(
     reply_kind: Option<&str>,
     shows: &state::Shows,
 ) -> String {
-    let newest = inbox.messages.last();
+    let newest = newest_of(&inbox.messages);
     let target = newest.map(|m| ReplyTarget {
         to: &m.sender,
         kind: reply_kind.unwrap_or_else(|| default_reply_kind(&m.kind)),
@@ -2955,6 +3147,31 @@ pub(crate) enum Answering {
     Sender(String),
 }
 
+/// Orders a turn's mail as it's delivered: the agent's `reports_to` first,
+/// then each other sender by its newest message, and within each sender
+/// newest first, so a newer instruction is read before the one it
+/// supersedes (friction cluster C1). A turn's lead conversation is its
+/// first message's.
+pub(crate) fn delivery_order(messages: &mut [crate::mail::Message], reports_to: &str) {
+    let mut newest: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    for m in messages.iter() {
+        let n = newest.entry(m.sender.clone()).or_default();
+        *n = (*n).max(m.seq);
+    }
+    messages.sort_by(|a, b| {
+        (a.sender != reports_to)
+            .cmp(&(b.sender != reports_to))
+            .then_with(|| newest[&b.sender].cmp(&newest[&a.sender]))
+            .then_with(|| a.sender.cmp(&b.sender))
+            .then_with(|| b.seq.cmp(&a.seq))
+    });
+}
+
+/// The newest message of a turn's mail, whatever order it's delivered in.
+pub(crate) fn newest_of(messages: &[crate::mail::Message]) -> Option<&crate::mail::Message> {
+    messages.iter().max_by_key(|m| m.seq)
+}
+
 pub(crate) fn conversation(m: &crate::mail::Message) -> (String, Answering) {
     let who = match &m.room {
         Some(r) => Answering::Room {
@@ -3122,7 +3339,7 @@ fn held_turn_with_receipts(
         crate::seam::Admitted::Idle(report) => return Ok(*report),
         crate::seam::Admitted::Grant(grant) => *grant,
     };
-    let newest = inbox.messages.last();
+    let newest = newest_of(&inbox.messages);
     // What the agent had already sent answering the newest message, before
     // the harness runs: the import skips the final message if the turn
     // answers it itself (#20931).
@@ -3264,7 +3481,7 @@ fn held_turn_with_receipts(
         &name,
         &cmd.environment,
     );
-    let billing = match (&mark, login) {
+    let (billing, refused) = match (&mark, login) {
         // A key that can't be read refuses the turn and keeps the mark;
         // the hint says what holds it there.
         (Some(_), _) => {
@@ -3273,10 +3490,15 @@ fn held_turn_with_receipts(
                 .keys
                 .read(service)
                 .map_err(|e| e.and_hint(mark_hint()))?;
-            crate::auth::Billing::ApiKey { service, key }
+            (crate::auth::Billing::ApiKey { service, key }, None)
         }
-        (None, Ok(b)) => b,
-        (None, Err(e)) => return Err(e),
+        (None, Ok(b)) => (b, None),
+        // No usable login: the turn is still recorded, below, and refused
+        // just after, before anything runs, so `agents status` shows it,
+        // its end sends `reports_to` a fault naming the sign-in step, and
+        // its mail stays unacked (a launcher-side failure takes its shows
+        // back). The billing is a placeholder nothing launches with.
+        (None, Err(e)) => (crate::auth::Billing::Subscription, Some(e)),
     };
     let session_id = new_session.clone();
     let cmd = build(&billing, &session_id, agent.session.as_deref());
@@ -3308,11 +3530,17 @@ fn held_turn_with_receipts(
             admitted: &mut || {
                 // A turn ran: the last limit's offer in `agents status` is
                 // gone (this one notes it again if it hits the limit too).
-                // Display only.
-                let _ = crate::auth::clear_limited(dir, &name);
+                // Display only. A turn refused for its login runs nothing,
+                // so the offer stays.
+                if refused.is_none() {
+                    let _ = crate::auth::clear_limited(dir, &name);
+                }
             },
         },
     )?;
+    if let Some(e) = refused {
+        return Err(e);
+    }
     let launch_wrapper = launch_wrapper.map(|wrapper| wrapper::Prepared {
         wrapper,
         turn: wrapper::Turn {

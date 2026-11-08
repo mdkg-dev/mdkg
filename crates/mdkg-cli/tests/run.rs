@@ -563,20 +563,23 @@ fn a_note_replying_to_someone_elses_request_cant_take_the_agents_reply() {
         "--cwd",
         lane.to_str().expect("utf-8"),
     ];
+    // mallory's note, the newer, gets its own turn and its own reply;
+    // nothing goes to alice for it.
     let out = ok(&graph(&repo), "launcher", &run);
+    assert_ne!(out["data"]["shown"], serde_json::json!([req]), "{out}");
+    assert_eq!(out["data"]["outcome"], "replied", "{out}");
+    assert_eq!(from_agent("mallory"), 1);
+    assert_eq!(from_agent("alice"), 0);
+    // alice's request is answered on its own, to her alone.
+    let out = ok(&graph(&repo), "launcher", &run[..2]);
     assert_eq!(out["data"]["shown"], serde_json::json!([req]), "{out}");
     let alice = ok(&repo, "alice", &["msg", "inbox"]);
+    assert_eq!(alice["data"]["messages"].as_array().map(Vec::len), Some(1));
     assert_eq!(
         alice["data"]["messages"][0]["referenceIds"][0],
         req.as_str()
     );
-    assert_eq!(from_agent("mallory"), 0);
-    // mallory's note gets its own turn and its own reply.
-    let out = ok(&graph(&repo), "launcher", &run[..2]);
-    assert_eq!(out["data"]["outcome"], "replied", "{out}");
     assert_eq!(from_agent("mallory"), 1);
-    let alice = ok(&repo, "alice", &["msg", "inbox"]);
-    assert_eq!(alice["data"]["messages"].as_array().map(Vec::len), Some(1));
 }
 
 #[test]
@@ -3933,7 +3936,7 @@ fn a_template_copy_names_its_own_folder_and_refuses_a_database_that_names_the_bu
 }
 
 /// H-M6 (0.7.2): a config with no `projections` key gets the legacy
-/// default from install, which 0.7.3 drops. install and doctor warn and
+/// default from install, which 0.7.4 drops. install and doctor warn and
 /// name the key; once the key is listed, neither does. Nothing else
 /// changes: install still writes the AGENTS.md block.
 #[test]
@@ -3958,7 +3961,7 @@ fn install_and_doctor_warn_about_the_legacy_projections_default() {
     assert_eq!(warned[0]["severity"], "warning", "{install}");
     let message = warned[0]["message"].as_str().expect("message");
     assert!(message.contains("`projections`"), "{message}");
-    assert!(message.contains("0.7.3"), "{message}");
+    assert!(message.contains("0.7.4"), "{message}");
     assert!(message.contains("agents-md"), "{message}");
     let hint = warned[0]["hint"].as_str().expect("hint");
     assert!(hint.contains("config set projections '["), "{hint}");

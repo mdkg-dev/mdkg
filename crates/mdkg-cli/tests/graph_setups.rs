@@ -2608,15 +2608,15 @@ fn a_hooks_path_inside_a_future_skill_mirror_refuses_before_publication() {
         "---\nname: demo\ndescription: fixture\n---\nDemo\n",
     )
     .unwrap();
-    fs::write(skill.join("post-commit"), "#!/bin/sh\nexit 0\n").unwrap();
-    fs::set_permissions(skill.join("post-commit"), fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(skill.join("post-merge"), "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(skill.join("post-merge"), fs::Permissions::from_mode(0o755)).unwrap();
     s.git(&["add", ".mdkg"]);
     s.git(&["commit", "-qm", "executable skill fixture"]);
     let (code, v) = s.mdkg(&["install", "--setup", "local", "--json"]);
     assert_eq!(code, 0, "{v}");
     s.git(&["config", "core.hooksPath", ".agents/skills/demo"]);
     let destination =
-        mdkg_run::install::hook_files::git_hooks_dir(&s.repo().join(".git")).join("post-commit");
+        mdkg_run::install::hook_files::git_hooks_dir(&s.repo().join(".git")).join("post-merge");
     fs::create_dir_all(&destination).unwrap();
     let tip = s.git(&["rev-parse", GRAPH]);
     let config = s.git(&["show", &format!("{GRAPH}:.mdkg/config.json")]);
@@ -3271,6 +3271,11 @@ fn ref_mode_view_keeps_status_working() {
     let (code, v) = s.mdkg(&["install", "--view", "--json"]);
     assert_eq!(code, 0, "{v}");
     assert!(s.repo().join(".worktrees/graph/.git").exists());
+    // The view changed no tracked file: info/exclude keeps it out of git.
+    assert!(!s.repo().join(".gitignore").exists(), "{v}");
+    assert_eq!(s.git(&["status", "--porcelain"]).trim(), "", "{v}");
+    let exclude = fs::read_to_string(s.repo().join(".git/info/exclude")).expect("exclude");
+    assert!(exclude.lines().any(|l| l == "/.worktrees/"), "{exclude}");
     s.status_works();
     // Ref-mode writes go to the graph ref, past the view.
     let (code, v) = s.mdkg(&["new", "task", "beside the view", "--json"]);

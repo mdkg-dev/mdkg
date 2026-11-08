@@ -488,6 +488,10 @@ enum Command {
         /// With --mode: the scope is this node's (always exclusive).
         #[arg(long, hide = true, requires = "mode")]
         node: Option<String>,
+        /// With --mode: the worker's branch, for a repository that scopes
+        /// path leases by branch.
+        #[arg(long, hide = true, requires = "mode", conflicts_with = "node")]
+        branch: Option<String>,
         /// Print JSON.
         #[arg(long)]
         json: bool,
@@ -504,6 +508,13 @@ enum Command {
         /// holds the node under another path.
         #[arg(long)]
         node: Option<String>,
+        /// For a lease authority's client: the branch its checkout is on,
+        /// in a repository that scopes path leases by branch.
+        #[arg(long, hide = true)]
+        branch: Option<String>,
+        /// For a lease authority's client: its checkout is detached.
+        #[arg(long, hide = true, conflicts_with = "branch")]
+        detached: bool,
         /// Print JSON.
         #[arg(long)]
         json: bool,
@@ -556,6 +567,13 @@ enum Command {
         /// canonical scope (relative to the repository's top) instead.
         #[arg(long, hide = true, conflicts_with = "target")]
         scope: Option<String>,
+        /// With --scope: the branch the client's checkout is on, in a
+        /// repository that scopes path leases by branch.
+        #[arg(long, hide = true, requires = "scope")]
+        branch: Option<String>,
+        /// With --scope: the client's checkout is detached.
+        #[arg(long, hide = true, requires = "scope", conflicts_with = "branch")]
+        detached: bool,
         /// Release every active lease you hold.
         #[arg(long, conflicts_with_all = ["target", "scope", "clean", "committed"])]
         all: bool,
@@ -1075,6 +1093,7 @@ fn run(cli: Cli, root: &Path, gate: Option<mdkg_graph::graphref::Authority>) -> 
             exclusive,
             mode,
             node,
+            branch,
             json,
         } => {
             let opts = coord::ClaimOptions {
@@ -1088,6 +1107,7 @@ fn run(cli: Cli, root: &Path, gate: Option<mdkg_graph::graphref::Authority>) -> 
                     }
                 }),
                 node,
+                branch,
                 exact: false,
             };
             if more.is_empty() {
@@ -1097,8 +1117,15 @@ fn run(cli: Cli, root: &Path, gate: Option<mdkg_graph::graphref::Authority>) -> 
                 coord::claim_many(root, actor, &targets, opts, json)
             }
         }
-        Command::Holds { scope, node, json } => {
-            coord::holds(root, actor, &scope, node.as_deref(), json)
+        Command::Holds {
+            scope,
+            node,
+            branch,
+            detached,
+            json,
+        } => {
+            let branch = coord::asked_branch(branch.as_deref(), detached);
+            coord::holds(root, actor, &scope, node.as_deref(), branch, json)
         }
         Command::Renew { json, local_turn } => {
             coord::renew(root, actor, json, local_turn.as_deref())
@@ -1126,11 +1153,15 @@ fn run(cli: Cli, root: &Path, gate: Option<mdkg_graph::graphref::Authority>) -> 
         Command::Release {
             target,
             scope,
+            branch,
+            detached,
             json,
             ..
         } => {
             let which = match (&target, &scope) {
-                (_, Some(s)) => coord::ReleaseTarget::Scope(s),
+                (_, Some(s)) => {
+                    coord::ReleaseTarget::Scope(s, coord::asked_branch(branch.as_deref(), detached))
+                }
                 (Some(t), None) => coord::ReleaseTarget::Named(t),
                 (None, None) => coord::ReleaseTarget::Named(""),
             };

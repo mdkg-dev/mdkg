@@ -140,11 +140,11 @@ fn an_upgrade_copies_the_store_and_a_restore_puts_it_back() {
         .flatten()
         .find(|d| d["code"] == "coord.store_upgraded")
         .unwrap_or_else(|| panic!("no upgrade notice: {out}"));
-    let copy = db.with_file_name("coord.sqlite.pre-1+msg5-to-4+msg5.sqlite");
+    let copy = db.with_file_name("coord.sqlite.pre-1+msg5-to-5+msg5.sqlite");
     assert!(
         notice["message"]
             .as_str()
-            .is_some_and(|m| m.contains("coord.sqlite.pre-1+msg5-to-4+msg5.sqlite")),
+            .is_some_and(|m| m.contains("coord.sqlite.pre-1+msg5-to-5+msg5.sqlite")),
         "{out}"
     );
     assert!(copy.exists());
@@ -177,7 +177,7 @@ fn an_upgrade_copies_the_store_and_a_restore_puts_it_back() {
             &[
                 "store",
                 "restore",
-                "coord.sqlite.pre-1+msg5-to-4+msg5.sqlite",
+                "coord.sqlite.pre-1+msg5-to-5+msg5.sqlite",
             ],
         );
         assert_eq!(
@@ -198,11 +198,11 @@ fn an_upgrade_copies_the_store_and_a_restore_puts_it_back() {
         &[
             "store",
             "restore",
-            "coord.sqlite.pre-1+msg5-to-4+msg5.sqlite",
+            "coord.sqlite.pre-1+msg5-to-5+msg5.sqlite",
         ],
     );
     assert_eq!(code, 0, "{out}");
-    assert_eq!(out["data"]["replaced"], "4+msg5", "{out}");
+    assert_eq!(out["data"]["replaced"], "5+msg5", "{out}");
     assert_eq!(out["data"]["restored"], "1+msg5", "{out}");
     assert!(
         codes(&out).contains(&"coord.store_restored".to_string()),

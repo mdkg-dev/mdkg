@@ -2924,6 +2924,7 @@ fn older_stores_text_is_escaped_and_not_recorded() {
                     now: 100,
                     request: None,
                     node: None,
+                    branch: None,
                 })
                 .expect("claim");
         }
@@ -3118,6 +3119,7 @@ fn round_six_lease_regressions() {
                 now: 100,
                 request: None,
                 node: None,
+                branch: None,
             })
             .expect("claim");
     }
@@ -4271,4 +4273,138 @@ fn a_committed_lease_with_a_draft_in_another_case_stays() {
     let (code, out) = run(&wa, "a", now, &["release", "--committed"]);
     assert_eq!(code, 0, "{out}");
     assert_eq!(out["data"]["released"][0]["scope"], "docs/Notes", "{out}");
+}
+
+/// Branch-scoped path leases: with `mdkg.leaseScope branch` in the
+/// repository's own config, two branches hold one path side by side, warned
+/// `coord.lease_other_branch`; nodes and detached checkouts still hold on
+/// every branch, and a lease holds only in a checkout of its branch.
+#[test]
+fn branch_scoped_leases_let_two_branches_hold_one_path() {
+    let (dir, repo, wa, wb) = two_worktrees();
+    // The default: a path is held on every branch.
+    let (code, out) = run(&wa, "a", 0, &["claim", "src/lib.rs"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out["data"]["lease"].get("branch").is_none(), "{out}");
+    let (code, out) = run(&wb, "b", 1, &["claim", "src/lib.rs"]);
+    assert_eq!(code, 5, "{out}");
+    let (code, out) = run(&wa, "a", 2, &["release", "src/lib.rs"]);
+    assert_eq!(code, 0, "{out}");
+
+    // A bad value is refused, not read as either scope.
+    sh(&repo, &["config", "mdkg.leaseScope", "worktree"]);
+    let (code, out) = run(&wa, "a", 3, &["claim", "src/lib.rs"]);
+    assert_ne!(code, 0, "{out}");
+    assert!(codes(&out).contains(&"config.invalid".to_string()), "{out}");
+
+    sh(&repo, &["config", "mdkg.leaseScope", "branch"]);
+    let (code, out) = run(&wa, "a", 4, &["claim", "src/lib.rs"]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(out["data"]["lease"]["branch"], "a", "{out}");
+    let (code, out) = run(&wb, "b", 5, &["claim", "src/lib.rs"]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(out["data"]["lease"]["branch"], "b", "{out}");
+    assert_eq!(
+        out["data"]["lease"]["shared_with"],
+        serde_json::json!(["a"])
+    );
+    assert!(
+        codes(&out).contains(&"coord.lease_other_branch".to_string()),
+        "{out}"
+    );
+    assert!(
+        !codes(&out).contains(&"coord.lease_shared".to_string()),
+        "{out}"
+    );
+    let (code, out) = run(&wa, "a", 6, &["status"]);
+    assert_eq!(code, 0, "{out}");
+    let leases = out["data"]["leases"].as_array().expect("leases");
+    let mut branches: Vec<&str> = leases
+        .iter()
+        .filter(|l| l["scope"] == "src/lib.rs")
+        .filter_map(|l| l["branch"].as_str())
+        .collect();
+    branches.sort_unstable();
+    assert_eq!(branches, ["a", "b"], "{out}");
+
+    // A node settles on one branch: it's still held on every branch.
+    let (code, out) = run(&wa, "a", 7, &["claim", "task-1"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out["data"]["lease"].get("branch").is_none(), "{out}");
+    let (code, out) = run(&wb, "b", 8, &["claim", "task-1"]);
+    assert_eq!(code, 5, "{out}");
+
+    // A detached checkout names no branch, so it contends with both.
+    let wc = dir.0.join("wt-c");
+    sh(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            wc.to_str().expect("utf-8"),
+            "main",
+        ],
+    );
+    let (code, out) = run(&wc, "c", 9, &["claim", "src/lib.rs"]);
+    assert_eq!(code, 5, "{out}");
+
+    // A lease holds only in a checkout of its branch: a's worktree,
+    // switched to another branch, holds nothing until it claims again.
+    let (code, out) = run(&wa, "a", 10, &["holds", "src/lib.rs"]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(out["data"]["holds"], true, "{out}");
+    sh(&wa, &["switch", "-q", "-c", "a2"]);
+    let (code, out) = run(&wa, "a", 11, &["holds", "src/lib.rs"]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(out["data"]["holds"], false, "{out}");
+    let (code, out) = run(&wa, "a", 12, &["claim", "src/lib.rs"]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(out["data"]["lease"]["branch"], "a2", "{out}");
+    assert_eq!(out["data"]["renewed"], false, "{out}");
+    let (code, out) = run(&wa, "a", 13, &["holds", "src/lib.rs"]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(out["data"]["holds"], true, "{out}");
+}
+
+/// An actor who switched branches holds a path once per branch: release
+/// by path takes the lease on the checkout's branch, and a detached
+/// checkout's claim never renews a branch's lease (it asks for one on
+/// every branch, which the branch's lease blocks).
+#[test]
+fn a_branch_lease_is_renewed_and_released_only_on_its_branch() {
+    let (_dir, repo, wa, _wb) = two_worktrees();
+    sh(&repo, &["config", "mdkg.leaseScope", "branch"]);
+    let (code, out) = run(&wa, "a", 0, &["claim", "src/lib.rs"]);
+    assert_eq!(code, 0, "{out}");
+    let on_a = out["data"]["lease"]["id"].as_str().expect("id").to_string();
+    sh(&wa, &["switch", "-q", "-c", "a2"]);
+    let (code, out) = run(&wa, "a", 1, &["claim", "src/lib.rs"]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(out["data"]["lease"]["branch"], "a2", "{out}");
+    let on_a2 = out["data"]["lease"]["id"].as_str().expect("id").to_string();
+    assert_ne!(on_a, on_a2);
+    // On a2, release by path takes a2's lease, whichever was claimed first.
+    let (code, out) = run(&wa, "a", 2, &["release", "src/lib.rs"]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(out["data"]["lease"]["id"], on_a2.as_str(), "{out}");
+    let (code, out) = run(&wa, "a", 3, &["status"]);
+    assert_eq!(code, 0, "{out}");
+    let active: Vec<&str> = out["data"]["leases"]
+        .as_array()
+        .expect("leases")
+        .iter()
+        .filter(|l| l["scope"] == "src/lib.rs")
+        .filter_map(|l| l["id"].as_str())
+        .collect();
+    assert_eq!(active, [on_a.as_str()], "{out}");
+    // Detached, a claim isn't a renewal of a's lease.
+    sh(&wa, &["switch", "-q", "--detach"]);
+    let (code, out) = run(&wa, "a", 4, &["claim", "src/lib.rs"]);
+    assert_ne!(code, 0, "{out}");
+    assert_ne!(out["data"]["renewed"], true, "{out}");
+    let (code, out) = run(&wa, "a", 5, &["holds", "src/lib.rs"]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(out["data"]["holds"], false, "{out}");
 }

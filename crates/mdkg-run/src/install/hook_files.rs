@@ -561,7 +561,7 @@ fn shell_words(line: &str) -> Option<Vec<String>> {
 }
 
 /// The hooks git's own adapter (`hooks:git`) routes through mdkg.
-pub const GIT_ROUTED: &[&str] = &["pre-commit", "pre-push"];
+pub const GIT_ROUTED: &[&str] = &["post-commit", "pre-commit", "pre-push"];
 
 /// Where `hooks:git` keeps its hooks: a folder of the repository's git
 /// common dir, shared by every worktree, that `core.hooksPath` names.

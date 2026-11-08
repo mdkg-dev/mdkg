@@ -1761,7 +1761,7 @@ fn doctor_checks_the_agents_instructions_are_this_builds() {
     assert_eq!(status_of(&v, "agents"), "ok", "{v}");
     assert!(v.to_string().contains("own changes"), "{v}");
     // Whitespace the frontmatter parser takes is the same version.
-    let spaced = shipped.replace("version: 0.7.2", "version :  0.7.2");
+    let spaced = shipped.replace("version: 0.7.3", "version :  0.7.3");
     assert_ne!(
         spaced, shipped,
         "the whitespace fixture must change the skill"
@@ -1770,7 +1770,7 @@ fn doctor_checks_the_agents_instructions_are_this_builds() {
     let (_, v) = json(&dir, &["doctor", "--json"]);
     assert_eq!(status_of(&v, "agents"), "ok", "{v}");
     // Another build's skill: bring in this build's.
-    let older = shipped.replace("version: 0.7.2", "version: 0.6.9");
+    let older = shipped.replace("version: 0.7.3", "version: 0.6.9");
     assert_ne!(older, shipped, "the version fixture must change the skill");
     std::fs::write(&skill, older).expect("write");
     let (_, v) = json(&dir, &["doctor", "--json"]);

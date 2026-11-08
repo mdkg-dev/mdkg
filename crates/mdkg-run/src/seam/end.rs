@@ -130,18 +130,22 @@ pub(crate) fn end(
     // Then the agent's clean path leases go, as the agent in its worktree
     // (step 5; orchestrator, #12639): a file lease protects uncommitted
     // edits only, so one on a file the turn committed doesn't wait out its
-    // term. After the turn lease, whatever the turn's end; a failure only
-    // warns.
+    // term. After the turn lease, whatever the turn's end. A failed
+    // release warns and is recorded, so the supervisor tries it again
+    // between turns (friction 148): a busy store that failed the turn's
+    // end mustn't leave its path leases held until they expire.
     if lifecycle.claimed {
-        let cleaned = mdkg_coord_sqlite::git::toplevel(&agent.spec.cwd)
-            .map_err(|e| RunError::io("can't find the agent's worktree", e))
-            .and_then(|top| mail.release_clean(&agent.spec.name, &top));
-        if let Err(e) = cleaned {
-            eprintln!(
+        match mdkg_coord_sqlite::git::toplevel(&agent.spec.cwd) {
+            Err(e) => eprintln!(
                 "warning: can't release {}'s clean leases: {}",
                 crate::digest::clean(&agent.spec.name),
-                crate::digest::terminal_safe(&e.message)
-            );
+                crate::digest::terminal_safe(
+                    &RunError::io("can't find the agent's worktree", e).message
+                )
+            ),
+            Ok(top) => {
+                crate::turn::release_clean_noted(mail, dir, &agent.spec.name, &top);
+            }
         }
     }
     Closed {

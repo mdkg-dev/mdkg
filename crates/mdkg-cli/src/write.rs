@@ -1854,6 +1854,7 @@ fn take_leases(
                 now,
                 request: None,
                 node: Some(key.clone()),
+                branch: None,
             })
         });
         if capped {
@@ -1972,6 +1973,7 @@ fn settle_landed(
                 now,
                 request: None,
                 node: node.clone(),
+                branch: None,
             })
         })
         .map_err(store_error)?;

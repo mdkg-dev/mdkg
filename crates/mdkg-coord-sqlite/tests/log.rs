@@ -63,6 +63,7 @@ fn claim(owner: &str, leaf: &str, node: Option<&str>) -> Command {
         now: 0,
         request: None,
         node: node.map(String::from),
+        branch: None,
     }
 }
 
@@ -384,7 +385,7 @@ fn a_snapshot_is_a_copy_restore_takes() {
     drop(store);
     let copy = mdkg_coord_sqlite::snapshot(&dir.db(), "migrate").unwrap();
     assert!(
-        copy.ends_with("coord.sqlite.pre-4+msg5-to-migrate.sqlite"),
+        copy.ends_with("coord.sqlite.pre-5+msg5-to-migrate.sqlite"),
         "{copy:?}"
     );
     let listed = mdkg_coord_sqlite::backups(&dir.db()).unwrap();

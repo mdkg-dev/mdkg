@@ -1685,6 +1685,17 @@ pub fn main_ref(dir: &Path) -> String {
     name.strip_prefix("refs/heads/").unwrap_or(name).to_string()
 }
 
+/// `mdkg.leaseScope` in the repository's own config (never a worktree's
+/// `config.worktree`, which an agent can write), trimmed, when set: where
+/// this clone's path leases hold, without a tracked change.
+pub fn lease_scope(dir: &Path) -> Option<String> {
+    checkout_for(dir)
+        .ok()
+        .and_then(|c| common_config(&c.common, "mdkg.leaseScope"))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// The largest config file the value cache reads to look for includes.
 const KEPT_CONFIG_LIMIT: u64 = 1 << 20;
 

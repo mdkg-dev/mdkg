@@ -508,6 +508,7 @@ mod tests {
                 now: 1,
                 request: None,
                 node: None,
+                branch: None,
             })
             .unwrap()
         {

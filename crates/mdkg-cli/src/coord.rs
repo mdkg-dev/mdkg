@@ -2107,9 +2107,14 @@ pub struct LeaseRecord {
     pub deadline_ms: u64,
     /// `exclusive`, or `shared` when the config lets others share the path.
     pub mode: String,
-    /// Owners of other active leases overlapping a shared one.
+    /// Owners of other active leases overlapping a shared one, or one
+    /// held on a branch (theirs on other branches).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub shared_with: Vec<String>,
+    /// The branch a path lease holds its scope on, where the repository
+    /// scopes path leases by branch; absent for one held on every branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub changeset: Option<String>,
     /// In `status`: whether the lease is the acting actor's.
@@ -2181,6 +2186,7 @@ pub(crate) fn lease_record(l: &Lease) -> LeaseRecord {
         deadline_ms: l.deadline,
         mode: mode_name(l.mode).into(),
         shared_with: Vec::new(),
+        branch: l.branch.clone(),
         changeset: l.changeset.map(|c| c.to_string()),
         mine: None,
         expiring: None,
@@ -2240,9 +2246,16 @@ fn mode_name(m: Mode) -> &'static str {
     }
 }
 
-/// Other active leases overlapping `l`, for a shared lease.
+/// Whether `l` may be held beside other actors' leases: a shared lease,
+/// or one held on a branch.
+fn co_holdable(l: &Lease) -> bool {
+    l.mode == Mode::Shared || l.branch.is_some()
+}
+
+/// Other actors' active leases overlapping `l`, for a lease held beside
+/// them ([`co_holdable`]).
 fn co_holders<'a>(state: &'a Coordinator, l: &'a Lease) -> Vec<&'a Lease> {
-    if l.mode != Mode::Shared || l.status != Status::Active {
+    if !co_holdable(l) || l.status != Status::Active {
         return Vec::new();
     }
     state
@@ -2265,9 +2278,52 @@ fn lease_record_in(state: &Coordinator, l: &Lease) -> LeaseRecord {
     }
 }
 
-/// The `coord.lease_shared` notice for a shared lease with co-holders.
+/// The notices for a lease held beside others: `coord.lease_shared` for
+/// co-holders on its branch (or every branch), `coord.lease_other_branch`
+/// for those on other branches.
+fn co_hold_notices(state: &Coordinator, l: &Lease) -> Vec<Diagnostic> {
+    shared_notice(state, l)
+        .into_iter()
+        .chain(other_branch_notice(state, l))
+        .collect()
+}
+
+/// The `coord.lease_other_branch` notice for a lease with co-holders on
+/// other branches.
+fn other_branch_notice(state: &Coordinator, l: &Lease) -> Option<Diagnostic> {
+    let others: Vec<&Lease> = co_holders(state, l)
+        .into_iter()
+        .filter(|h| h.on_other_branch(l.branch.as_deref()))
+        .collect();
+    if others.is_empty() {
+        return None;
+    }
+    // Their names are data, never prose: other actors chose them.
+    Some(
+        Diagnostic::warning(
+            Code::CoordLeaseOtherBranch,
+            format!(
+                "your lease {} overlaps {} other holder(s)' on other branches",
+                l.id,
+                others.len()
+            ),
+        )
+        .at(l.scope.to_string(), None)
+        .held_by(others.iter().map(|h| h.owner.clone()))
+        .with_hint(
+            "this repository scopes path leases by branch; tell them what you change, \
+             and expect to merge",
+        ),
+    )
+}
+
+/// The `coord.lease_shared` notice for a shared lease with co-holders on
+/// its branch, or on every branch.
 fn shared_notice(state: &Coordinator, l: &Lease) -> Option<Diagnostic> {
-    let others = co_holders(state, l);
+    let others: Vec<&Lease> = co_holders(state, l)
+        .into_iter()
+        .filter(|h| !h.on_other_branch(l.branch.as_deref()))
+        .collect();
     if others.is_empty() {
         return None;
     }
@@ -2438,6 +2494,71 @@ pub(crate) fn own_lease<'a>(
     })
 }
 
+/// [`own_lease`] for a checkout on the branch `here` gives (`None`:
+/// detached), read only when the actor holds `scope` on more than one
+/// branch: the one held there, else the first (Terra #21585 F4).
+fn own_lease_here<'a>(
+    state: &'a Coordinator,
+    actor: &str,
+    scope: &Scope,
+    here: impl FnOnce() -> Option<String>,
+) -> Option<&'a Lease> {
+    let mine: Vec<&Lease> = state
+        .leases()
+        .filter(|l| {
+            l.owner == actor && l.confirmed && l.status == Status::Active && l.scope == *scope
+        })
+        .collect();
+    if mine.len() < 2 {
+        return mine.first().copied();
+    }
+    let here = here();
+    mine.iter()
+        .find(|l| l.holds_on(here.as_deref()))
+        .or(mine.first())
+        .copied()
+}
+
+/// The branch the checkout asking about a lease is on: the `--branch` a
+/// lease authority's client named (empty: `--detached`), else `repo`'s own.
+fn asking_branch(repo: &Repo, asked: Option<&str>) -> Option<String> {
+    match asked {
+        Some(b) => Some(b).filter(|b| !b.is_empty()).map(str::to_string),
+        None => checked_out_branch(&repo.top),
+    }
+}
+
+/// The branch a host's `holds` or `release --scope` was asked on: its
+/// client's `--branch`, or empty for `--detached`; `None` when neither
+/// was given.
+pub fn asked_branch(branch: Option<&str>, detached: bool) -> Option<&str> {
+    branch.or(detached.then_some(""))
+}
+
+/// What a client tells its lease authority's `holds` and `release
+/// --scope` about its checkout, so the host judges the lease on the
+/// client's branch, not its own (Terra #21585 F1): `--branch <name>`, or
+/// `--detached`; nothing where this repository doesn't scope path leases
+/// by branch.
+fn branch_option(repo: &Repo) -> Result<Option<(&'static str, Option<String>)>, GraphError> {
+    let policy = committed_lease_policy(repo)?;
+    if lease_scope(repo, &policy)? != config::LeaseScope::Branch {
+        return Ok(None);
+    }
+    Ok(Some(branch_flag(Some(
+        checked_out_branch(&repo.top).unwrap_or_default(),
+    ))))
+}
+
+/// The option that passes the branch `asked` on (empty: detached) to a
+/// lease authority.
+fn branch_flag(asked: Option<String>) -> (&'static str, Option<String>) {
+    match asked.filter(|b| !b.is_empty()) {
+        Some(b) => ("--branch", Some(b)),
+        None => ("--detached", None),
+    }
+}
+
 /// The actor's active lease on `scope` or on a folder containing it, so
 /// claiming a file inside a folder you hold renews the folder.
 pub(crate) fn covering_lease<'a>(
@@ -2445,17 +2566,31 @@ pub(crate) fn covering_lease<'a>(
     actor: &str,
     scope: &Scope,
 ) -> Option<&'a Lease> {
-    own_lease(state, actor, scope).or_else(|| {
-        state.leases().find(|l| {
-            // A role or a turn covers only itself: never renewed by a claim
-            // of a scope inside it (a node squatting a `role:x/...` folder).
-            l.owner == actor
-                && l.confirmed
-                && l.status == Status::Active
-                && l.scope.contains(scope)
-                && !is_role_or_turn(&l.scope)
+    covering_lease_where(state, actor, scope, |_| true)
+}
+
+/// [`covering_lease`] among the leases `keep` accepts: an actor whose
+/// worktree switched branches may hold one lease per branch.
+fn covering_lease_where<'a>(
+    state: &'a Coordinator,
+    actor: &str,
+    scope: &Scope,
+    keep: impl Fn(&Lease) -> bool,
+) -> Option<&'a Lease> {
+    own_lease(state, actor, scope)
+        .filter(|l| keep(l))
+        .or_else(|| {
+            state.leases().find(|l| {
+                // A role or a turn covers only itself: never renewed by a claim
+                // of a scope inside it (a node squatting a `role:x/...` folder).
+                l.owner == actor
+                    && l.confirmed
+                    && l.status == Status::Active
+                    && l.scope.contains(scope)
+                    && !is_role_or_turn(&l.scope)
+                    && keep(l)
+            })
         })
-    })
 }
 
 /// How to claim.
@@ -2472,6 +2607,9 @@ pub struct ClaimOptions {
     pub mode: Option<Mode>,
     /// With `mode`: the node the scope is, by id (always exclusive).
     pub node: Option<String>,
+    /// With `mode`: the branch the worker's checkout has, for a
+    /// repository that scopes path leases by branch.
+    pub branch: Option<String>,
     /// The target is an id or scope this build already resolved (`goal
     /// claim`'s pick, a turn's scope): taken exactly, never as a handle, so
     /// a file named like it can't take its place.
@@ -2542,6 +2680,9 @@ fn claim_planned(root: &Path, plan: Plan) -> Result<Report<ClaimData>, GraphErro
         // The qualified id, so a host with the id in two workspaces
         // knows which.
         options.push(("--node", Some(q.clone())));
+    }
+    if let Some(b) = &plan.branch {
+        options.push(("--branch", Some(b.clone())));
     }
     options.push(("--as", Some(plan.actor.clone())));
     let mut report: Report<ClaimData> =
@@ -2687,6 +2828,8 @@ struct Plan {
     /// A host's claim of a canonical scope (`--mode`): the worker adds the
     /// notes about its own worktree, so none come from here.
     canonical: bool,
+    /// The branch a branch-scoped path lease holds its scope on.
+    branch: Option<String>,
 }
 
 /// Resolves and checks a claim: the scope, its mode, the actor. Nothing
@@ -2793,6 +2936,7 @@ fn plan_claim(
             )
             .with_hint("claim the nodes, files or folders you'll edit"));
         }
+        let branch = lease_branch(&repo, &config.leases, &resolved, opts)?;
         let Target {
             scope,
             label,
@@ -2822,8 +2966,85 @@ fn plan_claim(
             new: opts.new,
             exclusive: opts.exclusive,
             canonical: opts.mode.is_some(),
+            branch,
         })
     }
+}
+
+/// Where `repo`'s path leases hold: `git config mdkg.leaseScope` in the
+/// repository's own config (so a clone can choose without a tracked
+/// change), else the committed `coordination.leases.scope`.
+fn lease_scope(
+    repo: &Repo,
+    policy: &config::LeasePolicy,
+) -> Result<config::LeaseScope, GraphError> {
+    match mdkg_git::lease_scope(&repo.top) {
+        None => Ok(policy.scope),
+        Some(name) => config::LeaseScope::named(&name).ok_or_else(|| {
+            GraphError::failure(
+                Code::ConfigInvalid,
+                "git config mdkg.leaseScope must be `repository` or `branch`",
+            )
+            .with_hint("set it with `git config mdkg.leaseScope branch`, or unset it")
+        }),
+    }
+}
+
+/// The branch the worktree at `top` has checked out, without
+/// `refs/heads/`: `None` for a detached HEAD, or when git can't say.
+pub(crate) fn checked_out_branch(top: &Path) -> Option<String> {
+    let out = git::command(top)
+        .args(["symbolic-ref", "-q", "HEAD"])
+        .run(None)
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let name = String::from_utf8(out.stdout).ok()?;
+    name.trim()
+        .strip_prefix("refs/heads/")
+        .filter(|b| !b.is_empty() && !hidden_characters(b))
+        .map(str::to_string)
+}
+
+/// Whether a lease on `target` may hold its scope on one branch: a path,
+/// never a node, a role, a turn, or anything holding a graph's files,
+/// which settle on one branch whatever the claimant's.
+fn branch_scopable(repo: &Repo, target: &Target) -> bool {
+    target.qid.is_none()
+        && target.node_key.is_none()
+        && target.node.is_none()
+        && !is_named_scope(&target.scope)
+        && !target.scope.overlaps(&repo.graph_scope())
+        && !target
+            .scope
+            .as_str()
+            .split('/')
+            .any(|s| s.eq_ignore_ascii_case(".mdkg"))
+}
+
+/// The branch a claim of `target` holds its scope on: the claimant
+/// worktree's (or, for a host, the worker's `--branch`) where the
+/// repository scopes path leases by branch, else none.
+fn lease_branch(
+    repo: &Repo,
+    policy: &config::LeasePolicy,
+    target: &Target,
+    opts: &ClaimOptions,
+) -> Result<Option<String>, GraphError> {
+    if !branch_scopable(repo, target) {
+        return Ok(None);
+    }
+    if lease_scope(repo, policy)? != config::LeaseScope::Branch {
+        return Ok(None);
+    }
+    if opts.mode.is_some() {
+        if let Some(b) = &opts.branch {
+            refuse_hidden(b)?;
+        }
+        return Ok(opts.branch.clone());
+    }
+    Ok(checked_out_branch(&repo.top))
 }
 
 /// Grants a planned claim in the local store.
@@ -2939,7 +3160,14 @@ fn claim_command(c: &Coordinator, plan: &Plan, now: u64) -> Command {
         .as_deref()
         .and_then(|k| c.node_holder(k))
         .is_some_and(|h| h.scope != plan.scope && h.deadline > now);
-    match covering_lease(c, &plan.actor, &plan.scope).filter(|_| !turn && !elsewhere) {
+    // A lease you hold on another branch (your worktree switched) isn't
+    // renewed for this one, nor a branch's for a claim on every branch
+    // (a detached checkout): the claim asks for its own (Terra #21585 F2).
+    let covering = covering_lease_where(c, &plan.actor, &plan.scope, |l| {
+        l.holds_on(plan.branch.as_deref())
+    })
+    .filter(|_| !turn && !elsewhere);
+    match covering {
         Some(l) => Command::Heartbeat {
             owner: plan.actor.clone(),
             lease: l.id.clone(),
@@ -2952,6 +3180,7 @@ fn claim_command(c: &Coordinator, plan: &Plan, now: u64) -> Command {
             now,
             request: None,
             node: plan.node_key.clone(),
+            branch: plan.branch.clone(),
         },
     }
 }
@@ -2977,13 +3206,18 @@ fn claim_granted(
         new,
         exclusive,
         canonical,
+        branch,
         ..
     } = plan;
     let (target, new, exclusive, canonical, mode) =
         (target.as_str(), *new, *exclusive, *canonical, *mode);
+    let branch = branch.as_deref();
     let (lease, renewed) = match outcome {
         Outcome::Lease { lease } => (state.lease(lease).cloned(), false),
-        Outcome::Deadline { .. } => (covering_lease(state, actor, scope).cloned(), true),
+        Outcome::Deadline { .. } => (
+            covering_lease_where(state, actor, scope, |l| l.holds_on(branch)).cloned(),
+            true,
+        ),
         Outcome::Refused {
             error: CoordError::Held(_),
         } => {
@@ -3009,7 +3243,7 @@ fn claim_granted(
                 .filter(|h| h.scope != *scope)
                 .or_else(|| {
                     state
-                        .blockers(scope, mode)
+                        .blockers(scope, mode, branch)
                         .find(|l| l.owner != *actor || l.scope != *scope)
                 });
             return Err(match holder {
@@ -3097,7 +3331,7 @@ fn claim_finish(
     } else {
         claim_notes(state, scope, label, target, *missing && !*new, *node)
     };
-    diagnostics.extend(shared_notice(state, &lease));
+    diagnostics.extend(co_hold_notices(state, &lease));
     // The shared-lease merge advisory (#16942): a co-holder's branch that conflicts with
     // yours under a shared lease, warned at the claim.
     if !canonical {
@@ -3389,7 +3623,7 @@ fn refuse_held(plans: &[Plan]) -> Result<(), GraphError> {
             continue;
         }
         if let Some(h) = state
-            .blockers(&plan.scope, plan.mode)
+            .blockers(&plan.scope, plan.mode, plan.branch.as_deref())
             .find(|l| l.owner != plan.actor && l.deadline > now)
         {
             let mut d = Diagnostic::error(
@@ -3504,7 +3738,7 @@ pub(crate) fn holds_report(
     scope: &str,
     node: Option<&str>,
 ) -> Result<Report<HoldsData>, GraphError> {
-    holds_report_with(root, actor, scope, node, false)
+    holds_report_with(root, actor, scope, node, false, None)
 }
 
 /// [`holds_report`]; with `detail` (the `holds` command, not an edit
@@ -3516,6 +3750,7 @@ fn holds_report_with(
     scope: &str,
     node: Option<&str>,
     detail: bool,
+    asked: Option<&str>,
 ) -> Result<Report<HoldsData>, GraphError> {
     refuse_hidden(scope)?;
     let repo = Repo::open(root)?;
@@ -3544,7 +3779,23 @@ fn holds_report_with(
         if let Some(q) = &target.qid {
             options.push(("--node", Some(q.clone())));
         }
-        return authority.delegate(root, "holds", &[target.scope.to_string()], &options);
+        match asked {
+            Some(b) => options.push(branch_flag(Some(b.to_string()))),
+            None => options.extend(branch_option(&repo)?),
+        }
+        let mut report: Report<HoldsData> =
+            authority.delegate(root, "holds", &[target.scope.to_string()], &options)?;
+        // A host that can't take `--branch` judged the lease on its own
+        // checkout: one it reports held on another branch is checked here.
+        if let Some(d) = report.data.as_mut()
+            && d.lease
+                .as_ref()
+                .is_some_and(|l| !held_on_this_branch(&repo, asked, l.branch.as_deref()))
+        {
+            d.holds = false;
+            d.lease = None;
+        }
+        return Ok(report);
     }
     let mut store = repo.store()?;
     let now = now_ms();
@@ -3557,8 +3808,11 @@ fn holds_report_with(
         .is_some_and(|h| h.scope != target.scope && h.deadline > now);
     // A lease this build wouldn't grant holds nothing for an edit: it
     // lapses.
-    let lease = covering_lease(&state, &actor, &target.scope)
-        .filter(|l| l.deadline > now && !elsewhere && repo.lease_still_granted(&l.scope));
+    let here = std::cell::OnceCell::new();
+    let lease = covering_lease_where(&state, &actor, &target.scope, |l| {
+        l.holds_on(here.get_or_init(|| asking_branch(&repo, asked)).as_deref())
+    })
+    .filter(|l| l.deadline > now && !elsewhere && repo.lease_still_granted(&l.scope));
     let mut record = lease.map(|l| {
         if !detail {
             return lease_record_in(&state, l);
@@ -3587,14 +3841,29 @@ fn holds_report_with(
     }))
 }
 
+/// Whether a lease held on `branch` (none: on every branch) holds in
+/// `repo`'s checkout: a worktree switched to another branch, or detached,
+/// claims again.
+fn held_on_this_branch(repo: &Repo, asked: Option<&str>, branch: Option<&str>) -> bool {
+    branch.is_none_or(|b| asking_branch(repo, asked).as_deref() == Some(b))
+}
+
+/// `holds`; `branch` is the hidden `--branch` a lease authority's client
+/// names its checkout's branch with (empty: `--detached`).
 pub fn holds(
     root: &Path,
     actor: Option<String>,
     scope: &str,
     node: Option<&str>,
+    branch: Option<&str>,
     json: bool,
 ) -> u8 {
-    let report = holds_report_with(root, actor, scope, node, true)
+    if let Some(b) = branch
+        && let Err(e) = refuse_hidden(b)
+    {
+        return output::emit("holds", json, Report::<HoldsData>::failed(e), |_| {});
+    }
+    let report = holds_report_with(root, actor, scope, node, true, branch)
         .unwrap_or_else(Report::failed)
         .with(authority::committed_key_warning(root));
     // The claim that takes it: `holds` names a scope from the repository's
@@ -3829,11 +4098,12 @@ pub(crate) fn release_at_authority(
 }
 
 /// What to release: a target as a person names it, or a canonical scope
-/// (relative to the repository's top) as a lease authority's host is given.
+/// (relative to the repository's top) as a lease authority's host is given,
+/// with the `--branch` its client's checkout is on (empty: `--detached`).
 #[derive(Debug, Clone, Copy)]
 pub enum ReleaseTarget<'a> {
     Named(&'a str),
-    Scope(&'a str),
+    Scope(&'a str, Option<&'a str>),
 }
 
 /// What `release` of one target takes: an active lease to release, or
@@ -3854,16 +4124,16 @@ fn release_pick(
     let actor = actor.to_string();
     {
         let target = match which {
-            ReleaseTarget::Named(t) | ReleaseTarget::Scope(t) => t,
+            ReleaseTarget::Named(t) | ReleaseTarget::Scope(t, _) => t,
         };
-        let lease = if let ReleaseTarget::Scope(scope) = which {
+        let lease = if let ReleaseTarget::Scope(scope, asked) = which {
             let scope = repo.canonical_target(scope, None)?.scope;
             if own_lease(state, &actor, &scope).is_none()
                 && let Some(l) = ended_lease(state, &actor, &scope)
             {
                 return Ok(Pick::Ended(l.clone()));
             }
-            own_lease(state, &actor, &scope).cloned()
+            own_lease_here(state, &actor, &scope, || asking_branch(repo, asked)).cloned()
         } else if is_lease_id(target) {
             let named = state.lease(&LeaseId(target.to_string())).cloned();
             // Your own lease that has already ended: nothing left to do.
@@ -3913,7 +4183,7 @@ fn release_pick(
             {
                 return Ok(Pick::Ended(l.clone()));
             }
-            own_lease(state, &actor, &scope).cloned()
+            own_lease_here(state, &actor, &scope, || checked_out_branch(&repo.top)).cloned()
         };
         let Some(lease) = lease else {
             return Err(GraphError::not_found(
@@ -3994,10 +4264,13 @@ fn release_report(
 ) -> Result<Report<ReleaseData>, GraphError> {
     let repo = Repo::open(root)?;
     let target = match which {
-        ReleaseTarget::Named(t) | ReleaseTarget::Scope(t) => t,
+        ReleaseTarget::Named(t) | ReleaseTarget::Scope(t, _) => t,
     };
     // Its refusals quote the target: never include hidden characters.
     refuse_hidden(target)?;
+    if let ReleaseTarget::Scope(_, Some(b)) = which {
+        refuse_hidden(b)?;
+    }
     // A role or a turn is named alone (`./role:x` is a path): always
     // local, whatever the authority's state.
     if !target.contains('/') && is_named_scope(&Scope::new(target)) {
@@ -4006,18 +4279,21 @@ fn release_report(
     let authority = authority::find(&repo)?;
     let ReleaseTarget::Named(target) = which else {
         // A canonical scope (as a host is asked): through the authority
-        // when there is one.
+        // when there is one, with the branch it was asked on.
         let scope = repo.canonical_target(target, None)?.scope;
+        let branch = match which {
+            ReleaseTarget::Scope(_, Some(b)) => Some(branch_flag(Some(b.to_string()))),
+            _ => branch_option(&repo)?,
+        };
         return match authority {
-            Some(a) if !is_named_scope(&scope) => a.delegate(
-                root,
-                "release",
-                &[],
-                &[
+            Some(a) if !is_named_scope(&scope) => {
+                let mut options = vec![
                     ("--scope", Some(scope.to_string())),
                     ("--as", Some(repo.actor(actor))),
-                ],
-            ),
+                ];
+                options.extend(branch);
+                a.delegate(root, "release", &[], &options)
+            }
             _ => release_local(root, actor, which),
         };
     };
@@ -4081,12 +4357,9 @@ fn release_report(
     if is_named_scope(&scope) {
         return release_local(root, Some(actor), which);
     }
-    authority.delegate(
-        root,
-        "release",
-        &[],
-        &[("--scope", Some(scope.to_string())), ("--as", Some(actor))],
-    )
+    let mut options = vec![("--scope", Some(scope.to_string())), ("--as", Some(actor))];
+    options.extend(branch_option(&repo)?);
+    authority.delegate(root, "release", &[], &options)
 }
 
 pub fn release(root: &Path, actor: Option<String>, which: ReleaseTarget<'_>, json: bool) -> u8 {
@@ -4313,11 +4586,25 @@ fn release_all_local(
     actor: &str,
     selection: ReleaseSelection,
 ) -> Result<Report<ReleaseManyData>, GraphError> {
+    release_all_local_with(repo, actor, selection, None)
+}
+
+/// [`release_all_local`], with `just_made` the commit a post-commit hook
+/// runs for.
+fn release_all_local_with(
+    repo: &Repo,
+    actor: &str,
+    selection: ReleaseSelection,
+    just_made: Option<String>,
+) -> Result<Report<ReleaseManyData>, GraphError> {
     let mut store = repo.store()?;
     let now = now_ms();
     repo.observe(&mut store, now)?;
     let state = store.coordinator().map_err(store_error)?;
-    let mut changes = Changes::default();
+    let mut changes = Changes {
+        just_made,
+        ..Changes::default()
+    };
     let mut skipped = Vec::new();
     let mine: Vec<Lease> = match selection {
         ReleaseSelection::All => state
@@ -4653,7 +4940,7 @@ fn renew_local(
         let mut diagnostics: Vec<Diagnostic> = ids
             .iter()
             .filter_map(|id| state.lease(id))
-            .filter_map(|l| shared_notice(&state, l))
+            .flat_map(|l| co_hold_notices(&state, l))
             .collect();
         // Leases an older build granted on scopes this one refuses: not
         // renewed, and said so, by id (their scopes are escaped in `status`).
@@ -4969,10 +5256,11 @@ fn lease_request_report(
     // one in the claim's mode.
     let mut blocking: Vec<&Lease> = Vec::new();
     let node_holder = plan.node_key.as_deref().and_then(|k| state.node_holder(k));
-    for l in node_holder
-        .into_iter()
-        .chain(state.blockers(&plan.scope, plan.mode))
-    {
+    for l in node_holder.into_iter().chain(state.blockers(
+        &plan.scope,
+        plan.mode,
+        plan.branch.as_deref(),
+    )) {
         if l.owner != requester && !blocking.iter().any(|b| b.id == l.id) {
             blocking.push(l);
         }
@@ -5370,7 +5658,7 @@ fn granted_at(state: &Coordinator, l: &Lease) -> u64 {
 /// fast-forward, merge, pull, rebase, cherry-pick or reset: what those
 /// bring in is someone else's work, or the holder's replayed, #16988),
 /// with the entry's time in milliseconds. `None` when git can't say.
-fn own_commits(top: &Path) -> Option<Vec<(u64, String)>> {
+fn own_commits(top: &Path) -> Option<Vec<OwnCommit>> {
     let out = git::command(top)
         .args([
             "reflog",
@@ -5387,7 +5675,8 @@ fn own_commits(top: &Path) -> Option<Vec<(u64, String)>> {
     }
     let text = String::from_utf8_lossy(&out.stdout);
     let mut commits = Vec::new();
-    for line in text.lines() {
+    let mut lines = text.lines().peekable();
+    while let Some(line) = lines.next() {
         let mut parts = line.splitn(3, ' ');
         let (Some(sha), Some(at), Some(subject)) = (parts.next(), parts.next(), parts.next())
         else {
@@ -5405,10 +5694,68 @@ fn own_commits(top: &Path) -> Option<Vec<(u64, String)>> {
             .iter()
             .any(|p| subject.starts_with(p));
         if own && sha.bytes().all(|b| b.is_ascii_hexdigit()) {
-            commits.push((at, sha.to_string()));
+            // The reflog is newest first: the next entry is the HEAD an
+            // amend replaced. One the window cut off is unknown.
+            let replaced = subject
+                .starts_with("commit (amend):")
+                .then(|| {
+                    lines
+                        .peek()
+                        .and_then(|l| l.split(' ').next())
+                        .filter(|h| !h.is_empty() && h.bytes().all(|b| b.is_ascii_hexdigit()))
+                        .map(str::to_string)
+                })
+                .flatten();
+            commits.push(OwnCommit {
+                at,
+                sha: sha.to_string(),
+                replaced,
+            });
         }
     }
     Some(commits)
+}
+
+/// One of a worktree's own commits in its HEAD reflog ([`own_commits`]).
+#[derive(Debug, Clone)]
+struct OwnCommit {
+    /// When the reflog recorded it, in whole seconds as milliseconds.
+    at: u64,
+    sha: String,
+    /// For an amend, the commit it replaced, when the reflog still has it.
+    replaced: Option<String>,
+}
+
+/// The paths an amend of `replaced` into `sha` changed: those of `sha`'s
+/// own change that also differ from `replaced`. A path the amended commit
+/// carries over unchanged was committed by the earlier commit, not now.
+fn amend_paths(top: &Path, replaced: &str, sha: &str) -> Option<Vec<Scope>> {
+    let own = commit_paths(top, sha)?;
+    let out = git::command(top)
+        .args([
+            "diff-tree",
+            "-r",
+            "--no-commit-id",
+            "--name-only",
+            "-z",
+            replaced,
+            sha,
+        ])
+        .run(None)
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let changed: Vec<&[u8]> = out
+        .stdout
+        .split(|b| *b == 0)
+        .filter(|p| !p.is_empty())
+        .collect();
+    Some(
+        own.into_iter()
+            .filter(|p| changed.iter().any(|c| *c == p.as_str().as_bytes()))
+            .collect(),
+    )
 }
 
 /// The paths commit `sha`'s own change touches, relative to the top.
@@ -5648,9 +5995,10 @@ fn merge_drivers_configured(top: &Path) -> bool {
     }
 }
 
-/// The shared-lease merge advisory (#16942): for `l`, a shared
-/// path lease of `actor`'s, each co-holder whose worktree is found and
-/// whose branch head conflicts with this worktree's under the lease.
+/// The shared-lease merge advisory (#16942): for `l`, a shared or
+/// branch-held path lease of `actor`'s, each co-holder whose worktree is
+/// found and whose branch head conflicts with this worktree's under the
+/// lease.
 /// Committed content only; a co-holder whose worktree isn't found, or a
 /// merge git can't judge, is left out.
 fn lease_merge_conflicts(
@@ -5662,7 +6010,7 @@ fn lease_merge_conflicts(
 ) -> Vec<MergeConflict> {
     // `git merge-tree --write-tree` writes objects: never under
     // `--read-only`, which changes nothing in git (#18694).
-    if l.mode != Mode::Shared
+    if !co_holdable(l)
         || !is_path_lease(l)
         || is_named_scope(&l.scope)
         || mdkg_coord_sqlite::store_writes_forbidden()
@@ -5803,6 +6151,30 @@ fn path_states(
 /// folder names (an actor's default name, as `status` finds another
 /// owner's worktree). A lease authority's host acting `--as` a client, or
 /// anyone else's `--as`, isn't.
+/// What git's post-commit hook gives back (`lease.committed`): the path
+/// leases `release --committed` releases, for the actor this worktree is
+/// named after only, since it reads this worktree's own commits. The
+/// scopes released; a lease whose release failed is left to lapse.
+pub(crate) fn release_after_commit(root: &Path, actor: &str) -> Result<Vec<String>, GraphError> {
+    let repo = Repo::open(root)?;
+    if !owns_worktree(&repo, actor) {
+        return Ok(Vec::new());
+    }
+    // HEAD is the commit just made: it counts after a claim in its second.
+    let head = git::command(&repo.top)
+        .args(["rev-parse", "--verify", "-q", "HEAD"])
+        .run(None)
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|h| !h.is_empty());
+    let report = release_all_local_with(&repo, actor, ReleaseSelection::Committed, head)?;
+    Ok(report
+        .data
+        .map(|d| d.released.into_iter().map(|l| l.scope).collect())
+        .unwrap_or_default())
+}
+
 fn owns_worktree(repo: &Repo, actor: &str) -> bool {
     // Not `$MDKG_ACTOR`: a local authority wrapper inherits the client's
     // (#17066). An actor named otherwise keeps the first-quarter rule.
@@ -5851,11 +6223,13 @@ struct Changes {
     read: std::collections::HashMap<PathBuf, Option<Vec<Scope>>>,
     worktrees: Option<Vec<PathBuf>>,
     /// Each worktree's own commits ([`own_commits`]), read once.
-    commits: std::collections::HashMap<PathBuf, Option<Vec<(u64, String)>>>,
+    commits: std::collections::HashMap<PathBuf, Option<Vec<OwnCommit>>>,
     /// Each commit's paths ([`commit_paths`]), read once (#17074).
     paths: std::collections::HashMap<String, Option<Vec<Scope>>>,
     /// Each worktree's [`StrictRead`], read once.
     strict: std::collections::HashMap<PathBuf, Option<StrictRead>>,
+    /// The commit git's post-commit hook runs for ([`release_after_commit`]).
+    just_made: Option<String>,
 }
 
 impl Changes {
@@ -5880,14 +6254,31 @@ impl Changes {
             .entry(top.to_path_buf())
             .or_insert_with(|| own_commits(top))
             .clone()?;
-        for (at, sha) in commits {
+        for OwnCommit { at, sha, replaced } in commits {
+            // The commit git's post-commit hook runs for was made now,
+            // after every claim still active: the reflog's whole second
+            // can't order it against a claim in that second.
+            let at = if self.just_made.as_deref() == Some(sha.as_str()) {
+                now
+            } else {
+                at
+            };
             if at < since_ms || at > now {
                 continue;
             }
+            // An amend counts only what it changed: a path it carries
+            // over was settled by the commit it replaced (Terra #21577 F2).
+            let key = match &replaced {
+                Some(r) => format!("{r}..{sha}"),
+                None => sha.clone(),
+            };
             let paths = self
                 .paths
-                .entry(sha.clone())
-                .or_insert_with(|| commit_paths(top, &sha))
+                .entry(key)
+                .or_insert_with(|| match &replaced {
+                    Some(r) => amend_paths(top, r, &sha),
+                    None => commit_paths(top, &sha),
+                })
                 .as_deref()?;
             // A path the lease contains: never an ancestor file, which a
             // lease on a path beneath it (one about to replace the file
@@ -6400,8 +6791,12 @@ pub fn status(
             let age = l.age_ms.map_or(String::new(), |ms| {
                 format!("; age {}{}", age_text(ms), paths_text(l))
             });
+            let branch = l
+                .branch
+                .as_ref()
+                .map_or(String::new(), |b| format!(" on branch {b}"));
             say(format!(
-                "lease {} {}{} by {}{shared} until {}{age}{idle}",
+                "lease {} {}{}{branch} by {}{shared} until {}{age}{idle}",
                 l.id,
                 l.scope,
                 NodeName::suffix(l.node.as_ref()),

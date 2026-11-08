@@ -436,6 +436,7 @@ fn lease(
             now,
             request: None,
             node: Some(key),
+            branch: None,
         })
         .map_err(store_error)?
     {

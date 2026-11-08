@@ -4949,7 +4949,7 @@ fn a_person_sends_unsigned_mail_only_outside_agent_turns() {
     );
     assert_eq!(
         (code, codes(&out)),
-        (1, vec!["api.actor_not_allowed".to_string()]),
+        (1, vec!["run.turn_active".to_string()]),
         "{out}"
     );
     // A turn in another worktree whose launcher is this test's process,
@@ -4958,7 +4958,7 @@ fn a_person_sends_unsigned_mail_only_outside_agent_turns() {
     let (code, out) = with_env(Some("human:nick"), &[], &send("t2", "note"));
     assert_eq!(
         (code, codes(&out)),
-        (1, vec!["api.actor_not_allowed".to_string()]),
+        (1, vec!["run.turn_active".to_string()]),
         "{out}"
     );
     drop(turn);
@@ -5053,4 +5053,219 @@ fn digest_reports_slot_replacements_and_leaves_old_delivery_acked() {
         ids(&ok(&wb, "b", 3, &["msg", "inbox", "--no-mark"])),
         ["new-slot"]
     );
+}
+
+/// `--reply-to` joins the replied-to message's thread, whatever its kind:
+/// a direct reply to direct mail, a reply in the same channel to a channel
+/// post, and a reply to that reply.
+fn a_reply_joins_its_thread(kind: &str) {
+    let (_dir, wa, wb) = two_worktrees();
+    ok(&wa, "a", 0, &["room", "create", "ops", "--member", "b"]);
+    let ask = ok(
+        &wa,
+        "a",
+        1,
+        &[
+            "msg", "send", "--to", "b", "--kind", kind, "--id", "ask", "--text", "ask",
+        ],
+    );
+    let context = ask["data"]["message"]["contextId"].clone();
+    assert_eq!(context, "ask");
+    let answer = ok(
+        &wb,
+        "b",
+        2,
+        &[
+            "msg",
+            "send",
+            "--to",
+            "a",
+            "--kind",
+            kind,
+            "--id",
+            "answer",
+            "--reply-to",
+            "ask",
+            "--text",
+            "answer",
+        ],
+    );
+    assert_eq!(answer["data"]["message"]["contextId"], context, "{kind}");
+    let again = ok(
+        &wa,
+        "a",
+        3,
+        &[
+            "msg",
+            "send",
+            "--to",
+            "b",
+            "--kind",
+            kind,
+            "--id",
+            "again",
+            "--reply-to",
+            "answer",
+            "--text",
+            "again",
+        ],
+    );
+    assert_eq!(again["data"]["message"]["contextId"], context, "{kind}");
+    let thread = ok(&wb, "b", 4, &["msg", "thread", "answer"]);
+    assert_eq!(ids(&thread), ["ask", "answer", "again"], "{kind}");
+    // In a channel, a reply posted there joins the post's thread too.
+    ok(
+        &wa,
+        "a",
+        5,
+        &[
+            "msg",
+            "send",
+            "--channel",
+            "ops",
+            "--kind",
+            kind,
+            "--id",
+            "post",
+            "--text",
+            "post",
+        ],
+    );
+    let threaded = ok(
+        &wb,
+        "b",
+        6,
+        &[
+            "msg",
+            "send",
+            "--channel",
+            "ops",
+            "--kind",
+            kind,
+            "--id",
+            "re",
+            "--reply-to",
+            "post",
+            "--text",
+            "re",
+        ],
+    );
+    assert_eq!(
+        threaded["data"]["message"]["contextId"], "room:ops",
+        "{kind}"
+    );
+    let channel = ok(&wa, "a", 7, &["msg", "thread", "--channel", "ops"]);
+    assert_eq!(ids(&channel), ["post", "re"], "{kind}");
+}
+
+#[test]
+fn a_review_request_reply_joins_its_thread() {
+    a_reply_joins_its_thread("review_request");
+}
+
+#[test]
+fn a_findings_reply_joins_its_thread() {
+    a_reply_joins_its_thread("findings");
+}
+
+#[test]
+fn a_resolution_reply_joins_its_thread() {
+    a_reply_joins_its_thread("resolution");
+}
+
+#[test]
+fn a_question_reply_joins_its_thread() {
+    a_reply_joins_its_thread("question");
+}
+
+#[test]
+fn a_handoff_reply_joins_its_thread() {
+    a_reply_joins_its_thread("handoff");
+}
+
+#[test]
+fn a_note_reply_joins_its_thread() {
+    a_reply_joins_its_thread("note");
+}
+
+/// `msg thread --json` gives each body as one `text` field, so no reader
+/// parses the text output's boundary lines; a purged body has none, and
+/// other listings leave it out.
+#[test]
+fn thread_json_gives_each_body_as_a_text_field() {
+    let (dir, wa, wb) = two_worktrees();
+    let data = dir.0.join("data.json");
+    fs::write(&data, r#"{"n":1}"#).expect("data");
+    let data = data.to_str().expect("utf-8");
+    ok(
+        &wa,
+        "a",
+        1,
+        &[
+            "msg",
+            "send",
+            "--to",
+            "b",
+            "--kind",
+            "question",
+            "--id",
+            "q",
+            "--text",
+            "first line\nmdkg-body-0123456789abcdef",
+            "--text",
+            "second",
+            "--url",
+            "https://example.com/x",
+            "--data-file",
+            data,
+        ],
+    );
+    ok(
+        &wb,
+        "b",
+        2,
+        &[
+            "msg",
+            "send",
+            "--to",
+            "a",
+            "--kind",
+            "resolution",
+            "--id",
+            "r",
+            "--reply-to",
+            "q",
+            "--text",
+            "done",
+        ],
+    );
+    let thread = ok(&wa, "a", 3, &["msg", "thread", "q"]);
+    let texts: Vec<&Value> = thread["data"]["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .map(|m| &m["text"])
+        .collect();
+    assert_eq!(
+        texts,
+        [
+            &json!(
+                "first line\nmdkg-body-0123456789abcdef\nsecond\n<data> {\"n\":1}\n<url> https://example.com/x"
+            ),
+            &json!("done"),
+        ]
+    );
+    let inbox = ok(&wb, "b", 4, &["msg", "inbox"]);
+    assert!(
+        inbox["data"]["messages"][0].get("text").is_none(),
+        "{inbox}"
+    );
+    // Acked, q's body purges after the ack grace, and its thread shows no
+    // text.
+    ok(&wb, "b", 5, &["msg", "ack", "q"]);
+    let day: u64 = 24 * 60 * 60 * 1000;
+    let thread = ok(&wa, "a", 5 + 7 * day, &["msg", "thread", "q"]);
+    let q = &thread["data"]["messages"][0];
+    assert_eq!(q["body"], "purged", "{thread}");
+    assert!(q.get("text").is_none(), "{thread}");
 }

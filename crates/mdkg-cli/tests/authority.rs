@@ -1936,3 +1936,40 @@ fn an_authority_backed_lease_is_never_released_at_commit() {
         s.args()
     );
 }
+
+/// Where path leases are scoped by branch, the host judges a worker's
+/// lease on the worker's branch, not on its own checkout's: a claim on
+/// `feature` holds there while the host is on another branch, a detached
+/// worker holds nothing, and release by path finds the lease.
+#[test]
+fn a_host_judges_a_branch_lease_on_the_workers_branch() {
+    let p = Pair::new();
+    let s = &p.worker;
+    let git = |dir: &Path, args: &[&str]| {
+        let out = isolated(Command::new("git").arg("-C").arg(dir).args(args))
+            .output()
+            .expect("git");
+        assert!(out.status.success(), "{args:?}: {out:?}");
+    };
+    git(&p.host, &["config", "mdkg.leaseScope", "branch"]);
+    git(&s.repo, &["config", "mdkg.leaseScope", "branch"]);
+    git(&s.repo, &["switch", "-q", "-c", "feature"]);
+    let (code, out) = s.run("a", &["claim", "--new", "src/feature.rs"]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(out["data"]["lease"]["branch"], "feature", "{out}");
+    let (code, out) = s.run("a", &["holds", "src/feature.rs"]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(out["data"]["holds"], true, "{out}");
+    // Detached, the worker's checkout is on no branch: the lease on
+    // `feature` doesn't hold there.
+    git(&s.repo, &["switch", "-q", "--detach"]);
+    let (code, out) = s.run("a", &["holds", "src/feature.rs"]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(out["data"]["holds"], false, "{out}");
+    git(&s.repo, &["switch", "-q", "feature"]);
+    let (code, out) = s.run("a", &["release", "src/feature.rs"]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(out["data"]["lease"]["branch"], "feature", "{out}");
+    let (_, out) = s.run("a", &["holds", "src/feature.rs"]);
+    assert_eq!(out["data"]["holds"], false, "{out}");
+}

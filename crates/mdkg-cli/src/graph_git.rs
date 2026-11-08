@@ -1316,6 +1316,7 @@ pub(crate) fn record_graph_file<T>(
                 now,
                 request: None,
                 node: None,
+                branch: None,
             })
         });
         if capped {
@@ -2118,6 +2119,7 @@ mod tests {
                 now: 1,
                 request: None,
                 node: None,
+                branch: None,
             })
             .expect("claim")
         {
@@ -2878,6 +2880,7 @@ mod tests {
                     now: crate::coord::now_ms(),
                     request: None,
                     node: None,
+                    branch: None,
                 })
                 .expect("claim");
         };
@@ -3028,6 +3031,7 @@ mod tests {
                 now: crate::coord::now_ms(),
                 request: None,
                 node: None,
+                branch: None,
             })
             .expect("claim");
         let task = task_node(&root);

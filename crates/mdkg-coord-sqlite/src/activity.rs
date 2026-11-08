@@ -422,6 +422,7 @@ mod tests {
                 valid_until: 1_000,
             }),
             node: node.map(String::from),
+            branch: None,
         }
     }
     fn claim(store: &mut Store, owner: &str, scope: &str, node: Option<&str>) -> LeaseId {

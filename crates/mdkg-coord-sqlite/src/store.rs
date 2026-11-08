@@ -20,6 +20,13 @@ use rusqlite::{
 
 use crate::git;
 
+/// "5" since a lease may name the branch it holds its path on: a binary
+/// that predates branches would drop the field from the state it saves,
+/// and its claims and edit guards would ignore it. A lease without a
+/// branch holds on every branch, as before. Opening a "4" store upgrades
+/// it in place, copying it first; no table changes, nothing it held
+/// changes, and its chain goes on.
+///
 /// "4" since the flow tables (edd-01a1878e: message links to nodes,
 /// supersession and expiry, the ledger's entries): a binary that predates
 /// them would send, ack and finish work around the flow rules (a `done`
@@ -38,10 +45,10 @@ use crate::git;
 /// behind the journal's back. A lease or claim without a mode reads as
 /// exclusive. There is no way back: an older binary refuses an upgraded
 /// store.
-const SCHEMA_VERSION: &str = "4";
+const SCHEMA_VERSION: &str = "5";
 
 /// Versions this binary upgrades in place on open.
-const UPGRADES_FROM: &[&str] = &["1", "2", "3"];
+const UPGRADES_FROM: &[&str] = &["1", "2", "3", "4"];
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -529,7 +536,7 @@ fn check_coordinator_structure(conn: &Connection, schema: &str) -> Result<(), St
         ("state", true),
         ("events", true),
     ];
-    tables.push(("log", matches!(schema, "3" | "4")));
+    tables.push(("log", matches!(schema, "3" | "4" | "5")));
     tables.extend(
         [
             "msg_links",
@@ -538,7 +545,7 @@ fn check_coordinator_structure(conn: &Connection, schema: &str) -> Result<(), St
             "entries",
             "entry_events",
         ]
-        .map(|table| (table, schema == "4")),
+        .map(|table| (table, matches!(schema, "4" | "5"))),
     );
     tables.extend(
         [
@@ -3680,6 +3687,7 @@ mod tests {
                             now: 0,
                             request: None,
                             node: None,
+                            branch: None,
                         })
                         .unwrap(),
                     Outcome::Lease { .. }
@@ -4156,7 +4164,7 @@ mod tests {
         let mut out: Vec<PathBuf> = std::fs::read_dir(dir)
             .expect("dir")
             .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.to_string_lossy().contains(".pre-3+msg5-to-4+msg5"))
+            .filter(|p| p.to_string_lossy().contains(".pre-3+msg5-to-5+msg5"))
             .filter(|p| !p.to_string_lossy().ends_with(".synced"))
             .collect();
         out.sort();
@@ -4251,7 +4259,7 @@ mod tests {
         assert!(failed.is_err());
         assert_eq!(schema_at(&path), "3", "nothing upgraded");
         drop(Store::open_with(&path, 1_000, Upgrade::Allow).expect("retry"));
-        assert_eq!(schema_at(&path), "4");
+        assert_eq!(schema_at(&path), SCHEMA_VERSION);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -4277,7 +4285,7 @@ mod tests {
             // #6817, minor 2; Terra's #6874, finding 2).
             assert!(copies_beside(&path).is_empty(), "{step}: no copy left");
             drop(Store::open_with(&path, 1_000, Upgrade::Allow).expect("retry"));
-            assert_eq!(schema_at(&path), "4");
+            assert_eq!(schema_at(&path), SCHEMA_VERSION);
             let conn = Connection::open(&path).expect("conn");
             assert_eq!(meta(&conn, "upgrade_barrier").expect("meta"), None);
             std::fs::remove_dir_all(&dir).ok();
@@ -4299,7 +4307,7 @@ mod tests {
         // The open says so, for the CLI's upgrade notice.
         assert!(opened.backup_weak());
         drop(opened);
-        assert_eq!(schema_at(&path), "4");
+        assert_eq!(schema_at(&path), SCHEMA_VERSION);
         let conn = Connection::open(&path).expect("conn");
         assert_eq!(
             meta(&conn, "upgrade_barrier").expect("meta").as_deref(),
@@ -4471,7 +4479,7 @@ mod tests {
         FAIL_AT.with(|f| f.set(Some("after_commit")));
         assert!(Store::open_with(&path, 1_000, Upgrade::Allow).is_err());
         FAIL_AT.with(|f| f.set(None));
-        assert_eq!(schema_at(&path), "4");
+        assert_eq!(schema_at(&path), SCHEMA_VERSION);
         assert_eq!(copies_beside(&path).len(), 1, "the recovery copy stays");
         std::fs::remove_dir_all(&dir).ok();
     }

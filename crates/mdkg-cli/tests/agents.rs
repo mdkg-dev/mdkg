@@ -1516,6 +1516,58 @@ fn status_names_dropped_rules_of_an_agent_not_yet_made() {
     assert_eq!(dropped, ["Bash(mdkg *)"], "{w}");
 }
 
+/// A turn lease its last turn couldn't release (friction 148) shows in
+/// `agents status`, as a field and a warning, until a turn holds it again.
+#[test]
+fn status_shows_a_turn_lease_its_last_turn_couldnt_release() {
+    let (_dir, repo) = make_repo(json!({
+        "w": {"harness": "claude", "role": "worker"},
+    }));
+    let run = repo.join(".git/mdkg/run");
+    fs::create_dir_all(&run).unwrap();
+    let w = |status: &Value| status["data"]["agents"][0].clone();
+    let status = ok(
+        &graph(&repo),
+        "launcher",
+        &["agents", "status", "--no-probe"],
+    );
+    assert!(
+        w(&status).get("turn_lease_unreleased").is_none(),
+        "{status}"
+    );
+    fs::write(
+        run.join("w.release-failed"),
+        json!({"holder": "launcher@run-1", "code": "coord.store_failed",
+               "message": "the coordinator store is busy", "at_ms": 1_000})
+        .to_string(),
+    )
+    .unwrap();
+    let status = ok(
+        &graph(&repo),
+        "launcher",
+        &["agents", "status", "--no-probe"],
+    );
+    let unreleased = &w(&status)["turn_lease_unreleased"];
+    assert_eq!(unreleased["code"], "coord.store_failed", "{status}");
+    assert_eq!(unreleased["message"], "the coordinator store is busy");
+    assert!(
+        unreleased["at"]
+            .as_str()
+            .is_some_and(|a| a.starts_with("1970-"))
+    );
+    assert!(
+        status["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["severity"] == "warning"
+                && d["message"]
+                    .as_str()
+                    .is_some_and(|m| m.starts_with("w: its turn lease wasn't released"))),
+        "{status}"
+    );
+}
+
 #[test]
 fn up_runs_each_configured_agent_on_its_mail_and_makes_a_workers_worktree() {
     let (_dir, repo) = make_repo(json!({
@@ -2185,30 +2237,30 @@ fn durable_mixed_group_finalization_refuses_before_writes_and_recovers_only_unfi
 
 #[test]
 fn durable_interrupted_cli_turn_requires_resume_and_carries_recovery_context() {
-    use std::os::unix::{fs::PermissionsExt, process::CommandExt};
+    use std::os::unix::fs::PermissionsExt;
     use std::time::{Duration, Instant};
-    struct Running(std::process::Child);
-    impl Drop for Running {
-        fn drop(&mut self) {
-            // Without `--`, procps-ng 4.0.4's kill (Ubuntu 24.04) misreads
-            // the group id and signals every process the user owns, the CI
-            // runner included.
-            let _ = Command::new("/bin/kill")
-                .args(["-KILL", "--", &format!("-{}", self.0.id())])
-                .status();
-            self.0.kill().ok();
-            self.0.wait().ok();
-        }
-    }
     let (scratch, repo) = make_repo(json!({"rev": {"harness":"claude", "role":"reviewer"}}));
     let root = graph(&repo);
     let message = send(&repo, "rev", "inspect once", None);
     let script = scratch.0.join("blocked-claude");
     let started = scratch.0.join("harness-started");
-    fs::write(&script, format!("#!/bin/sh\nif [ \"$1\" = auth ]; then echo '{{\"loggedIn\":true,\"authMethod\":\"claude.ai\"}}'; exit 0; fi\ncat >/dev/null\ntouch '{}'\nsleep 30\n", started.display())).unwrap();
+    let ended = scratch.0.join("harness-ended");
+    // The turn holds until its supervisor is killed (its parent gone), with
+    // a bound of a few minutes, so status and doctor below read a live turn
+    // however slowly they run. `ended` marks a turn that ran out first.
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = auth ]; then echo '{{\"loggedIn\":true,\"authMethod\":\"claude.ai\"}}'; exit 0; fi\ncat >/dev/null\ntouch '{}'\nn=0\nwhile kill -0 \"$PPID\" 2>/dev/null && [ \"$n\" -lt 3000 ]; do n=$((n + 1)); sleep 0.05; done\ntouch '{}'\n",
+            started.display(),
+            ended.display()
+        ),
+    )
+    .unwrap();
     fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
     let stderr = scratch.0.join("watch.err");
-    let child = isolated(&mut Command::new(env!("CARGO_BIN_EXE_mdkg")))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_mdkg"));
+    isolated(&mut command)
         .current_dir(&root)
         .arg("--root")
         .arg(&root)
@@ -2226,15 +2278,12 @@ fn durable_interrupted_cli_turn_requires_resume_and_carries_recovery_context() {
         ])
         .env("MDKG_RUN_CLAUDE", &script)
         .stdout(fs::File::create(scratch.0.join("watch.out")).unwrap())
-        .stderr(fs::File::create(&stderr).unwrap())
-        .process_group(0)
-        .spawn()
-        .unwrap();
-    let mut child = Running(child);
+        .stderr(fs::File::create(&stderr).unwrap());
+    let mut child = Group::spawn(&mut command, &scratch.0);
     let deadline = Instant::now() + Duration::from_secs(40);
     while !started.exists() {
         assert!(
-            child.0.try_wait().unwrap().is_none(),
+            child.child.try_wait().unwrap().is_none(),
             "{}",
             fs::read_to_string(&stderr).unwrap()
         );
@@ -2248,7 +2297,6 @@ fn durable_interrupted_cli_turn_requires_resume_and_carries_recovery_context() {
     let before = read_progress(&repo, "rev");
     assert_eq!(before["current"]["mail_ids"], json!([message]));
     assert!(before["current"]["start_head"].is_string());
-    let began = Instant::now();
     let status = ok(&root, "launcher", &["agents", "status"]);
     let active = &status["data"]["progress"][0];
     assert_eq!(active["active"], true);
@@ -2263,7 +2311,11 @@ fn durable_interrupted_cli_turn_requires_resume_and_carries_recovery_context() {
         .find(|c| c["name"] == "supervisor_progress")
         .unwrap();
     assert_eq!(check["status"], "ok", "{check}");
-    assert!(began.elapsed() < Duration::from_secs(15));
+    // Both read the turn while it ran, without waiting for it to end.
+    assert!(
+        !ended.exists(),
+        "the turn ended before status and doctor read it"
+    );
     drop(child); // actual process death with an admitted, uncompleted turn
     let bytes = fs::read(progress_file(&repo, "rev")).unwrap();
     let (code, events) = up(&repo, &["rev"]);
@@ -2421,18 +2473,7 @@ fn durable_corrupt_or_foreign_progress_refuses_before_agent_setup() {
 
 #[test]
 fn a_running_watch_reloads_an_edited_definition_before_its_next_turn() {
-    use std::os::unix::process::CommandExt;
     use std::time::{Duration, Instant};
-    struct Running(std::process::Child);
-    impl Drop for Running {
-        fn drop(&mut self) {
-            let _ = Command::new("/bin/kill")
-                .args(["-KILL", "--", &format!("-{}", self.0.id())])
-                .status();
-            self.0.kill().ok();
-            self.0.wait().ok();
-        }
-    }
     // The reload is the supervisor's, not the harness's: each one gets the
     // same drain and re-exec.
     for (harness, prompt_file) in [
@@ -2459,7 +2500,8 @@ fn a_running_watch_reloads_an_edited_definition_before_its_next_turn() {
         let first = git_text(&root, &["rev-parse", "HEAD"]);
         send(&repo, "rev", "first request", None);
         let stderr = scratch.0.join("watch.err");
-        let child = isolated(&mut Command::new(env!("CARGO_BIN_EXE_mdkg")))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_mdkg"));
+        isolated(&mut command)
             .current_dir(&root)
             .arg("--root")
             .arg(&root)
@@ -2472,17 +2514,14 @@ fn a_running_watch_reloads_an_edited_definition_before_its_next_turn() {
             .env("MDKG_RUN_CODEX", fixture("fake-codex.sh"))
             .env("MDKG_RUN_OPENCODE", fixture("fake-opencode.sh"))
             .stdout(fs::File::create(scratch.0.join("watch.out")).unwrap())
-            .stderr(fs::File::create(&stderr).unwrap())
-            .process_group(0)
-            .spawn()
-            .unwrap();
-        let mut child = Running(child);
-        let wait_for = |what: &str, child: &mut Running, done: &dyn Fn() -> bool| {
+            .stderr(fs::File::create(&stderr).unwrap());
+        let mut child = Group::spawn(&mut command, &scratch.0);
+        let wait_for = |what: &str, child: &mut Group, done: &dyn Fn() -> bool| {
             let deadline = Instant::now() + Duration::from_secs(60);
             while !done() {
                 let err = fs::read_to_string(&stderr).unwrap_or_default();
                 assert!(
-                    child.0.try_wait().unwrap().is_none(),
+                    child.child.try_wait().unwrap().is_none(),
                     "{harness}: {what}: {err}"
                 );
                 assert!(Instant::now() < deadline, "{harness}: {what}: {err}");
@@ -2518,7 +2557,7 @@ fn a_running_watch_reloads_an_edited_definition_before_its_next_turn() {
         send(&repo, "rev", "second request", None);
         let deadline = Instant::now() + Duration::from_secs(60);
         let status = loop {
-            if let Some(status) = child.0.try_wait().unwrap() {
+            if let Some(status) = child.child.try_wait().unwrap() {
                 break status;
             }
             assert!(Instant::now() < deadline, "{harness}: no second turn");
@@ -2561,48 +2600,133 @@ fn a_running_watch_reloads_an_edited_definition_before_its_next_turn() {
     }
 }
 
-/// A long-running `agents up` for the drain tests: its group is killed if
-/// the test fails first.
-struct Watching {
+/// A background `agents up` (or another long-running mdkg) in a process
+/// group of its own, so a test can signal it and its turns apart from the
+/// test process. Dropping it, when the test passes, fails or panics, kills
+/// that whole group and reaps it, then checks that no supervisor naming the
+/// test's scratch folder is left. If the test process dies before the drop
+/// can run (nextest kills a timed-out test's group, which this group isn't),
+/// a watchdog outside both groups kills the group within about a second.
+struct Group {
     child: std::process::Child,
-    stderr: PathBuf,
+    watchdog: Option<std::process::Child>,
+    scratch: PathBuf,
 }
 
-impl Drop for Watching {
+impl Group {
+    fn spawn(command: &mut Command, scratch: &Path) -> Self {
+        use std::os::unix::process::CommandExt;
+        let child = command
+            .process_group(0)
+            .spawn()
+            .expect("start background mdkg");
+        let watchdog = Command::new("/bin/sh")
+            .args([
+                "-c",
+                "while kill -0 \"$1\" 2>/dev/null; do /bin/sleep 1; done; \
+                 exec /bin/kill -KILL -- \"-$2\"",
+                "mdkg-test-watchdog",
+            ])
+            .arg(std::process::id().to_string())
+            .arg(child.id().to_string())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0)
+            .spawn();
+        let mut group = Self {
+            child,
+            watchdog: None,
+            scratch: scratch.to_path_buf(),
+        };
+        group.watchdog = Some(watchdog.expect("start the test's watchdog"));
+        group
+    }
+}
+
+impl Drop for Group {
     fn drop(&mut self) {
-        let _ = Command::new("/bin/kill")
-            .args(["-KILL", "--", &format!("-{}", self.child.id())])
-            .status();
+        // Without `--`, procps-ng 4.0.4's kill (Ubuntu 24.04) misreads the
+        // group id and signals every process the user owns: signal the group
+        // directly.
+        if let Some(pid) = rustix::process::Pid::from_raw(self.child.id() as i32) {
+            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+        }
         self.child.kill().ok();
         self.child.wait().ok();
+        if let Some(mut watchdog) = self.watchdog.take() {
+            watchdog.kill().ok();
+            watchdog.wait().ok();
+        }
+        // The group's members are gone once the kill lands. A supervisor
+        // still running after that left the group: kill it, and fail the
+        // test unless it's already failing.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut left = supervisors_naming(&self.scratch);
+        while !left.is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            left = supervisors_naming(&self.scratch);
+        }
+        for (pid, _) in &left {
+            if let Some(pid) = rustix::process::Pid::from_raw(*pid) {
+                let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+            }
+        }
+        if !std::thread::panicking() {
+            assert!(left.is_empty(), "supervisors outlived the test: {left:?}");
+        }
     }
+}
+
+/// Running `agents up` processes whose command line names `scratch`: the
+/// supervisors a test with that scratch folder started, with their pids.
+fn supervisors_naming(scratch: &Path) -> Vec<(i32, String)> {
+    let out = Command::new("/bin/ps")
+        .args(["-A", "-ww", "-o", "pid=", "-o", "command="])
+        .output()
+        .expect("list processes");
+    assert!(out.status.success(), "ps: {out:?}");
+    let scratch = scratch.to_string_lossy();
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| {
+            let (pid, command) = line.trim_start().split_once(char::is_whitespace)?;
+            let named = command.contains(&*scratch) && command.contains(" agents up");
+            Some((pid.parse().ok()?, command.trim().to_string())).filter(|_| named)
+        })
+        .collect()
+}
+
+/// A long-running `agents up` for the drain tests, in a [`Group`].
+struct Watching {
+    group: Group,
+    stderr: PathBuf,
 }
 
 impl Watching {
     /// `program` runs `agents up rev` from `root`, as the operator would,
     /// with `claude` as the harness.
     fn start(scratch: &Path, root: &Path, program: &Path, claude: &Path, extra: &[&str]) -> Self {
-        use std::os::unix::process::CommandExt;
         let home = scratch.join("home");
         fs::create_dir_all(home.join(".codex")).expect("home");
         let stderr = scratch.join("watch.err");
-        let child = isolated(&mut Command::new(program))
-            .current_dir(root)
-            .arg("--root")
-            .arg(root)
-            .args(["--as", "launcher", "agents", "up", "rev", "--wait", "1"])
-            .args(extra)
-            .env("HOME", &home)
-            .env("XDG_CONFIG_HOME", home.join(".config"))
-            .env("XDG_DATA_HOME", home.join(".local/share"))
-            .env("CODEX_HOME", home.join(".codex"))
-            .env("MDKG_RUN_CLAUDE", claude)
-            .stdout(fs::File::create(scratch.join("watch.out")).expect("watch stdout"))
-            .stderr(fs::File::create(&stderr).expect("watch stderr"))
-            .process_group(0)
-            .spawn()
-            .expect("start watch");
-        Self { child, stderr }
+        let group = Group::spawn(
+            isolated(&mut Command::new(program))
+                .current_dir(root)
+                .arg("--root")
+                .arg(root)
+                .args(["--as", "launcher", "agents", "up", "rev", "--wait", "1"])
+                .args(extra)
+                .env("HOME", &home)
+                .env("XDG_CONFIG_HOME", home.join(".config"))
+                .env("XDG_DATA_HOME", home.join(".local/share"))
+                .env("CODEX_HOME", home.join(".codex"))
+                .env("MDKG_RUN_CLAUDE", claude)
+                .stdout(fs::File::create(scratch.join("watch.out")).expect("watch stdout"))
+                .stderr(fs::File::create(&stderr).expect("watch stderr")),
+            scratch,
+        );
+        Self { group, stderr }
     }
 
     /// Its stderr, then its stdout.
@@ -2619,7 +2743,7 @@ impl Watching {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         while !done(self) {
             assert!(
-                self.child.try_wait().expect("poll watch").is_none(),
+                self.group.child.try_wait().expect("poll watch").is_none(),
                 "{what}: {}",
                 self.err()
             );
@@ -2635,7 +2759,7 @@ impl Watching {
     fn exit(&mut self) -> std::process::ExitStatus {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         loop {
-            if let Some(status) = self.child.try_wait().expect("poll watch") {
+            if let Some(status) = self.group.child.try_wait().expect("poll watch") {
                 return status;
             }
             assert!(
@@ -2650,7 +2774,7 @@ impl Watching {
     /// Signals the supervisor's whole process group, its turn's included.
     fn signal_group(&self, signal: &str) {
         let sent = Command::new("/bin/kill")
-            .args([signal, "--", &format!("-{}", self.child.id())])
+            .args([signal, "--", &format!("-{}", self.group.child.id())])
             .status()
             .expect("signal watch group");
         assert!(sent.success());
@@ -2661,7 +2785,7 @@ impl Watching {
     /// group, and a group SIGTERM stops running turns at once.
     fn signal(&self, signal: &str) {
         let sent = Command::new("/bin/kill")
-            .args([signal, &self.child.id().to_string()])
+            .args([signal, &self.group.child.id().to_string()])
             .status()
             .expect("signal watch");
         assert!(sent.success());
@@ -2717,7 +2841,11 @@ fn sigterm_lets_the_current_turn_finish_then_leaves_the_watch_finished() {
     });
     // Still running: the turn decides when it ends.
     std::thread::sleep(std::time::Duration::from_millis(500));
-    assert!(watch.child.try_wait().unwrap().is_none(), "{}", watch.err());
+    assert!(
+        watch.group.child.try_wait().unwrap().is_none(),
+        "{}",
+        watch.err()
+    );
     fs::write(scratch.0.join("release"), "").unwrap();
     let status = watch.exit();
     assert!(status.success(), "{}", watch.err());
@@ -2767,7 +2895,7 @@ fn sigterm_during_a_reload_drain_stops_instead_of_re_execing() {
     watch.signal("-TERM");
     std::thread::sleep(std::time::Duration::from_millis(500));
     assert!(
-        watch.child.try_wait().expect("poll watch").is_none(),
+        watch.group.child.try_wait().expect("poll watch").is_none(),
         "{}",
         watch.err()
     );
@@ -2837,7 +2965,11 @@ fn agents_stop_drains_a_turn_in_flight_then_the_supervisor_exits() {
     assert_eq!(out["data"]["agents"][0]["state"], "draining", "{out}");
     let again: Value = serde_json::from_slice(&fs::read(&request).unwrap()).unwrap();
     assert_eq!(again, written);
-    assert!(watch.child.try_wait().unwrap().is_none(), "{}", watch.err());
+    assert!(
+        watch.group.child.try_wait().unwrap().is_none(),
+        "{}",
+        watch.err()
+    );
     fs::write(scratch.0.join("release"), "").unwrap();
     let status = watch.exit();
     assert!(status.success(), "{}", watch.err());
@@ -3272,7 +3404,7 @@ fn agents_status_gives_what_a_client_needs_to_re_attach() {
     let (_, rev) = status_agent(&root, "rev");
     assert_eq!(rev["state"], "running", "{rev}");
     assert_eq!(rev["supervisor"]["state"], "running", "{rev}");
-    assert_eq!(rev["supervisor"]["pid"], watch.child.id(), "{rev}");
+    assert_eq!(rev["supervisor"]["pid"], watch.group.child.id(), "{rev}");
     let current = &rev["current_turn"];
     assert_eq!(current["number"], 1, "{rev}");
     let turn_id = current["turn_id"].as_str().expect("turn id").to_string();
@@ -3287,7 +3419,7 @@ fn agents_status_gives_what_a_client_needs_to_re_attach() {
     assert_eq!(lines.len(), 1, "{lines:?}");
     assert_eq!(lines[0]["line"], "start");
     assert_eq!(lines[0]["number"], 1);
-    assert_eq!(lines[0]["pid"], watch.child.id());
+    assert_eq!(lines[0]["pid"], watch.group.child.id());
     assert_eq!(
         lines[0]["supervisor_id"], rev["supervisor"]["supervisor_id"],
         "{lines:?}"
@@ -4800,7 +4932,11 @@ fn conformance_10_a_drain_lets_the_turn_finish_records_no_interruption_and_holds
     assert_eq!(code, 6, "{out}");
     assert_eq!(out["diagnostics"][0]["code"], "msg.wait_timeout", "{out}");
     assert_eq!(out["data"]["agents"][0]["state"], "draining", "{out}");
-    assert!(watch.child.try_wait().unwrap().is_none(), "{}", watch.err());
+    assert!(
+        watch.group.child.try_wait().unwrap().is_none(),
+        "{}",
+        watch.err()
+    );
     // A7: the agent reads draining while its turn still runs.
     let (_, rev) = status_agent(&root, "rev");
     assert_eq!(rev["state"], "draining", "{rev}");
@@ -6008,7 +6144,8 @@ fn sigterm_during_startup_git_stops_before_any_turn_is_admitted() {
     fs::set_permissions(&claude, fs::Permissions::from_mode(0o755)).expect("chmod");
     let home = dir.join("home");
     fs::create_dir_all(home.join(".codex")).expect("home");
-    let mut up = isolated(&mut Command::new(env!("CARGO_BIN_EXE_mdkg")))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_mdkg"));
+    isolated(&mut command)
         .current_dir(&root)
         .arg("--root")
         .arg(&root)
@@ -6027,27 +6164,15 @@ fn sigterm_during_startup_git_stops_before_any_turn_is_admitted() {
         .env("CODEX_HOME", home.join(".codex"))
         .env("MDKG_RUN_CLAUDE", &claude)
         .stdout(std::process::Stdio::null())
-        .stderr(fs::File::create(dir.join("up.err")).expect("stderr"))
-        .spawn()
-        .expect("agents up");
-    // On a failed assertion, agents up and the held git end too: the git
-    // shim's wait is bounded (60 s), and this kills agents up.
-    struct KillOnPanic(u32);
-    impl Drop for KillOnPanic {
-        fn drop(&mut self) {
-            if std::thread::panicking() {
-                let _ = Command::new("/bin/kill")
-                    .args(["-KILL", &self.0.to_string()])
-                    .status();
-            }
-        }
-    }
-    let _guard = KillOnPanic(up.id());
+        .stderr(fs::File::create(dir.join("up.err")).expect("stderr"));
+    // However the test ends, agents up and the held git end too: the guard
+    // kills their group, and the git shim's wait is bounded (60 s).
+    let mut up = Group::spawn(&mut command, dir);
     let err = || fs::read_to_string(dir.join("up.err")).unwrap_or_default();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     while !dir.join("in-add").exists() {
         assert!(
-            up.try_wait().expect("wait").is_none(),
+            up.child.try_wait().expect("wait").is_none(),
             "agents up ended before its worktree add: {}",
             err()
         );
@@ -6059,18 +6184,18 @@ fn sigterm_during_startup_git_stops_before_any_turn_is_admitted() {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     let _ = Command::new("/bin/kill")
-        .args(["-TERM", &up.id().to_string()])
+        .args(["-TERM", &up.child.id().to_string()])
         .status();
     std::thread::sleep(std::time::Duration::from_millis(500));
     assert!(
-        up.try_wait().expect("wait").is_none(),
+        up.child.try_wait().expect("wait").is_none(),
         "agents up died under its git: {}",
         err()
     );
     fs::write(dir.join("release"), "").expect("release");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let status = loop {
-        if let Some(status) = up.try_wait().expect("wait") {
+        if let Some(status) = up.child.try_wait().expect("wait") {
             break status;
         }
         assert!(

@@ -5325,6 +5325,7 @@ mod tests {
                 now: 0,
                 request: None,
                 node: Some(on.into()),
+                branch: None,
             })
             .expect("claim")
         {

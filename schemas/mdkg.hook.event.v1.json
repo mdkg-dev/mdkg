@@ -118,6 +118,11 @@
           "description": "The git adapter's event, when git has prepared a ref update.",
           "type": "string",
           "const": "git.reference-transaction"
+        },
+        {
+          "description": "The git adapter's event, after a commit was made (it can't stop\none).",
+          "type": "string",
+          "const": "git.post-commit"
         }
       ]
     },

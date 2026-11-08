@@ -46,8 +46,11 @@ fn shared_leases_overlap_each_other_but_never_an_exclusive_one() {
 fn blockers_name_only_the_leases_a_claim_cant_sit_beside() {
     let mut c = Coordinator::new(10);
     c.claim_mode("a", &s("src"), Mode::Shared, 0, None).unwrap();
-    assert_eq!(c.blockers(&s("src/lib.rs"), Mode::Shared).count(), 0);
-    assert_eq!(c.blockers(&s("src/lib.rs"), Mode::Exclusive).count(), 1);
+    assert_eq!(c.blockers(&s("src/lib.rs"), Mode::Shared, None).count(), 0);
+    assert_eq!(
+        c.blockers(&s("src/lib.rs"), Mode::Exclusive, None).count(),
+        1
+    );
 }
 
 #[test]
@@ -97,4 +100,53 @@ fn journals_and_states_from_before_modes_read_as_exclusive() {
     lease.as_object_mut().unwrap().remove("mode");
     let back: Coordinator = serde_json::from_value(state).unwrap();
     assert_eq!(back.lease(&id).map(|l| l.mode), Some(Mode::Exclusive));
+}
+
+#[test]
+fn leases_on_two_named_branches_never_block_each_other() {
+    let mut c = Coordinator::new(10);
+    let x = Mode::Exclusive;
+    let a = c
+        .claim_on_branch("a", &s("src"), x, None, Some("feat-a"), 0, None)
+        .unwrap();
+    // Another branch: granted beside it, in either mode, on any overlap.
+    c.claim_on_branch("b", &s("src/lib.rs"), x, None, Some("feat-b"), 1, None)
+        .unwrap();
+    assert_eq!(c.holders(&s("src/lib.rs")).count(), 2);
+    // The same branch, or no branch, still contends both ways.
+    assert!(matches!(
+        c.claim_on_branch("c", &s("src/lib.rs"), x, None, Some("feat-a"), 2, None),
+        Err(Error::Held(_))
+    ));
+    assert!(matches!(
+        c.claim_mode("c", &s("src/lib.rs"), Mode::Shared, 2, None),
+        Err(Error::Held(_))
+    ));
+    assert_eq!(c.blockers(&s("src/main.rs"), x, Some("feat-c")).count(), 0);
+    assert_eq!(c.blockers(&s("src/main.rs"), x, None).count(), 1);
+    c.release("a", &a, 3).unwrap();
+    let free = c.claim_mode("c", &s("tests"), x, 3, None).unwrap();
+    assert!(matches!(
+        c.claim_on_branch("d", &s("tests/a.rs"), x, None, Some("feat-d"), 4, None),
+        Err(Error::Held(_))
+    ));
+    assert_eq!(c.lease(&free).and_then(|l| l.branch.clone()), None);
+}
+
+#[test]
+fn journals_and_states_from_before_branches_hold_every_branch() {
+    let old = r#"{"op":"claim","owner":"a","scope":"f","mode":"exclusive","now":0,"request":null}"#;
+    let command: Command = serde_json::from_str(old).unwrap();
+    let Command::Claim { branch, .. } = &command else {
+        panic!("not a claim: {command:?}");
+    };
+    assert_eq!(*branch, None);
+
+    let mut c = Coordinator::new(10);
+    let id = c.claim("a", &s("f"), 0, None).unwrap();
+    let state = serde_json::to_value(&c).unwrap();
+    // A lease on no branch writes no field, so an older build reads it.
+    assert!(state["leases"][id.0.as_str()].get("branch").is_none());
+    let back: Coordinator = serde_json::from_value(state).unwrap();
+    assert_eq!(back.lease(&id).and_then(|l| l.branch.clone()), None);
 }

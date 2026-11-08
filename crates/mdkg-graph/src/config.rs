@@ -137,13 +137,38 @@ pub enum Unleased {
     Block,
 }
 
+/// Where a path lease holds its scope.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LeaseScope {
+    /// On every branch: two overlapping leases contend whatever their
+    /// worktrees have checked out.
+    #[default]
+    Repository,
+    /// On the claimant worktree's branch: leases on two different branches
+    /// don't contend. Nodes, roles, turns and detached checkouts still
+    /// hold on every branch.
+    Branch,
+}
+
+impl LeaseScope {
+    /// The setting named `name` (`repository` or `branch`).
+    pub fn named(name: &str) -> Option<LeaseScope> {
+        match name {
+            "repository" => Some(LeaseScope::Repository),
+            "branch" => Some(LeaseScope::Branch),
+            _ => None,
+        }
+    }
+}
+
 /// `coordination.leases` in the config:
 ///
 /// ```json
 /// {"coordination": {"leases": {
 ///   "default": "exclusive",
 ///   "paths": [{"glob": "go.sum", "mode": "shared"}],
-///   "unleased": "warn"
+///   "unleased": "warn",
+///   "scope": "repository"
 /// }}}
 /// ```
 ///
@@ -157,6 +182,7 @@ pub struct LeasePolicy {
     pub default: LeaseMode,
     pub paths: Vec<(String, LeaseMode)>,
     pub unleased: Unleased,
+    pub scope: LeaseScope,
 }
 
 /// The lowercase form lease scopes compare by.
@@ -309,6 +335,16 @@ fn lease_policy(v: &Value, errors: &mut Vec<String>) -> LeasePolicy {
         Some(Some("block")) => policy.unleased = Unleased::Block,
         Some(_) => {
             errors.push("coordination.leases.unleased must be \"warn\" or \"block\"".into());
+        }
+    }
+    match leases
+        .get("scope")
+        .map(|v| v.as_str().and_then(LeaseScope::named))
+    {
+        None => {}
+        Some(Some(scope)) => policy.scope = scope,
+        Some(None) => {
+            errors.push("coordination.leases.scope must be \"repository\" or \"branch\"".into());
         }
     }
     match leases.get("paths") {
@@ -1472,6 +1508,7 @@ mod tests {
             default,
             paths: paths.iter().map(|(g, m)| (g.to_string(), *m)).collect(),
             unleased: Unleased::Warn,
+            scope: LeaseScope::Repository,
         }
     }
 
@@ -1591,19 +1628,23 @@ mod tests {
         let v: Value = serde_json::json!({"coordination": {"leases": {
             "default": "shared",
             "paths": [{"glob": "a", "mode": "exclusive"}],
-            "unleased": "block"
+            "unleased": "block",
+            "scope": "branch"
         }}});
         let p = lease_policy(&v, &mut errors);
         assert!(errors.is_empty(), "{errors:?}");
-        assert_eq!(p, policy(S, &[("a", X)]).with_unleased(Unleased::Block));
+        let mut want = policy(S, &[("a", X)]).with_unleased(Unleased::Block);
+        want.scope = LeaseScope::Branch;
+        assert_eq!(p, want);
 
         let bad: Value = serde_json::json!({"coordination": {"leases": {
             "default": "advisory",
             "paths": [{"glob": "", "mode": "shared"}, {"glob": "b"}],
-            "unleased": "ignore"
+            "unleased": "ignore",
+            "scope": "worktree"
         }}});
         lease_policy(&bad, &mut errors);
-        assert_eq!(errors.len(), 4, "{errors:?}");
+        assert_eq!(errors.len(), 5, "{errors:?}");
         assert_eq!(
             lease_policy(&Value::Null, &mut errors),
             LeasePolicy::default()

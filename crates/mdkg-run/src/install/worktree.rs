@@ -13,7 +13,9 @@ use crate::RunError;
 use crate::orchestration::Names;
 
 const BRANCH: &str = "mdkg-graph";
-const IGNORE: &str = "/.worktrees/";
+/// The rule that keeps agents' worktrees out of git: a `.gitignore` line
+/// in checkout mode, a common `info/exclude` line in ref mode.
+pub const IGNORE: &str = "/.worktrees/";
 /// The common `info/exclude` line that keeps `node edit`'s copies in
 /// `.mdkg-edit/` out of every commit (edd-01a18867, R45).
 pub const EDIT_IGNORE: &str = "/.mdkg-edit/";
@@ -126,8 +128,11 @@ pub fn graph_ids_on(root: &Path, reference: &str) -> Result<Vec<String>, RunErro
     graph_ids_at(root, reference)
 }
 
-/// Add the worktree ignore rule when creating the first worktree, preserving
-/// the user's content. A dry run checks the file but creates nothing.
+/// Add the worktree ignore rule to the tracked `.gitignore` when creating
+/// the first worktree, preserving the user's content: checkout mode's rule.
+/// A ref-mode clone keeps it in `info/exclude` instead, and its callers
+/// choose that before calling here. A dry run checks the file but creates
+/// nothing.
 pub fn ignore_worktrees(root: &Path, dry_run: bool) -> Result<(), RunError> {
     ignore_line(root, IGNORE, &[".worktrees/"], dry_run).map(drop)
 }

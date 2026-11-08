@@ -143,6 +143,7 @@ pub const BUILTINS: &[&str] = &[
     "lease.audit",
     "lease.done",
     "lease.staged",
+    "lease.committed",
     "git.protect",
     "git.graph_path",
     "git.graph_ref",
@@ -197,6 +198,14 @@ pub fn defaults() -> Vec<Rule> {
             "lease.staged",
             &[GitPreCommit],
             &[Agent, Orchestrator, Human],
+            Match::default(),
+        ),
+        // A commit gives back the path leases it settled (R2 of the 0.7.3
+        // lease work): `release --committed`, as the worktree's own actor.
+        rule(
+            "lease.committed",
+            &[GitPostCommit],
+            &[Agent, Orchestrator, Reviewer, Human],
             Match::default(),
         ),
         rule(

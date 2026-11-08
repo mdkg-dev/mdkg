@@ -955,6 +955,10 @@ mod tests {
         pending_on_release: bool,
         held: bool,
         releases: usize,
+        /// Releases of a lease already freed, which succeed as the
+        /// coordinator's do: a claim gives back what a failed release may
+        /// have left first.
+        freed_releases: usize,
         /// `fresh_reads_count()` at each claim, where a step starts.
         claimed_at: Vec<u64>,
         /// Checks each release's saved progress; off for a run of several
@@ -981,7 +985,10 @@ mod tests {
             Ok(u64::MAX)
         }
         fn release(&mut self, _: &str) -> Result<(), RunError> {
-            assert!(self.held);
+            if !self.held {
+                self.freed_releases += 1;
+                return Ok(());
+            }
             if !self.check_release {
                 self.held = false;
                 self.releases += 1;
@@ -1166,6 +1173,7 @@ mod tests {
             pending_on_release: false,
             held: false,
             releases: 0,
+            freed_releases: 0,
             claimed_at: Vec::new(),
             check_release: true,
             stop_at: None,
@@ -1338,6 +1346,8 @@ exit 0
         fs::remove_file(f.0.join("fake.started")).unwrap();
         let out = dispatch_watched(&mut mail, &dir, &agent, &mut reopened).unwrap();
         assert_eq!(out.result.unwrap().status, WakeStatus::NoMail);
+        // The failed release's lease is given back before the claim.
+        assert_eq!(mail.freed_releases, 1);
         assert_eq!(out.progress.ran, 5);
         assert!(!f.0.join("fake.started").exists());
         assert_eq!(reopened.record().unwrap().receiver_recovery, vec![pending]);
@@ -1554,6 +1564,7 @@ exit 0
             pending_on_release: false,
             held: false,
             releases: 0,
+            freed_releases: 0,
             claimed_at: Vec::new(),
             check_release: true,
             stop_at: None,
@@ -1598,6 +1609,7 @@ exit 0
             pending_on_release: false,
             held: false,
             releases: 0,
+            freed_releases: 0,
             claimed_at: Vec::new(),
             check_release: true,
             stop_at: None,
