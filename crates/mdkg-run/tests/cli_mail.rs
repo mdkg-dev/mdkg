@@ -20,6 +20,7 @@ fn setup(name: &str) -> (PathBuf, CliMail) {
         trusted_worktree: Some(root.join("top")),
         receipts: None,
         receipt_transport_overridden: false,
+        wake_kinds: None,
     };
     (root, mail)
 }
@@ -37,6 +38,7 @@ fn receipt_transport_override_refuses_before_the_installed_callback() {
     let (root, mut mail) = setup("receipt-override");
     mail.receipt_transport_overridden = true;
     mail.receipts = Some(mdkg_run::mail::ReceiptCallbacks {
+        review_import: |_, _| panic!("must not bypass overridden transport"),
         baseline: |_| panic!("must not bypass overridden transport"),
         activity: |_, _, _| panic!("must not bypass overridden transport"),
         tasks: |_, _, _| panic!("must not bypass overridden transport"),
@@ -59,6 +61,16 @@ fn receipt_transport_override_refuses_before_the_installed_callback() {
         "receipt delivery refused: MDKG_RUN_MDKG overrides the mail transport"
     );
     assert!(mail.receipt_baseline().is_err());
+    assert!(
+        mail.attest_review_import(&mdkg_run::mail::ReviewImport {
+            reviewer: "reviewer",
+            turn: "turn",
+            message: "message",
+            requests: &[],
+            file: &root.join("reply"),
+        })
+        .is_err()
+    );
     let fault = mdkg_run::fault::Fault::new(
         "worker",
         "run.agent_failed",
@@ -176,6 +188,31 @@ fn ack_ids_come_after_a_separator() {
         )]
     );
     let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn wake_kinds_filter_transport_waits_without_filtering_delivery_reads() {
+    let (root, mut mail) = setup("wake-kinds");
+    mail.wake_kinds = Some(vec!["question".into(), "note".into()]);
+    mail.wait("lane", Some(3), 1).expect("wait");
+    mail.wait_digest("lane", Some(3), 1).expect("digest wait");
+    mail.wait_headers("lane", Some(3), 1).expect("header wait");
+    mail.headers("lane", Some(3), 10).expect("headers");
+    mail.inbox("lane", 10).expect("delivery");
+    let calls = log(&root);
+    for call in &calls[..4] {
+        assert!(call.contains("--kind=question,note"), "{call}");
+        assert!(!call.contains("--channel-kind"), "{call}");
+    }
+    assert!(
+        !calls[4].contains("--kind"),
+        "deferred mail is delivered too"
+    );
+    mail.wake_kinds = Some(vec![]);
+    mail.wait("lane", Some(5), 1)
+        .expect("empty filter still blocks on events");
+    assert!(log(&root).last().unwrap().contains("msg wait --timeout 1"));
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

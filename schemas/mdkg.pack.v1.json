@@ -75,6 +75,17 @@
           "items": {
             "$ref": "#/$defs/NodeRequirements"
           }
+        },
+        "message": {
+          "description": "Present only for a message-scoped pack.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MessageContext"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -224,6 +235,32 @@
         "requirement"
       ]
     },
+    "MessageContext": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "context_id": {
+          "type": "string"
+        },
+        "messages": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "cut": {
+          "description": "Thread text was cut by the bounded read or the shared pack budget.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "id",
+        "context_id",
+        "messages",
+        "cut"
+      ]
+    },
     "DiagnosticOut": {
       "type": "object",
       "properties": {
@@ -307,6 +344,7 @@
         "config.missing",
         "config.unreadable",
         "config.invalid",
+        "authority.field_in_turn",
         "config.unknown_workspace",
         "config.graph_v2_unsupported",
         "frontmatter.missing_open",

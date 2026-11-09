@@ -388,7 +388,7 @@ def execute(report, action):
         base_args += ["-p", package]
     # A v1 plan that omits targets selects whole packages, as Cargo's default
     # test run does.
-    whole, filters = True, set()
+    whole, filters, scopes, whole_packages = True, set(), set(), set(packages)
     if "rust_targets" in selected:
         targets = selected["rust_targets"]
         covered, filters = set(), set()
@@ -402,15 +402,18 @@ def execute(report, action):
                 if not valid_name(name):
                     raise SystemExit("affected target has no name")
                 filters.add(("--" + kind, name))
+                scopes.add((package, kind, name))
             elif kind == "lib":
                 filters.add(("--lib",))
+                scopes.add((package, kind, ""))
             elif kind == "package":
-                pass
+                scopes.add((package, kind, ""))
             else:
                 raise SystemExit("affected returned an unknown target kind")
         if covered != set(packages):
             raise SystemExit("affected target plan does not cover its packages")
-        whole = any(target["kind"] == "package" for target in targets)
+        whole_packages = {target["package"] for target in targets if target["kind"] == "package"}
+        whole = bool(whole_packages)
         grouped_args = base_args + ([] if whole else [arg for scope in sorted(filters) for arg in scope])
         for target in targets:
             if target["cargo_args"] != grouped_args:
@@ -430,19 +433,33 @@ def execute(report, action):
     elif action == "test":
         # nextest runs the tests: each target's tests go in one pool, so a slow
         # binary no longer holds up the ones after it (decided 2026-10-30). The
-        # affected plan's target scopes become nextest filters: `--test` and
-        # `--bin` name a binary, `--lib` is the lib kind, and a whole package
-        # runs every target. It runs no doctests, so a whole-package scope also
-        # runs `cargo test --doc`, which is what a plain `cargo test` included.
+        # affected plan's target scopes become nextest filters, each qualified
+        # by the package it came from: a test or bin target is its binary id
+        # (`<package>::<test>`, `<package>::bin/<bin>`), a lib is its package's
+        # lib kind, and a whole package is every target of its package.
+        # Cargo's grouped arguments don't say which package a target came
+        # from, so an unqualified scope would also select a same-named binary,
+        # or the lib, of every other selected package, and a whole package
+        # would run every target of the others. With every package whole
+        # there is no filter. nextest runs no doctests, so a plan with a
+        # whole package also runs `cargo test --doc` over the selected
+        # packages, as a plain `cargo test` did; over all of them, since a
+        # package without a lib fails `--doc` alone.
         commands = []
         if packages:
             nextest = ["cargo", "nextest", "run"]
             for package in packages:
                 nextest += ["-p", package]
-            if not whole:
-                expression = " or ".join(
-                    "kind(lib)" if scope == ("--lib",) else "binary(%s)" % scope[1]
-                    for scope in sorted(filters))
+            if whole_packages != set(packages):
+                def scope_filter(package, kind, name):
+                    if kind == "package":
+                        return "package(=%s)" % package
+                    if kind == "lib":
+                        return "(package(=%s) & kind(lib))" % package
+                    if kind == "bin":
+                        return "binary_id(=%s::bin/%s)" % (package, name)
+                    return "binary_id(=%s::%s)" % (package, name)
+                expression = " or ".join(scope_filter(*scope) for scope in sorted(scopes))
                 nextest += ["-E", expression]
             # Lanes test four at a time; the machine-wide build slots cap the
             # processes across lanes. A selected target with no tests passes,
@@ -511,20 +528,47 @@ def self_test():
     lib_plan = {"rust": ["core"], "go": [], "suites": [], "rust_targets": [
         {"package": "core", "kind": "lib", "cargo_args": ["test", "-p", "core", "--lib"]}]}
     filtered = ["cargo", "nextest", "run", "-p", "core", "-p", "cli",
-                "-E", "kind(lib) or binary(smoke)", "--test-threads=4", "--no-tests=pass"]
+                "-E", "binary_id(=cli::smoke) or (package(=core) & kind(lib))",
+                "--test-threads=4", "--no-tests=pass"]
+    # This workspace's two packages that both have a `decisions` test (and
+    # mdkg-coord-sqlite a lib): a scope selects only the package it came from.
+    cli, store = "mdkg", "mdkg-coord-sqlite"
+    shared = ["test", "-p", cli, "-p", store, "--lib", "--test", "decisions"]
+    shared_plan = {"rust": [cli, store], "go": [], "suites": [], "rust_targets": [
+        {"package": cli, "kind": "test", "name": "decisions", "cargo_args": shared},
+        {"package": store, "kind": "lib", "cargo_args": shared}]}
+    # The mirror image, for the runner's logic (mdkg itself has no lib).
+    swapped_plan = {**shared_plan, "rust_targets": [
+        {"package": store, "kind": "test", "name": "decisions", "cargo_args": shared},
+        {"package": cli, "kind": "lib", "cargo_args": shared}]}
+    # A whole package beside another package's target scope.
+    mixed_plan = {**shared_plan, "rust_targets": [
+        {"package": cli, "kind": "test", "name": "decisions", "cargo_args": ["test", "-p", cli, "-p", store]},
+        {"package": store, "kind": "package", "cargo_args": ["test", "-p", cli, "-p", store]}]}
+    def expression(selection):
+        code, calls = run(report(selection), "test")
+        assert code == 0 and calls and calls[0][:3] == ["cargo", "nextest", "run"], (code, calls)
+        return calls[0][calls[0].index("-E") + 1]
     everything = ["cargo", "nextest", "run", "-p", "core", "-p", "cli",
                   "--test-threads=4", "--no-tests=pass"]
+    mixed = ["cargo", "nextest", "run", "-p", "core", "-p", "cli",
+             "-E", "binary_id(=cli::smoke) or package(=core)",
+             "--test-threads=4", "--no-tests=pass"]
+    all_whole = {**plan, "rust_targets": [
+        {"package": "core", "kind": "package", "cargo_args": base},
+        {"package": "cli", "kind": "package", "cargo_args": base}]}
     doctests = ["cargo", "test", "--doc", "-p", "core", "-p", "cli"]
     cases = [
         (report(empty), "test", (0, [])),
         (report(empty), "clippy", (0, [])),
         (report(plan), "test", (0, [filtered])),
-        (report(whole), "test", (0, [everything, doctests])),
+        (report(whole), "test", (0, [mixed, doctests])),
+        (report(all_whole), "test", (0, [everything, doctests])),
         (report(legacy), "test", (0, [everything, doctests])),
         (report(bin_plan), "test", (0, [["cargo", "nextest", "run", "-p", "cli",
-                                         "-E", "binary(mdkg)", "--test-threads=4", "--no-tests=pass"]])),
+                                         "-E", "binary_id(=cli::bin/mdkg)", "--test-threads=4", "--no-tests=pass"]])),
         (report(lib_plan), "test", (0, [["cargo", "nextest", "run", "-p", "core",
-                                         "-E", "kind(lib)", "--test-threads=4", "--no-tests=pass"]])),
+                                         "-E", "(package(=core) & kind(lib))", "--test-threads=4", "--no-tests=pass"]])),
         (report(empty, "full"), "mode", (0, [])),
         (report(empty, "full"), "finish", (3, [])),
         ({"ok": False}, "test", None),
@@ -549,8 +593,15 @@ def self_test():
             assert result[0] != 0 and result[1] == [], result
         else:
             assert result == expected, (result, expected)
+    assert expression(shared_plan) == "binary_id(=mdkg::decisions) or (package(=mdkg-coord-sqlite) & kind(lib))"
+    assert expression(swapped_plan) == "(package(=mdkg) & kind(lib)) or binary_id(=mdkg-coord-sqlite::decisions)"
+    assert expression(mixed_plan) == "binary_id(=mdkg::decisions) or package(=mdkg-coord-sqlite)"
+    for selection, other in [(shared_plan, "mdkg-coord-sqlite::decisions"), (swapped_plan, "mdkg::decisions")]:
+        chosen = expression(selection)
+        assert other not in chosen and "binary(" not in chosen, chosen
+        assert chosen.count("kind(lib)") == chosen.count("& kind(lib)") == 1, chosen
     # A failing nextest run still runs the doctests, then fails the step.
-    assert run(report(whole), "test", status=1) == (1, [everything, doctests])
+    assert run(report(whole), "test", status=1) == (1, [mixed, doctests])
     output = io.StringIO()
     with contextlib.redirect_stderr(output):
         try:
@@ -642,7 +693,7 @@ def self_test():
     config_path = (CHECKOUT or Path.cwd()) / ".mdkg/config.json"
     if config_path.is_file():
         template_coverage(json.loads(config_path.read_text()))
-    print(f"affected runner self-test passed ({len(cases) + 11 + len(coverage_cases)} cases)")
+    print(f"affected runner self-test passed ({len(cases) + 16 + len(coverage_cases)} cases)")
 
 
 if sys.argv[2] == "self-test":

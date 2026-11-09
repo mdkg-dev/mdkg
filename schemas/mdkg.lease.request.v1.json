@@ -63,8 +63,19 @@
           "$ref": "#/$defs/LeaseRecord"
         },
         "sent": {
-          "description": "The `question` sent to its holder (and the requester's\n`reports_to`), in the context `lease:<lease id>:<requester>`.",
+          "description": "The `question` sent to its holder in the context\n`lease:<lease id>:<requester>`.",
           "$ref": "#/$defs/SendData"
+        },
+        "copied": {
+          "description": "A non-waking `notice` copied to the requester's `reports_to`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SendData"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -431,6 +442,7 @@
         "decision",
         "handoff",
         "note",
+        "notice",
         "receipt",
         "fault"
       ]
@@ -723,6 +735,7 @@
         "config.missing",
         "config.unreadable",
         "config.invalid",
+        "authority.field_in_turn",
         "config.unknown_workspace",
         "config.graph_v2_unsupported",
         "frontmatter.missing_open",

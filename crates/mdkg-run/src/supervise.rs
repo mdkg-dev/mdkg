@@ -473,6 +473,42 @@ fn worker_panicked(name: &str) -> RunError {
     )
 }
 
+/// Failure delays are independent of mail arrival and the idle wait cadence.
+/// Successful turns reset the streak; a successful mail poll does not.
+#[derive(Debug, Default)]
+pub(crate) struct FailureBackoff(u32);
+
+impl FailureBackoff {
+    pub(crate) fn failed(&mut self) -> Duration {
+        let delay = Duration::from_secs(30u64.saturating_mul(1u64 << self.0.min(4)))
+            .min(Duration::from_secs(300));
+        self.0 = self.0.saturating_add(1);
+        delay
+    }
+
+    pub(crate) fn succeeded(&mut self) {
+        self.0 = 0;
+    }
+
+    /// Resumed-session capacity failures have a bounded fresh-session recovery
+    /// path. Delay only if that recovery also fails; other errors still back off.
+    fn after_turn(
+        &mut self,
+        result: &Result<TurnReport, RunError>,
+        fresh: bool,
+    ) -> Option<Duration> {
+        match result {
+            Err(e) if !fresh && turn::at_capacity(e) => None,
+            Err(_) => Some(self.failed()),
+            Ok(r) if r.outcome == Outcome::Idle => None,
+            Ok(_) => {
+                self.succeeded();
+                None
+            }
+        }
+    }
+}
+
 /// One agent's loop; returns the turns it ran.
 #[allow(clippy::too_many_arguments)]
 fn supervise(
@@ -515,6 +551,7 @@ fn supervise(
     // person; newer mail wakes the agent.
     let mut seen: Option<u64> = progress.seen;
     let mut capacity = Capacity::load(dir, name);
+    let mut failures = FailureBackoff::default();
     let opts = TurnOptions {
         limit: a.policy.batch_max(),
         digest_budget: match a.policy.shape {
@@ -562,7 +599,7 @@ fn supervise(
             }
             Err(e) => {
                 on(name, Event::Trouble(&e));
-                pause(how.pause);
+                pause(failures.failed().max(how.pause));
                 continue;
             }
         };
@@ -578,14 +615,20 @@ fn supervise(
             .loop_guard
             .and_then(|g| guard.next_cooldown(&g, now));
         if check_inbox {
-            let inbox = match turn::peek_for(mail, name, &paused, opts.digest_budget.is_some()) {
+            let inbox = match turn::peek_for(
+                mail,
+                name,
+                &paused,
+                opts.digest_budget.is_some(),
+                opts.wake_kinds.as_deref(),
+            ) {
                 Ok(i) => i,
                 Err(e) => {
                     on(name, Event::Trouble(&e));
                     if how.once {
                         return Ok(ran);
                     }
-                    pause(how.pause);
+                    pause(failures.failed().max(how.pause));
                     continue;
                 }
             };
@@ -600,6 +643,7 @@ fn supervise(
             let mut agent = agent;
             let mut turn_opts = TurnOptions {
                 require_headless: a.opts.graph_root.is_some(),
+                mail_triggered: true,
                 loop_guard: a.policy.loop_guard,
                 ..opts.clone()
             };
@@ -612,8 +656,20 @@ fn supervise(
                 },
                 None => None,
             };
-            if stop_requested() {
-                return Ok(ran);
+            match control::admit_turn() {
+                control::Admit::Yes => (),
+                control::Admit::Stop => return Ok(ran),
+                control::Admit::Unreadable(e) => {
+                    // The mail stays unread; it starts its turn once the
+                    // definitions read again.
+                    drop(permit);
+                    on(name, Event::Trouble(&e));
+                    if how.once {
+                        return Ok(ran);
+                    }
+                    pause(failures.failed().max(how.pause));
+                    continue;
+                }
             }
             record_state(name, registry::AgentState::Running, on);
             let durable = saved.is_some();
@@ -626,7 +682,7 @@ fn supervise(
                         if how.once {
                             return Ok(ran);
                         }
-                        pause(how.pause);
+                        pause(failures.failed().max(how.pause));
                         continue;
                     }
                     WatchedOutcome::Completed { result, progress } => {
@@ -649,7 +705,7 @@ fn supervise(
                 if how.once {
                     return Ok(ran);
                 }
-                pause(how.pause);
+                pause(failures.failed().max(how.pause));
                 continue;
             }
             // The turn charged the guard itself, under its lease, before
@@ -658,6 +714,14 @@ fn supervise(
             capacity.after(&result, capacity_fresh);
             if let Err(e) = capacity.save(dir, name) {
                 on(name, Event::Trouble(&e));
+            }
+            // Pause even if newer mail is already queued. A missing login
+            // or repeatedly failing turn must not retry on every wake, while
+            // resumed-session capacity recovery can reach its fresh turn promptly.
+            if let Some(delay) = failures.after_turn(&result, turn_opts.flags.fresh)
+                && !how.once
+            {
+                pause(delay.max(how.pause));
             }
             if durable {
                 continue;
@@ -702,7 +766,7 @@ fn supervise(
             Ok(None) => check_inbox = cooldown.is_some(),
             Err(e) => {
                 on(name, Event::Trouble(&e));
-                pause(how.pause);
+                pause(failures.failed().max(how.pause));
             }
         }
     }
@@ -815,6 +879,51 @@ mod tests {
         turns: 3,
         window: Duration::from_secs(60),
     };
+
+    #[test]
+    fn failures_back_off_to_five_minutes_and_reset_after_success() {
+        let mut backoff = FailureBackoff::default();
+        let delays: Vec<_> = (0..8).map(|_| backoff.failed().as_secs()).collect();
+        assert_eq!(delays, [30, 60, 120, 240, 300, 300, 300, 300]);
+        backoff.succeeded();
+        assert_eq!(backoff.failed(), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn capacity_recovery_backs_off_only_when_the_fresh_turn_also_fails() {
+        let at_capacity = Err(RunError::failure(
+            crate::error::CODE_AGENT_FAILED,
+            "the agent exited with exit status: 1",
+        )
+        .and_hint(turn::CAPACITY_HINT));
+        let mut capacity = Capacity::default();
+        let mut failures = FailureBackoff::default();
+        for expected in [30, 60, 120, 240, 300, 300] {
+            // Two resumed failures request a fresh session. After a failed fresh
+            // session, one further resumed failure reaches that threshold again.
+            while !capacity.fresh_next() {
+                assert_eq!(failures.after_turn(&at_capacity, false), None);
+                capacity.after(&at_capacity, false);
+            }
+            assert_eq!(
+                failures.after_turn(&at_capacity, true),
+                Some(Duration::from_secs(expected))
+            );
+            capacity.after(&at_capacity, true);
+        }
+        // Errors without the capacity diagnosis never take the recovery exemption,
+        // including when resuming rather than starting a fresh session.
+        for code in [
+            crate::error::CODE_LOGIN_REQUIRED,
+            crate::error::CODE_AGENT_FAILED,
+        ] {
+            failures.succeeded();
+            assert_eq!(
+                failures.after_turn(&Err(RunError::failure(code, "failed")), false),
+                Some(Duration::from_secs(30))
+            );
+        }
+    }
 
     #[test]
     fn a_thread_pauses_at_the_limit_and_runs_again_as_turns_leave_the_window() {
@@ -1004,6 +1113,7 @@ mod tests {
         live_mail: bool,
         claims: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         stop_on_wait: bool,
+        claim_error: &'static str,
     }
 
     impl Mail for IdleMail {
@@ -1062,7 +1172,7 @@ mod tests {
         fn claim(&mut self, _: &str) -> Result<(), RunError> {
             self.claims
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Err(RunError::failure("run.agent_failed", "unexpected turn"))
+            Err(RunError::failure(self.claim_error, "unexpected turn"))
         }
         fn release(&mut self, _: &str) -> Result<(), RunError> {
             panic!("unexpected release")
@@ -1121,6 +1231,42 @@ mod tests {
     }
 
     #[test]
+    fn wake_kinds_leave_excluded_headless_mail_unacked_and_available() {
+        let control = Control::default();
+        let (waited, _) = std::sync::mpsc::channel();
+        let mut mail = IdleMail {
+            control,
+            waited,
+            blocked_read: None,
+            live_mail: true,
+            claims: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            stop_on_wait: false,
+            claim_error: crate::error::CODE_AGENT_FAILED,
+        };
+        let questions = vec!["question".into()];
+        let deferred = turn::peek_for(&mut mail, "worker", &[], false, Some(&questions)).unwrap();
+        assert!(!deferred.live);
+        assert_eq!(deferred.cursor, Some(1));
+        assert!(
+            !turn::peek_for(&mut mail, "worker", &[], false, Some(&[]))
+                .unwrap()
+                .live
+        );
+        assert!(
+            turn::peek_for(&mut mail, "worker", &[], false, None)
+                .unwrap()
+                .live
+        );
+        let handoffs = vec!["handoff".into()];
+        assert!(
+            turn::peek_for(&mut mail, "worker", &[], false, Some(&handoffs))
+                .unwrap()
+                .live
+        );
+        assert_eq!(mail.inbox("worker", 10).unwrap().messages.len(), 1);
+    }
+
+    #[test]
     fn durable_unclaimed_once_returns_without_spinning_or_charging() {
         bounded_test(
             "supervise::tests::durable_unclaimed_once_returns_without_spinning_or_charging",
@@ -1144,6 +1290,7 @@ mod tests {
                     live_mail: true,
                     claims: claims.clone(),
                     stop_on_wait: false,
+                    claim_error: crate::error::CODE_AGENT_FAILED,
                 };
                 how.once = true;
                 let counts = up_durable(
@@ -1164,6 +1311,60 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_turn_backs_off_despite_live_mail_and_stop_wakes_it() {
+        for code in [
+            crate::error::CODE_LOGIN_REQUIRED,
+            crate::error::CODE_AGENT_FAILED,
+        ] {
+            let (dir, agent, mut how) = saved_idle_agent();
+            how.pause = Duration::ZERO;
+            let control = Control::default();
+            let claims = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let (waited, _) = std::sync::mpsc::channel();
+            let make = |_: &str| IdleMail {
+                control: control.clone(),
+                waited: waited.clone(),
+                blocked_read: None,
+                live_mail: true,
+                claims: claims.clone(),
+                stop_on_wait: false,
+                claim_error: code,
+            };
+            let (failed, failure) = std::sync::mpsc::channel();
+            std::thread::scope(|scope| {
+                struct StopOnDrop(Control);
+                impl Drop for StopOnDrop {
+                    fn drop(&mut self) {
+                        self.0.request_stop();
+                    }
+                }
+                let _stop = StopOnDrop(control.clone());
+                let worker = scope.spawn(|| {
+                    up_controlled(
+                        &make,
+                        &dir.0,
+                        &[agent],
+                        &how,
+                        &|_, event| {
+                            if matches!(event, Event::Turn(Err(_))) {
+                                failed.send(()).unwrap();
+                            }
+                        },
+                        &control,
+                    )
+                });
+                failure.recv_timeout(Duration::from_secs(10)).unwrap();
+                assert!(failure.recv_timeout(Duration::from_millis(200)).is_err());
+                assert_eq!(claims.load(std::sync::atomic::Ordering::Relaxed), 1);
+                let stopped = std::time::Instant::now();
+                control.request_stop();
+                worker.join().unwrap().unwrap();
+                assert!(stopped.elapsed() < Duration::from_secs(1));
+            });
+        }
+    }
+
+    #[test]
     fn controlled_wait_preserves_retry_cursor_and_remaining_turn_budget() {
         let (dir, agent, mut how) = saved_idle_agent();
         let progress = Progress {
@@ -1181,6 +1382,7 @@ mod tests {
             live_mail: false,
             claims: claims.clone(),
             stop_on_wait: true,
+            claim_error: crate::error::CODE_AGENT_FAILED,
         };
         let ran = up_controlled(
             &make,
@@ -1192,7 +1394,7 @@ mod tests {
         )
         .expect("up");
         assert_eq!(ran, [2]);
-        assert_eq!(observations.try_recv().expect("wait"), (Some(17), 1));
+        assert_eq!(observations.try_recv().expect("wait"), (Some(17), 600));
         assert_eq!(control.progress()["worker"], progress);
         // At the original cap, the replacement process does not reset its
         // budget or inspect the inbox, even if --fresh is still in argv.
@@ -1205,6 +1407,7 @@ mod tests {
             live_mail: false,
             claims: claims.clone(),
             stop_on_wait: true,
+            claim_error: crate::error::CODE_AGENT_FAILED,
         };
         assert_eq!(
             up_controlled(&make_resumed, &dir.0, &[agent], &how, &|_, _| (), &resumed)
@@ -1252,6 +1455,7 @@ mod tests {
                     live_mail: false,
                     claims: claims.clone(),
                     stop_on_wait: false,
+                    claim_error: crate::error::CODE_AGENT_FAILED,
                 };
                 let (events, stopped) = std::sync::mpsc::channel::<String>();
                 let events = Mutex::new(events);
@@ -1360,6 +1564,7 @@ mod tests {
             live_mail: true,
             claims: claims.clone(),
             stop_on_wait: true,
+            claim_error: crate::error::CODE_AGENT_FAILED,
         };
         std::thread::scope(|s| {
             // Both guards belong to the scope body, so they drop before
@@ -1434,6 +1639,7 @@ mod tests {
                             live_mail: false,
                             claims: claims.clone(),
                             stop_on_wait: false,
+                            claim_error: crate::error::CODE_AGENT_FAILED,
                         }
                     };
                     let agents = [agent, second.clone()];
@@ -1525,6 +1731,7 @@ mod tests {
                         live_mail: true,
                         claims: claims.clone(),
                         stop_on_wait: true,
+                        claim_error: crate::error::CODE_AGENT_FAILED,
                     }
                 };
                 std::thread::scope(|scope| {

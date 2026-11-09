@@ -231,7 +231,14 @@ const MCP_READ: &[&str] = &[
     "pack",
     "next",
     "scratch_path",
+    "entry_list",
+    "entry_show",
 ];
+/// The one coordinator write a reviewer may make, for reviewers only: its
+/// own verdict on a requirement, which the ledger binds to an open review
+/// round naming it at the reviewed head. `entry_update` stays off for
+/// reviewers.
+const MCP_REVIEW: &[&str] = &["req_verdict"];
 /// MCP tools that write to the coordinator, or block (`inbox_wait`), for
 /// workers only.
 const MCP_WRITE: &[&str] = &[
@@ -698,6 +705,7 @@ pub fn claude_rules(
     if role == Role::Worker {
         // Native worker tools and command permissions remain intact. Only
         // explicitly configured user grants are added, never a default list.
+        deny.extend(mcp_rules(MCP_REVIEW));
         return (extra_allow.to_vec(), deny);
     }
     let mut allow: Vec<String> = ["Read", "Glob", "Grep"].map(String::from).to_vec();
@@ -707,6 +715,7 @@ pub fn claude_rules(
         &reads.iter().map(String::as_str).collect::<Vec<_>>(),
     ));
     allow.extend(mcp_rules(MCP_READ));
+    allow.extend(mcp_rules(MCP_REVIEW));
     deny.extend(REVIEWER_DENY.iter().map(|s| s.to_string()));
     deny.extend(REVIEWER_OUTPUT_DENY.iter().map(|c| format!("Bash({c})")));
     // Read-only: no edits or coordinator writes; extra allows are ignored.
@@ -1322,8 +1331,9 @@ pub(crate) fn codex(t: &TurnInput<'_>, shell_binary: Option<&Path>) -> AgentComm
 /// The mdkg MCP tools a role may call.
 pub fn mcp_tools(role: Role) -> Vec<&'static str> {
     let mut tools = MCP_READ.to_vec();
-    if role == Role::Worker {
-        tools.extend(MCP_WRITE);
+    match role {
+        Role::Worker => tools.extend(MCP_WRITE),
+        Role::Reviewer => tools.extend(MCP_REVIEW),
     }
     tools
 }
@@ -1682,8 +1692,12 @@ pub fn opencode_config(t: &TurnInput<'_>) -> serde_json::Value {
     }
     let mut cfg = opencode_permissions(t.role, &names);
     let mut off = MCP_DENY.to_vec();
-    if t.role == Role::Reviewer {
-        off.extend(MCP_WRITE);
+    match t.role {
+        Role::Reviewer => {
+            off.extend(MCP_WRITE);
+            off.push("entry_update");
+        }
+        Role::Worker => off.extend(MCP_REVIEW),
     }
     cfg["tools"] = off
         .iter()
@@ -2228,9 +2242,9 @@ mod tests {
                         .any(|c| rule.contains(c.as_str()))
             };
             assert!(
-                denied
-                    .iter()
-                    .all(|rule| refusal(rule) || rule == "mcp__mdkg__agents_use_key"),
+                denied.iter().all(|rule| refusal(rule)
+                    || rule == "mcp__mdkg__agents_use_key"
+                    || rule == "mcp__mdkg__req_verdict"),
                 "{denied:?}"
             );
 
@@ -2255,7 +2269,7 @@ mod tests {
             );
             assert_eq!(
                 cfg["tools"],
-                serde_json::json!({"mdkg_agents_use_key": false}),
+                serde_json::json!({"mdkg_agents_use_key": false, "mdkg_req_verdict": false}),
                 "{cfg}"
             );
             assert_eq!(cfg["mcp"]["mdkg"]["enabled"], true);
@@ -2336,6 +2350,105 @@ mod tests {
         let (allow, _) = claude_rules(Role::Worker, &["Bash(npm test *)".into()], &names());
         assert!(allow.contains(&"Bash(npm test *)".to_string()));
         assert_eq!(allow, ["Bash(npm test *)"]);
+    }
+
+    #[test]
+    fn reviewers_write_only_their_own_verdicts_on_every_harness() {
+        for harness in [Harness::Claude, Harness::Codex, Harness::OpenCode] {
+            for resume in [None, Some("fixture-session")] {
+                let t = input(harness, Role::Reviewer, resume);
+                let launched = command(&t);
+                assert!(!mcp_tools(t.role).contains(&"entry_update"));
+                // The ledger reads, and the one bound verdict write.
+                for tool in ["entry_list", "entry_show", "req_verdict"] {
+                    assert!(mcp_tools(t.role).contains(&tool), "{tool}");
+                    match harness {
+                        Harness::Claude => {
+                            let (allow, deny) = claude_rules(t.role, &[], &names());
+                            let rule = format!("mcp__mdkg__{tool}");
+                            assert!(allow.contains(&rule), "{tool}");
+                            assert!(!deny.contains(&rule), "{tool}");
+                        }
+                        Harness::Codex => assert!(
+                            launched.args.iter().any(|a| a
+                                == &format!(
+                                    "mcp_servers.mdkg.tools.{tool}.approval_mode=\"approve\""
+                                )),
+                            "{tool}"
+                        ),
+                        Harness::OpenCode => assert_ne!(
+                            opencode_21_effect(
+                                &serde_json::json!({}),
+                                &launched,
+                                &format!("mdkg_{tool}"),
+                                "*"
+                            ),
+                            "deny",
+                            "{tool}"
+                        ),
+                    }
+                }
+                // A worker never gets the reviewer's verdict tool.
+                let worker = input(harness, Role::Worker, resume);
+                assert!(!mcp_tools(worker.role).contains(&"req_verdict"));
+                match harness {
+                    Harness::Claude => {
+                        let (_, deny) = claude_rules(worker.role, &[], &names());
+                        assert!(deny.contains(&"mcp__mdkg__req_verdict".to_string()));
+                    }
+                    Harness::Codex => {}
+                    Harness::OpenCode => {
+                        assert_eq!(opencode_config(&worker)["tools"]["mdkg_req_verdict"], false)
+                    }
+                }
+                for tool in MCP_WRITE.iter().copied().chain(["entry_update"]) {
+                    match harness {
+                        Harness::Claude => {
+                            let (allow, deny) = claude_rules(t.role, &[], &names());
+                            let rule = format!("mcp__mdkg__{tool}");
+                            assert!(!allow.contains(&rule), "{tool}");
+                            if MCP_WRITE.contains(&tool) {
+                                assert!(deny.contains(&rule), "{tool}");
+                            }
+                        }
+                        Harness::Codex => assert!(!mcp_tools(t.role).contains(&tool), "{tool}"),
+                        Harness::OpenCode => assert_eq!(
+                            opencode_21_effect(
+                                &serde_json::json!({}),
+                                &launched,
+                                &format!("mdkg_{tool}"),
+                                "*"
+                            ),
+                            "deny",
+                            "{tool}"
+                        ),
+                    }
+                }
+                match harness {
+                    Harness::Claude => {
+                        let (allow, _) = claude_rules(t.role, &[], &names());
+                        assert!(!allow.iter().any(|r| r.contains("entry_update")));
+                        assert!(has_pair(&launched.args, "--permission-mode", "manual"));
+                    }
+                    Harness::Codex => {
+                        assert_eq!(codex_settings(t.role, None, None).sandbox, "read-only");
+                        assert!(
+                            launched
+                                .args
+                                .iter()
+                                .any(|s| s == "approval_policy=\"never\"")
+                        );
+                    }
+                    Harness::OpenCode => {
+                        let worker = input(harness, Role::Worker, resume);
+                        assert_ne!(
+                            opencode_config(&worker)["tools"]["mdkg_entry_update"],
+                            false
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -3319,7 +3432,7 @@ mod tests {
         assert!(has_pair(
             &first.args,
             "-c",
-            "mcp_servers.mdkg.enabled_tools=[\"channel_read\",\"room_read\",\"inbox\",\"show\",\"list\",\"search\",\"pack\",\"next\",\"scratch_path\"]"
+            "mcp_servers.mdkg.enabled_tools=[\"channel_read\",\"room_read\",\"inbox\",\"show\",\"list\",\"search\",\"pack\",\"next\",\"scratch_path\",\"entry_list\",\"entry_show\",\"req_verdict\"]"
         ));
         // Each tool the role may call is approved for Codex, and only those.
         let approved = |c: &AgentCommand| -> Vec<String> {
@@ -4108,10 +4221,11 @@ esac
                     assert_ne!(opencode_agent(&t), selected);
                 } else {
                     assert_eq!(selected, "build");
-                    // Only use-key's MCP tool is turned off for a worker.
+                    // Only use-key's MCP tool, and the reviewer's verdict
+                    // tool, are turned off for a worker.
                     assert_eq!(
                         cfg["tools"],
-                        serde_json::json!({"mdkg_agents_use_key": false})
+                        serde_json::json!({"mdkg_agents_use_key": false, "mdkg_req_verdict": false})
                     );
                     assert!(cfg["agent"][&selected].get("model").is_none());
                 }

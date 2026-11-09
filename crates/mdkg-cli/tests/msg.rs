@@ -133,6 +133,38 @@ fn ids(envelope: &Value) -> Vec<String> {
 }
 
 #[test]
+fn passive_notice_stays_readable_in_inbox_and_thread() {
+    let (_dir, wa, wb) = two_worktrees();
+    ok(
+        &wa,
+        "a",
+        0,
+        &[
+            "msg",
+            "send",
+            "--to",
+            "b",
+            "--kind",
+            "notice",
+            "--id",
+            "fyi",
+            "--text",
+            "Readable status",
+        ],
+    );
+    let inbox = ok(&wb, "b", 1, &["msg", "inbox", "--no-mark"]);
+    assert_eq!(ids(&inbox), ["fyi"]);
+    assert_eq!(inbox["data"]["messages"][0]["kind"], "notice");
+    assert!(inbox.to_string().contains("Readable status"));
+    let thread = ok(&wb, "b", 2, &["msg", "thread", "fyi", "--no-mark"]);
+    assert!(thread.to_string().contains("Readable status"));
+    assert_eq!(
+        ids(&ok(&wb, "b", 3, &["msg", "inbox", "--no-mark"])),
+        ["fyi"]
+    );
+}
+
+#[test]
 fn a_room_post_reaches_the_other_worktree_and_acks_purge_it() {
     let (_dir, wa, wb) = two_worktrees();
     let out = ok(
@@ -667,7 +699,7 @@ fn bodies_are_checked_before_anything_is_stored() {
     let hint = out["diagnostics"][0]["hint"].as_str().unwrap_or_default();
     assert_eq!(
         hint,
-        "use one of: review_request, findings, resolution, question, handoff, note; \
+        "use one of: review_request, findings, resolution, question, handoff, note, notice; \
          decision mail only from its delegate, outside a turn",
         "{out}"
     );
@@ -692,7 +724,7 @@ fn bodies_are_checked_before_anything_is_stored() {
     assert_eq!((code, codes(&out)), (1, vec!["msg.bad_kind".to_string()]));
     let hint = out["diagnostics"][0]["hint"].as_str().unwrap_or_default();
     assert_eq!(
-        hint, "use one of: review_request, findings, resolution, question, handoff, note",
+        hint, "use one of: review_request, findings, resolution, question, handoff, note, notice",
         "{out}"
     );
     let (code, out) = send("note", "token ghp_abcdefghijklmnopqrstuvwxyz0123456789");
@@ -5268,4 +5300,188 @@ fn thread_json_gives_each_body_as_a_text_field() {
     let q = &thread["data"]["messages"][0];
     assert_eq!(q["body"], "purged", "{thread}");
     assert!(q.get("text").is_none(), "{thread}");
+}
+
+#[test]
+fn pending_is_unanswered_not_unacked_and_paginates_without_marking() {
+    let (_dir, wa, wb) = two_worktrees();
+    ok(&wb, "b", 0, &["claim", "role:reviewer"]);
+    for (id, to, kind, time) in [
+        ("q1", "b", "question", 10),
+        ("q2", "role:reviewer", "question", 20),
+        ("info", "b", "notice", 30),
+        ("other", "c", "question", 40),
+    ] {
+        ok(
+            &wa,
+            "a",
+            time,
+            &[
+                "msg",
+                "send",
+                "--to",
+                to,
+                "--kind",
+                kind,
+                "--id",
+                id,
+                "--text",
+                "body",
+                "--context",
+                "thread",
+            ],
+        );
+    }
+    let page = ok(
+        &wb,
+        "b",
+        100,
+        &["--read-only", "msg", "pending", "--limit", "1"],
+    );
+    assert_eq!(ids(&page), ["q1"]);
+    assert_eq!(page["data"]["messages"][0]["ageMs"], 90);
+    assert_eq!(page["data"]["more"], true);
+    let cursor = page["data"]["cursor"].as_u64().unwrap().to_string();
+    assert_eq!(
+        ids(&ok(&wb, "b", 100, &["msg", "pending", "--after", &cursor])),
+        ["q2"]
+    );
+    // Pending is a pure read: a question still cannot be acked until shown.
+    assert_ne!(run(&wb, "b", 100, &["msg", "ack", "q1"]).0, 0);
+    ok(&wb, "b", 100, &["msg", "inbox"]);
+    ok(&wb, "b", 100, &["msg", "ack", "q1"]);
+    assert_eq!(ids(&ok(&wb, "b", 101, &["msg", "pending"])), ["q1", "q2"]);
+    // Same-context mail is not a reply. An explicit reference is, even a notice.
+    ok(
+        &wb,
+        "b",
+        102,
+        &[
+            "msg",
+            "send",
+            "--to",
+            "a",
+            "--kind",
+            "note",
+            "--context",
+            "thread",
+            "--text",
+            "unrelated",
+        ],
+    );
+    assert_eq!(ids(&ok(&wb, "b", 103, &["msg", "pending"])), ["q1", "q2"]);
+    ok(
+        &wb,
+        "b",
+        104,
+        &[
+            "msg",
+            "send",
+            "--to",
+            "a",
+            "--kind",
+            "notice",
+            "--reply-to",
+            "q1",
+            "--reply-to",
+            "q2",
+            "--text",
+            "answered",
+        ],
+    );
+    // A role:* delivery needs a sender/via matching that mailbox; historical
+    // role-holder resolution is not inferred from the current lease.
+    assert_eq!(ids(&ok(&wb, "b", 105, &["msg", "pending"])), ["q2"]);
+}
+
+#[test]
+fn pending_reads_a_persons_own_mailbox() {
+    let (_dir, wa, wb) = two_worktrees();
+    ok(
+        &wa,
+        "a",
+        10,
+        &[
+            "msg",
+            "send",
+            "--to",
+            "human:operator",
+            "--kind",
+            "question",
+            "--id",
+            "ask-person",
+            "--text",
+            "Choice?",
+        ],
+    );
+    assert_eq!(
+        ids(&ok(
+            &wb,
+            "human:operator",
+            20,
+            &["--read-only", "msg", "pending"]
+        )),
+        ["ask-person"]
+    );
+}
+
+#[test]
+fn pending_ignores_self_nudges_and_accepts_the_addressed_role_actor() {
+    let (_dir, wa, wb) = two_worktrees();
+    ok(
+        &wa,
+        "asker",
+        0,
+        &[
+            "msg",
+            "send",
+            "--to",
+            "reviewer",
+            "--kind",
+            "question",
+            "--id",
+            "ask-role",
+            "--text",
+            "Question?",
+        ],
+    );
+    ok(
+        &wa,
+        "asker",
+        1,
+        &[
+            "msg",
+            "send",
+            "--to",
+            "reviewer",
+            "--kind",
+            "note",
+            "--reply-to",
+            "ask-role",
+            "--text",
+            "Still waiting?",
+        ],
+    );
+    assert_eq!(
+        ids(&ok(&wb, "reviewer", 2, &["msg", "pending"])),
+        ["ask-role"]
+    );
+    ok(
+        &wb,
+        "reviewer",
+        3,
+        &[
+            "msg",
+            "send",
+            "--to",
+            "asker",
+            "--kind",
+            "resolution",
+            "--reply-to",
+            "ask-role",
+            "--text",
+            "Answer.",
+        ],
+    );
+    assert!(ids(&ok(&wb, "reviewer", 4, &["msg", "pending"])).is_empty());
 }

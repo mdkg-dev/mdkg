@@ -1,6 +1,6 @@
 [package]
 name = "mdkg-git"
-version = "0.7.3"
+version = "0.7.4"
 description = "Hardened Git commands and trusted worktree primitives. Internal to mdkg, no stable API; depend on the mdkg binary"
 edition.workspace = true
 license.workspace = true

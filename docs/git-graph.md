@@ -428,10 +428,16 @@ Agents can't commit to graph files by hand: with the git hooks
 installed, that commit is refused (`git.graph_path`). An agent can run
 `mdkg config set` and `config unset`, as it can run `agents edit`: the
 change goes through mdkg's own writer and takes effect at once.
-A later release is planned to refuse writes to authority fields (env, sandbox,
-approvals) from inside an agent's turn, through `config set`, `config
-unset` and `agents edit`. The one exception is the orchestrator role,
-and only under an explicit delegation the person records.
+Changes to authority fields (`env`, `sandbox`, `approvals`) are refused inside
+an agent's turn with `authority.field_in_turn`. This covers `config set`,
+`config unset`, and definition add, edit and removal, including whole-object
+replacements and `agents edit --file`. Defaults and per-agent policies are
+checked. The same fields may be changed by a person outside a turn, in their
+own terminal; orchestrators have no turn-time exception. Turn markers, live
+actor records and launcher ancestry are checked using the existing outside-turn
+mechanism. Clearing a marker or changing the claimed actor does not grant
+permission. An unrelated worker in the same checkout does not block a person's
+terminal. Ordinary edits, identical values and config dry runs remain available.
 
 ## How work settles
 

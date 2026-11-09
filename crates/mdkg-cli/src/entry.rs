@@ -458,6 +458,10 @@ pub struct EntryRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(with = "Verified")]
     pub verified: Option<Verified>,
+    /// A requirement verdict relayed by an outside-turn coordinator.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "ReviewReceipt")]
+    pub review_receipt: Option<ReviewReceipt>,
     /// A duplicate finding's original (`<node>#<id>`).
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(with = "String")]
@@ -535,6 +539,20 @@ pub struct Fix {
     pub commits: Vec<String>,
     pub by: String,
     pub at: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ReviewReceipt {
+    pub round: String,
+    pub reviewer: String,
+    pub recorded_by: String,
+    pub message: String,
+    pub sha: String,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -617,6 +635,7 @@ impl From<&Entry> for EntryRecord {
             fixers: take(rest, "fixers"),
             superseded_commits: take(rest, "superseded_commits"),
             verified: take(rest, "verified"),
+            review_receipt: take(rest, "review_receipt"),
             duplicate_of: take(rest, "duplicate_of"),
             superseded_by: take(rest, "superseded_by"),
             supersedes: take(rest, "supersedes"),
@@ -2033,7 +2052,7 @@ pub(crate) fn requirement_ids(body: &str) -> Vec<String> {
     out
 }
 
-fn entry_failure(e: EntryError) -> GraphError {
+pub(crate) fn entry_failure(e: EntryError) -> GraphError {
     let message = e.to_string();
     let Some(code) = e.code().and_then(Code::parse) else {
         return match e {

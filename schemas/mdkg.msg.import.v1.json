@@ -235,6 +235,7 @@
         "decision",
         "handoff",
         "note",
+        "notice",
         "receipt",
         "fault"
       ]
@@ -527,6 +528,7 @@
         "config.missing",
         "config.unreadable",
         "config.invalid",
+        "authority.field_in_turn",
         "config.unknown_workspace",
         "config.graph_v2_unsupported",
         "frontmatter.missing_open",

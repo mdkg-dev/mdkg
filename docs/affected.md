@@ -326,7 +326,9 @@ and manifest values containing terminal controls.
   `.mdkg/config.json`; anything under `.github/workflows/`; and whatever
   the config adds. Built-in global paths match ignoring ASCII case, including
   directory components, regardless of the host filesystem. User-defined
-  `global` globs and rule `paths` still match case-sensitively.
+  `global` globs and rule `paths` still match case-sensitively. Two kinds
+  of edit to a built-in global file are narrowed instead (see
+  [Narrowed global files](#narrowed-global-files)).
 - **Everything else** needs a rule, or the answer is `full`.
 
 ## Rules
@@ -419,8 +421,58 @@ In `.mdkg/config.json`:
 - The section is strict: unknown keys, an empty list, an empty `select`
   object, or a `version` other than 1 make the answer `full`
   (`config_invalid`).
-- The config is a global file, so a change to these rules always runs
-  everything.
+- The config is a global file: a change to it runs everything, unless
+  the change is confined to these rules (below).
+
+## Narrowed global files
+
+Two edits to a built-in global file can't change what every test does,
+so they don't force a full run. `affected` parses the file at the base
+and at the head and compares the parsed values, so formatting, key order
+and comments never count. When either side doesn't parse, or anything
+else differs, the file stays global and the run is full. Only a plain
+modification of a regular file up to 16 MiB counts (not a rename, a mode
+change or a case variant of the name), and a user-defined `global` glob
+matching the file still wins.
+
+- **`.mdkg/config.json`, its `affected` rules only.** Every other key of
+  the config, and `affected.version` and `affected.global`, must be equal,
+  and both sides' `affected` sections must be valid. The rules are
+  compared as a set of parsed rules, so reordering them changes nothing.
+  The config then selects what the rules matching `.mdkg/config.json`
+  name (the tests of `affected` itself, say), plus the targets of every
+  rule the range added, changed or removed: a changed rule counts as its
+  old version removed and its new one added.
+- **A Cargo manifest or `Cargo.lock`, versions only.** A `Cargo.toml` may
+  differ only in its package's `version`, `workspace.package.version`, and
+  the `version` requirement of `path` dependencies (in any dependency
+  table, `target.*` and `workspace.dependencies` included): Cargo builds
+  the code at the path either way. A `Cargo.lock` may differ only in the
+  versions of local packages (entries without a `source`) and in
+  dependency lists naming those exact versions. A registry dependency's
+  requirement, a feature, or anything else keeps the file global. The
+  manifest then selects what the rules matching it name: a version bump
+  changes `CARGO_PKG_VERSION`, so name the tests that read the version.
+
+A narrowed file that no rule matches still requests a full run
+(`global_file`, saying which rule is missing), so nothing changes until a
+repository names the tests these edits need.
+
+A removed rule's targets still run because the rule was the evidence that
+those targets cover its paths. Once it's gone, the next change to those
+paths selects something else (another rule's targets, a whole-crate
+fallback, or a full run), and running the old targets once confirms they
+pass at the head the range ends on, so a removal that hid a breakage is
+caught in the range that made it. A changed rule runs its old and new
+targets for the same reason.
+
+A range that changes the rules is also judged under the base's rules:
+every changed path must be accounted for by the base's rules on their
+own as well as by the current ones, and both selections run. A rule the
+range adds therefore can't exempt the range's own paths (a new
+`"select": "none"` rule over a new script still leaves the script
+`unmatched_path`), and `.mdkg/config.json` itself needs a matching rule
+at the base. A rule takes effect for selection once it is in the base.
 
 ## When it says `full`
 
@@ -429,7 +481,7 @@ In `.mdkg/config.json`:
 | `base_missing`, `head_missing` | A revision names no commit (in a shallow clone, fetch it). |
 | `base_not_ancestor` | The base isn't an ancestor of the head, or a shallow clone lacks the history. |
 | `partial_clone` | Objects may be missing and would be fetched; use a full clone. |
-| `global_file` | A file every test depends on changed. |
+| `global_file` | A file every test depends on changed, or a [narrowed](#narrowed-global-files) one that no rule names tests for. |
 | `unmatched_path` | Nothing maps the path (add a rule if it needs no tests or names a suite), or it's a `.go` file no package builds here (build constraints, an ignored folder); no rule fixes the latter. |
 | `rule_selects_all` | A rule says so. |
 | `adapter_failed` | `go list` or `cargo metadata` failed or loaded a package incompletely, or the head's tree couldn't be written faithfully (a symlink, paths a disk would merge, a path git won't check out, over the size caps); the reason has the error. |
@@ -460,7 +512,12 @@ select `affected`, whose private fixture uses the configured active set's
 malformed task data. Partial overrides use bundled defaults for absent kinds.
 Other spec, loop and skill template files are not exercised by this fixture.
 Shared schema/default inputs
-keep whole-package coverage. The configuration itself remains a global file.
+keep whole-package coverage. The configuration is a global file, except
+that a change to its `affected` rules alone selects the `affected` tests
+and the binary's unit tests (beside what the `.mdkg/` rule selects) plus
+the changed rules' targets, and a version-only change to `Cargo.toml`,
+`crates/*/Cargo.toml` or `Cargo.lock` selects `version` and
+`commands_doc` (see [Narrowed global files](#narrowed-global-files)).
 `.config/nextest.toml` selects everything, like `clippy.toml`: it changes how
 every test runs.
 

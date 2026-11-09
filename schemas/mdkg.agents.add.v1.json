@@ -176,6 +176,16 @@
           "type": "string",
           "default": "orchestrator"
         },
+        "wake_kinds": {
+          "description": "Mail kinds that may start a turn. Omitted preserves the default wake\nrules; an empty list leaves mail for a manually started turn.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
         "mode": {
           "description": "Cross-harness preset. This release supports auto only.",
           "type": "string",
@@ -329,6 +339,7 @@
         "config.missing",
         "config.unreadable",
         "config.invalid",
+        "authority.field_in_turn",
         "config.unknown_workspace",
         "config.graph_v2_unsupported",
         "frontmatter.missing_open",

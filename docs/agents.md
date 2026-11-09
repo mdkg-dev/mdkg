@@ -33,7 +33,9 @@ What the launcher adds is the role and the coordinator:
   worker's real git commit in a linked worktree and preservation of staged
   work across all three harnesses.
 - A **reviewer** reads only (Codex in `read-only` mode); its final message
-  is imported as its reply. Its checkout is the author's, so its settings
+  is imported as its reply. Its one ledger write is its own verdict on a
+  requirement, through the `req_verdict` MCP tool, which an open review
+  round naming it must allow ([review receipts](review-receipts.md)). Its checkout is the author's, so its settings
   aren't loaded: Claude reads only your user settings (no project
   `.claude/settings*.json` hooks or permissions, `.mcp.json` or
   `CLAUDE.md`), and OpenCode skips the project's config. Codex can't load
@@ -1192,8 +1194,8 @@ interruption and thread-only recovery.
 
 ### Reloads, restarts and stopping
 
-A long-running `agents up` (without `--once`) checks every two seconds for
-three things, and on any of them stops starting new turns, lets every
+A long-running `agents up` (without `--once`) checks local files every two
+seconds for three things, and on any of them stops starting new turns, lets every
 running turn or queue dispatch finish, then re-execs itself with the same
 arguments:
 
@@ -1209,6 +1211,35 @@ arguments:
   versions this build doesn't use. If the binary was also replaced, it
   re-execs the new one. Otherwise it stops once with `coord.store_failed`
   and the hint to start the newer build, instead of failing every turn.
+
+Idle mail waits keep one CLI child alive for the requested timeout (600
+seconds by default, with a 30-second minimum under supervision), including
+workers and reviewers waiting for a request.
+The supervisor checks stop and drain locally while that child waits and
+cancels and reaps it within about one second. Unchanged repository config,
+refs and worktree registrations skip full Git reload reads. Full authority
+read attempts run at most once per 30 seconds, including after unrelated ref
+updates or a failed read. Committed definition changes reload on the next
+permitted read. Before admitting each headless turn, the supervisor also
+checks all three now, without that spacing. Mail that arrives just after
+`agents edit` (a new harness, model or instructions) therefore doesn't
+start a turn from the old definition: the supervisor finishes, re-execs,
+and the mail starts its turn there. That check reads Git only when local
+refs or config changed since the last read. Claude, Codex and OpenCode
+share this behavior.
+
+Interactive receivers also keep a long header wait (at least 30 seconds,
+600 by default). Local route, pending/observed evidence, saved actor state,
+and thread records for the actor or its selected worktree cancel that wait
+and refresh dispatch within about one second. Unrelated actors' activity
+does not restart an idle receiver's wait. The filesystem snapshot is taken before dispatch so a change
+just before waiting is not missed. Identical route writes by an idle dispatch
+do not wake it again. These reads only invalidate the wait; existing mode,
+lease, routing and evidence checks still decide whether delivery may run.
+
+Missing sign-in and repeated turn failures back off independently of incoming
+mail: 30, 60, 120, 240, then 300 seconds between attempts. Successful turns
+reset the failure streak. Stop and drain also interrupt these pauses.
 
 For a supervisor already running 0.7.1, a reinstall that upgrades the
 store needs no manual restart: the install replaces the binary, and the
@@ -1661,14 +1692,26 @@ The 0.7.0 behaviours, now the mail and lease rules:
   has already been told about blocks a stop once. Mail delivered at start
   does not block the same session again just because it remains unacked.
 - **Idle wake**: Claude and OpenCode use `wait` after a turn ends; Codex
-  needs its separate interactive mail receiver. Direct mail of any kind
-  wakes a session, as does a
+  needs its separate interactive mail receiver. With no `wake_kinds` in
+  the agent definition, direct mail of any kind wakes a session, as does a
   channel's question, handoff, decision, findings, review_request or
   resolution; channel notes don't, and neither does a note replying to the
   agent's own message, in the hooks and in Codex's receiver. (Past 40
   pages of such notes, the receiver wakes on the newest one rather than
   read on, so later mail is never hidden.) A session's reminder record
   prevents a stop and a waiter from delivering the same new mail twice.
+  An optional [`wake_kinds`](agent-definitions.md) list selects which kinds
+  start a turn instead, in the supervisor, hooks and Codex receiver. Other
+  mail remains available to the next turn or digest. An empty list starts
+  no mail-triggered turns. An explicit filter never wakes on an excluded
+  kind, including past the legacy receiver page cap.
+  `notice` is readable in inboxes, threads and digests but never starts a
+  turn, even if listed in `wake_kinds`. The launcher uses it for default
+  final replies when every delivered message is a resolution, decision,
+  note or notice. Mixed actionable mail keeps the ordinary reply kind;
+  an explicit operator `--reply-kind` takes precedence. A lease request
+  sends its holder a question and its requester's `reports_to` a separate
+  notice in the same thread, so only the holder is asked to act.
 - **Edit guard** (`lease.edit`): an edit to a file the agent holds no lease on is
   refused, with the claim command to run, as is any edit inside git's own
   folder. A file in another worktree of the repository is checked against
@@ -2242,3 +2285,17 @@ attempts separately; failure diagnostics retain each attempted launch's fixed
 explanation. Hook contents and commands are never copied into these reasons.
 Idle turns and other roles/harnesses have no such receipt. Interactive users
 still review project and hook trust in Codex; mdkg writes no trust hashes.
+
+Before the first turn, `mdkg agents prepare worker-1` creates or verifies the
+worker's managed worktree and prints its canonical path. `--json` returns
+`data.agent` and `data.cwd`. It uses the same configured worktree/branch names,
+base selection and checks as `agents up`, records `work_base`, and starts no
+turn, supervisor, login probe or model call. A later `agents up worker-1`
+reuses that directory, including settings files placed there in advance.
+
+Preparation runs outside agent turns and requires a configured worker with
+`worktree` enabled, in a file definition or legacy inline settings. Unknown
+agents return `run.unknown_agent`; saved-only agents, reviewers and `--cwd`
+agents return `run.unsupported`. Existing legacy inline agents keep their
+saved execution settings, as `agents up` does. Preparation does not infer
+whether a saved-only directory was originally a managed worktree.

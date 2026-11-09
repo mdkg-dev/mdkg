@@ -19,6 +19,7 @@ mod evidence;
 #[doc(hidden)]
 pub mod guard;
 pub mod route;
+mod wake;
 pub use dispatch::{
     Report, WakeStatus, WatchedDispatch, dispatch_watched, supervise, supervise_durable,
 };
@@ -338,18 +339,48 @@ pub fn wake_page(
     floor: u64,
     limit: usize,
 ) -> Result<Vec<Header>, RunError> {
+    wake_page_for(mail, actor, floor, limit, None)
+}
+
+pub(crate) fn wake_page_for(
+    mail: &mut dyn Mail,
+    actor: &str,
+    floor: u64,
+    limit: usize,
+    kinds: Option<&[String]>,
+) -> Result<Vec<Header>, RunError> {
+    if kinds.is_some_and(<[String]>::is_empty) {
+        return Ok(Vec::new());
+    }
     let mut out: Vec<Header> = Vec::new();
     let mut after = floor;
-    for _ in 0..WAKE_PAGES {
+    let mut pages = 0;
+    loop {
         let page = mail.headers(actor, Some(after), limit)?;
         let more = page.more;
         let next = page.messages.iter().map(|h| h.seq).max().or(page.cursor);
         let headers = wake_headers(mail, actor, page.messages);
-        let woke = headers.iter().any(hooks::wakes);
-        out.extend(headers);
+        let woke = headers.iter().any(|m| hooks::wakes_for(m, kinds));
+        if kinds.is_some() {
+            // Deferred headers remain unread. Do not retain every excluded
+            // page or turn an excluded kind into a wake at the legacy cap.
+            out.extend(headers.into_iter().filter(|m| hooks::wakes_for(m, kinds)));
+        } else {
+            // Notices remain readable in the mailbox, but cannot become
+            // the legacy cap's fallback wake or hide a later actionable page.
+            out.extend(
+                headers
+                    .into_iter()
+                    .filter(|h| h.kind != mdkg_coord_sqlite::mail::NOTICE_KIND),
+            );
+        }
         match next {
             Some(n) if more && !woke && n > after => after = n,
             _ => return Ok(out),
+        }
+        pages += 1;
+        if kinds.is_none() && pages >= WAKE_PAGES && !out.is_empty() {
+            break;
         }
     }
     if let Some(last) = out.last_mut() {
@@ -372,8 +403,22 @@ pub fn reserve_payload(
     session: &Uuid,
     unread: &[Header],
 ) -> Option<Reserved> {
+    reserve_payload_for(common, actor, session, unread, None)
+}
+
+pub(crate) fn reserve_payload_for(
+    common: &Path,
+    actor: &str,
+    session: &Uuid,
+    unread: &[Header],
+    kinds: Option<&[String]>,
+) -> Option<Reserved> {
     state::check_name(actor).ok()?;
-    let mut eligible: Vec<Header> = unread.iter().filter(|m| hooks::wakes(m)).cloned().collect();
+    let mut eligible: Vec<Header> = unread
+        .iter()
+        .filter(|m| hooks::wakes_for(m, kinds))
+        .cloned()
+        .collect();
     eligible.sort_by_key(|m| m.seq);
     eligible.dedup_by_key(|m| m.seq);
     let through = eligible.last()?.seq;
@@ -690,6 +735,84 @@ mod tests {
         // Only a note that replies is looked up.
         assert_eq!(mail.asked, ["mine", "theirs", "unknown", "broken"]);
         assert!(reserve_payload(Path::new("/unused"), "alice", &Uuid::nil(), &got[..1]).is_none());
+    }
+
+    #[test]
+    fn passive_notices_never_become_the_receiver_cap_fallback_or_hide_questions() {
+        let count = (WAKE_PAGES + 1) * 5;
+        let mut unread: Vec<_> = (1..=count as u64)
+            .map(|seq| crate::mail::Header {
+                seq,
+                kind: "notice".into(),
+                sender: "peer".into(),
+                room: None,
+                reference_ids: vec![],
+            })
+            .collect();
+        let mut mail = Senders {
+            unread: unread.clone(),
+            ..Senders::default()
+        };
+        assert!(wake_page(&mut mail, "alice", 0, 200).unwrap().is_empty());
+        unread.push(crate::mail::Header {
+            seq: count as u64 + 1,
+            kind: "question".into(),
+            sender: "peer".into(),
+            room: None,
+            reference_ids: vec![],
+        });
+        mail.unread = unread;
+        let got = wake_page(&mut mail, "alice", 0, 200).unwrap();
+        assert_eq!(
+            got.iter()
+                .filter(|h| hooks::wakes(h))
+                .map(|h| h.seq)
+                .collect::<Vec<_>>(),
+            [count as u64 + 1]
+        );
+    }
+
+    #[test]
+    fn wake_kinds_receiver_scans_past_excluded_pages_without_a_false_wake() {
+        let excluded = 5 * (WAKE_PAGES + 1) as u64;
+        let mut unread: Vec<_> = (1..=excluded)
+            .map(|seq| crate::mail::Header {
+                seq,
+                kind: "note".into(),
+                sender: "peer".into(),
+                room: None,
+                reference_ids: vec![],
+            })
+            .collect();
+        unread.push(crate::mail::Header {
+            seq: excluded + 1,
+            kind: "question".into(),
+            sender: "peer".into(),
+            room: None,
+            reference_ids: vec![],
+        });
+        let mut mail = Senders {
+            unread,
+            ..Senders::default()
+        };
+        let questions = vec!["question".into()];
+        let got = wake_page_for(&mut mail, "alice", 0, 200, Some(&questions)).unwrap();
+        assert_eq!(
+            got.iter().map(|h| h.seq).collect::<Vec<_>>(),
+            [excluded + 1]
+        );
+        assert!(mail.pages > WAKE_PAGES);
+        assert_eq!(mail.unread.len(), (excluded + 1) as usize);
+        mail.unread.pop();
+        let got = wake_page_for(&mut mail, "alice", 0, 200, Some(&questions)).unwrap();
+        assert!(got.is_empty(), "excluded notes never fail open");
+        let pages = mail.pages;
+        assert!(
+            wake_page_for(&mut mail, "alice", 0, 200, Some(&[]))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(mail.pages, pages, "an empty filter reads no pages");
     }
 
     #[test]
@@ -1153,6 +1276,26 @@ mod tests {
             retry.previous
         ));
         assert!(reserve_payload(&f.0, "alice", &session, &[header(6), header(7)]).is_none());
+    }
+
+    #[test]
+    fn wake_kinds_reservation_accepts_selected_channel_notes_and_no_other_kinds() {
+        let f = Fixture::new();
+        let session = Uuid::now_v7();
+        let selected = vec!["note".into()];
+        let mut note = header(7);
+        note.room = Some("dev".into());
+        let mut question = header(8);
+        question.kind = "question".into();
+        let batch =
+            reserve_payload_for(&f.0, "alice", &session, &[note, question], Some(&selected))
+                .unwrap();
+        assert_eq!(batch.through, 7);
+        assert!(batch.line.contains("#7"));
+        assert!(!batch.line.contains("#8"));
+        assert!(
+            reserve_payload_for(&f.0, "alice", &Uuid::now_v7(), &[header(9)], Some(&[])).is_none()
+        );
     }
 
     #[test]

@@ -71,6 +71,10 @@ pub enum MsgCommand {
     /// Show your unacked mail (your mailbox and the roles you hold).
     #[command(after_help = examples!("msg inbox", "msg inbox --channel dev --json", "msg inbox --from orchestrator --kind question"))]
     Inbox(InboxArgs),
+    /// List unanswered questions and decisions, oldest first, with age.
+    /// Acknowledgement does not count as an answer; a --reply-to does.
+    #[command(after_help = examples!("msg pending --as worker", "msg pending --after 42 --json"))]
+    Pending(PendingArgs),
     /// Compute the current mail digest without marking any message shown.
     Digest(DigestArgs),
     /// Wait for mail; exits 6 if none arrives before the timeout.
@@ -148,6 +152,18 @@ pub enum RoomCommand {
 }
 
 #[derive(Debug, Args)]
+pub struct PendingArgs {
+    /// Continue after this store-wide message sequence.
+    #[arg(long, default_value_t = 0)]
+    after: u64,
+    /// The most unanswered messages to return.
+    #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u16).range(1..=1000))]
+    limit: u16,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
 pub struct Target {
     /// Post to this channel's members.
     #[arg(long = "channel", value_name = "NAME", conflicts_with_all = ["to", "legacy_room"], required_unless_present_any = ["to", "legacy_room"])]
@@ -164,7 +180,7 @@ pub struct SendArgs {
     #[command(flatten)]
     target: Target,
     /// review_request, findings, resolution, question, decision, handoff
-    /// or note.
+    /// or note; notice is readable information that never wakes an agent.
     #[arg(long)]
     kind: String,
     /// Decision scope: implement, test, commit, design or review. Fixed limits always apply.
@@ -525,6 +541,7 @@ impl MsgCommand {
             MsgCommand::Watch(a) => a.json,
             MsgCommand::Send(a) => a.json,
             MsgCommand::Inbox(a) => a.json,
+            MsgCommand::Pending(a) => a.json,
             MsgCommand::Digest(a) => a.json,
             MsgCommand::Wait(a) => a.json,
             MsgCommand::Ack(a) => a.json,
@@ -542,6 +559,7 @@ impl MsgCommand {
             MsgCommand::Watch(_) => "msg.watch",
             MsgCommand::Send(_) => "msg.send",
             MsgCommand::Inbox(_) => "msg.inbox",
+            MsgCommand::Pending(_) => "msg.pending",
             MsgCommand::Digest(_) => "msg.digest",
             MsgCommand::Wait(_) => "msg.wait",
             MsgCommand::Ack(_) => "msg.ack",
@@ -739,7 +757,7 @@ fn delivery_record(d: &Delivery) -> DeliveryRecord {
 }
 
 /// A body's parts as one string, for [`MessageRecord::text`].
-fn body_text(parts: &Value) -> String {
+pub(crate) fn body_text(parts: &Value) -> String {
     let lines: Vec<String> = parts
         .as_array()
         .into_iter()
@@ -867,6 +885,25 @@ pub struct InboxData {
     /// without `--after` to see the role's backlog.
     pub cursor: u64,
     /// More matched than `--limit` allowed.
+    pub more: bool,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingRecord {
+    #[serde(flatten)]
+    pub message: MessageRecord,
+    /// Milliseconds since sending, saturated at zero if the clock moved back.
+    pub age_ms: u64,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingData {
+    pub mailboxes: Vec<String>,
+    /// Store send order, oldest first. Includes acknowledged but unanswered mail.
+    pub messages: Vec<PendingRecord>,
+    pub cursor: u64,
     pub more: bool,
 }
 
@@ -1962,6 +1999,30 @@ pub(crate) fn receipt_baseline(
         store
             .activity_cursor()
             .map_err(|e| GraphError::failure(Code::CoordStoreFailed, e.to_string()))
+    })
+}
+
+pub(crate) fn attest_review_import(
+    mail: &mdkg_run::CliMail,
+    proof: &mdkg_run::mail::ReviewImport<'_>,
+) -> Result<(), mdkg_run::RunError> {
+    receipt_operation(mail, || {
+        let text = read_input(proof.file, "review final import")?;
+        let parts = imported_parts(&text);
+        let (_, digest, _) = mail::body_digest(&parts)
+            .map_err(|_| usage(Code::UsageInvalidArguments, "can't digest reviewer output"))?;
+        let (_, mut store) = open_writer(&mail.root)?;
+        store
+            .entry_attest_review_import(&mdkg_coord_sqlite::entries::ReviewImportEvidence {
+                reviewer: proof.reviewer,
+                launcher: &mail.launcher,
+                turn: proof.turn,
+                message: proof.message,
+                digest: &digest,
+                requests: proof.requests,
+                now_ms: now_ms(),
+            })
+            .map_err(crate::entry::entry_failure)
     })
 }
 
@@ -3098,6 +3159,90 @@ fn forward_report(
     }))
 }
 
+/// A bounded context read; total counts all selected message headers, while
+/// cut reports bodies omitted by the read budget before pack's final budgeting.
+pub(crate) struct PackThread {
+    pub context_id: String,
+    pub messages: Vec<Message>,
+    pub nodes: Vec<String>,
+    pub total: usize,
+    pub cut: bool,
+}
+
+/// Threads are public read surfaces. Preserve the trigger first and load other
+/// selected bodies in bounded pages, stopping once enough text can fill a pack.
+pub(crate) fn pack_thread(
+    root: &Path,
+    typed: &str,
+    budget: usize,
+) -> Result<PackThread, GraphError> {
+    const PAGE: usize = 16;
+    let (_, mut store) = open_reader(root)?;
+    let id = message_handle(&store, typed, false)?;
+    let target = store.message(&id, now_ms()).map_err(mail_error)?;
+    let context_id = target.context_id.clone();
+    let mut used = target
+        .parts
+        .as_ref()
+        .map_or(0, |_| target.size)
+        .saturating_add(256);
+    let mut messages = vec![target];
+    let mut after = 0;
+    let mut total;
+    let cap = budget.saturating_mul(4) as u64;
+    'pages: loop {
+        let (_, page, count) = store
+            .message_thread_page(&id, after, PAGE, now_ms())
+            .map_err(mail_error)?;
+        total = count;
+        let size = page.len();
+        for message in page {
+            after = message.seq;
+            if message.message_id == id {
+                continue;
+            }
+            if used >= cap {
+                break 'pages;
+            }
+            used = used.saturating_add(
+                message
+                    .parts
+                    .as_ref()
+                    .map_or(0, |_| message.size)
+                    .saturating_add(256),
+            );
+            messages.push(message);
+        }
+        if size < PAGE || messages.len() >= total {
+            break;
+        }
+    }
+    let cut = messages.len() < total;
+    let mut nodes = Vec::new();
+    for message in &messages {
+        let flow = store
+            .message_flow(&message.message_id)
+            .map_err(ledger_error)?;
+        nodes.extend(flow.nodes.into_iter().map(|n| n.id));
+        nodes.extend(flow.entries.into_iter().map(|(n, _)| n.id));
+        if let Some(node) = message
+            .decision
+            .as_ref()
+            .and_then(|d| d.get("nodeRef"))
+            .and_then(Value::as_str)
+        {
+            nodes.push(node.to_string());
+        }
+    }
+    Ok(PackThread {
+        context_id,
+        messages,
+        nodes,
+        total,
+        cut,
+    })
+}
+
 fn thread_report(
     root: &Path,
     actor: Option<String>,
@@ -3219,6 +3364,14 @@ fn thread_report(
     }))
 }
 
+fn imported_parts(text: &str) -> Value {
+    let part = match serde_json::from_str::<Value>(text) {
+        Ok(data) => json!({"kind": "data", "data": data, "mediaType": "application/json"}),
+        Err(_) => json!({"kind": "text", "text": text}),
+    };
+    Value::Array(vec![part])
+}
+
 fn import_report(
     root: &Path,
     actor: Option<String>,
@@ -3252,11 +3405,7 @@ fn import_report(
     }
     let to = destination(&a.target)?;
     let text = read_input(&a.file, "import")?;
-    let part = match serde_json::from_str::<Value>(&text) {
-        Ok(data) => json!({"kind": "data", "data": data, "mediaType": "application/json"}),
-        Err(_) => json!({"kind": "text", "text": text}),
-    };
-    let parts = Value::Array(vec![part]);
+    let parts = imported_parts(&text);
     check_body(&parts)?;
     let config = committed_config(&repo)?;
     let mut out = Outgoing {
@@ -3401,6 +3550,41 @@ pub fn run(root: &Path, actor: Option<String>, cmd: &mut MsgCommand) -> u8 {
                 mark_listed(root, listed);
             }
             code
+        }
+        MsgCommand::Pending(a) => {
+            let r = (|| {
+                let (repo, mut store) = open_reader(root)?;
+                let actor = reader(&repo, actor, None)?;
+                let (inbox, mailboxes) = store
+                    .pending_for_actor(&actor, a.after, usize::from(a.limit), now_ms)
+                    .map_err(mail_error)?;
+                let now = now_ms();
+                Ok(Report::ok(PendingData {
+                    mailboxes,
+                    messages: inbox
+                        .messages
+                        .iter()
+                        .map(|m| PendingRecord {
+                            message: message_record(m),
+                            age_ms: now.saturating_sub(m.sent_ms),
+                        })
+                        .collect(),
+                    cursor: inbox.cursor,
+                    more: inbox.more,
+                }))
+            })()
+            .unwrap_or_else(Report::failed);
+            output::emit(name, json, r, |d| {
+                if d.messages.is_empty() {
+                    println!("no unanswered mail");
+                }
+                for pending in &d.messages {
+                    println!("age {}s", pending.age_ms / 1000);
+                    print_message(&pending.message);
+                }
+                let more = if d.more { " (more: pass --after)" } else { "" };
+                println!("cursor {}{more}", d.cursor);
+            })
         }
         MsgCommand::Digest(a) => {
             let r = digest_report(root, actor, a).unwrap_or_else(Report::failed);
@@ -3738,7 +3922,7 @@ pub(crate) fn send_direct(
     // path, and kinds mdkg reserves to itself never go out from here.
     if !matches!(
         kind,
-        "question" | "note" | "handoff" | "findings" | "resolution" | "review_request"
+        "question" | "note" | "notice" | "handoff" | "findings" | "resolution" | "review_request"
     ) {
         return Err(usage(
             Code::MsgBadKind,

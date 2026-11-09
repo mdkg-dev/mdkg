@@ -8,6 +8,7 @@ loop-guard state remain machine-local, outside the committed definition.
 mdkg agents add coder --harness codex --role worker --model gpt-6.1-sol
 mdkg agents edit coder --instructions 'Work on the tasks assigned to you.'
 mdkg agents edit coder --policy '{"timeout":900}'
+mdkg agents edit coder --wake-kinds question,decision,handoff
 mdkg agents edit coder --unset model
 mdkg agents rm coder
 ```
@@ -38,6 +39,27 @@ The [JSON Schema](../schemas/mdkg.agent.v1.json) describes the fields.
 `cwd` is resolved from the launcher's checkout. `reports_to` defaults
 to `orchestrator` and names the actor receiving turn receipts and faults,
 including turn errors and refused replies.
+
+`wake_kinds` optionally lists the mail kinds that start an automatic turn,
+for Claude, Codex and OpenCode alike. Omit it to keep the default direct and
+channel wake rules. An empty array disables mail-triggered turns; a bare
+`--wake-kinds` writes that array. `--unset wake_kinds` restores the default.
+Use comma-separated values or repeat the flag. Unknown kinds are refused.
+An explicit list replaces the default direct/channel kind selection, so
+including `note` also enables channel notes. Receipts remain non-waking;
+hooks and the interactive receiver also leave notes answering the agent's
+own mail non-waking. Other mail remains unacked and readable until a turn
+starts for eligible mail, a manual prompt, or digest delivery.
+Automatic batch turns choose an eligible conversation, paging past
+deferred conversations. A conversation containing no waking message is not
+delivered by a later automatic batch turn for another conversation; read it
+manually or use digest delivery. Digest delivery includes deferred kinds in
+its normal budget.
+
+`agents list --json` and the read-only MCP `agents_list` tool expose the
+optional list. Definition changes remain operator CLI operations; MCP
+does not provide definition mutation tools. Existing supervisors reload
+when their committed definition changes.
 
 `mode` defaults to `auto`, the only supported preset in this release.
 Other presets are reserved and refused. Optional `sandbox` and `approvals`

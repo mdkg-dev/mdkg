@@ -4456,3 +4456,273 @@ fn record_output_and_api_schema_changes_select_the_watch_tests() {
         base = head;
     }
 }
+
+/// Sets the config's `affected` section (or another top-level key).
+fn set_config(dir: &Path, key: &str, value: Value) {
+    let path = dir.join(".mdkg/config.json");
+    let mut config: Value =
+        serde_json::from_slice(&fs::read(&path).expect("config")).expect("config JSON");
+    config[key] = value;
+    write(dir, ".mdkg/config.json", &config.to_string());
+}
+
+fn suites(v: &Value) -> Vec<String> {
+    v["data"]["selected"]["suites"]
+        .as_array()
+        .expect("suites")
+        .iter()
+        .map(|s| s.as_str().expect("suite").to_string())
+        .collect()
+}
+
+/// A config edit confined to its `affected` rules selects the config's own
+/// rule plus every added, changed or removed rule's targets; anything else
+/// that differs keeps the run full.
+#[test]
+fn a_rules_only_config_edit_selects_the_changed_rules_targets() {
+    let rules = || {
+        vec![
+            serde_json::json!({"paths": [".mdkg/config.json"], "select": {"suites": ["affected"]}}),
+            serde_json::json!({"paths": ["docs/**"], "select": {"suites": ["docs"]}}),
+            serde_json::json!({"paths": ["a/**"], "select": {"suites": ["a"]}}),
+        ]
+    };
+    let added = {
+        let mut r = rules();
+        r.push(serde_json::json!({"paths": ["c/**"], "select": {"suites": ["c"]}}));
+        r
+    };
+    let removed = {
+        let mut r = rules();
+        r.remove(2);
+        r
+    };
+    let changed = {
+        let mut r = rules();
+        r[1] = serde_json::json!({"paths": ["docs/**"], "select": {"suites": ["docs2"]}});
+        r
+    };
+    let reordered = {
+        let mut r = rules();
+        r.swap(1, 2);
+        r
+    };
+    for (what, head, want) in [
+        ("added", added, vec!["affected", "c"]),
+        ("removed", removed, vec!["a", "affected"]),
+        ("changed", changed, vec!["affected", "docs", "docs2"]),
+        ("reordered", reordered, vec!["affected"]),
+    ] {
+        let (s, _) = repo();
+        set_config(
+            &s.0,
+            "affected",
+            serde_json::json!({"version": 1, "rules": rules()}),
+        );
+        let base = commit(&s.0, "rules");
+        set_config(
+            &s.0,
+            "affected",
+            serde_json::json!({"version": 1, "rules": head}),
+        );
+        commit(&s.0, what);
+        let (code, v) = affected(&s.0, &["--base", &base]);
+        assert_eq!(code, 0, "{what}: {v}");
+        assert_eq!(v["data"]["mode"], "selective", "{what}: {v}");
+        assert_eq!(suites(&v), want, "{what}: {v}");
+        assert_eq!(
+            v["data"]["paths"][0]["matched_by"],
+            serde_json::json!(["rule"]),
+            "{what}"
+        );
+    }
+    // A key outside `affected`, or `affected.global`, keeps it global.
+    for (what, key, value) in [
+        ("outside", "root_required", serde_json::json!(true)),
+        (
+            "global",
+            "affected",
+            serde_json::json!({"version": 1, "global": ["x/**"], "rules": rules()}),
+        ),
+    ] {
+        let (s, _) = repo();
+        set_config(
+            &s.0,
+            "affected",
+            serde_json::json!({"version": 1, "rules": rules()}),
+        );
+        let base = commit(&s.0, "rules");
+        set_config(&s.0, key, value);
+        commit(&s.0, what);
+        let (_, v) = affected(&s.0, &["--base", &base]);
+        assert_eq!(v["data"]["mode"], "full", "{what}: {v}");
+        assert!(
+            codes(&v).contains(&"global_file".to_string()),
+            "{what}: {v}"
+        );
+    }
+    // A base whose section doesn't parse fails toward full.
+    let (s, _) = repo();
+    set_config(&s.0, "affected", serde_json::json!({"rulez": []}));
+    let base = commit(&s.0, "broken");
+    set_config(
+        &s.0,
+        "affected",
+        serde_json::json!({"version": 1, "rules": rules()}),
+    );
+    commit(&s.0, "fixed");
+    let (_, v) = affected(&s.0, &["--base", &base]);
+    assert_eq!(v["data"]["mode"], "full", "{v}");
+    assert!(codes(&v).contains(&"global_file".to_string()), "{v}");
+}
+
+/// The range's own rules can't narrow it: each changed path must also be
+/// accounted for by the base's rules, and the config itself needs a rule
+/// at the base.
+#[test]
+fn a_rules_only_config_edit_cant_exempt_its_own_range() {
+    let own =
+        serde_json::json!({"paths": [".mdkg/config.json"], "select": {"suites": ["affected"]}});
+    let (s, _) = repo();
+    set_config(
+        &s.0,
+        "affected",
+        serde_json::json!({"rules": [own.clone()]}),
+    );
+    let base = commit(&s.0, "own rule");
+    write(&s.0, "scripts/x.sh", "x\n");
+    set_config(
+        &s.0,
+        "affected",
+        serde_json::json!({"rules": [own.clone(), {"paths": ["scripts/**"], "select": "none"}]}),
+    );
+    commit(&s.0, "exempt scripts");
+    let (_, v) = affected(&s.0, &["--base", &base]);
+    assert_eq!(v["data"]["mode"], "full", "{v}");
+    let reasons = v["data"]["reasons"].as_array().expect("reasons");
+    assert!(
+        reasons.iter().any(|r| r["code"] == "unmatched_path"
+            && r["path"] == "scripts/x.sh"
+            && r["detail"]
+                .as_str()
+                .expect("detail")
+                .contains("the base's rules")),
+        "{v}"
+    );
+    assert!(
+        !reasons.iter().any(|r| r["path"] == ".mdkg/config.json"),
+        "{v}"
+    );
+
+    // Without a rule for the config at the base, adding one is still full.
+    let (s, base) = repo();
+    set_config(&s.0, "affected", serde_json::json!({"rules": [own]}));
+    commit(&s.0, "own rule");
+    let (_, v) = affected(&s.0, &["--base", &base]);
+    assert_eq!(v["data"]["mode"], "full", "{v}");
+    let reasons = v["data"]["reasons"].as_array().expect("reasons");
+    assert!(
+        reasons.iter().any(|r| r["code"] == "global_file"
+            && r["path"] == ".mdkg/config.json"
+            && r["detail"]
+                .as_str()
+                .expect("detail")
+                .contains("the base's rules")),
+        "{v}"
+    );
+}
+
+/// The Rust workspace with a rule naming the manifests' version tests.
+fn rust_repo_with_version_rule(lock: Option<&str>) -> (Scratch, String) {
+    let (s, _) = rust_repo();
+    set_config(
+        &s.0,
+        "affected",
+        serde_json::json!({"rules": [{"paths": ["Cargo.toml", "Cargo.lock", "crates/*/Cargo.toml"], "select": {"suites": ["version"]}}]}),
+    );
+    if let Some(lock) = lock {
+        write(&s.0, "Cargo.lock", lock);
+    }
+    let base = commit(&s.0, "version rule");
+    (s, base)
+}
+
+fn fixture_lock(local: &str, registry: &str) -> String {
+    format!(
+        "version = 4\n\n[[package]]\nname = \"cli-fx\"\nversion = \"{local}\"\ndependencies = [\n \"core-fx {local}\",\n \"dep-fx\",\n]\n\n[[package]]\nname = \"core-fx\"\nversion = \"{local}\"\n\n[[package]]\nname = \"core-fx\"\nversion = \"9.0.0\"\nsource = \"registry+https://example.invalid/index\"\nchecksum = \"00\"\n\n[[package]]\nname = \"dep-fx\"\nversion = \"{registry}\"\nsource = \"registry+https://example.invalid/index\"\nchecksum = \"00\"\n"
+    )
+}
+
+/// A manifest change confined to the workspace packages' versions selects
+/// the rule naming the version tests; anything else stays global.
+#[test]
+fn a_version_only_manifest_change_selects_the_version_rule() {
+    if !have("cargo") {
+        eprintln!("skipped: cargo isn't on PATH");
+        return;
+    }
+    let core = "[package]\nname = \"core-fx\"\nversion = \"0.0.0\"\nedition = \"2021\"\n";
+    let cli = "[package]\nname = \"cli-fx\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[dependencies]\ncore-fx = { path = \"../core\" }\n";
+    let bump = |text: &str| text.replace("0.0.0", "0.1.0");
+    for (what, edits, want) in [
+        (
+            "version bump",
+            vec![
+                ("crates/core/Cargo.toml", bump(core)),
+                (
+                    "crates/cli/Cargo.toml",
+                    bump(cli).replace(
+                        "{ path = \"../core\" }",
+                        "{ path = \"../core\", version = \"0.1.0\" }",
+                    ),
+                ),
+                ("Cargo.lock", fixture_lock("0.1.0", "1.0.0")),
+            ],
+            "selective",
+        ),
+        (
+            "a dependency change",
+            vec![(
+                "crates/cli/Cargo.toml",
+                cli.replace(
+                    "{ path = \"../core\" }",
+                    "{ path = \"../core\", default-features = false }",
+                ),
+            )],
+            "full",
+        ),
+        (
+            "a lock change beyond the workspace versions",
+            vec![("Cargo.lock", fixture_lock("0.1.0", "1.0.1"))],
+            "full",
+        ),
+    ] {
+        let (s, base) = rust_repo_with_version_rule(Some(&fixture_lock("0.0.0", "1.0.0")));
+        for (path, text) in &edits {
+            write(&s.0, path, text);
+        }
+        commit(&s.0, what);
+        let (_, v) = affected(&s.0, &["--base", &base]);
+        assert_eq!(v["data"]["mode"], want, "{what}: {v}");
+        if want == "selective" {
+            assert_eq!(suites(&v), ["version"], "{what}: {v}");
+            assert_eq!(
+                v["data"]["selected"]["rust"],
+                serde_json::json!([]),
+                "{what}"
+            );
+        } else {
+            assert!(
+                codes(&v).contains(&"global_file".to_string()),
+                "{what}: {v}"
+            );
+        }
+    }
+    // Without a rule naming the version tests, a bump stays global.
+    let (s, base) = rust_repo();
+    write(&s.0, "crates/core/Cargo.toml", &bump(core));
+    commit(&s.0, "bump");
+    let (_, v) = affected(&s.0, &["--base", &base]);
+    assert_eq!(v["data"]["mode"], "full", "{v}");
+    assert_eq!(codes(&v), ["global_file"], "{v}");
+}

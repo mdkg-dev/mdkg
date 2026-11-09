@@ -944,10 +944,10 @@ fn answered(conn: &Connection, seq: u64, message_id: &str) -> Result<bool, Ledge
         return Ok(open == 0);
     }
     let replied: bool = conn.query_row(
-        "SELECT EXISTS (
-             SELECT 1 FROM msg_messages r, json_each(r.reference_ids) j
-             WHERE j.value = ?2 AND r.seq > ?1
-               AND r.sender IN (SELECT mailbox FROM msg_deliveries WHERE seq = ?1))",
+        &format!(
+            "SELECT EXISTS (SELECT 1 FROM ({}) answered WHERE seq = ?1 AND message_id = ?2)",
+            crate::mail::ANSWER_REFS_SQL
+        ),
         params![sql_ms(seq), message_id],
         |r| r.get(0),
     )?;
@@ -2139,6 +2139,32 @@ mod tests {
                 .acks
                 .iter()
                 .any(|a| a.message_id == "q1" && a.via == "supersede")
+        );
+    }
+
+    #[test]
+    fn ledger_and_pending_share_recipient_and_import_writer_answers() {
+        let dir = Scratch::new("reply-recipient");
+        let mut s = dir.store();
+        let (ask, _) = s
+            .send(&out("ask", "question", "asker", &["reviewer"], 0))
+            .unwrap();
+        let mut nudge = out("nudge", "note", "asker", &["reviewer"], 1);
+        nudge.reference_ids = vec!["ask".into()];
+        s.send(&nudge).unwrap();
+        assert!(!answered(&s.conn, ask.seq, "ask").unwrap());
+        let mut imported = out("imported", "note", "external:run", &["asker"], 2);
+        imported.via = Some("reviewer".into());
+        imported.sender_mailboxes = vec!["reviewer".into()];
+        imported.reference_ids = vec!["ask".into()];
+        s.send(&imported).unwrap();
+        assert!(answered(&s.conn, ask.seq, "ask").unwrap());
+        assert!(
+            s.pending_for_actor("reviewer", 0, 10, || 3)
+                .unwrap()
+                .0
+                .messages
+                .is_empty()
         );
     }
 

@@ -602,7 +602,8 @@ fn supervisor_retries_pre_spawn_timeout_on_its_next_cycle() {
     let mut events: Vec<Value> = Vec::new();
     for (cycle, allowance) in [
         ("the unsent reminder", STARTUP_ALLOWANCE * 3),
-        ("its retry", STARTUP_ALLOWANCE),
+        // Receiver failures now back off before retrying known unsent work.
+        ("its retry", Duration::from_secs(30) + STARTUP_ALLOWANCE),
     ] {
         match lines.recv_timeout(allowance) {
             Ok(line) => events.push(serde_json::from_str(&line).unwrap()),

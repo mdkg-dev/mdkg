@@ -275,6 +275,56 @@ fn envelope(result: &Value) -> Value {
 }
 
 #[test]
+fn agents_list_exposes_wake_kinds_without_definition_mutation_tools() {
+    let repo = repo();
+    fs::create_dir_all(repo.0.join(".mdkg/agents")).unwrap();
+    for (name, harness, kinds) in [
+        ("worker-a", "claude", json!(["question", "handoff"])),
+        ("worker-b", "codex", json!([])),
+        ("worker-c", "opencode", json!(null)),
+    ] {
+        let mut definition = json!({"schema":"mdkg.agent.v1","harness":harness,"role":"worker"});
+        if !kinds.is_null() {
+            definition["wake_kinds"] = kinds;
+        }
+        fs::write(
+            repo.0.join(format!(".mdkg/agents/{name}.json")),
+            definition.to_string(),
+        )
+        .unwrap();
+    }
+    git(&repo.0, &["add", ".mdkg/agents"]);
+    git(&repo.0, &["commit", "-qm", "Define workers"]);
+    let mut server = Server::start(&repo.0);
+    server.request("initialize", json!({"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"0"}}));
+    server.send(&json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
+    let listed = server.request("tools/list", json!({}));
+    let tools = listed["result"]["tools"].as_array().unwrap();
+    let reader = tools.iter().find(|t| t["name"] == "agents_list").unwrap();
+    assert_eq!(reader["annotations"]["readOnlyHint"], true);
+    assert!(
+        tools
+            .iter()
+            .all(|t| t["name"] != "agents_add" && t["name"] != "agents_edit")
+    );
+    let before = fs::read(repo.0.join(".mdkg/agents/worker-a.json")).unwrap();
+    let result = envelope(&server.call("agents_list", json!({})));
+    assert_eq!(result["ok"], true, "{result}");
+    let agents = result["data"]["agents"].as_array().unwrap();
+    let worker = |name: &str| agents.iter().find(|agent| agent["name"] == name).unwrap();
+    assert_eq!(
+        worker("worker-a")["wake_kinds"],
+        json!(["question", "handoff"])
+    );
+    assert_eq!(worker("worker-b")["wake_kinds"], json!([]));
+    assert!(worker("worker-c").get("wake_kinds").is_none());
+    assert_eq!(
+        fs::read(repo.0.join(".mdkg/agents/worker-a.json")).unwrap(),
+        before
+    );
+}
+
+#[test]
 fn tools_return_the_cli_envelopes() {
     let repo = repo();
     let mut server = Server::start(&repo.0);
@@ -301,6 +351,7 @@ fn tools_return_the_cli_envelopes() {
     assert_eq!(
         names,
         [
+            "agents_list",
             "scratch_path",
             "show",
             "list",
@@ -320,7 +371,8 @@ fn tools_return_the_cli_envelopes() {
             "ack",
             "entry_list",
             "entry_show",
-            "entry_update"
+            "entry_update",
+            "req_verdict"
         ]
     );
 

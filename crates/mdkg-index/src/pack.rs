@@ -314,7 +314,39 @@ fn header(index: &Index, opts: &Options, qids: &[&str], omitted: usize) -> Strin
 /// nodes go in best first while they fit, and the seed is cut to what's
 /// left. Only a seed whose qid can't fit in the header is left out.
 pub fn build(index: &Index, ranked: &[(String, f64)], opts: Options) -> Pack {
+    build_inner(index, ranked, opts, None).0
+}
+
+/// Build through the same node selection and budget accounting, with untrusted
+/// event context before the nodes. Context may use half the budget when nodes
+/// are requested, leaving space for their cards and requirements; otherwise it
+/// may use the whole remaining budget. The bool reports context truncation.
+pub fn build_with_context(
+    index: &Index,
+    ranked: &[(String, f64)],
+    opts: Options,
+    context: &str,
+) -> (Pack, bool) {
+    build_inner(index, ranked, opts, Some(context))
+}
+
+fn build_inner(
+    index: &Index,
+    ranked: &[(String, f64)],
+    opts: Options,
+    context: Option<&str>,
+) -> (Pack, bool) {
     let limit = opts.budget.max(MIN_BUDGET) * 4;
+    let context_room =
+        limit.saturating_sub(header(index, &opts, &[], ranked.len()).len() + RULE.len());
+    let context_room = if ranked.is_empty() {
+        context_room
+    } else {
+        context_room.min(limit / 2)
+    };
+    let context_cut = context.is_some_and(|text| text.len() > context_room);
+    let context = context.map(|text| cut_to(text, context_room));
+    let context_bytes = context.as_ref().map_or(0, |text| RULE.len() + text.len());
     let mut qids: Vec<&str> = Vec::new();
     let mut sections: Vec<String> = Vec::new();
     let mut nodes: Vec<Included> = Vec::new();
@@ -322,6 +354,7 @@ pub fn build(index: &Index, ranked: &[(String, f64)], opts: Options) -> Pack {
     // Bytes so far, with the header sized for the most omitted it can say.
     let used = |qids: &[&str], sections: &[String], extra: usize| {
         header(index, &opts, qids, ranked.len()).len()
+            + context_bytes
             + sections.iter().map(|s| RULE.len() + s.len()).sum::<usize>()
             + extra
     };
@@ -332,7 +365,20 @@ pub fn build(index: &Index, ranked: &[(String, f64)], opts: Options) -> Pack {
             continue;
         }
         let body = match opts.profile {
-            Profile::Concise if i > 0 => summary(&node.body),
+            Profile::Concise if i > 0 => {
+                let mut body = summary(&node.body);
+                // Event packs must retain requirements beyond the opening.
+                if context.is_some() {
+                    let reqs = mdkg_graph::requirements::parse(&node.body).requirements;
+                    if !reqs.is_empty() {
+                        body.push_str("\n\n### Requirements\n");
+                        for req in reqs {
+                            body.push_str(&format!("- {}: {}\n", req.id, req.statement));
+                        }
+                    }
+                }
+                body
+            }
             _ => node.body.clone(),
         };
         let mut with: Vec<&str> = qids.clone();
@@ -373,18 +419,25 @@ pub fn build(index: &Index, ranked: &[(String, f64)], opts: Options) -> Pack {
         sections.push(text);
     }
     let mut markdown = header(index, &opts, &qids, omitted);
+    if let Some(context) = context {
+        markdown.push_str(RULE);
+        markdown.push_str(&context);
+    }
     for s in &sections {
         markdown.push_str(RULE);
         markdown.push_str(s);
     }
-    Pack {
-        profile: opts.profile,
-        budget: opts.budget,
-        tokens: estimate_tokens(&markdown),
-        nodes,
-        omitted,
-        markdown,
-    }
+    (
+        Pack {
+            profile: opts.profile,
+            budget: opts.budget,
+            tokens: estimate_tokens(&markdown),
+            nodes,
+            omitted,
+            markdown,
+        },
+        context_cut,
+    )
 }
 
 #[cfg(test)]

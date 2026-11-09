@@ -28,9 +28,8 @@ pub struct Mail {
     pub own_reply: bool,
 }
 
-/// The channel kinds that wake an agent; direct mail always does. Only channel
-/// notes wait for the next turn; request a review with `review_request`
-/// so it wakes the reviewer.
+/// The default channel kinds that wake an agent. Direct mail follows
+/// [`wakes`]; request a review with `review_request` so it wakes the reviewer.
 pub const ROOM_WAKE_KINDS: &[&str] = &[
     "question",
     "handoff",
@@ -43,12 +42,27 @@ pub const ROOM_WAKE_KINDS: &[&str] = &[
 /// Whether a message wakes an agent, or keeps it from stopping. A note
 /// replying to the agent's own message never does: otherwise two agents
 /// acknowledging each other would wake each other in turn. A turn's
-/// receipt never does either: it is set aside unseen (A26, R5).
+/// receipt never does either: it is set aside unseen (A26, R5). A notice
+/// remains readable without starting a turn.
 pub fn wakes(m: &Mail) -> bool {
-    if m.kind == "receipt" || (m.own_reply && m.kind == "note") {
+    wakes_for(m, None)
+}
+
+/// Apply a committed agent's optional kind filter. It replaces the default
+/// direct/channel kind selection, while notices, receipts and passive own replies
+/// remain non-waking. An empty filter disables automatic mail wakes.
+pub fn wakes_for(m: &Mail, kinds: Option<&[String]>) -> bool {
+    if matches!(
+        m.kind.as_str(),
+        "receipt" | mdkg_coord_sqlite::mail::NOTICE_KIND
+    ) || (m.own_reply && m.kind == "note")
+    {
         return false;
     }
-    m.room.is_none() || ROOM_WAKE_KINDS.contains(&m.kind.as_str())
+    match kinds {
+        Some(kinds) => kinds.contains(&m.kind),
+        None => m.room.is_none() || ROOM_WAKE_KINDS.contains(&m.kind.as_str()),
+    }
 }
 
 /// Whether a message is a note replying to `actor`'s own message: the
@@ -1563,6 +1577,37 @@ mod tests {
         // A receipt never wakes; a fault is direct mail, and does (A26).
         assert!(!wakes(&mail(1, "receipt", "mdkg:receipts", None)));
         assert!(wakes(&mail(1, "fault", "mdkg:supervisor", None)));
+    }
+
+    #[test]
+    fn wake_kinds_select_direct_and_channel_mail_without_overriding_passive_replies() {
+        let selected = vec!["question".into(), "decision".into()];
+        for room in [None, Some("dev")] {
+            for kind in mdkg_coord_sqlite::mail::KINDS {
+                let message = mail(1, kind, "sender", room);
+                assert_eq!(
+                    wakes_for(&message, Some(&selected)),
+                    matches!(*kind, "question" | "decision"),
+                    "{kind} {room:?}"
+                );
+                assert!(!wakes_for(&message, Some(&[])));
+                assert_eq!(wakes_for(&message, None), wakes(&message));
+            }
+            let selected = vec!["note".into(), "receipt".into(), "notice".into()];
+            let mut note = mail(1, "note", "sender", room);
+            assert!(wakes_for(&note, Some(&selected)));
+            note.own_reply = true;
+            assert!(!wakes_for(&note, Some(&selected)));
+            assert!(!wakes_for(
+                &mail(2, "receipt", "mdkg:receipts", room),
+                Some(&selected)
+            ));
+            assert!(!wakes_for(
+                &mail(3, "notice", "sender", room),
+                Some(&selected)
+            ));
+            assert!(!wakes(&mail(3, "notice", "sender", room)));
+        }
     }
 
     #[test]

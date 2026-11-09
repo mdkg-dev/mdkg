@@ -32,6 +32,7 @@ mod authority;
 #[cfg(not(unix))]
 #[path = "authority_none.rs"]
 mod authority;
+mod authority_fields;
 mod backup;
 mod compat;
 mod config_cmd;
@@ -985,6 +986,7 @@ fn read_only_allowed(command: &Command) -> bool {
         Command::Status { .. }
             | Command::Msg(
                 msg::MsgCommand::Inbox(_)
+                    | msg::MsgCommand::Pending(_)
                     | msg::MsgCommand::Digest(_)
                     | msg::MsgCommand::Wait(_)
                     | msg::MsgCommand::Thread(_)
@@ -1835,6 +1837,7 @@ fn main() -> ExitCode {
         Command::Msg(
             msg::MsgCommand::Ack(_)
                 | msg::MsgCommand::Inbox(_)
+                | msg::MsgCommand::Pending(_)
                 | msg::MsgCommand::Digest(_)
                 | msg::MsgCommand::Wait(_)
                 | msg::MsgCommand::Thread(_)

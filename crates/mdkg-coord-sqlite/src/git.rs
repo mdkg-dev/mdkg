@@ -168,10 +168,12 @@ pub fn no_commits(repo: &Path) -> io::Result<bool> {
 
 /// The commit `refname` names.
 pub fn commit_of(repo: &Path, refname: &str) -> io::Result<String> {
-    line(git(
-        repo,
-        &["rev-parse", "--verify", &format!("{refname}^{{commit}}")],
-    )?)
+    mdkg_git::cached_ref(repo, refname, "coord_commit", || {
+        line(git(
+            repo,
+            &["rev-parse", "--verify", &format!("{refname}^{{commit}}")],
+        )?)
+    })
 }
 
 /// The content hash of a worktree file, or `None` if it doesn't exist.

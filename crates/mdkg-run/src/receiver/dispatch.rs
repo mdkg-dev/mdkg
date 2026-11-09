@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::{Mode, invalid, reserve_payload, route, with_mode_on_renewal_failure};
+use super::{Mode, invalid, reserve_payload_for, route, with_mode_on_renewal_failure};
 use crate::{
     Mail, RunError, hooks, identity,
     policy::Policy,
@@ -526,7 +526,14 @@ fn step_inner(
         }
         let floor = hooks::try_reminded_through(common, actor, session)
             .map_err(|_| invalid("receiver reminder record is unreadable"))?;
-        let headers = super::wake_page(mail, actor, floor, policy.batch_max().min(200))?;
+        let kinds = crate::orchestration::agent::committed_wake_kinds(root, actor)?;
+        let headers = super::wake_page_for(
+            mail,
+            actor,
+            floor,
+            policy.batch_max().min(200),
+            kinds.as_deref(),
+        )?;
         let session_id =
             Uuid::parse_str(session).map_err(|_| invalid("receiver session isn't a UUID"))?;
         let attempt_id = Uuid::now_v7().to_string();
@@ -565,7 +572,7 @@ fn step_inner(
                 if let Some(watch) = watch.as_deref_mut()
                     && let Some(through) = headers
                         .iter()
-                        .filter(|h| hooks::wakes(h))
+                        .filter(|h| hooks::wakes_for(h, kinds.as_deref()))
                         .map(|h| h.seq)
                         .max()
                 {
@@ -575,7 +582,8 @@ fn step_inner(
                         through,
                     })?;
                 }
-                reserved = reserve_payload(common, actor, &session_id, &headers);
+                reserved =
+                    reserve_payload_for(common, actor, &session_id, &headers, kinds.as_deref());
                 if let Some(batch) = &reserved {
                     if let Some(g) = &policy.loop_guard {
                         guard.record(g, &key, now);
@@ -696,6 +704,16 @@ fn step_inner(
     })
 }
 
+fn read_wake<'a>(
+    inputs: Option<(&'a Path, &'a Path)>,
+    actor: &'a str,
+) -> Result<Option<super::wake::Wake<'a>>, RunError> {
+    inputs
+        .map(|(common, run)| super::wake::Wake::new(common, run, actor))
+        .transpose()
+        .map_err(|e| RunError::io("can't watch receiver inputs", e))
+}
+
 /// Bounded header waits plus state rechecks; no model polling or body listing.
 /// A mode change stops this watcher and requires restarting agents up.
 pub fn supervise(
@@ -716,7 +734,7 @@ pub fn supervise(
         .program
         .clone()
         .unwrap_or_else(|| crate::Harness::Codex.program());
-    supervise_steps(mail, &a.name, how, on, |mail| {
+    supervise_steps(mail, &a.name, how, Some((common, dir)), on, |mail| {
         step(mail, root, common, dir, &a.name, &a.policy, &program)
     })
 }
@@ -736,6 +754,7 @@ pub fn supervise_durable(
         .ok_or_else(|| invalid("watch not started"))?
         .progress;
     let mut last = None;
+    let mut failures = supervise::FailureBackoff::default();
     loop {
         // Each step reads the repository fresh (#13066 D2).
         mdkg_git::fresh_reads();
@@ -748,6 +767,18 @@ pub fn supervise_durable(
             supervise::note_end(supervise::End::Cap);
             return Ok(current.ran);
         }
+        let inputs = a.opts.common_dir.as_deref().map(|common| (common, dir));
+        let wake = match read_wake(inputs, &a.name) {
+            Ok(wake) => wake,
+            Err(error) => {
+                on(&a.name, Event::Trouble(&error));
+                if how.once {
+                    return Ok(current.ran);
+                }
+                supervise::pause(failures.failed().max(how.pause));
+                continue;
+            }
+        };
         let outcome = dispatch_watched(mail, dir, a, saved)?;
         current = outcome.progress;
         match outcome.result {
@@ -761,32 +792,44 @@ pub fn supervise_durable(
                 if report.status == WakeStatus::ModeChanged || how.once {
                     return Ok(current.ran);
                 }
-                if report.status == WakeStatus::NotSent {
-                    supervise::pause(how.pause);
+                let retry = report.status == WakeStatus::NotSent;
+                if report.status == WakeStatus::Queued {
+                    failures.succeeded();
                 }
                 last = Some(report);
+                if retry {
+                    supervise::pause(failures.failed().max(how.pause));
+                    // Known unsent work retries after backoff, independently
+                    // of whether newer mail wakes a long header wait.
+                    continue;
+                }
             }
             Err(error) => {
                 on(&a.name, Event::Trouble(&error));
                 if how.once {
                     return Ok(current.ran);
                 }
-                supervise::pause(how.pause);
+                supervise::pause(failures.failed().max(how.pause));
+                continue;
             }
         }
         if supervise::stop_requested() {
             return Ok(current.ran);
         }
-        match mail.wait_headers(
+        if how.max_turns.is_some_and(|n| current.ran >= n) {
+            continue;
+        }
+        match mail.wait_headers_waking(
             &a.name,
             current.seen,
-            supervise::wait_secs(how.wait_secs.clamp(1, 5)),
+            supervise::wait_secs(how.wait_secs.max(30)),
+            &|| wake.as_ref().is_some_and(super::wake::Wake::changed),
         ) {
             Ok(Some(page)) => current.seen = current.seen.max(page.cursor),
             Ok(None) => (),
             Err(error) => {
                 on(&a.name, Event::Trouble(&error));
-                supervise::pause(how.pause);
+                supervise::pause(failures.failed().max(how.pause));
             }
         }
     }
@@ -796,6 +839,7 @@ fn supervise_steps(
     mail: &mut dyn Mail,
     name: &str,
     how: &Up,
+    inputs: Option<(&Path, &Path)>,
     on: &(dyn Fn(&str, Event<'_>) + Sync),
     mut step: impl FnMut(&mut dyn Mail) -> Result<Report, RunError>,
 ) -> u64 {
@@ -803,6 +847,7 @@ fn supervise_steps(
     let mut ran = previous.ran;
     let mut seen = previous.seen;
     let mut last = None;
+    let mut failures = supervise::FailureBackoff::default();
     loop {
         // Each step reads the repository fresh (#13066 D2).
         mdkg_git::fresh_reads();
@@ -821,6 +866,17 @@ fn supervise_steps(
             supervise::note_end(supervise::End::Cap);
             return ran;
         }
+        let wake = match read_wake(inputs, name) {
+            Ok(wake) => wake,
+            Err(error) => {
+                on(name, Event::Trouble(&error));
+                if how.once {
+                    return ran;
+                }
+                supervise::pause(failures.failed().max(how.pause));
+                continue;
+            }
+        };
         // Never stop a step after it has reserved delivery. Drain it and
         // record its result before observing stop again at the boundary.
         match step(mail) {
@@ -845,28 +901,44 @@ fn supervise_steps(
                 if report.status == WakeStatus::ModeChanged || how.once {
                     return ran;
                 }
-                if report.status == WakeStatus::NotSent {
-                    supervise::pause(how.pause);
+                let retry = report.status == WakeStatus::NotSent;
+                if report.status == WakeStatus::Queued {
+                    failures.succeeded();
                 }
                 last = Some(report);
+                if retry {
+                    supervise::pause(failures.failed().max(how.pause));
+                    // Known unsent work retries after backoff, independently
+                    // of whether newer mail wakes a long header wait.
+                    continue;
+                }
             }
             Err(e) => {
                 on(name, Event::Trouble(&e));
                 if how.once {
                     return ran;
                 }
-                supervise::pause(how.pause);
+                supervise::pause(failures.failed().max(how.pause));
+                continue;
             }
         }
         if supervise::stop_requested() {
             return ran;
         }
-        match mail.wait_headers(name, seen, supervise::wait_secs(how.wait_secs.clamp(1, 5))) {
+        if how.max_turns.is_some_and(|n| ran >= n) {
+            continue;
+        }
+        match mail.wait_headers_waking(
+            name,
+            seen,
+            supervise::wait_secs(how.wait_secs.max(30)),
+            &|| wake.as_ref().is_some_and(super::wake::Wake::changed),
+        ) {
             Ok(Some(page)) => seen = seen.max(page.cursor),
             Ok(None) => (),
             Err(e) => {
                 on(name, Event::Trouble(&e));
-                supervise::pause(how.pause);
+                supervise::pause(failures.failed().max(how.pause));
             }
         }
     }
@@ -894,7 +966,7 @@ mod tests {
             seconds: u64,
         ) -> Result<Option<crate::mail::Headers>, RunError> {
             assert_eq!(after, Some(17));
-            assert_eq!(seconds, 1);
+            assert_eq!(seconds, 600);
             self.waits += 1;
             self.ready.send(()).unwrap();
             supervise::pause(Duration::from_secs(600));
@@ -969,6 +1041,14 @@ mod tests {
         stop_at: Option<(usize, supervise::Control)>,
     }
     impl Mail for DispatchMail {
+        fn wait_headers(
+            &mut self,
+            _: &str,
+            _: Option<u64>,
+            _: u64,
+        ) -> Result<Option<crate::mail::Headers>, RunError> {
+            Ok(None)
+        }
         fn claim(&mut self, _: &str) -> Result<(), RunError> {
             assert!(!self.held);
             self.held = true;
@@ -1524,6 +1604,140 @@ exit 0
         }
     }
 
+    struct WaitScratch(PathBuf);
+    impl Drop for WaitScratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn receiver_wait_case(change: Option<&str>, drain: bool, idle: Duration) {
+        use crate::supervise::registry::Registered;
+        use crate::supervise::stop;
+        let scratch = WaitScratch(
+            std::env::temp_dir().join(format!("mdkg-receiver-wait-{}", Uuid::now_v7())),
+        );
+        let common = scratch.0.join(".git");
+        let run = common.join("mdkg/run");
+        let receiver = hooks::dir(&common).join("receiver");
+        fs::create_dir_all(&run).unwrap();
+        fs::create_dir_all(&receiver).unwrap();
+        let route = receiver.join("idle.json");
+        fs::write(&route, "{}").unwrap();
+        let program = scratch.0.join("wait");
+        let calls = scratch.0.join("calls");
+        fs::write(&program, format!("#!/bin/sh\nprintf 'wait\\n' >> '{}'\nwhile [ \"$#\" -gt 0 ]; do if [ \"$1\" = --timeout ]; then shift; timeout=$1; break; fi; shift; done\nexec /bin/sleep \"$timeout\"\n", calls.display())).unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut mail = crate::CliMail::new(program, scratch.0.clone(), "launcher".into());
+        let control = supervise::Control::default();
+        let registered = std::sync::Arc::new(
+            Registered::register(&run, &["idle".into()], None, None)
+                .unwrap()
+                .unwrap(),
+        );
+        control.set_supervisor(registered.clone());
+        let how = Up {
+            max_turns: None,
+            pause: Duration::ZERO,
+            ..loop_options()
+        };
+        let (stepped, steps) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let _stop = Stop(control.clone());
+            let worker = scope.spawn(|| {
+                supervise::with_control(Some(&control), || {
+                    supervise::with_agent("idle", || {
+                        supervise_steps(
+                            &mut mail,
+                            "idle",
+                            &how,
+                            Some((&common, &run)),
+                            &|_, event| {
+                                if let Event::Trouble(error) = event {
+                                    panic!("unexpected wait error: {error:?}");
+                                }
+                            },
+                            |_| {
+                                // Production's idle no-mail dispatch writes identical route
+                                // bytes. That must not cause a self-wake or another child.
+                                fs::write(&route, "{}").unwrap();
+                                stepped.send(()).unwrap();
+                                Ok(Report::new(WakeStatus::Waiting))
+                            },
+                        )
+                    })
+                })
+            });
+            steps.recv_timeout(STARTUP_ALLOWANCE).unwrap();
+            let ready = Instant::now();
+            while !calls.exists() {
+                assert!(ready.elapsed() < STARTUP_ALLOWANCE);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            std::thread::sleep(idle);
+            assert_eq!(fs::read_to_string(&calls).unwrap(), "wait\n");
+            assert!(steps.try_recv().is_err(), "idle receiver dispatched again");
+            if let Some(change) = change {
+                let changed = Instant::now();
+                match change {
+                    "route" => fs::write(&route, "{\"changed\":true}").unwrap(),
+                    "state" => fs::write(state::state_path(&run, "idle"), "{}").unwrap(),
+                    "thread" => {
+                        let threads = hooks::dir(&common).join("threads");
+                        fs::create_dir_all(&threads).unwrap();
+                        fs::write(
+                            threads.join("codex-fixture.json"),
+                            serde_json::json!({"actor":"idle", "cwd":scratch.0}).to_string(),
+                        )
+                        .unwrap();
+                    }
+                    kind => {
+                        let evidence = receiver.join(format!("idle.{kind}"));
+                        fs::create_dir_all(&evidence).unwrap();
+                        fs::write(evidence.join("marker"), "{}").unwrap();
+                    }
+                }
+                steps
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("local change refreshes within one second");
+                assert!(changed.elapsed() < Duration::from_secs(1));
+            }
+            let stopped = Instant::now();
+            if drain {
+                stop::write(
+                    &run,
+                    "idle",
+                    &stop::Request::drain("fixture", "now".into(), &registered.id()),
+                )
+                .unwrap();
+            } else {
+                control.request_stop();
+            }
+            assert_eq!(worker.join().unwrap(), 0);
+            assert!(stopped.elapsed() < Duration::from_secs(1));
+        });
+        drop(registered);
+    }
+
+    #[test]
+    fn idle_receiver_starts_only_one_child_in_thirty_seconds() {
+        receiver_wait_case(None, false, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn receiver_local_route_evidence_state_and_thread_changes_wake_within_one_second() {
+        for change in ["route", "pending", "observed", "state", "thread"] {
+            receiver_wait_case(Some(change), false, Duration::from_millis(100));
+        }
+    }
+
+    #[test]
+    fn receiver_stop_and_drain_cancel_long_header_wait_within_one_second() {
+        for drain in [false, true] {
+            receiver_wait_case(None, drain, Duration::from_millis(100));
+        }
+    }
+
     struct Stop(supervise::Control);
     impl Drop for Stop {
         fn drop(&mut self) {
@@ -1576,7 +1790,7 @@ exit 0
         let control = supervise::Control::default();
         supervise::with_control(Some(&control), || {
             supervise::with_agent("worker", || {
-                supervise_steps(&mut mail, "worker", &how, &|_, _| (), |_| {
+                supervise_steps(&mut mail, "worker", &how, None, &|_, _| (), |_| {
                     Ok(Report::new(WakeStatus::ModeChanged))
                 })
             })
@@ -1589,7 +1803,7 @@ exit 0
         let control = supervise::Control::default();
         supervise::with_control(Some(&control), || {
             supervise::with_agent("worker", || {
-                supervise_steps(&mut mail, "worker", &capped, &|_, _| (), |_| {
+                supervise_steps(&mut mail, "worker", &capped, None, &|_, _| (), |_| {
                     Ok(Report::new(WakeStatus::Queued))
                 })
             })
@@ -1621,7 +1835,7 @@ exit 0
         };
         let before = mdkg_git::fresh_reads_count();
         let mut seen = Vec::new();
-        let ran = supervise_steps(&mut mail, "worker", &how, &|_, _| (), |_| {
+        let ran = supervise_steps(&mut mail, "worker", &how, None, &|_, _| (), |_| {
             seen.push(mdkg_git::fresh_reads_count());
             Ok(Report::new(WakeStatus::Queued))
         });
@@ -1657,6 +1871,7 @@ exit 0
                                 &mut mail,
                                 "worker",
                                 &loop_options(),
+                                None,
                                 &|_, _| (),
                                 |_| {
                                     calls += 1;
@@ -1710,6 +1925,7 @@ exit 0
                                     &mut mail,
                                     "worker",
                                     &loop_options(),
+                                    None,
                                     &|_, _| {
                                         if !mode.starts_with("headers") {
                                             ready.send(()).unwrap();

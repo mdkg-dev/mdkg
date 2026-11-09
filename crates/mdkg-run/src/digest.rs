@@ -266,6 +266,9 @@ pub fn digest_at(
                     .unwrap_or_default()
             )),
         }
+        if r.kind == mdkg_coord_sqlite::mail::NOTICE_KIND {
+            out.push_str("This notice stays readable without starting its recipient's turn. Send typed action mail separately when needed.\n");
+        }
         out.push_str(&format!(
             "If nothing here needs an answer from you, make your final message exactly \
              {NO_REPLY}: no reply is sent, and the mail shown is acked as answered.\n"

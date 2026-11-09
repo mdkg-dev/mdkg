@@ -1,6 +1,6 @@
 [package]
 name = "mdkg-presence"
-version = "0.7.3"
+version = "0.7.4"
 description = "Person keys that need their person present: the Secure Enclave and FIDO2 (the serve edd, S41). Internal to mdkg, no stable API; depend on the mdkg binary"
 edition.workspace = true
 license.workspace = true
@@ -10,11 +10,11 @@ homepage.workspace = true
 readme = "README.md"
 
 [dependencies]
-mdkg-format = { path = "../mdkg-format", version = "0.7.3" }
-mdkg-ops = { path = "../mdkg-ops", version = "0.7.3" }
+mdkg-format = { path = "../mdkg-format", version = "0.7.4" }
+mdkg-ops = { path = "../mdkg-ops", version = "0.7.4" }
 # wire's shared encodings: fingerprints, the pairing codes, the FIDO2
 # assertion format and the person-grade types (#6731).
-mdkg-wire = { path = "../mdkg-wire", version = "0.7.3" }
+mdkg-wire = { path = "../mdkg-wire", version = "0.7.4" }
 base64.workspace = true
 ring.workspace = true
 rustls-pki-types.workspace = true

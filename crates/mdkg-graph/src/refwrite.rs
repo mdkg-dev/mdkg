@@ -1996,65 +1996,8 @@ impl RefWriter {
         if let Some(found) = self.identity.get() {
             return Ok(found);
         }
-        let global = std::env::var_os("GIT_CONFIG_GLOBAL")
-            .map(PathBuf::from)
-            .map(
-                |path| match path.is_relative() && !path.as_os_str().is_empty() {
-                    true => relative_global_base().join(path),
-                    false => path,
-                },
-            );
-        let honoured = global.clone().filter(|path| global_config_honoured(path));
-        let mut command = mdkg_git::command(&self.repo);
-        // The user's git configuration, not inherited overrides.
-        for var in [
-            "GIT_COMMITTER_NAME",
-            "GIT_COMMITTER_EMAIL",
-            "GIT_AUTHOR_NAME",
-            "GIT_AUTHOR_EMAIL",
-            "EMAIL",
-            "GIT_CONFIG_GLOBAL",
-            "GIT_CONFIG_SYSTEM",
-            "GIT_CONFIG_NOSYSTEM",
-        ] {
-            command = command.env_remove(var);
-        }
-        if let Some(path) = &honoured {
-            command = command.env("GIT_CONFIG_GLOBAL", path);
-        }
-        let failed = |why: &str| identity_error(why, global.as_deref(), honoured.is_some());
-        let out = command
-            .args([
-                "-c",
-                "user.useConfigOnly=true",
-                "var",
-                "GIT_COMMITTER_IDENT",
-            ])
-            .run(None)?;
-        if !out.status.success() {
-            // git's last line says what's missing; the lines before it are
-            // its own advice, which names `--global` even where that's not
-            // the file read here.
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let why = stderr
-                .lines()
-                .rev()
-                .map(str::trim)
-                .find(|line| !line.is_empty())
-                .unwrap_or("git found none");
-            return Err(failed(why));
-        }
-        let ident = text(&out.stdout)?.trim();
-        let (name, rest) = ident
-            .split_once(" <")
-            .ok_or_else(|| failed("unparsable identity"))?;
-        let (email, _) = rest
-            .split_once('>')
-            .ok_or_else(|| failed("unparsable identity"))?;
-        if name.trim().is_empty() || email.trim().is_empty() {
-            return Err(failed("empty name or email"));
-        }
-        Ok(self.identity.get_or_init(|| (name.into(), email.into())))
+        let found = commit_identity(&self.repo)?;
+        Ok(self.identity.get_or_init(|| found))
     }
 
     fn commit(&self, tree: &str, parents: &[&str], message: &str) -> Result<String> {
@@ -2439,6 +2382,75 @@ fn relative_global_base() -> PathBuf {
 /// an absolute path other than `/dev/null`.
 fn global_config_honoured(path: &Path) -> bool {
     path.is_absolute() && path != Path::new("/dev/null")
+}
+
+/// Checks the same configured identity graph commits use, without opening a
+/// writer, acquiring a lock or writing repository state. Setup callers can
+/// refuse a missing identity before making any local changes.
+pub fn check_commit_identity(repo: &Path) -> Result<()> {
+    commit_identity(repo).map(|_| ())
+}
+
+fn commit_identity(repo: &Path) -> Result<(String, String)> {
+    let global = std::env::var_os("GIT_CONFIG_GLOBAL")
+        .map(PathBuf::from)
+        .map(
+            |path| match path.is_relative() && !path.as_os_str().is_empty() {
+                true => relative_global_base().join(path),
+                false => path,
+            },
+        );
+    let honoured = global.clone().filter(|path| global_config_honoured(path));
+    let mut command = mdkg_git::command(repo);
+    // The user's git configuration, not inherited overrides.
+    for var in [
+        "GIT_COMMITTER_NAME",
+        "GIT_COMMITTER_EMAIL",
+        "GIT_AUTHOR_NAME",
+        "GIT_AUTHOR_EMAIL",
+        "EMAIL",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_CONFIG_NOSYSTEM",
+    ] {
+        command = command.env_remove(var);
+    }
+    if let Some(path) = &honoured {
+        command = command.env("GIT_CONFIG_GLOBAL", path);
+    }
+    let failed = |why: &str| identity_error(why, global.as_deref(), honoured.is_some());
+    let out = command
+        .args([
+            "-c",
+            "user.useConfigOnly=true",
+            "var",
+            "GIT_COMMITTER_IDENT",
+        ])
+        .run(None)?;
+    if !out.status.success() {
+        // git's last line says what's missing; the lines before it are
+        // its own advice, which names `--global` even where that's not
+        // the file read here.
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let why = stderr
+            .lines()
+            .rev()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or("git found none");
+        return Err(failed(why));
+    }
+    let ident = text(&out.stdout)?.trim();
+    let (name, rest) = ident
+        .split_once(" <")
+        .ok_or_else(|| failed("unparsable identity"))?;
+    let (email, _) = rest
+        .split_once('>')
+        .ok_or_else(|| failed("unparsable identity"))?;
+    if name.trim().is_empty() || email.trim().is_empty() {
+        return Err(failed("empty name or email"));
+    }
+    Ok((name.into(), email.into()))
 }
 
 /// [`Error::Identity`] with the fix for the global file the identity read

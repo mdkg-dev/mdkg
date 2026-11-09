@@ -1814,3 +1814,183 @@ fn pure_reads_purge_nothing_and_show_due_bodies_as_purged() {
     assert_eq!(bodies(&path), 1);
     assert_ne!(mdkg_coord_sqlite::events::head(&path).unwrap(), head);
 }
+
+#[test]
+fn pending_includes_decisions_and_keeps_reply_evidence_after_purge() {
+    let dir = Scratch::new("pending");
+    let mut store = dir.store();
+    let mut out = post(
+        "choice",
+        "human:operator",
+        To::Mailboxes(vec!["worker".into()]),
+        "choice",
+        10,
+    );
+    out.kind = "decision".into();
+    let grant = mdkg_coord_sqlite::mail::DecisionGrant {
+        human: "human:operator".into(),
+        source_file: "decision.md".into(),
+        action: "implement".into(),
+        node_ref: "decision".into(),
+        node_commit: "a".repeat(40),
+        node_path: "decision.md".into(),
+        node_digest: "b".repeat(64),
+        graph_config_path: ".mdkg/config.json".into(),
+    };
+    store.send_decision(&out, &grant).unwrap();
+    let (pending, _) = store.pending_for_actor("worker", 0, 10, || 20).unwrap();
+    assert_eq!(pending.messages[0].message_id, "choice");
+    let mut reply = post(
+        "answer",
+        "worker",
+        To::Mailboxes(vec!["human:operator".into()]),
+        "answer",
+        30,
+    );
+    reply.reference_ids = vec!["choice".into()];
+    store.send(&reply).unwrap();
+    show(&mut store, "human:operator", 31);
+    store
+        .ack(
+            &["answer".into()],
+            &["human:operator".into()],
+            "human:operator",
+            None,
+            None,
+            32,
+        )
+        .unwrap();
+    assert!(store.message("answer", 40).unwrap().parts.is_none());
+    let (pending, _) = store.pending_for_actor("worker", 0, 10, || 40).unwrap();
+    assert!(pending.messages.is_empty());
+}
+
+#[test]
+fn message_thread_pages_follow_only_channel_ancestors_and_descendants() {
+    let dir = Scratch::new("thread-pages");
+    let mut store = dir.store();
+    store
+        .room_create("dev", "sender", &["worker".into()], 0)
+        .unwrap();
+    for (id, parent, channel) in [
+        ("noise", None, true),
+        ("parent", None, true),
+        ("trigger", Some("parent"), true),
+        ("sibling", Some("parent"), true),
+        ("child", Some("trigger"), true),
+        ("cross", Some("child"), false),
+    ] {
+        let mut out = post(
+            id,
+            "sender",
+            if channel {
+                To::Room("dev".into())
+            } else {
+                To::Mailboxes(vec!["worker".into()])
+            },
+            "body",
+            1,
+        );
+        out.reference_ids = parent.into_iter().map(String::from).collect();
+        store.send(&out).unwrap();
+    }
+    let (_, first, total) = store.message_thread_page("trigger", 0, 2, 2).unwrap();
+    assert_eq!(total, 4);
+    assert_eq!(
+        first
+            .iter()
+            .map(|m| m.message_id.as_str())
+            .collect::<Vec<_>>(),
+        ["parent", "trigger"]
+    );
+    let (_, second, total) = store
+        .message_thread_page("trigger", first.last().unwrap().seq, 2, 2)
+        .unwrap();
+    assert_eq!(total, 4);
+    assert_eq!(
+        second
+            .iter()
+            .map(|m| m.message_id.as_str())
+            .collect::<Vec<_>>(),
+        ["child", "cross"]
+    );
+    let (_, direct, _) = store.message_thread_page("cross", 0, 2, 2).unwrap();
+    assert_eq!(
+        direct
+            .iter()
+            .map(|m| m.message_id.as_str())
+            .collect::<Vec<_>>(),
+        ["cross"]
+    );
+}
+
+#[test]
+fn pending_answers_require_a_delivered_sender_or_importing_writer() {
+    let dir = Scratch::new("pending-sender");
+    let mut store = dir.store();
+    for (id, recipient) in [("ask", "worker"), ("role-ask", "reviewer")] {
+        let mut out = post(
+            id,
+            "asker",
+            To::Mailboxes(vec![recipient.into()]),
+            "question",
+            0,
+        );
+        out.kind = "question".into();
+        store.send(&out).unwrap();
+    }
+    let mut nudge = post(
+        "nudge",
+        "asker",
+        To::Mailboxes(vec!["worker".into()]),
+        "still waiting",
+        1,
+    );
+    nudge.reference_ids = vec!["ask".into()];
+    store.send(&nudge).unwrap();
+    assert_eq!(
+        store
+            .pending_for_actor("worker", 0, 10, || 2)
+            .unwrap()
+            .0
+            .messages
+            .len(),
+        1
+    );
+    let mut imported = post(
+        "imported",
+        "external:run",
+        To::Mailboxes(vec!["asker".into()]),
+        "answer",
+        2,
+    );
+    imported.reference_ids = vec!["ask".into()];
+    imported.via = Some("worker".into());
+    imported.sender_mailboxes = vec!["worker".into()];
+    store.send(&imported).unwrap();
+    assert!(
+        store
+            .pending_for_actor("worker", 0, 10, || 3)
+            .unwrap()
+            .0
+            .messages
+            .is_empty()
+    );
+    let mut role_answer = post(
+        "role-answer",
+        "reviewer",
+        To::Mailboxes(vec!["asker".into()]),
+        "answer",
+        3,
+    );
+    role_answer.reference_ids = vec!["role-ask".into()];
+    store.send(&role_answer).unwrap();
+    assert!(
+        store
+            .pending_for_actor("reviewer", 0, 10, || 4)
+            .unwrap()
+            .0
+            .messages
+            .is_empty()
+    );
+}

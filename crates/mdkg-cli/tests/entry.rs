@@ -2547,3 +2547,513 @@ fn digest_mail_transport_marks_only_delivered_bodies() {
     let (_, code) = f.refused("rev", &["msg", "ack", "second"]);
     assert_eq!(code, "msg.not_shown");
 }
+
+impl Fixture {
+    fn receipt_op(&self, actor: &str, op: Value, vars: &[(&str, &str)]) -> Value {
+        let file = self.dir.join("receipt.jsonl");
+        fs::write(&file, op.to_string()).expect("receipt op fixture");
+        let (_, envelope) = self.run_with(
+            actor,
+            &[
+                "entry",
+                "update",
+                NODE,
+                "--op-file",
+                file.to_str().expect("receipt path"),
+            ],
+            vars,
+        );
+        envelope["data"]["results"][0].clone()
+    }
+
+    fn imported_verdict(&self, reviewer: &str, request: &str, sha: &str) -> String {
+        let id = self.imported_verdict_by("launcher", reviewer, request, sha);
+        let text = format!("Reviewed {sha}: R1 met; R2 unmet.\n");
+        let (_, digest, _) =
+            mdkg_coord_sqlite::mail::body_digest(&json!([{"kind":"text", "text":text}]))
+                .expect("captured final digest");
+        // Models the installed runner's private callback, not a CLI grant.
+        let mut store =
+            mdkg_coord_sqlite::Store::open_for_repo(&self.repo, STORE_TTL_MS).expect("store");
+        store
+            .entry_attest_review_import(&mdkg_coord_sqlite::entries::ReviewImportEvidence {
+                reviewer,
+                launcher: "launcher",
+                turn: "fixture-reviewer-turn",
+                message: &id,
+                digest: &digest,
+                requests: &[request.to_string()],
+                now_ms: mdkg_run::state::now_ms(),
+            })
+            .expect("trusted reviewer import");
+        id
+    }
+
+    fn imported_verdict_by(
+        &self,
+        writer: &str,
+        reviewer: &str,
+        request: &str,
+        sha: &str,
+    ) -> String {
+        let file = self.dir.join("review.txt");
+        fs::write(&file, format!("Reviewed {sha}: R1 met; R2 unmet.\n")).expect("review fixture");
+        let sent = self.ok(
+            writer,
+            &[
+                "msg",
+                "import",
+                "--from",
+                reviewer,
+                "--kind",
+                "findings",
+                "--to",
+                "orchestrator",
+                "--reply-to",
+                request,
+                file.to_str().expect("review path"),
+            ],
+        );
+        sent["message"]["messageId"]
+            .as_str()
+            .expect("imported message id")
+            .into()
+    }
+}
+
+#[test]
+fn review_receipt_refuses_a_worker_forging_an_assigned_reviewers_import() {
+    let f = Fixture::new("# Requirements\n\n- R1: Works.\n");
+    f.ok("wrk", &["claim", NODE]);
+    let base = f.git(&["rev-parse", "HEAD"]);
+    let head = f.commit("src/lib.rs", "// reviewed\n");
+    assert_eq!(
+        f.request(&format!("{base}..{head}"), &["--id", "review-request"])
+            .0,
+        0
+    );
+    let message = f.imported_verdict_by("wrk", "rev", "review-request", &head);
+    let mut store = mdkg_coord_sqlite::Store::open_for_repo(&f.repo, STORE_TTL_MS).unwrap();
+    assert!(
+        store
+            .entry_attest_review_import(&mdkg_coord_sqlite::entries::ReviewImportEvidence {
+                reviewer: "rev",
+                launcher: "launcher",
+                turn: "wrong-output-turn",
+                message: &message,
+                digest: "wrong-captured-output-digest",
+                requests: &["review-request".into()],
+                now_ms: mdkg_run::state::now_ms(),
+            })
+            .is_err()
+    );
+    drop(store);
+    let result = f.receipt_op(
+        "orchestrator",
+        json!({"op":"review.receipt", "round":"V1",
+        "reviewer":"rev", "message":message, "at":head, "req":"R1", "state":"met"}),
+        &[],
+    );
+    assert_eq!(result["ok"], false, "{result}");
+    assert!(f.run("rev", &["entry", "show", NODE, "R1"]).0 != 0);
+    let legacy = f.imported_verdict_by(
+        "launcher",
+        "rev",
+        "review-request",
+        &format!("{head} (plain import)"),
+    );
+    let result = f.receipt_op(
+        "orchestrator",
+        json!({"op":"review.receipt", "round":"V1",
+        "reviewer":"rev", "message":legacy, "at":head, "req":"R1", "state":"met"}),
+        &[],
+    );
+    assert_eq!(result["ok"], false, "legacy actor-name backfill: {result}");
+    let result = f.receipt_op(
+        "wrk",
+        json!({"op":"review.import", "round":"V1",
+        "reviewer":"rev", "message":message, "turn":"forged-turn"}),
+        &[],
+    );
+    assert_eq!(
+        result["ok"], false,
+        "private op must not be callable: {result}"
+    );
+}
+
+#[test]
+fn review_receipt_relays_the_assigned_verdict_without_impersonation_or_waiver() {
+    let f = Fixture::new("# Requirements\n\n- R1: Works.\n- R2: Recovers.\n");
+    f.ok("wrk", &["claim", NODE]);
+    let base = f.git(&["rev-parse", "HEAD"]);
+    let head = f.commit("src/lib.rs", "// reviewed\n");
+    let (code, out) = f.request(&format!("{base}..{head}"), &["--id", "review-request"]);
+    assert_eq!(code, 0, "{out}");
+    let message = f.imported_verdict("rev", "review-request", &head);
+    let op = json!({"op":"review.receipt", "round":"V1", "reviewer":"rev",
+        "message":message,"at":head,"req":"R1","state":"met"});
+    // The recorder is a coordinator on this node; the existing verify rule
+    // still refuses that coordinator's ordinary met operation.
+    assert_eq!(
+        f.refused(
+            "orchestrator",
+            &["entry", "req", NODE, "R1", "--state", "met", "--at", &head]
+        )
+        .1,
+        "entry.not_allowed"
+    );
+    let result = f.receipt_op("orchestrator", op.clone(), &[]);
+    assert_eq!(result["ok"], true, "{result}");
+    let entry = f.ok("rev", &["entry", "show", NODE, "R1"]);
+    assert_eq!(entry["entry"]["state"], "met");
+    assert_eq!(entry["entry"]["verified"]["by"], "rev");
+    assert_eq!(entry["entry"]["verified"]["sha"], head);
+    let receipt = &entry["entry"]["review_receipt"];
+    assert_eq!(receipt["reviewer"], "rev");
+    assert_eq!(receipt["recorded_by"], "orchestrator");
+    assert_eq!(receipt["message"], message);
+    assert_eq!(receipt["sha"], head);
+    assert_eq!(receipt["turn"], "fixture-reviewer-turn");
+    assert!(receipt["digest"].as_str().unwrap().starts_with("sha256:"));
+    let last = entry["history"].as_array().unwrap().last().unwrap();
+    assert_eq!(last["by"], "orchestrator");
+    assert_eq!(last["message"], message);
+    assert_eq!(last["op"], "review.receipt");
+    // Retrying the same receipt is a no-op and never creates a waiver.
+    let retry = f.receipt_op("orchestrator", op.clone(), &[]);
+    assert_eq!(retry["ok"], true, "{retry}");
+    assert_eq!(retry["changed"], json!([]));
+    let mut unmet = op;
+    unmet["req"] = json!("R2");
+    unmet["state"] = json!("unmet");
+    assert_eq!(f.receipt_op("orchestrator", unmet, &[])["ok"], true);
+    let entry = f.ok("rev", &["entry", "show", NODE, "R2"]);
+    assert_eq!(entry["entry"]["state"], "unmet");
+    assert_eq!(entry["entry"]["review_receipt"]["reviewer"], "rev");
+    assert!(entry["entry"].get("verified").is_none());
+    f.ok(
+        "rev",
+        &[
+            "entry", "req", NODE, "R1", "--state", "unmet", "--at", &head,
+        ],
+    );
+    let entry = f.ok("rev", &["entry", "show", NODE, "R1"]);
+    assert!(entry["entry"].get("review_receipt").is_none());
+}
+
+/// A reviewer records its own requirement verdict (`review.verdict`) only
+/// while an open round on the node names it and reviewed exactly `at`:
+/// no round, another head, another reviewer, a worker, a coordinator or a
+/// closed round is refused, and nothing is relayed or waived.
+#[test]
+fn review_verdict_records_an_assigned_reviewers_own_verdict_only() {
+    let f = Fixture::new("# Requirements\n\n- R1: Works.\n- R2: Recovers.\n");
+    f.commit_graph(".mdkg/agents/rev2.json", &agent("reviewer"));
+    f.ok("wrk", &["claim", NODE]);
+    let base = f.git(&["rev-parse", "HEAD"]);
+    let head = f.commit("src/lib.rs", "// reviewed\n");
+    let op = json!({"op":"review.verdict","req":"R1","state":"met","at":head,
+        "text":"Works at the reviewed head."});
+    // No round yet: a request without `--node` and `--range` opens none.
+    let result = f.receipt_op("rev", op.clone(), &[]);
+    assert_eq!(result["ok"], false, "{result}");
+    assert_eq!(
+        f.request(&format!("{base}..{head}"), &["--id", "rr-v"]).0,
+        0
+    );
+    for actor in ["rev2", "wrk", "orchestrator", "human:operator"] {
+        let result = f.receipt_op(actor, op.clone(), &[]);
+        assert_eq!(result["ok"], false, "{actor}: {result}");
+    }
+    for (field, value) in [("at", base.as_str()), ("state", "waived"), ("req", "F1")] {
+        let mut bad = op.clone();
+        bad[field] = json!(value);
+        let result = f.receipt_op("rev", bad, &[]);
+        assert_eq!(result["ok"], false, "{field}: {result}");
+    }
+    assert!(f.run("rev", &["entry", "show", NODE, "R1"]).0 != 0);
+    // The assigned reviewer, inside its turn, in its own name.
+    let result = f.receipt_op("rev", op.clone(), &[("MDKG_RUN_TURN", "fixture-turn")]);
+    assert_eq!(result["ok"], true, "{result}");
+    let entry = f.ok("rev", &["entry", "show", NODE, "R1"]);
+    assert_eq!(entry["entry"]["state"], "met");
+    assert_eq!(entry["entry"]["verified"]["by"], "rev");
+    assert_eq!(entry["entry"]["verified"]["sha"], head);
+    assert!(entry["entry"].get("review_receipt").is_none());
+    let last = entry["history"].as_array().unwrap().last().unwrap();
+    assert_eq!(last["by"], "rev");
+    assert_eq!(last["op"], "req");
+    // A retry is a no-op, not a refused transition.
+    let retry = f.receipt_op("rev", op.clone(), &[]);
+    assert_eq!(retry["ok"], true, "{retry}");
+    assert_eq!(retry["changed"], json!([]));
+    let mut unmet = op.clone();
+    unmet["req"] = json!("R2");
+    unmet["state"] = json!("unmet");
+    assert_eq!(f.receipt_op("rev", unmet, &[])["ok"], true);
+    assert_eq!(f.state("R2"), "unmet");
+    // A closed round assigns nothing more.
+    let range = format!("{base}..{head}");
+    f.ok(
+        "rev",
+        &[
+            "entry",
+            "complete",
+            NODE,
+            "V1",
+            "--range",
+            &range,
+            "--verdict",
+            "clean",
+        ],
+    );
+    let mut late = op;
+    late["req"] = json!("R2");
+    late["state"] = json!("met");
+    let result = f.receipt_op("rev", late, &[]);
+    assert_eq!(result["ok"], false, "{result}");
+    assert_eq!(f.state("R2"), "unmet");
+}
+
+/// Every assigned reviewer's verdict is recorded in its own name, even when
+/// the state doesn't change: a second reviewer agreeing, a new reason, or
+/// a verdict at a later head. Only this reviewer's identical retry is a
+/// no-op.
+#[test]
+fn review_verdict_records_each_reviewer_reason_and_head() {
+    let f = Fixture::new("# Requirements\n\n- R1: Works.\n- R2: Recovers.\n");
+    f.commit_graph(".mdkg/agents/rev2.json", &agent("reviewer"));
+    f.ok("wrk", &["claim", NODE]);
+    let base = f.git(&["rev-parse", "HEAD"]);
+    let head = f.commit("src/lib.rs", "// reviewed\n");
+    let request = |range: &str, id: &str| {
+        let args = [
+            "msg",
+            "send",
+            "--kind",
+            "review_request",
+            "--to",
+            "rev,rev2",
+            "--node",
+            NODE,
+            "--range",
+            range,
+            "--id",
+            id,
+            "--text",
+            "Review the fix",
+        ];
+        assert_eq!(f.run_with("orchestrator", &args, &[]).0, 0, "{id}");
+    };
+    request(&format!("{base}..{head}"), "rr-1");
+    let verdict = |actor: &str, req: &str, state: &str, at: &str, text: &str| {
+        let op = json!({"op":"review.verdict","req":req,"state":state,"at":at,"text":text});
+        let result = f.receipt_op(actor, op, &[]);
+        assert_eq!(result["ok"], true, "{actor} {req} {state}: {result}");
+        !result["changed"].as_array().is_none_or(Vec::is_empty)
+    };
+    let history = |req: &str| -> Vec<(String, String)> {
+        let entry = f.ok("rev", &["entry", "show", NODE, req]);
+        entry["history"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| {
+                (
+                    h["by"].as_str().unwrap_or_default().to_string(),
+                    h["op"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect()
+    };
+    // Two reviewers agree that R1 is met: both are recorded.
+    assert!(verdict("rev", "R1", "met", &head, "Works."));
+    assert!(verdict("rev2", "R1", "met", &head, "Works for me."));
+    let entry = f.ok("rev", &["entry", "show", NODE, "R1"]);
+    assert_eq!(entry["entry"]["state"], "met");
+    assert_eq!(entry["entry"]["verified"]["by"], "rev2");
+    let r1 = history("R1");
+    assert!(r1.ends_with(&[("rev".into(), "req".into()), ("rev2".into(), "req".into())]));
+    // Two reviewers find R2 unmet, each with its own reason: both kept.
+    assert!(verdict("rev", "R2", "unmet", &head, "Leaks a handle."));
+    assert!(verdict("rev2", "R2", "unmet", &head, "No retry."));
+    // The same reviewer's identical retry changes nothing; a new reason
+    // from it does.
+    assert!(!verdict("rev2", "R2", "unmet", &head, "No retry."));
+    assert!(!verdict("rev", "R1", "met", &head, "Works."));
+    assert!(verdict("rev", "R2", "unmet", &head, "Also no timeout."));
+    let r2 = history("R2");
+    assert_eq!(r2.iter().filter(|(_, op)| op == "req").count(), 3, "{r2:?}");
+    // A later head's round: the verdict there is recorded at that head.
+    let head2 = f.commit("src/lib.rs", "// reviewed again\n");
+    request(&format!("{base}..{head2}"), "rr-2");
+    assert!(verdict("rev", "R1", "met", &head2, "Works."));
+    let entry = f.ok("rev", &["entry", "show", NODE, "R1"]);
+    assert_eq!(entry["entry"]["verified"]["by"], "rev");
+    assert_eq!(entry["entry"]["verified"]["sha"], head2);
+}
+
+#[test]
+fn review_receipt_refuses_wrong_actor_assignment_message_range_and_turn() {
+    let f = Fixture::new("# Requirements\n\n- R1: Works.\n");
+    f.ok("wrk", &["claim", NODE]);
+    let base = f.git(&["rev-parse", "HEAD"]);
+    let head = f.commit("src/lib.rs", "// reviewed\n");
+    assert_eq!(
+        f.request(&format!("{base}..{head}"), &["--id", "review-request"])
+            .0,
+        0
+    );
+    let message = f.imported_verdict("rev", "review-request", &head);
+    let op = json!({"op":"review.receipt","round":"V1","reviewer":"rev",
+        "message":message,"at":head,"req":"R1","state":"met"});
+    for actor in ["wrk", "rev", "human:operator"] {
+        let result = f.receipt_op(actor, op.clone(), &[]);
+        assert_eq!(result["ok"], false, "{actor}: {result}");
+    }
+    for (field, value) in [
+        ("at", base.as_str()),
+        ("reviewer", "unassigned"),
+        ("message", "missing"),
+        ("round", "V99"),
+        ("state", "waived"),
+    ] {
+        let mut bad = op.clone();
+        bad[field] = json!(value);
+        let result = f.receipt_op("orchestrator", bad, &[]);
+        assert_eq!(result["ok"], false, "{field}: {result}");
+    }
+    let result = f.receipt_op(
+        "orchestrator",
+        op.clone(),
+        &[("MDKG_RUN_TURN", "fixture-turn")],
+    );
+    assert_eq!(result["ok"], false, "{result}");
+    assert!(f.run("rev", &["entry", "show", NODE, "R1"]).0 != 0);
+    let other_node = format!("task-{}", mdkg_format::Uuid7::now());
+    let body = fs::read_to_string(f.graph().join(NODE_PATH))
+        .unwrap()
+        .replace(NODE, &other_node);
+    f.commit_graph(".mdkg/work/other.md", &body);
+    f.commit(".mdkg/work/other.md", &body);
+    f.ok("wrk", &["claim", &other_node]);
+    let mut bad = op.clone();
+    bad["node"] = json!(other_node);
+    bad["round"] = json!(format!("{NODE}#V1"));
+    let result = f.receipt_op("orchestrator", bad, &[]);
+    assert_eq!(result["ok"], false, "{result}");
+    assert_eq!(result["code"], "entry.range_mismatch", "{result}");
+    assert_eq!(
+        f.request(
+            &format!("{base}..{head}"),
+            &["--id", "other-review-request"]
+        )
+        .0,
+        0
+    );
+    let mut bad = op.clone();
+    bad["round"] = json!("V2");
+    assert_eq!(f.receipt_op("orchestrator", bad, &[])["ok"], false);
+    let unrelated = f.ok(
+        "rev",
+        &[
+            "msg",
+            "send",
+            "--kind",
+            "note",
+            "--to",
+            "orchestrator",
+            "--reply-to",
+            "review-request",
+            "--text",
+            "Still reading.",
+        ],
+    );
+    let mut bad = op.clone();
+    bad["message"] = unrelated["message"]["messageId"].clone();
+    assert_eq!(f.receipt_op("orchestrator", bad, &[])["ok"], false);
+    let mut bad = op.clone();
+    bad["reviewer"] = json!("wrk");
+    assert_eq!(f.receipt_op("orchestrator", bad, &[])["ok"], false);
+    // An acknowledged verdict keeps its immutable assignment/reply metadata.
+    f.ok("orchestrator", &["msg", "thread", &message]);
+    f.ok("orchestrator", &["msg", "ack", &message]);
+    assert_eq!(f.receipt_op("orchestrator", op, &[])["ok"], true);
+}
+
+#[test]
+fn review_receipt_accepts_private_attestation_from_an_actual_reviewer_turn() {
+    use std::os::unix::fs::PermissionsExt;
+    for digest in [false, true] {
+        let f = Fixture::new("# Requirements\n\n- R1: Works.\n");
+        f.ok("wrk", &["claim", NODE]);
+        if digest {
+            let mut definition: Value = serde_json::from_str(&agent("reviewer")).unwrap();
+            definition["policy"] = json!({"shape":"digest"});
+            f.commit_graph(".mdkg/agents/rev.json", &definition.to_string());
+        }
+        let base = f.git(&["rev-parse", "HEAD"]);
+        let head = f.commit("src/lib.rs", "// reviewed\n");
+        assert_eq!(
+            f.request(&format!("{base}..{head}"), &["--id", "review-request"])
+                .0,
+            0
+        );
+        // Reuse the fake Codex protocol without its environment-capture probes.
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../mdkg-run/tests/fixtures/fake-codex.sh");
+        let script = fs::read_to_string(fixture)
+            .unwrap()
+            .replace("env >> \"$FAKE_DIR/codex.environ\"", ":")
+            .replace(
+                "env > \"$FAKE_DIR/codex.debugenv\"",
+                ": > \"$FAKE_DIR/codex.debugenv\"",
+            );
+        let fake = f.dir.join("fake-codex");
+        fs::write(&fake, script).unwrap();
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(
+            f.graph().join("fake-reply"),
+            format!("Reviewed {head}: R1 met.\n"),
+        )
+        .unwrap();
+        let output = f
+            .env(&mut Command::new(env!("CARGO_BIN_EXE_mdkg")))
+            .env("MDKG_RUN_CODEX", &fake)
+            .args([
+                "--root",
+                f.graph().to_str().unwrap(),
+                "--as",
+                "launcher",
+                "agents",
+                "up",
+                "rev",
+                "--once",
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let round = f.ok("rev", &["entry", "show", NODE, "V1"]);
+        let imports = round["entry"]["review_imports"]
+            .as_object()
+            .expect("private proof");
+        assert_eq!(imports.len(), 1);
+        let (message, proof) = imports.iter().next().unwrap();
+        assert_eq!(proof["reviewer"], "rev");
+        assert_eq!(proof["sha"], head);
+        assert!(proof["turn"].as_str().is_some_and(|t| !t.is_empty()));
+        let result = f.receipt_op(
+            "orchestrator",
+            json!({"op":"review.receipt", "round":"V1",
+            "reviewer":"rev", "message":message, "at":head, "req":"R1", "state":"met"}),
+            &[],
+        );
+        assert_eq!(result["ok"], true, "{result}");
+    }
+}

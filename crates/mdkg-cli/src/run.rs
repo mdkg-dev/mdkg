@@ -695,6 +695,52 @@ pub(crate) fn plan_watch(
     })
 }
 
+/// Materialize the same planned worktree as a watch, recording the resolved
+/// base without admitting a turn or creating supervisor progress. The caller
+/// has already checked that this operation is outside an agent turn.
+pub(crate) fn prepare_worktree(
+    mut plan: WatchPlan,
+    args: &AgentArgs,
+) -> Result<PathBuf, GraphError> {
+    let mut held = HeldTurns {
+        root: plan.repo.root.clone(),
+        dir: plan.dir.clone(),
+        holder: format!("{}@prepare-{}", plan.launcher, std::process::id()),
+        names: Vec::new(),
+        marker: None,
+    };
+    hold_named_turn(&mut held, &args.agent)?;
+    if state::load(&plan.dir, &args.agent).map_err(graph_error)? != plan.existing {
+        return Err(graph_error(RunError::usage(
+            "run.unknown_agent",
+            "agent state changed during preparation; retry agents prepare",
+        )));
+    }
+    if args.definition
+        && let Some(existing) = plan.existing.clone()
+    {
+        // The preview has now resolved the managed worktree cwd. Resolve
+        // against the saved state again so the provisional launcher cwd
+        // cannot discard its session or base. Real execution changes still
+        // invalidate state through the same resolver used by a turn.
+        plan.agent = state::resolve_definition(existing, plan.agent.spec.clone(), args.fresh)
+            .map_err(graph_error)?;
+    }
+    give_worktree(args, &plan.repo, &mut plan.agent, &mut plan.opts)?;
+    if let Some(existing) = &plan.existing
+        && existing.spec.cwd == plan.agent.spec.cwd
+    {
+        plan.agent.spec.pinned = existing.spec.pinned.clone();
+    }
+    check_cwd(&plan.repo, &plan.agent)?;
+    let cwd = std::fs::canonicalize(&plan.agent.spec.cwd)
+        .map_err(|e| graph_error(RunError::io("can't resolve prepared worktree", e)))?;
+    if plan.existing.as_ref() != Some(&plan.agent) {
+        state::save(&plan.dir, &plan.agent).map_err(graph_error)?;
+    }
+    Ok(cwd)
+}
+
 pub(crate) fn apply_watch(
     mut plan: WatchPlan,
     a: &AgentArgs,
@@ -2338,8 +2384,8 @@ fn held_for_install(top: &Path, actor: Option<String>) -> Result<Option<HeldTurn
     hold_turns(&repo, actor).map(Some)
 }
 
-/// The turn leases install holds and its marker, released when it's
-/// dropped.
+/// Recorded turn leases held by installation or preparation, and an optional
+/// install marker, released when dropped.
 #[derive(Debug)]
 struct HeldTurns {
     root: PathBuf,
@@ -2412,42 +2458,49 @@ fn hold_turns(repo: &Repo, actor: Option<String>) -> Result<HeldTurns, GraphErro
     })?);
     let here = install_turn_names(repo, &dir, &top)?;
     for name in here {
-        let _record_lock = state::lock_lease_record(&dir, &name).map_err(graph_error)?;
-        let scope = turn::lease_scope(&name);
-        let root = &repo.root;
-        // The holder recorded before the claim, as a launcher's turn does
-        // (friction 81): an install killed in between is still named.
-        let claimed = turn::claim_recorded(
-            &dir,
-            &name,
-            &turn::lease_record(held.holder.clone()),
-            || crate::coord::claim_report(root, Some(held.holder.clone()), &scope).map(|_| ()),
-            |e: &GraphError| e.diagnostic.code == Code::CoordLeaseHeld,
-            |holder| {
-                crate::coord::holds_report(root, Some(holder.to_string()), &scope, None)
-                    .ok()
-                    .and_then(|r| r.data)
-                    .is_none_or(|d| d.holds)
-            },
-            |holder| {
-                let _ = crate::coord::release_local(
-                    root,
-                    Some(holder.to_string()),
-                    crate::coord::ReleaseTarget::Named(&scope),
-                );
-            },
-        )
-        .map_err(graph_error)?;
-        match claimed {
-            Ok(()) => held.names.push(name.clone()),
-            // Dropping `held` releases what it took.
-            Err((e, records)) if e.diagnostic.code == Code::CoordLeaseHeld => {
-                return Err(held_refusal(&name, &scope, records.first(), &e));
-            }
-            Err((e, _)) => return Err(e),
-        }
+        hold_named_turn(&mut held, &name)?;
     }
     Ok(held)
+}
+
+/// Shares the launcher's recorded run lease between installation and
+/// preparation, so neither can overwrite state while a turn owns it.
+fn hold_named_turn(held: &mut HeldTurns, name: &str) -> Result<(), GraphError> {
+    let _record_lock = state::lock_lease_record(&held.dir, name).map_err(graph_error)?;
+    let scope = turn::lease_scope(name);
+    let root = &held.root;
+    // The holder recorded before the claim, as a launcher's turn does
+    // (friction 81): an operation killed in between is still named.
+    let claimed = turn::claim_recorded(
+        &held.dir,
+        name,
+        &turn::lease_record(held.holder.clone()),
+        || crate::coord::claim_report(root, Some(held.holder.clone()), &scope).map(|_| ()),
+        |e: &GraphError| e.diagnostic.code == Code::CoordLeaseHeld,
+        |holder| {
+            crate::coord::holds_report(root, Some(holder.to_string()), &scope, None)
+                .ok()
+                .and_then(|r| r.data)
+                .is_none_or(|d| d.holds)
+        },
+        |holder| {
+            let _ = crate::coord::release_local(
+                root,
+                Some(holder.to_string()),
+                crate::coord::ReleaseTarget::Named(&scope),
+            );
+        },
+    )
+    .map_err(graph_error)?;
+    match claimed {
+        Ok(()) => held.names.push(name.to_string()),
+        // Dropping `held` releases what it took.
+        Err((e, records)) if e.diagnostic.code == Code::CoordLeaseHeld && held.marker.is_some() => {
+            return Err(held_refusal(name, &scope, records.first(), &e));
+        }
+        Err((e, _)) => return Err(e),
+    }
+    Ok(())
 }
 
 /// Called only after publishing the install marker. Existing holders must be
@@ -2650,13 +2703,13 @@ pub(crate) fn legacy_projections(config: &serde_json::Value) -> bool {
 }
 
 /// The warning `install` and `doctor` give a config with no `projections`
-/// key. It changes nothing: the default is still written in 0.7.3.
+/// key. It changes nothing: the default is still written in 0.7.4.
 pub(crate) fn legacy_projections_warning() -> Diagnostic {
     Diagnostic::warning(
         Code::InstallLegacyProjections,
         format!(
             "{} has no `{}` key, so install uses the legacy default list ({}); \
-             in 0.7.4 a config without the key lists none of them",
+             in 0.7.5 a config without the key lists none of them",
             mdkg_graph::config::CONFIG_PATH,
             mdkg_run::projection::KEY,
             mdkg_run::projection::LEGACY.join(", "),

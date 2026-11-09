@@ -251,6 +251,17 @@ fn no_hint_writes_a_literal_mdkg_command() {
             "add it later with\\n`mdkg skills add",
         ),
         ("mdkg-cli/src/init.rs", "enabled (`mdkg install --enable"),
+        // The ref-mode README's lead for agents: human documentation in the
+        // user's repository, where `mdkg` is the published command, like the
+        // README's `mdkg doctor` line.
+        (
+            "mdkg-cli/src/init.rs",
+            "Agents: read `mdkg skills show mdkg-workflow` before any task",
+        ),
+        (
+            "mdkg-cli/src/init.rs",
+            "`mdkg init` in an existing clone: it would start a second graph.",
+        ),
         // The AGENTS.md block install writes: the public command on PATH.
         (
             "mdkg-run/src/install.rs",

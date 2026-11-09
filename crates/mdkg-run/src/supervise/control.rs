@@ -43,6 +43,11 @@ struct Shared {
     external: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Why each agent's worker returned, when it said ([`note_end`]).
     ends: BTreeMap<String, End>,
+    /// What a long-running watch restarts on, read again before each turn
+    /// is admitted ([`admit_turn`]).
+    watch: Option<Arc<super::reload::Watch>>,
+    /// The first reason that check found: the watch drains and re-execs.
+    restart: Option<super::reload::Reason>,
 }
 
 /// Why a worker returned on its own, not on a stop: kept so the
@@ -86,6 +91,8 @@ impl Control {
                 supervisor: None,
                 external: None,
                 ends: BTreeMap::new(),
+                watch: None,
+                restart: None,
             }),
             Condvar::new(),
         )))
@@ -134,6 +141,48 @@ impl Control {
         let (shared, wake) = &*self.0;
         shared.lock().unwrap_or_else(|e| e.into_inner()).external = Some(flag);
         wake.notify_all();
+    }
+
+    /// Checks `watch` before admitting each turn ([`admit_turn`]).
+    pub fn restart_on(&self, watch: Arc<super::reload::Watch>) {
+        self.0.0.lock().unwrap_or_else(|e| e.into_inner()).watch = Some(watch);
+    }
+
+    /// Why a check before a turn stopped this supervisor to restart, if
+    /// one did.
+    pub fn restart(&self) -> Option<super::reload::Reason> {
+        self.0
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .restart
+            .clone()
+    }
+
+    /// Reads the watch now. A change stops admitting work, as the
+    /// watcher's own poll does, and is kept for [`Control::restart`]. An
+    /// authority that can't be read is the error.
+    fn stale(&self) -> Result<Option<super::reload::Reason>, RunError> {
+        let Some(watch) = self
+            .0
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .watch
+            .clone()
+        else {
+            return Ok(None);
+        };
+        // Read without the lock: a full read runs git.
+        let Some(reason) = watch.changed_now()? else {
+            return Ok(None);
+        };
+        let (shared, wake) = &*self.0;
+        let mut shared = shared.lock().unwrap_or_else(|e| e.into_inner());
+        shared.restart.get_or_insert(reason.clone());
+        shared.stopped = true;
+        wake.notify_all();
+        Ok(Some(reason))
     }
 
     pub fn stopped(&self) -> bool {
@@ -281,15 +330,43 @@ pub fn stop_requested() -> bool {
     CURRENT.with(|c| c.borrow().as_ref().is_some_and(Control::stopped)) || drain_requested()
 }
 
-/// Controlled idle waits poll at least once per second so a stopped process
-/// can join promptly. This includes the local panic-drain control used by `up`:
-/// a synchronous mail wait cannot otherwise notice a sibling's failure until
-/// its timeout expires. With CLI mail this costs one child per idle second.
-/// The mail cursor still decides which messages are new.
+/// Whether this worker may start a turn now.
+#[derive(Debug)]
+pub(crate) enum Admit {
+    /// No stop was asked, and its supervisor's committed definitions,
+    /// binary and store are those it runs on.
+    Yes,
+    /// A stop was asked, or a change was found here. A change stops the
+    /// supervisor, which finishes running turns and re-execs on the new
+    /// definitions, so the mail that woke this worker starts its turn
+    /// there.
+    Stop,
+    /// The committed definitions couldn't be read: the turn waits and is
+    /// tried again, rather than starting from one that may be stale.
+    Unreadable(RunError),
+}
+
+/// Called once per turn, just before it is admitted ([`Admit`]).
+pub(crate) fn admit_turn() -> Admit {
+    if stop_requested() {
+        return Admit::Stop;
+    }
+    let Some(control) = CURRENT.with(|c| c.borrow().clone()) else {
+        return Admit::Yes;
+    };
+    match control.stale() {
+        Ok(None) => Admit::Yes,
+        Ok(Some(_)) => Admit::Stop,
+        Err(e) => Admit::Unreadable(e),
+    }
+}
+
+/// Controlled waits have a thirty-second floor even with a short requested
+/// poll interval. Local cancellation still notices stop/drain promptly.
 pub fn wait_secs(requested: u64) -> u64 {
     CURRENT.with(|c| {
         if c.borrow().is_some() {
-            requested.min(1)
+            requested.max(30)
         } else {
             requested
         }
@@ -484,7 +561,9 @@ mod tests {
         let _ = std::panic::catch_unwind(|| {
             with_control(Some(&c), || {
                 assert!(stop_requested());
-                assert_eq!(wait_secs(600), 1);
+                assert_eq!(wait_secs(600), 600);
+                assert_eq!(wait_secs(1), 30);
+                assert_eq!(wait_secs(0), 30);
                 assert!(!std::thread::spawn(stop_requested).join().expect("child"));
                 panic!("restore test");
             })

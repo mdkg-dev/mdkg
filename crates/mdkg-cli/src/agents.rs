@@ -48,6 +48,14 @@ pub enum AgentsCommand {
     /// until stopped.
     #[command(after_help = examples!("agents up", "agents up --once", "agents up worker-1 --max-turns 3"))]
     Up(UpArgs),
+    /// Create or verify a worker's worktree without running a turn.
+    /// Only outside an agent turn; prints the canonical working directory.
+    #[command(after_help = examples!("agents prepare worker-1", "agents prepare worker-1 --json"))]
+    Prepare {
+        agent: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Stop agents gracefully: a turn in flight finishes, then each
     /// agent's supervisor admits no more of its turns. Nothing is killed.
     /// Inside an agent's turn it may stop only that agent.
@@ -124,6 +132,7 @@ impl AgentsCommand {
             AgentsCommand::Edit(_) => "agents.edit",
             AgentsCommand::Rm { .. } => "agents.rm",
             AgentsCommand::Up(_) => "agents.up",
+            AgentsCommand::Prepare { .. } => "agents.prepare",
             AgentsCommand::Stop(_) => "agents.stop",
             AgentsCommand::Logs(_) => "agents.logs",
             AgentsCommand::Turns(_) => "agents.turns",
@@ -139,6 +148,7 @@ impl AgentsCommand {
             AgentsCommand::Add(a) | AgentsCommand::Edit(a) => a.json,
             AgentsCommand::Rm { json, .. } => *json,
             AgentsCommand::Up(a) => a.json,
+            AgentsCommand::Prepare { json, .. } => *json,
             AgentsCommand::Stop(a) => a.json,
             AgentsCommand::Logs(a) => a.json,
             AgentsCommand::Turns(a) => a.json,
@@ -184,6 +194,10 @@ pub struct DefinitionArgs {
     /// replies (default: orchestrator).
     #[arg(long)]
     pub reports_to: Option<String>,
+    /// Mail kinds that start a turn (comma-separated or repeated). With no
+    /// values, disable mail-triggered wakes; --unset wake_kinds restores defaults.
+    #[arg(long, value_delimiter = ',', num_args = 0..=1)]
+    pub wake_kinds: Option<Vec<String>>,
     /// Reserved remote definition reference; this release does not run it.
     #[arg(long)]
     pub extends: Option<String>,
@@ -197,7 +211,7 @@ pub struct DefinitionArgs {
     #[arg(long)]
     pub approvals: Option<String>,
     /// Remove an optional field; repeat for several fields.
-    #[arg(long, value_parser = ["extends", "cwd", "worktree", "model", "effort", "base", "instructions", "policy", "allow", "protect", "reports_to", "mode", "sandbox", "approvals", "follow"])]
+    #[arg(long, value_parser = ["extends", "cwd", "worktree", "model", "effort", "base", "instructions", "policy", "allow", "protect", "reports_to", "wake_kinds", "mode", "sandbox", "approvals", "follow"])]
     pub unset: Vec<String>,
     #[arg(long)]
     pub json: bool,
@@ -265,6 +279,15 @@ fn record_definition(
     coord::check_scope_text(&scope)?;
     let actor = repo.actor(actor);
     crate::msg::check_actor_mailbox(&actor, true)?;
+    let change = |repo: &Repo, path: &Path| {
+        let proposed = change(repo, path)?;
+        let after = match &proposed {
+            Change::Write { definition, .. } => Some(definition.as_ref()),
+            Change::Remove => None,
+        };
+        crate::authority_fields::definition(repo, &actor, name, after)?;
+        Ok(proposed)
+    };
     let held = coord::require_authority_hold(&repo, &actor, &scope, None)?;
     let mut store = repo.store()?;
     let now = now_ms();
@@ -615,6 +638,10 @@ fn definition_report(
                     .map_err(|e| bad_agent(&a.agent, e))?,
             );
             set("worktree", a.worktree.then_some(Value::Bool(true)));
+            set(
+                "wake_kinds",
+                a.wake_kinds.as_ref().map(|kinds| serde_json::json!(kinds)),
+            );
             if let Some(policy) = &a.policy {
                 set(
                     "policy",
@@ -1344,6 +1371,7 @@ fn run_args(
         "schema",
         "extends",
         "reports_to",
+        "wake_kinds",
         "mode",
         "sandbox",
         "approvals",
@@ -1908,7 +1936,7 @@ fn ready(root: &Path, actor: Option<String>, a: &UpArgs) -> Result<Ready, GraphE
         );
         mail.trusted_common = Some(common.clone());
         mail.trusted_worktree = Some(repo.top.clone());
-        let (opts, mail) = if let Some((args, plan)) = p.headless {
+        let (mut opts, mut mail) = if let Some((args, plan)) = p.headless {
             let new = state::load(&dir, &p.name).map_err(graph_error)?.is_none();
             let w = if a.dry_run || !new {
                 run::apply_watch(plan, &args, false)?
@@ -1976,6 +2004,8 @@ fn ready(root: &Path, actor: Option<String>, a: &UpArgs) -> Result<Ready, GraphE
                 mail,
             )
         };
+        opts.wake_kinds = agent::wake_kinds(cfg, &p.name).map_err(graph_error)?;
+        mail.wake_kinds = opts.wake_kinds.clone();
         agents.push(Supervised {
             name: p.name,
             policy: p.policy,
@@ -2277,7 +2307,13 @@ fn up(root: &Path, actor: Option<String>, a: &UpArgs) -> u8 {
     // SIGTERM during startup's git (a worker's `git worktree add`) waits
     // for it instead of killing mdkg under it.
     let term = term_flag();
-    let watch = (!a.once).then(|| supervise::reload::Watch::new(definitions, binary, store));
+    let watch = (!a.once)
+        .then(|| std::sync::Arc::new(supervise::reload::Watch::new(definitions, binary, store)));
+    // Read again before each turn is admitted, so a turn never starts
+    // from a definition edited since the last poll.
+    if let Some(watch) = &watch {
+        control.restart_on(watch.clone());
+    }
     let stop = Mutex::new(None::<Stop>);
     let drained = std::sync::atomic::AtomicBool::new(false);
     // The control reads the SIGTERM flag itself: once the handler has run,
@@ -2350,7 +2386,9 @@ fn up(root: &Path, actor: Option<String>, a: &UpArgs) -> u8 {
     let stop = if term.load(std::sync::atomic::Ordering::SeqCst) {
         Some(Stop::Term)
     } else {
-        stop.into_inner().unwrap_or_else(|e| e.into_inner())
+        stop.into_inner()
+            .unwrap_or_else(|e| e.into_inner())
+            .or_else(|| control.restart().map(Stop::Restart))
     };
     let finish = |progress: &mut Vec<supervise::progress::Locked>| {
         for saved in progress {
@@ -3340,6 +3378,102 @@ fn resume_report(
     })
 }
 
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct PrepareData {
+    pub agent: String,
+    /// The existing or newly created worker worktree, canonicalized.
+    pub cwd: PathBuf,
+}
+
+fn prepare(
+    root: &Path,
+    actor: Option<String>,
+    name: &str,
+) -> Result<Report<PrepareData>, GraphError> {
+    state::check_name(name).map_err(graph_error)?;
+    run::no_inherited_git_env()?;
+    let repo = Repo::open(root)?;
+    let snapshot = config(&repo)?;
+    let cfg = &snapshot.effective.values;
+    let dir = state::run_dir(&repo.top).map_err(graph_error)?;
+    let existing = state::load(&dir, name).map_err(graph_error)?;
+    let entry = cfg
+        .get("agents")
+        .and_then(|agents| agents.get(name))
+        .ok_or_else(|| if existing.is_some() {
+            GraphError::usage(Code::RunUnsupported, "agents prepare requires a configured worker; saved-only agents are not supported")
+        } else { unknown_agent(name) })?;
+    agent::check_execution(cfg, name).map_err(graph_error)?;
+    Policy::for_agent(cfg, name)
+        .and_then(|p| p.check_supported(name))
+        .map_err(graph_error)?;
+    let pass = UpArgs {
+        agents: vec![name.into()],
+        once: true,
+        max_turns: None,
+        wait: 600,
+        fresh: false,
+        prompt: None,
+        reply_kind: None,
+        limit: None,
+        timeout: None,
+        keep_logs: false,
+        dry_run: false,
+        binary: None,
+        allow_zen: false,
+        json: false,
+    };
+    let configured = run_args(name, Some(entry), &pass, true)?;
+    if !configured.worktree
+        || configured.cwd.is_some()
+        || !matches!(configured.role, Some(RoleArg::Worker))
+    {
+        return Err(GraphError::usage(
+            Code::RunUnsupported,
+            "agents prepare requires a worker configured with a worktree; --cwd agents have no managed worktree",
+        ));
+    }
+    // Existing legacy entries reuse saved execution fields, exactly as up.
+    let args = run_args(name, Some(entry), &pass, existing.is_none())?;
+    let common = mdkg_coord_sqlite::git::common_dir(&repo.top).map_err(crate::coord::git_error)?;
+    let cwd = std::env::current_dir().unwrap_or_else(|_| repo.top.clone());
+    mdkg_run::approval::outside_turn(
+        &common,
+        name,
+        &[&repo.top, &cwd],
+        std::env::var_os(mdkg_run::profile::TURN_MARK).is_some(),
+    )
+    .map_err(|why| {
+        GraphError::usage(
+            Code::RunTurnActive,
+            format!("agents prepare is refused inside an agent turn: {why}"),
+        )
+    })?;
+    let plan = run::plan_watch(root, actor, &args, cfg)?;
+    if plan.agent.spec.role != mdkg_run::Role::Worker {
+        return Err(GraphError::usage(
+            Code::RunUnsupported,
+            "agents prepare requires a worker",
+        ));
+    }
+    let cwd = run::prepare_worktree(plan, &args)?;
+    let warnings: Vec<_> = snapshot
+        .warnings
+        .iter()
+        .map(|w| {
+            Diagnostic::warning(
+                Code::UsageInvalidArguments,
+                crate::config_cmd::display_text(&w.to_string()),
+            )
+        })
+        .collect();
+    Ok(Report::ok(PrepareData {
+        agent: name.into(),
+        cwd,
+    })
+    .with(warnings))
+}
+
 pub fn run(root: &Path, actor: Option<String>, c: &AgentsCommand) -> u8 {
     let safe = output::shown_path;
     match c {
@@ -3366,6 +3500,15 @@ pub fn run(root: &Path, actor: Option<String>, c: &AgentsCommand) -> u8 {
             })
         }
         AgentsCommand::Up(a) => up(root, actor, a),
+        AgentsCommand::Prepare { agent, json } => {
+            let mut report = prepare(root, actor, agent).unwrap_or_else(Report::failed);
+            for diagnostic in &mut report.diagnostics {
+                redact_diagnostic(diagnostic);
+            }
+            output::emit(c.name(), *json, report, |data| {
+                println!("{}", safe(&data.cwd.to_string_lossy()))
+            })
+        }
         AgentsCommand::Logs(a) => logs::run(root, a),
         AgentsCommand::Turns(a) => {
             let r = turns::report(root, a);

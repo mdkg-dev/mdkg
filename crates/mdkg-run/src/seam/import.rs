@@ -9,7 +9,7 @@ use std::path::Path;
 
 use super::Turn;
 use crate::error::RunError;
-use crate::mail::{DigestImport, Import, Mail, Message};
+use crate::mail::{DigestImport, Import, Mail, Message, ReviewImport};
 use crate::state;
 use crate::turn::Outcome;
 
@@ -17,6 +17,8 @@ use crate::turn::Outcome;
 pub(crate) struct ImportRequest<'a> {
     /// The agent whose turn this is.
     pub(crate) agent: &'a str,
+    /// Review requests actually delivered to this reviewer in this turn.
+    pub(crate) review_requests: &'a [String],
     /// The final message, verbatim.
     pub(crate) reply: String,
     /// The mail the turn was shown, by id.
@@ -28,7 +30,7 @@ pub(crate) struct ImportRequest<'a> {
     pub(crate) digest_nodes: &'a [String],
     pub(crate) digest_answer: Option<&'a str>,
     pub(crate) digest_references: &'a [String],
-    /// The kind the reply is sent as; `note` when unset.
+    /// The resolved reply kind; unset applies the answered message's default.
     pub(crate) reply_kind: Option<&'a str>,
     /// The turn's number and its files' stem, where the reply is kept.
     pub(crate) number: u64,
@@ -69,6 +71,7 @@ pub(crate) fn import(
 ) -> Result<Imported, RunError> {
     let ImportRequest {
         agent: name,
+        review_requests,
         reply,
         shown,
         newest,
@@ -171,7 +174,11 @@ pub(crate) fn import(
                 })
             } else {
                 mail.import(&Import {
-                    kind: reply_kind.unwrap_or("note"),
+                    kind: crate::turn::final_reply_kind(
+                        std::iter::once(m),
+                        reply_kind,
+                        crate::turn::default_reply_kind(&m.kind),
+                    ),
                     from: name,
                     reply_to: &m.message_id,
                     to: &m.sender,
@@ -257,6 +264,15 @@ pub(crate) fn import(
                     None => return Err(e),
                 },
             };
+            if !review_requests.is_empty() {
+                mail.attest_review_import(&ReviewImport {
+                    reviewer: name,
+                    turn: lifecycle.indexed.as_deref().unwrap_or(""),
+                    message: &id,
+                    requests: review_requests,
+                    file: &reply_file,
+                })?;
+            }
             if let Some(receipt) = lifecycle.receipt.as_mut() {
                 receipt.reply_id = Some(id.clone());
                 receipt.reply_status = "imported; acknowledgements pending";

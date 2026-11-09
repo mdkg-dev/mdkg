@@ -60,9 +60,17 @@ const REF_START: &str = include_str!("init_readme_ref.md");
 /// by ref mode's (publishes to the graph ref, no merge), and its skill
 /// steps replaced: in ref mode install refreshes the mirrors from the
 /// graph ref, `skills sync` refuses there, and `skills add` publishes to
-/// the graph ref.
+/// the graph ref. It opens with a lead for agents, who find no `.mdkg`
+/// folder in a ref-mode checkout to tell them the project uses mdkg.
 pub fn ref_readme() -> String {
-    const REPLACED: [(&str, &str); 3] = [
+    const REPLACED: [(&str, &str); 4] = [
+        (
+            "# Project memory and agent setup\n\n",
+            "# Project memory and agent setup\n\n\
+             Agents: read `mdkg skills show mdkg-workflow` before any task (in a\n\
+             launcher turn, `\"$MDKG_BIN\" skills show mdkg-workflow`). Never run\n\
+             `mdkg init` in an existing clone: it would start a second graph.\n\n",
+        ),
         ("\nmdkg skills sync\nmdkg doctor\n", "\nmdkg doctor\n"),
         (
             "Edit canonical skills in\n`.mdkg/skills/`, then run `mdkg skills sync` to refresh \
@@ -723,15 +731,15 @@ fn init_setup(
     let here = std::fs::canonicalize(&top).unwrap_or_else(|_| top.clone());
     let others = crate::coord::graph_git::git::worktrees(&top)
         .map_err(|e| graph_error("io.git_failed", e.to_string()))?;
-    for wt in others {
-        if std::fs::canonicalize(&wt).unwrap_or_else(|_| wt.clone()) == here {
+    for wt in &others {
+        if std::fs::canonicalize(wt).unwrap_or_else(|_| wt.clone()) == here {
             continue;
         }
-        let (found, _) = checkout_graphs(&wt)?;
+        let (found, _) = checkout_graphs(wt)?;
         let Some(first) = found
             .first()
             .cloned()
-            .or_else(|| config::has_config(&wt).then(|| CONFIG_PATH.to_owned()))
+            .or_else(|| config::has_config(wt).then(|| CONFIG_PATH.to_owned()))
         else {
             continue;
         };
@@ -739,7 +747,7 @@ fn init_setup(
         // The main checkout's git folder is the common one, whatever its
         // `.git` is (a file with --separate-git-dir); `git worktree
         // remove` takes only linked ones (Opus #20726).
-        let primary = main_checkout(&wt);
+        let primary = main_checkout(wt);
         return Err(usage(
             Code::InitExists,
             format!(
@@ -871,6 +879,48 @@ fn init_setup(
             ),
         ));
     }
+    // Setup adds an ignore rule in the common git folder. It applies to
+    // every worktree, including those outside this checkout, so protect
+    // visible edit files in each before adding it.
+    if !install_setup::excluded(&top, install_setup::EDIT_IGNORE)? {
+        for wt in &others {
+            let untracked = crate::coord::graph_git::git::command(wt)
+                .args([
+                    "ls-files",
+                    "--others",
+                    "--exclude-standard",
+                    "-z",
+                    "--",
+                    ".mdkg-edit/",
+                ])
+                .run(None)
+                .map_err(|e| graph_error("io.git_failed", e.to_string()))?;
+            if !untracked.status.success() {
+                return Err(graph_error(
+                    "io.git_failed",
+                    format!(
+                        "can't check .mdkg-edit/ for untracked files in {}",
+                        wt.display()
+                    ),
+                ));
+            }
+            if !untracked.stdout.is_empty() {
+                return Err(usage(
+                    Code::InitConflict,
+                    format!("init --setup would hide existing untracked files in .mdkg-edit/ at {}", wt.display()),
+                    "move those files somewhere safe first, or deliberately add `/.mdkg-edit/` to \
+                     the clone's common info/exclude if they should stay ignored, then run init --setup again"
+                        .into(),
+                ));
+            }
+        }
+    }
+    // Use the graph writer's own identity policy, before setup writes keys,
+    // the graph lock, exclusion, creation intent or coordinator store.
+    if !args.dry_run {
+        mdkg_graph::refwrite::check_commit_identity(&top)
+            .map_err(|e| graph_error(e.code(), e.to_string()))?;
+    }
     // The work choice comes first, so a prompt never runs after the keys
     // are written, and the preview shows what the run does (#20348).
     let work = match args.work {
@@ -897,8 +947,8 @@ fn init_setup(
             "dry run: init would commit the graph to {GRAPH}; this checkout stays unchanged"
         ));
         notes.push(
-            "dry run: git's user identity for that commit is checked only when it's made \
-             (`git config user.name` and `user.email`)"
+            "dry run: git's user identity for that commit is checked before setup writes on the \
+             real run (`git config user.name` and `user.email`)"
                 .into(),
         );
         return Ok(Report::ok(InitData {

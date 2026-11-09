@@ -924,6 +924,12 @@ fn record(
                         // The cache is at the tip, under the exclusive lock.
                         base = w.base().to_owned();
                         let applied = apply(&read_regular(&repo.root.join(CONFIG))?, key, change)?;
+                        crate::authority_fields::config(
+                            &repo,
+                            &actor,
+                            &applied.before,
+                            &applied.after,
+                        )?;
                         if applied.changed() {
                             w.write(scope.as_str(), &applied.bytes)?;
                         }
@@ -996,6 +1002,7 @@ fn record(
             None => {
                 let (authority, bytes) = checkout.expect("checkout mode read its config");
                 let applied = apply(&bytes, key, change)?;
+                crate::authority_fields::config(&repo, &actor, &applied.before, &applied.after)?;
                 let path = repo.root.join(CONFIG);
                 if !applied.changed() {
                     if taken {

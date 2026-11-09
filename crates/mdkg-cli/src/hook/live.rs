@@ -30,6 +30,10 @@ pub(super) fn poll_interval() -> Duration {
 }
 
 impl MailSource for Live {
+    fn wake_kinds(&self) -> Result<Option<Vec<String>>, String> {
+        mdkg_run::orchestration::agent::committed_wake_kinds(&self.root, &self.actor)
+            .map_err(|e| e.message)
+    }
     /// Read as `msg inbox` reads it, the actor's own mailbox and the roles
     /// it holds, straight from the store, whose `inbox()` marks nothing as
     /// shown (lane 2): a hook names messages and never shows a body.

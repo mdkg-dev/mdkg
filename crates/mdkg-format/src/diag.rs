@@ -60,6 +60,7 @@ codes! {
     ConfigMissing => "config.missing", "There is no .mdkg/config.json at the root.";
     ConfigUnreadable => "config.unreadable", "The config file can't be read or isn't JSON.";
     ConfigInvalid => "config.invalid", "The config file breaks a config rule.";
+    AuthorityFieldInTurn => "authority.field_in_turn", "An agent turn cannot change env, sandbox or approvals fields; a person changes them outside a turn.";
     ConfigUnknownWorkspace => "config.unknown_workspace", "A workspace alias isn't configured.";
     ConfigGraphV2Unsupported => "config.graph_v2_unsupported", "Graph format v2 (.mdkg/graph.json) isn't supported yet.";
 
@@ -248,7 +249,7 @@ codes! {
     RunCwdOutside => "run.cwd_outside", "An agent's folder must be one of the repository's worktrees.";
     InstallUnmergeable => "install.unmergeable", "A config file can't be merged safely, so install left it alone.";
     InstallUnsupportedLayout => "install.unsupported_layout", "install needs the graph at the top of its worktree.";
-    InstallLegacyProjections => "install.legacy_projections", "The config has no projections key, so install uses the legacy default list; in 0.7.4 a config without the key lists none.";
+    InstallLegacyProjections => "install.legacy_projections", "The config has no projections key, so install uses the legacy default list; in 0.7.5 a config without the key lists none.";
     InitExists => "init.exists", "The folder already has an mdkg graph (.mdkg/config.json).";
     DoctorCheckFailed => "doctor.check_failed", "A doctor check failed; its record in the output says which and why.";
     DoctorCheckWarned => "doctor.check_warned", "A doctor check found something to look at; its record says what.";

@@ -5205,9 +5205,12 @@ pub struct LeaseRequestData {
 pub struct LeaseRequestRecord {
     /// The lease in the way.
     pub lease: LeaseRecord,
-    /// The `question` sent to its holder (and the requester's
-    /// `reports_to`), in the context `lease:<lease id>:<requester>`.
+    /// The `question` sent to its holder in the context
+    /// `lease:<lease id>:<requester>`.
     pub sent: crate::msg::SendData,
+    /// A non-waking `notice` copied to the requester's `reports_to`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub copied: Option<crate::msg::SendData>,
 }
 
 /// Who `actor` reports to, as the committed agent definitions say: `None`
@@ -5290,10 +5293,7 @@ fn lease_request_report(
     let mut failed: Option<GraphError> = None;
     for l in blocking {
         let record = lease_record_in(&state, l);
-        let mut to = vec![l.owner.clone()];
-        if let Some(c) = copy.as_ref().filter(|c| **c != l.owner && **c != requester) {
-            to.push(c.clone());
-        }
+        let to = vec![l.owner.clone()];
         // Names and the reason are data: the text names neither.
         let parts = serde_json::json!([
             {
@@ -5323,13 +5323,14 @@ fn lease_request_report(
         ]);
         // One conversation per lease and asker: a mail context admits only
         // its members, so a second asker can't post into the first's.
+        let context = lease_request_context(&l.id, &requester);
         let sent = match crate::msg::send_direct(
             root,
             Some(requester.clone()),
             to,
             "question",
-            &lease_request_context(&l.id, &requester),
-            parts,
+            &context,
+            parts.clone(),
         ) {
             Ok(sent) => sent,
             // Mail already sent to other holders stands: say which lease
@@ -5347,9 +5348,43 @@ fn lease_request_report(
         let Some(sent) = sent.data else {
             continue;
         };
+        let copied = if let Some(to) = copy.as_ref().filter(|c| **c != l.owner && **c != requester)
+        {
+            let mut parts = parts;
+            parts.as_array_mut().expect("constructed parts").insert(0, serde_json::json!({
+                "kind":"text",
+                "text":"Lease request copy for visibility. The holder was asked directly; the original request follows."
+            }));
+            match crate::msg::send_direct(
+                root,
+                Some(requester.clone()),
+                vec![to.clone()],
+                mdkg_coord_sqlite::mail::NOTICE_KIND,
+                &context,
+                parts,
+            ) {
+                Ok(report) => {
+                    diagnostics.extend(report.diagnostics);
+                    report.data
+                }
+                Err(e) => {
+                    let mut diagnostic = (*e.diagnostic).clone();
+                    diagnostic.severity = Severity::Warning;
+                    diagnostic.message = format!(
+                        "the holder was asked, but the reports_to copy wasn't sent: {}",
+                        diagnostic.message
+                    );
+                    diagnostics.push(diagnostic);
+                    None
+                }
+            }
+        } else {
+            None
+        };
         requests.push(LeaseRequestRecord {
             lease: record,
             sent,
+            copied,
         });
     }
     if requests.is_empty()
@@ -5406,6 +5441,17 @@ pub fn lease_request(
                     r.sent.message.to.join(", ")
                 ))
             );
+            if let Some(copy) = &r.copied {
+                println!(
+                    "{}",
+                    output::shown(&format!(
+                        "copied {} as notice {} #{}",
+                        copy.message.to.join(", "),
+                        copy.message.message_id,
+                        copy.message.seq
+                    ))
+                );
+            }
         }
     })
 }

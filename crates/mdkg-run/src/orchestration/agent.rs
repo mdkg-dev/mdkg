@@ -62,6 +62,10 @@ pub struct Definition {
     /// The actor receiving deterministic turn receipts.
     #[serde(default = "reports_to_default")]
     pub reports_to: String,
+    /// Mail kinds that may start a turn. Omitted preserves the default wake
+    /// rules; an empty list leaves mail for a manually started turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake_kinds: Option<Vec<String>>,
     /// Cross-harness preset. This release supports auto only.
     #[serde(default = "mode_default")]
     #[schemars(schema_with = "mode_field")]
@@ -103,6 +107,7 @@ fn definition_schema(schema: &mut schemars::Schema) {
 
 /// Validation shared by every execution path, including saved agents.
 pub fn check_execution(config: &Value, name: &str) -> Result<(), RunError> {
+    wake_kinds(config, name)?;
     let entry = config.get("agents").and_then(|a| a.get(name));
     if entry
         .and_then(|a| a.get("follow"))
@@ -132,6 +137,31 @@ pub fn check_execution(config: &Value, name: &str) -> Result<(), RunError> {
             .is_some_and(|v| !v.is_null() && !v.is_string())
         {
             return Err(bad(format!("agent {name}: {field} must be a string")));
+        }
+    }
+    Ok(())
+}
+
+/// Read the optional wake filter without changing omitted and empty into the
+/// same setting. Shared by supervisor and interactive mail consumers.
+pub fn wake_kinds(config: &Value, name: &str) -> Result<Option<Vec<String>>, RunError> {
+    let Some(value) = config
+        .get("agents")
+        .and_then(|agents| agents.get(name))
+        .and_then(|agent| agent.get("wake_kinds"))
+    else {
+        return Ok(None);
+    };
+    let kinds: Option<Vec<String>> = serde_json::from_value(value.clone())
+        .map_err(|_| bad(format!("agent {name}: wake_kinds must list mail kinds")))?;
+    check_wake_kinds(name, kinds.as_deref())?;
+    Ok(kinds)
+}
+
+fn check_wake_kinds(name: &str, kinds: Option<&[String]>) -> Result<(), RunError> {
+    for kind in kinds.into_iter().flatten() {
+        if !mdkg_coord_sqlite::mail::KINDS.contains(&kind.as_str()) {
+            return Err(bad(format!("agent {name}: unknown wake kind {kind:?}")));
         }
     }
     Ok(())
@@ -187,6 +217,7 @@ impl Definition {
             },
         )?;
         state::check_reports_to(name, &definition.reports_to)?;
+        check_wake_kinds(name, definition.wake_kinds.as_deref())?;
         if let (Some(harness), Some(role)) = (definition.harness, definition.role) {
             state::check_native(
                 harness,
@@ -321,6 +352,7 @@ pub fn check_authority_override(authored: &Value, optional: &Input) -> Result<()
         for field in [
             "role",
             "reports_to",
+            "wake_kinds",
             "protect",
             "placement",
             "follow",
@@ -553,6 +585,15 @@ pub fn committed_protect(root: &Path, actor: &str) -> Result<Vec<String>, RunErr
     }
 }
 
+/// The actor's wake kinds from the pinned graph authority. An absent graph
+/// has no filter; unreadable or invalid authority is an error.
+pub fn committed_wake_kinds(root: &Path, actor: &str) -> Result<Option<Vec<String>>, RunError> {
+    let Some(authority) = crate::orchestration::authority_or_absent(root)? else {
+        return Ok(None);
+    };
+    wake_kinds(&authority_config(&authority)?, actor)
+}
+
 /// Publish complete JSON atomically. Adding never overwrites a definition;
 /// editing first checks that the existing destination is a regular file.
 pub fn write(
@@ -666,13 +707,59 @@ mod receipt_target_tests {
     }
 
     #[test]
+    fn wake_kinds_preserve_omitted_empty_and_explicit_filters_for_every_harness() {
+        for harness in ["claude", "codex", "opencode"] {
+            let base = json!({"schema":SCHEMA,"harness":harness,"role":"worker"});
+            let definition = Definition::parse("worker", base.clone()).unwrap();
+            assert!(definition.wake_kinds.is_none());
+            assert!(
+                serde_json::to_value(definition)
+                    .unwrap()
+                    .get("wake_kinds")
+                    .is_none()
+            );
+            for kinds in [json!([]), json!(["question", "decision", "handoff"])] {
+                let mut value = base.clone();
+                value["wake_kinds"] = kinds.clone();
+                let definition = Definition::parse("worker", value.clone()).unwrap();
+                assert_eq!(
+                    serde_json::to_value(&definition).unwrap()["wake_kinds"],
+                    kinds
+                );
+                let config = json!({"agents":{"worker":value}});
+                assert_eq!(
+                    wake_kinds(&config, "worker").unwrap(),
+                    definition.wake_kinds
+                );
+                check_execution(&config, "worker").unwrap();
+            }
+            for invalid in [
+                json!("question"),
+                json!([1]),
+                json!(["unknown"]),
+                json!([""]),
+            ] {
+                let mut value = base.clone();
+                value["wake_kinds"] = invalid;
+                assert!(Definition::parse("worker", value.clone()).is_err());
+                assert!(check_execution(&json!({"agents":{"worker":value}}), "worker").is_err());
+            }
+            assert_eq!(
+                wake_kinds(&json!({"agents":{"worker":base}}), "worker").unwrap(),
+                None
+            );
+        }
+    }
+
+    #[test]
     fn optional_layers_cannot_change_or_remove_authority_fields() {
         for harness in ["claude", "codex", "opencode"] {
             let authored = json!({
                 "agents":{"worker":{
                     "harness":harness,"role":"worker","reports_to":"lead",
                     "protect":["main"],"placement":{"host":"one"},"follow":"notes",
-                    "cwd":"/original","worktree":false,"base":"main","model":"old"
+                    "cwd":"/original","worktree":false,"base":"main","model":"old",
+                    "wake_kinds":["question"]
                 }},
                 "orchestration":{"branch":"agent/{agent}","worktree":".worktrees/{agent}"}
             });
@@ -680,6 +767,7 @@ mod receipt_target_tests {
                 for (field, changed) in [
                     ("role", json!("reviewer")),
                     ("reports_to", json!("other")),
+                    ("wake_kinds", json!(["note"])),
                     ("protect", json!([])),
                     ("placement", json!({"host":"two"})),
                     ("follow", json!("merge")),

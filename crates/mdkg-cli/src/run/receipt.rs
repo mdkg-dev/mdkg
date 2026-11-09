@@ -287,6 +287,7 @@ pub(crate) fn collect(
 
 pub(crate) fn callbacks() -> mdkg_run::mail::ReceiptCallbacks {
     mdkg_run::mail::ReceiptCallbacks {
+        review_import: crate::msg::attest_review_import,
         baseline: crate::msg::receipt_baseline,
         activity: crate::msg::receipt_activity,
         tasks: collect,

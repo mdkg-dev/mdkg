@@ -2007,8 +2007,8 @@ fn init_setup_refuses_before_writing_and_rolls_back_a_failed_creation() {
     );
     assert!(s.try_git(&["config", "mdkg.graph.ref"]).is_none(), "{out}");
 
-    // No git identity: the commit fails before the graph ref exists, so
-    // the clone is back in checkout mode with no key left.
+    // No git identity: preflight refuses before setup or graph creation,
+    // so the clone stays in checkout mode with no key written.
     let t = Scratch::named("setup-rollback");
     plain_clone(&t, false);
     let (code, out) = t.mdkg(&["init", "--setup", "local", "--json"]);
@@ -2024,6 +2024,163 @@ fn init_setup_refuses_before_writing_and_rolls_back_a_failed_creation() {
     t.git(&["config", "user.email", "graph@example.invalid"]);
     let (code, out) = t.mdkg(&["init", "--setup", "local", "--json"]);
     assert_eq!(code, 0, "{out}");
+}
+
+/// Missing commit identity must not leave a store, locks, objects or an
+/// exclude rule behind, including when only half the identity is configured.
+#[test]
+fn init_setup_missing_identity_leaves_git_unchanged() {
+    fn snapshot(root: &std::path::Path) -> std::collections::BTreeMap<PathBuf, Option<Vec<u8>>> {
+        fn visit(
+            root: &std::path::Path,
+            path: &std::path::Path,
+            files: &mut std::collections::BTreeMap<PathBuf, Option<Vec<u8>>>,
+        ) {
+            for entry in fs::read_dir(path).expect("read directory") {
+                let path = entry.expect("entry").path();
+                let relative = path.strip_prefix(root).expect("relative").to_owned();
+                if path.is_dir() {
+                    files.insert(relative, None);
+                    visit(root, &path, files);
+                } else {
+                    files.insert(relative, Some(fs::read(path).expect("read file")));
+                }
+            }
+        }
+        let mut files = std::collections::BTreeMap::new();
+        visit(root, root, &mut files);
+        files
+    }
+    for work in ["local", "shared"] {
+        for field in [None, Some("user.name"), Some("user.email")] {
+            let s = Scratch::new();
+            plain_clone(&s, false);
+            if let Some(key) = field {
+                let value = if key == "user.name" {
+                    "Graph Test"
+                } else {
+                    "graph@example.invalid"
+                };
+                s.git(&["config", key, value]);
+            }
+            let git = s.repo().join(".git");
+            let before = snapshot(&git);
+            let (code, out) = s.mdkg(&["init", "--setup", "local", "--work", work, "--json"]);
+            assert_ne!(code, 0, "{out}");
+            assert_eq!(
+                out["diagnostics"][0]["code"], "graph.identity_unset",
+                "{out}"
+            );
+            let after = snapshot(&git);
+            let changed: std::collections::BTreeSet<_> = before
+                .keys()
+                .chain(after.keys())
+                .filter(|path| before.get(*path) != after.get(*path))
+                .collect();
+            assert!(
+                changed.is_empty(),
+                "git paths changed with {field:?}, {work}: {changed:?}; {out}"
+            );
+            assert!(!s.repo().join(".mdkg").exists());
+        }
+    }
+}
+
+/// Init does not silently hide a caller's files in its edit-copy location.
+#[test]
+fn init_setup_refuses_to_hide_existing_untracked_edit_files() {
+    let s = Scratch::new();
+    plain_clone(&s, true);
+    let file = s.repo().join(".mdkg-edit/nested/user.md");
+    fs::create_dir_all(file.parent().expect("parent")).expect("directory");
+    fs::write(&file, "keep this visible\n").expect("file");
+    let exclude = s.repo().join(".git/info/exclude");
+    let before = fs::read(&exclude).expect("exclude");
+    for dry in [true, false] {
+        let mut args = vec!["init", "--setup", "local", "--json"];
+        if dry {
+            args.push("--dry-run");
+        }
+        let (code, out) = s.mdkg(&args);
+        assert_ne!(code, 0, "{out}");
+        assert_eq!(out["diagnostics"][0]["code"], "init.conflict", "{out}");
+        assert!(
+            out.to_string().contains("untracked files in .mdkg-edit/"),
+            "{out}"
+        );
+        assert_eq!(fs::read(&exclude).expect("exclude"), before);
+        assert!(!s.repo().join(".git/mdkg").exists());
+        assert_eq!(mdkg_keys(&s), "");
+        assert!(s.git(&["status", "--porcelain"]).contains(".mdkg-edit/"));
+        assert_eq!(
+            fs::read_to_string(&file).expect("file"),
+            "keep this visible\n"
+        );
+    }
+    // A deliberate existing ignore rule is respected; init changes no file.
+    let mut ignored = before;
+    ignored.extend_from_slice(b"\n/.mdkg-edit/\n");
+    fs::write(&exclude, &ignored).expect("exclude");
+    let (code, out) = s.mdkg(&["init", "--setup", "local", "--json"]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(fs::read(&exclude).expect("exclude"), ignored);
+    assert_eq!(
+        fs::read_to_string(file).expect("file"),
+        "keep this visible\n"
+    );
+}
+
+/// The ignore rule is clone-wide, so visible edit files in a linked worktree
+/// outside the invoking checkout must be protected by the same preflight.
+#[test]
+fn init_setup_refuses_to_hide_linked_worktrees_untracked_edit_files() {
+    let s = Scratch::new();
+    plain_clone(&s, true);
+    let linked = s.0.join("outside");
+    let linked_text = linked.to_str().expect("path");
+    s.git(&["worktree", "add", "-q", "-b", "worker", linked_text]);
+    let file = linked.join(".mdkg-edit/nested/user.md");
+    fs::create_dir_all(file.parent().expect("parent")).expect("directory");
+    fs::write(&file, "keep this visible\n").expect("file");
+    let exclude = s.repo().join(".git/info/exclude");
+    let before = fs::read(&exclude).expect("exclude");
+    for dry in [false, true] {
+        let mut args = vec!["init", "--setup", "local", "--json"];
+        if dry {
+            args.push("--dry-run");
+        }
+        let (code, out) = s.mdkg(&args);
+        assert_ne!(code, 0, "{out}");
+        assert_eq!(out["diagnostics"][0]["code"], "init.conflict", "{out}");
+        assert!(
+            out.to_string().contains("untracked files in .mdkg-edit/"),
+            "{out}"
+        );
+        assert!(
+            out.to_string().contains(linked_text),
+            "names the affected worktree: {out}"
+        );
+        assert_eq!(fs::read(&exclude).expect("exclude"), before);
+        assert!(!s.repo().join(".git/mdkg").exists());
+        assert_eq!(mdkg_keys(&s), "");
+        assert!(
+            s.git(&["-C", linked_text, "status", "--porcelain"])
+                .contains(".mdkg-edit/")
+        );
+        assert_eq!(
+            fs::read_to_string(&file).expect("file"),
+            "keep this visible\n"
+        );
+    }
+    // A per-worktree ignore rule means these files are already deliberately
+    // hidden. No false refusal when adding the shared exclusion afterward.
+    fs::write(linked.join(".gitignore"), "/.mdkg-edit/\n").expect("ignore");
+    let (code, out) = s.mdkg(&["init", "--setup", "local", "--json"]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(
+        fs::read_to_string(file).expect("file"),
+        "keep this visible\n"
+    );
 }
 
 /// init at a graph checkout made by hand is refused as before, and the

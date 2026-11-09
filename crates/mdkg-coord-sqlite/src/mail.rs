@@ -144,6 +144,9 @@ pub(crate) fn upgrade(tx: &Transaction<'_>) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// Readable information that does not start an agent turn.
+pub const NOTICE_KIND: &str = "notice";
+
 /// The message kinds this build knows. The kernel attaches no state machine
 /// to them. `receipt` and `fault` are sent only by mdkg's own `mdkg:` actors
 /// (A26).
@@ -155,6 +158,7 @@ pub const KINDS: &[&str] = &[
     "decision",
     "handoff",
     "note",
+    NOTICE_KIND,
     "receipt",
     "fault",
 ];
@@ -776,6 +780,51 @@ fn deliveries_of(conn: &Connection, seq: u64) -> Result<Vec<Delivery>, MailError
 
 const MESSAGE_COLUMNS: &str = "m.seq, m.message_id, m.context_id, m.kind, m.sender, m.via, m.room,
      m.reference_ids, m.digest, m.size, m.retention, m.sent_ms, b.parts";
+
+/// Shared by pending mail and ledger expiry: a reply is an answer only when
+/// its sender or importing writer received the original message. Delivery
+/// state and body retention do not erase this evidence.
+pub(crate) const ANSWER_REFS_SQL: &str =
+    "SELECT original.message_id AS message_id, original.seq AS seq
+    FROM msg_messages reply, json_each(reply.reference_ids) ref
+    JOIN msg_messages original ON original.message_id = ref.value
+    WHERE ref.type = 'text' AND reply.seq > original.seq
+      AND EXISTS (SELECT 1 FROM msg_deliveries recipient
+          WHERE recipient.seq = original.seq
+            AND (recipient.mailbox = reply.sender OR recipient.mailbox = reply.via))";
+
+// The answer set is evaluated once per statement, not once per delivery.
+// Filter kinds in SQL before considering answers; ordinary inboxes skip it.
+fn inbox_select() -> String {
+    format!(
+        "SELECT DISTINCT d.seq, m.kind, m.room IS NOT NULL, m.sender
+        FROM msg_deliveries d JOIN msg_messages m ON m.seq = d.seq
+        WHERE d.mailbox = ?1 AND d.seq > ?2 AND (?3 OR d.state = 'delivered')
+          AND (?4 IS NULL OR m.room = ?4)
+          AND (NOT ?5 OR (m.kind IN ('question', 'decision') AND m.message_id NOT IN (
+              SELECT message_id FROM ({ANSWER_REFS_SQL})
+          )))"
+    )
+}
+
+// A channel's default context contains unrelated posts. Follow only the
+// triggering message's explicit ancestors and descendants, across contexts.
+// Sibling branches of an ancestor are not descendants of the trigger.
+const REPLY_CHAIN: &str = "WITH RECURSIVE
+    refs(parent, child) AS MATERIALIZED (
+        SELECT ref.value, m.message_id FROM msg_messages m, json_each(m.reference_ids) ref
+        WHERE ref.type = 'text'
+    ),
+    ancestors(id) AS (
+        VALUES (?1) UNION SELECT refs.parent FROM refs JOIN ancestors ON refs.child = ancestors.id
+    ),
+    descendants(id) AS (
+        VALUES (?1) UNION SELECT refs.child FROM refs JOIN descendants ON refs.parent = descendants.id
+    ),
+    selected(seq) AS (
+        SELECT seq FROM msg_messages
+        WHERE message_id IN (SELECT id FROM ancestors UNION SELECT id FROM descendants)
+    )";
 
 fn message_from_row(conn: &Connection, r: &rusqlite::Row<'_>) -> Result<Message, MailError> {
     let seq = ms(r.get(0)?);
@@ -1526,7 +1575,7 @@ impl Store {
     /// [`Store::inbox`], only of messages from these senders (any of
     /// them); empty, every sender. The limit counts only those.
     pub fn inbox_from(&mut self, q: &InboxQuery, senders: &[String]) -> Result<Inbox, MailError> {
-        self.inbox_from_resolved(q, senders, None, || q.now_ms)
+        self.inbox_from_resolved(q, senders, None, false, || q.now_ms)
             .map(|(inbox, _)| inbox)
     }
 
@@ -1539,7 +1588,30 @@ impl Store {
         mailbox: Option<&str>,
         clock: impl FnOnce() -> u64,
     ) -> Result<(Inbox, Vec<String>), MailError> {
-        self.inbox_from_resolved(q, senders, Some((actor, mailbox)), clock)
+        self.inbox_from_resolved(q, senders, Some((actor, mailbox)), false, clock)
+    }
+
+    /// Questions and decisions delivered to the actor or its current roles,
+    /// including acknowledged deliveries, with no stored reply reference.
+    /// Reading does not mark mail shown or acknowledge it.
+    pub fn pending_for_actor(
+        &mut self,
+        actor: &str,
+        after: u64,
+        limit: usize,
+        clock: impl FnOnce() -> u64,
+    ) -> Result<(Inbox, Vec<String>), MailError> {
+        let query = InboxQuery {
+            mailboxes: Vec::new(),
+            kinds: vec!["question".into(), "decision".into()],
+            room: None,
+            room_kinds: Vec::new(),
+            after: Some(after),
+            limit: Some(limit),
+            all: true,
+            now_ms: 0,
+        };
+        self.inbox_from_resolved(&query, &[], Some((actor, None)), true, clock)
     }
 
     fn inbox_from_resolved(
@@ -1547,6 +1619,7 @@ impl Store {
         q: &InboxQuery,
         senders: &[String],
         reader: Option<(&str, Option<&str>)>,
+        unanswered: bool,
         clock: impl FnOnce() -> u64,
     ) -> Result<(Inbox, Vec<String>), MailError> {
         let ttl = self.ttl;
@@ -1563,21 +1636,19 @@ impl Store {
         let after = q.after.unwrap_or(0);
         let mut seqs: Vec<u64> = Vec::new();
         {
-            let mut stmt = tx.prepare(
-                "SELECT DISTINCT d.seq, m.kind, m.room IS NOT NULL, m.sender FROM msg_deliveries d
-                 JOIN msg_messages m ON m.seq = d.seq
-                 WHERE d.mailbox = ?1 AND d.seq > ?2 AND (?3 OR d.state = 'delivered')
-                   AND (?4 IS NULL OR m.room = ?4)",
-            )?;
+            let mut stmt = tx.prepare(&inbox_select())?;
             for mailbox in &q.mailboxes {
-                let rows = stmt.query_map(params![mailbox, sql_ms(after), q.all, q.room], |r| {
-                    Ok((
-                        r.get::<_, i64>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, bool>(2)?,
-                        r.get::<_, String>(3)?,
-                    ))
-                })?;
+                let rows = stmt.query_map(
+                    params![mailbox, sql_ms(after), q.all, q.room, unanswered],
+                    |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, bool>(2)?,
+                            r.get::<_, String>(3)?,
+                        ))
+                    },
+                )?;
                 for row in rows {
                     let (seq, kind, in_room, sender) = row?;
                     let wanted = |kinds: &[String]| kinds.is_empty() || kinds.contains(&kind);
@@ -1836,6 +1907,51 @@ impl Store {
         Self::mask_after_read(&tx, pure, std::slice::from_mut(&mut message), now_ms)?;
         tx.commit()?;
         Ok(message)
+    }
+
+    /// A bounded page for one message's context pack. Direct mail keeps its
+    /// explicit context; a channel post uses only explicit reply ancestry and
+    /// descendants, including cross-context replies. Total counts headers only.
+    pub fn message_thread_page(
+        &mut self,
+        id: &str,
+        after: u64,
+        limit: usize,
+        now_ms: u64,
+    ) -> Result<(String, Vec<Message>, usize), MailError> {
+        let pure = self.pure_reads;
+        let tx = self.read_tx()?;
+        Self::purge_before_read(&tx, pure, now_ms)?;
+        let target = message_by_id(&tx, id)?.ok_or_else(|| MailError::UnknownMessage(id.into()))?;
+        let (selection, key) = if target.room.is_some() {
+            (REPLY_CHAIN, target.message_id.as_str())
+        } else {
+            (
+                "WITH selected(seq) AS (SELECT seq FROM msg_messages WHERE context_id = ?1)",
+                target.context_id.as_str(),
+            )
+        };
+        let total: i64 = tx.query_row(
+            &format!("{selection} SELECT COUNT(*) FROM selected"),
+            [key],
+            |r| r.get(0),
+        )?;
+        let sql = format!(
+            "{selection} SELECT {MESSAGE_COLUMNS}
+            FROM msg_messages m LEFT JOIN msg_bodies b ON b.seq = m.seq
+            WHERE m.seq IN (SELECT seq FROM selected) AND m.seq > ?2 ORDER BY m.seq LIMIT ?3"
+        );
+        let mut messages = Vec::new();
+        {
+            let mut stmt = tx.prepare(&sql)?;
+            let mut rows = stmt.query(params![key, sql_ms(after), limit.clamp(1, 128) as u32])?;
+            while let Some(row) = rows.next()? {
+                messages.push(message_from_row(&tx, row)?);
+            }
+        }
+        Self::mask_after_read(&tx, pure, &mut messages, now_ms)?;
+        tx.commit()?;
+        Ok((target.context_id, messages, ms(total) as usize))
     }
 
     /// The messages of a context after seq `after`, oldest first: the
@@ -2564,5 +2680,41 @@ mod snapshot_clock_tests {
             );
             read_result.unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod pending_cost_tests {
+    use super::*;
+    use rusqlite::StatementStatus;
+
+    #[test]
+    fn pending_query_work_is_bounded_by_mail_history_not_its_square() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(MAIL_SCHEMA).unwrap();
+        conn.execute_batch("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<20000)
+            INSERT INTO msg_messages(message_id, context_id, kind, sender, reference_ids,
+                digest, request_digest, size, retention, sent_ms)
+            SELECT 'item-'||x, 'context', CASE WHEN x%5=0 THEN 'question' ELSE 'note' END,
+                CASE WHEN x%10=1 THEN 'reader' ELSE 'sender' END,
+                CASE WHEN x%10=1 AND x>1 THEN json_array('item-'||(x-1)) ELSE '[]' END,
+                '', '', 0, 'durable', x FROM n;
+            INSERT INTO msg_deliveries(seq,mailbox,state) SELECT seq,'reader','acked' FROM msg_messages;").unwrap();
+        let mut stmt = conn.prepare(&inbox_select()).unwrap();
+        let mut rows = stmt
+            .query(params!["reader", 0, true, None::<&str>, true])
+            .unwrap();
+        let mut count = 0;
+        while rows.next().unwrap().is_some() {
+            count += 1;
+        }
+        drop(rows);
+        // 4,000 questions, 1,999 explicitly answered by their recipient.
+        assert_eq!(count, 2001);
+        let steps = stmt.get_status(StatementStatus::VmStep);
+        eprintln!("pending: 20000 stored messages, {count} pending, {steps} VM steps");
+        // A generous linear-work envelope; the old correlated scan exceeds
+        // this by orders of magnitude, independent of machine timing/load.
+        assert!(steps < 20_000 * 200, "{steps} VM steps");
     }
 }

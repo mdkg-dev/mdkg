@@ -20,6 +20,7 @@ struct FakeMail {
     imports: Vec<(String, String, String, String, Option<String>, String)>,
     digest_imports: Vec<(String, String, Vec<String>, Vec<String>)>,
     digest_answers: Vec<Option<String>>,
+    review_imports: Vec<(String, String, String, Vec<String>)>,
     claims: Vec<String>,
     releases: Vec<String>,
     held: bool,
@@ -83,9 +84,29 @@ struct FakeMail {
     cleared: Vec<(String, String)>,
     /// Store the fault here, then die before its pending file is deleted.
     crash_after_fault_send: Option<PathBuf>,
+    /// The answer-send watermark before and after a fake turn.
+    sent_history: std::collections::VecDeque<u64>,
 }
 
 impl Mail for FakeMail {
+    fn attest_review_import(
+        &mut self,
+        proof: &mdkg_run::mail::ReviewImport<'_>,
+    ) -> Result<(), RunError> {
+        assert!(proof.file.is_file());
+        self.review_imports.push((
+            proof.reviewer.into(),
+            proof.turn.into(),
+            proof.message.into(),
+            proof.requests.to_vec(),
+        ));
+        Ok(())
+    }
+    fn sent_to(&mut self, _: &str, _: &Message, _: u64) -> Result<u64, RunError> {
+        self.sent_history
+            .pop_front()
+            .ok_or_else(|| RunError::failure("run.mail_failed", "no answer snapshot"))
+    }
     fn digest_inbox_after(
         &mut self,
         agent: &str,
@@ -1466,9 +1487,13 @@ fn a_room_posts_reply_is_promised_to_its_sender_alone_naming_the_channel() {
     // The label people read says channel; the reply goes to the sender.
     assert!(
         prompt.contains(
-            "delivered to orchestrator alone, as a `note` reply to their post in channel \
+            "delivered to orchestrator alone, as a `notice` reply to their post in channel \
              review; the channel's other members don't see it"
         ),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains("This notice stays readable without starting its recipient's turn"),
         "{prompt}"
     );
     // A direct reply to a room post starts a new conversation.
@@ -6247,6 +6272,58 @@ mod watched {
 }
 
 #[test]
+fn wake_kinds_automatic_turns_skip_deferred_conversations_for_every_harness() {
+    for (harness, fake) in [
+        (Harness::Claude, "fake-claude.sh"),
+        (Harness::Codex, "fake-codex.sh"),
+        (Harness::OpenCode, "fake-opencode.sh"),
+    ] {
+        let setup = Setup::new("wake-kinds-admission");
+        let mut agent = setup.agent("lane", harness, Role::Reviewer);
+        let mut inbox: Vec<_> = (1..=4)
+            .map(|seq| {
+                direct(
+                    &format!("n{seq}"),
+                    seq,
+                    "deferred",
+                    "orchestrator",
+                    "Deferred note",
+                )
+            })
+            .collect();
+        inbox.push(Message {
+            kind: "question".into(),
+            ..direct("q", 5, "action", "peer", "Needs an answer")
+        });
+        inbox.push(direct("n6", 6, "latest", "orchestrator", "Also deferred"));
+        let mut mail = FakeMail {
+            inbox,
+            ..FakeMail::default()
+        };
+        let mut options = opts(fake);
+        options.limit = 2;
+        options.mail_triggered = true;
+        options.wake_kinds = Some(vec!["question".into()]);
+        let report = turn::turn(&mut mail, &setup.dir, &mut agent, &options).unwrap();
+        assert_eq!(report.shown, ["q"], "{harness:?}");
+        assert_eq!(mail.acked, ["q"]);
+        let report = turn::turn(&mut mail, &setup.dir, &mut agent, &options).unwrap();
+        assert_eq!(
+            report.outcome,
+            Outcome::Idle,
+            "excluded mail never starts an automatic turn"
+        );
+        assert_eq!(mail.inbox("lane", 100).unwrap().messages.len(), 5);
+        options.mail_triggered = false;
+        let report = turn::turn(&mut mail, &setup.dir, &mut agent, &options).unwrap();
+        assert!(
+            !report.shown.is_empty(),
+            "a manual pass can read deferred mail"
+        );
+    }
+}
+
+#[test]
 fn a_channel_post_wakes_a_headless_agent_only_in_a_waking_kind() {
     // The rule interactive sessions follow (`hooks::wakes`), friction 83.
     let wakes = |m: Message| {
@@ -6280,6 +6357,196 @@ fn a_channel_post_wakes_a_headless_agent_only_in_a_waking_kind() {
     let p = turn::peek(&mut mail, "lane", &[]).expect("peek");
     assert!(!p.live);
     assert_eq!(p.cursor, Some(2));
+}
+
+#[test]
+fn passive_notices_never_displace_actionable_mail_when_wake_kinds_are_omitted() {
+    for (harness, fake) in [
+        (Harness::Claude, "fake-claude.sh"),
+        (Harness::Codex, "fake-codex.sh"),
+        (Harness::OpenCode, "fake-opencode.sh"),
+    ] {
+        let setup = Setup::new("passive-admission-default");
+        let mut agent = setup.agent("lane", harness, Role::Reviewer);
+        let mut inbox: Vec<_> = (1..=4)
+            .map(|seq| Message {
+                kind: "notice".into(),
+                ..direct(
+                    &format!("n{seq}"),
+                    seq,
+                    "status",
+                    "orchestrator",
+                    "Deferred status",
+                )
+            })
+            .collect();
+        inbox.push(Message {
+            kind: "question".into(),
+            ..direct("question", 5, "action", "peer", "Needs an answer")
+        });
+        let mut mail = FakeMail {
+            inbox,
+            ..FakeMail::default()
+        };
+        let options = TurnOptions {
+            mail_triggered: true,
+            limit: 2,
+            ..opts(fake)
+        };
+        let report = turn::turn(&mut mail, &setup.dir, &mut agent, &options).unwrap();
+        assert_eq!(report.shown, ["question"], "{harness:?}");
+        assert_eq!(mail.acked, ["question"]);
+        let report = turn::turn(&mut mail, &setup.dir, &mut agent, &options).unwrap();
+        assert_eq!(report.outcome, Outcome::Idle);
+        assert_eq!(mail.inbox("lane", 10).unwrap().messages.len(), 4);
+    }
+}
+
+#[test]
+fn passive_final_replies_are_notices_for_every_harness() {
+    for (harness, fake) in [
+        (Harness::Claude, "fake-claude.sh"),
+        (Harness::Codex, "fake-codex.sh"),
+        (Harness::OpenCode, "fake-opencode.sh"),
+    ] {
+        for kind in ["resolution", "decision", "note", "notice"] {
+            let setup = Setup::new("passive-final");
+            let mut agent = setup.agent("lane", harness, Role::Reviewer);
+            fs::write(setup.work.join("fake-reply"), "Readable final reply").unwrap();
+            let mut mail = FakeMail {
+                inbox: vec![Message {
+                    kind: kind.into(),
+                    ..direct("incoming", 1, "ctx", "peer", "Status update")
+                }],
+                ..FakeMail::default()
+            };
+            let report = turn::turn(&mut mail, &setup.dir, &mut agent, &opts(fake)).unwrap();
+            assert_eq!(report.outcome, Outcome::Replied);
+            assert_eq!(mail.imports[0].0, "notice", "{harness:?} {kind}");
+            assert_eq!(mail.imports[0].5.trim_end(), "Readable final reply");
+            let mut recipient = FakeMail {
+                inbox: vec![Message {
+                    kind: mail.imports[0].0.clone(),
+                    ..direct("reply", 2, "ctx", "lane", "Readable final reply")
+                }],
+                ..FakeMail::default()
+            };
+            assert!(!turn::peek(&mut recipient, "peer", &[]).unwrap().live);
+            assert_eq!(recipient.inbox("peer", 10).unwrap().messages.len(), 1);
+        }
+    }
+}
+
+#[test]
+fn passive_final_selection_preserves_actionable_threads_and_explicit_kinds() {
+    for explicit in [None, Some("question")] {
+        let setup = Setup::new("passive-override");
+        let mut agent = setup.agent("lane", Harness::Claude, Role::Reviewer);
+        let mut mail = FakeMail {
+            inbox: vec![
+                Message {
+                    kind: "question".into(),
+                    ..direct("question", 1, "ctx", "peer", "Please answer")
+                },
+                direct("note", 2, "ctx", "peer", "Additional context"),
+            ],
+            ..FakeMail::default()
+        };
+        let options = TurnOptions {
+            reply_kind: explicit.map(str::to_owned),
+            ..opts("fake-claude.sh")
+        };
+        turn::turn(&mut mail, &setup.dir, &mut agent, &options).unwrap();
+        assert_eq!(mail.imports[0].0, explicit.unwrap_or("note"));
+    }
+    let setup = Setup::new("explicit-passive-action");
+    let mut agent = setup.agent("lane", Harness::Claude, Role::Reviewer);
+    let mut mail = FakeMail {
+        inbox: vec![direct("note", 1, "ctx", "peer", "Status")],
+        ..FakeMail::default()
+    };
+    let options = TurnOptions {
+        reply_kind: Some("question".into()),
+        ..opts("fake-claude.sh")
+    };
+    turn::turn(&mut mail, &setup.dir, &mut agent, &options).unwrap();
+    assert_eq!(mail.imports[0].0, "question");
+}
+
+#[test]
+fn passive_digest_import_uses_only_delivered_bodies_for_every_harness() {
+    for (harness, fake) in [
+        (Harness::Claude, "fake-claude.sh"),
+        (Harness::Codex, "fake-codex.sh"),
+        (Harness::OpenCode, "fake-opencode.sh"),
+    ] {
+        let setup = Setup::new("passive-digest-final");
+        let mut agent = setup.agent("lane", harness, Role::Reviewer);
+        let mut mail = FakeMail {
+            inbox: vec![
+                direct("passive", 1, "status", "peer", "Readable status"),
+                Message {
+                    kind: "question".into(),
+                    ..direct("header-only", 2, "action", "peer", &"x".repeat(12000))
+                },
+            ],
+            ..FakeMail::default()
+        };
+        let options = TurnOptions {
+            digest_budget: Some(2000),
+            ..opts(fake)
+        };
+        let report = turn::turn(&mut mail, &setup.dir, &mut agent, &options).unwrap();
+        assert_eq!(report.shown, ["passive"], "{harness:?}");
+        assert_eq!(
+            mail.digest_imports[0].0, "notice",
+            "header-only action mail was not answered"
+        );
+        assert_eq!(mail.acked, ["passive"]);
+        assert_eq!(
+            mail.inbox("lane", 10).unwrap().messages[0].message_id,
+            "header-only"
+        );
+    }
+}
+
+#[test]
+fn a_repeated_handoff_final_is_kept_without_importing_another_message() {
+    let setup = Setup::new("duplicate-handoff-final");
+    let mut agent = setup.agent("lane", Harness::Claude, Role::Reviewer);
+    fs::write(setup.work.join("fake-reply"), "Handoff already sent").unwrap();
+    let mut mail = FakeMail {
+        inbox: vec![Message {
+            kind: "question".into(),
+            ..direct("question", 1, "ctx", "peer", "Please hand back")
+        }],
+        sent_history: std::collections::VecDeque::from([0, 2]),
+        ..FakeMail::default()
+    };
+    let report = turn::turn(
+        &mut mail,
+        &setup.dir,
+        &mut agent,
+        &TurnOptions {
+            keep_logs: true,
+            ..opts("fake-claude.sh")
+        },
+    )
+    .unwrap();
+    assert_eq!(report.outcome, Outcome::NoReply);
+    assert!(mail.imports.is_empty());
+    assert_eq!(mail.acked, ["question"]);
+    let files = fs::read_dir(report.logs.unwrap())
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    assert!(
+        files
+            .iter()
+            .any(|path| path.extension().is_some_and(|ext| ext == "reply")
+                && fs::read_to_string(path).unwrap() == "Handoff already sent")
+    );
 }
 
 #[test]
@@ -7372,4 +7639,48 @@ fn an_idle_supervisor_gives_back_a_lease_its_turn_couldnt_release() {
         "released between turns"
     );
     assert!(!state::lease_record_path(&s.dir, "lane").exists());
+}
+
+#[test]
+fn reviewer_final_imports_are_attested_for_ordinary_and_digest_turns_on_every_harness() {
+    for (name, harness, fake) in [
+        ("claude", Harness::Claude, "fake-claude.sh"),
+        ("codex", Harness::Codex, "fake-codex.sh"),
+        ("opencode", Harness::OpenCode, "fake-opencode.sh"),
+    ] {
+        for digest in [false, true] {
+            let s = Setup::new(&format!("review-proof-{name}-{digest}"));
+            let mut agent = s.agent(name, harness, Role::Reviewer);
+            if harness == Harness::OpenCode {
+                agent.spec.model = Some("anthropic/claude-haiku".into());
+            }
+            let mut mail = FakeMail {
+                inbox: vec![message("review", 1, "review_request", "review this head")],
+                ..FakeMail::default()
+            };
+            let o = TurnOptions {
+                digest_budget: digest.then_some(4000),
+                user_codex_home: Some(s.work.join("fake-codex-home")),
+                ..opts(fake)
+            };
+            let report = turn::turn(&mut mail, &s.dir, &mut agent, &o).expect("reviewer turn");
+            assert_eq!(report.outcome, Outcome::Replied);
+            let [(reviewer, turn, imported, requests)] = mail.review_imports.as_slice() else {
+                panic!("missing attestation: {:?}", mail.review_imports);
+            };
+            assert_eq!(reviewer, name);
+            assert!(!turn.is_empty());
+            assert_eq!(Some(imported), report.reply_id.as_ref());
+            assert_eq!(requests, &["review"]);
+            assert_eq!(mail.acked, ["review"]);
+        }
+    }
+    let s = Setup::new("worker-no-review-proof");
+    let mut agent = s.agent("worker", Harness::Claude, Role::Worker);
+    let mut mail = FakeMail {
+        inbox: vec![message("review", 1, "review_request", "claimed review")],
+        ..FakeMail::default()
+    };
+    turn::turn(&mut mail, &s.dir, &mut agent, &opts("fake-claude.sh")).expect("worker turn");
+    assert!(mail.review_imports.is_empty());
 }

@@ -4,7 +4,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::config::{Config, RuleSelect, RustTarget};
+use super::config::{Config, Rule, RuleSelect, RustTarget};
+use super::narrow::Narrowing;
 use super::{GoSelection, MatchKind, ReasonCode, RustTestSelection, Selected};
 
 /// One test target.
@@ -91,175 +92,293 @@ pub struct PathVerdict {
     /// said.
     pub fallback_crates: BTreeSet<(String, String, Option<String>)>,
     /// Rule targets the head doesn't have, skipped: the path whose rule
-    /// named it (the old side of a rename keeps its own path), the rule's
-    /// index, the target, and whether none of the rule's targets exist, so
-    /// its packages run whole.
-    pub missing_targets: BTreeSet<(String, usize, RustTarget, bool)>,
+    /// named it (the old side of a rename keeps its own path), the rule
+    /// as messages name it, the target, and whether none of the rule's
+    /// targets exist, so its packages run whole.
+    pub missing_targets: BTreeSet<(String, String, RustTarget, bool)>,
 }
 
 pub struct Engine<'a> {
     pub config: &'a Config,
     pub go: Option<&'a mut dyn Adapter>,
     pub rust: Option<&'a mut dyn Adapter>,
+    /// Built-in global files whose change was confined, and the base's
+    /// rules when a config edit was narrowed.
+    pub narrowing: Narrowing,
 }
 
 impl Engine<'_> {
     /// Judges one path: `deleted` when it doesn't exist at the head.
+    ///
+    /// When a config edit was narrowed, the path is also judged under the
+    /// base's rules on their own, and both verdicts count: a rule the range
+    /// adds or changes can't narrow the range's own selection.
     pub fn judge(&mut self, path: &str, deleted: bool) -> PathVerdict {
-        let mut v = PathVerdict::default();
-        if self.config.is_global(path) {
-            v.matched_by.insert(MatchKind::Global);
-            v.reasons.insert(
-                ReasonCode::GlobalFile,
-                "every test depends on this file".into(),
+        let Engine {
+            config,
+            go,
+            rust,
+            narrowing,
+        } = self;
+        let narrowed = narrowing.paths.get(path);
+        let changed = narrowed.map(Vec::as_slice).unwrap_or_default();
+        let mut v = judge_with(
+            config,
+            "",
+            narrowed.is_some(),
+            changed,
+            go,
+            rust,
+            path,
+            deleted,
+        );
+        if let Some(base) = &narrowing.base {
+            let b = judge_with(
+                base,
+                "the base's ",
+                narrowed.is_some(),
+                &[],
+                go,
+                rust,
+                path,
+                deleted,
             );
-        }
-        for (i, rule) in self.config.rules.iter().enumerate() {
-            let Some(glob) = rule.paths.iter().find(|g| g.matches(path)) else {
-                continue;
-            };
-            v.matched_by.insert(MatchKind::Rule);
-            match &rule.select {
-                RuleSelect::All => {
-                    v.reasons.insert(
-                        ReasonCode::RuleSelectsAll,
-                        format!("affected.rules[{i}] (`{}`) selects all", glob.as_str()),
-                    );
-                }
-                RuleSelect::None => {}
-                RuleSelect::Targets {
-                    go,
-                    rust,
-                    rust_targets,
-                    suites,
-                } => {
-                    v.selects
-                        .extend(suites.iter().map(|s| Target::Suite(s.clone())));
-                    for (names, adapter, kind) in [
-                        (go, self.go.as_deref_mut(), "go"),
-                        (rust, self.rust.as_deref_mut(), "rust"),
-                    ] {
-                        if names.is_empty() {
-                            continue;
-                        }
-                        let resolved = match adapter {
-                            Some(a) => a.resolve(names),
-                            None => Err(format!("no {kind} adapter applies to this repository")),
-                        };
-                        match resolved {
-                            Ok(t) => v.selects.extend(t),
-                            Err(e) => {
-                                v.reasons.insert(
-                                    ReasonCode::ConfigInvalid,
-                                    format!("affected.rules[{i}].select.{kind}: {e}"),
-                                );
-                            }
-                        }
-                    }
-                    if !rust_targets.is_empty() {
-                        let resolved = match self.rust.as_deref_mut() {
-                            Some(a) => a.resolve_tests(rust_targets).and_then(|r| {
-                                if r.missing.is_empty() {
-                                    return Ok((r, None));
-                                }
-                                // Every missing target's package must exist at
-                                // this head: a package the head lacks is an
-                                // error, even beside targets that resolve.
-                                let packages: Vec<String> = r
-                                    .missing
-                                    .iter()
-                                    .map(|t| t.package.clone())
-                                    .collect::<BTreeSet<_>>()
-                                    .into_iter()
-                                    .collect();
-                                let whole = a.resolve(&packages)?;
-                                // None of the rule's targets exist at this
-                                // head: run their packages whole.
-                                let all_missing = r.found.is_empty();
-                                Ok((r, all_missing.then_some(whole)))
-                            }),
-                            None => Err("no rust adapter applies to this repository".into()),
-                        };
-                        match resolved {
-                            Ok((r, whole)) => {
-                                let all_missing = whole.is_some();
-                                v.selects.extend(r.found);
-                                v.selects.extend(whole.into_iter().flatten());
-                                v.missing_targets.extend(
-                                    r.missing
-                                        .into_iter()
-                                        .map(|t| (path.to_string(), i, t, all_missing)),
-                                );
-                            }
-                            Err(e) => {
-                                v.reasons.insert(
-                                    ReasonCode::ConfigInvalid,
-                                    format!("affected.rules[{i}].select.rust_targets: {e}"),
-                                );
-                            }
-                        }
-                    }
-                }
+            v.matched_by.extend(b.matched_by);
+            v.selects.extend(b.selects);
+            for (code, detail) in b.reasons {
+                v.reasons.entry(code).or_insert(detail);
             }
-        }
-        for adapter in [self.go.as_deref_mut(), self.rust.as_deref_mut()]
-            .into_iter()
-            .flatten()
-        {
-            match adapter.map(path, deleted) {
-                Ok(Mapping::NotMine) => {}
-                Ok(m @ (Mapping::Selects(_) | Mapping::Coarse(..))) => {
-                    let (t, why) = match m {
-                        Mapping::Coarse(t, why) => (t, Some(why)),
-                        Mapping::Selects(t) => (t, None),
-                        _ => unreachable!(),
-                    };
-                    v.matched_by.insert(adapter.kind());
-                    for target in t {
-                        if let Target::Rust(package) = &target {
-                            let fine = v.selects.iter().any(|t| {
-                                matches!(t,
-                                Target::RustTest(t) if &t.package == package)
-                            });
-                            if fine {
-                                continue;
-                            }
-                            if !v.selects.contains(&target) {
-                                v.fallback_crates.insert((
-                                    path.into(),
-                                    package.clone(),
-                                    why.clone(),
-                                ));
-                            }
-                        }
-                        v.selects.insert(target);
-                    }
-                }
-                Ok(Mapping::Removed(detail)) => {
-                    v.matched_by.insert(adapter.kind());
-                    v.reasons.insert(ReasonCode::PackageRemoved, detail);
-                }
-                Ok(Mapping::Unaccounted(detail)) => {
-                    v.reasons.insert(ReasonCode::UnmatchedPath, detail);
-                }
-                Err(e) => {
-                    v.reasons.insert(
-                        ReasonCode::AdapterFailed,
-                        format!("the {} adapter failed: {e}", adapter.name()),
-                    );
-                }
-            }
-        }
-        if v.matched_by.is_empty()
-            && !v.reasons.contains_key(&ReasonCode::AdapterFailed)
-            && !v.reasons.contains_key(&ReasonCode::UnmatchedPath)
-        {
-            v.reasons.insert(
-                ReasonCode::UnmatchedPath,
-                "no adapter maps this path and no rule matches it".into(),
-            );
+            v.fallback_crates.extend(b.fallback_crates);
+            v.missing_targets.extend(b.missing_targets);
         }
         v
+    }
+}
+
+/// Judges one path under one set of rules. `whose` prefixes the rules in
+/// messages. A `narrowed` path isn't a built-in global file (its change was
+/// confined), and also selects the `changed` rules' targets.
+#[allow(clippy::too_many_arguments)]
+fn judge_with<'a>(
+    config: &Config,
+    whose: &str,
+    narrowed: bool,
+    changed: &[(String, Rule)],
+    go: &mut Option<&'a mut dyn Adapter>,
+    rust: &mut Option<&'a mut dyn Adapter>,
+    path: &str,
+    deleted: bool,
+) -> PathVerdict {
+    let mut v = PathVerdict::default();
+    let global = config.is_user_global(path) || (!narrowed && config.is_builtin_global(path));
+    if global {
+        v.matched_by.insert(MatchKind::Global);
+        v.reasons.insert(
+            ReasonCode::GlobalFile,
+            "every test depends on this file".into(),
+        );
+    }
+    // A detail recorded later replaces an earlier one, so the matching
+    // rules' details win over the changed rules'.
+    for (at, rule) in changed {
+        apply(
+            at,
+            format!("{at} selects all"),
+            &rule.select,
+            path,
+            go,
+            rust,
+            &mut v,
+        );
+    }
+    let mut matched = false;
+    for (i, rule) in config.rules.iter().enumerate() {
+        let Some(glob) = rule.paths.iter().find(|g| g.matches(path)) else {
+            continue;
+        };
+        matched = true;
+        let at = format!("{whose}affected.rules[{i}]");
+        let all = format!("{at} (`{}`) selects all", glob.as_str());
+        apply(&at, all, &rule.select, path, go, rust, &mut v);
+    }
+    if matched {
+        v.matched_by.insert(MatchKind::Rule);
+    }
+    for adapter in [go.as_deref_mut(), rust.as_deref_mut()]
+        .into_iter()
+        .flatten()
+    {
+        match adapter.map(path, deleted) {
+            Ok(Mapping::NotMine) => {}
+            Ok(m @ (Mapping::Selects(_) | Mapping::Coarse(..))) => {
+                let (t, why) = match m {
+                    Mapping::Coarse(t, why) => (t, Some(why)),
+                    Mapping::Selects(t) => (t, None),
+                    _ => unreachable!(),
+                };
+                v.matched_by.insert(adapter.kind());
+                for target in t {
+                    if let Target::Rust(package) = &target {
+                        let fine = v.selects.iter().any(|t| {
+                            matches!(t,
+                            Target::RustTest(t) if &t.package == package)
+                        });
+                        if fine {
+                            continue;
+                        }
+                        if !v.selects.contains(&target) {
+                            v.fallback_crates
+                                .insert((path.into(), package.clone(), why.clone()));
+                        }
+                    }
+                    v.selects.insert(target);
+                }
+            }
+            Ok(Mapping::Removed(detail)) => {
+                v.matched_by.insert(adapter.kind());
+                v.reasons.insert(ReasonCode::PackageRemoved, detail);
+            }
+            Ok(Mapping::Unaccounted(detail)) => {
+                v.reasons.insert(ReasonCode::UnmatchedPath, detail);
+            }
+            Err(e) => {
+                v.reasons.insert(
+                    ReasonCode::AdapterFailed,
+                    format!("the {} adapter failed: {e}", adapter.name()),
+                );
+            }
+        }
+    }
+    // A narrowed file's tests come only from a rule matching it: an adapter
+    // that owns the file (a Go package folder holding a `Cargo.toml`) knows
+    // nothing of what a version bump or a rules edit needs.
+    if (narrowed && !matched)
+        || (v.matched_by.is_empty()
+            && !v.reasons.contains_key(&ReasonCode::AdapterFailed)
+            && !v.reasons.contains_key(&ReasonCode::UnmatchedPath))
+    {
+        let none = if whose.is_empty() {
+            "no rule matches".to_string()
+        } else {
+            format!("none of {whose}rules matches")
+        };
+        let (code, detail) = if !narrowed {
+            let when = if whose.is_empty() {
+                ""
+            } else {
+                "; a rule takes effect once the base has it"
+            };
+            (
+                ReasonCode::UnmatchedPath,
+                format!("no adapter maps this path and {none} it{when}"),
+            )
+        } else {
+            let what = if path == super::narrow::CONFIG_PATH {
+                "the affected rules"
+            } else {
+                "package versions"
+            };
+            (
+                ReasonCode::GlobalFile,
+                format!("only {what} changed, but {none} this file to name its tests"),
+            )
+        };
+        v.reasons.insert(code, detail);
+    }
+    v
+}
+
+/// Applies a matching (or changed) rule's selection to a path's verdict.
+/// `at` names the rule in messages; `all` is the detail when it selects
+/// everything.
+fn apply<'a>(
+    at: &str,
+    all: String,
+    select: &RuleSelect,
+    path: &str,
+    go: &mut Option<&'a mut dyn Adapter>,
+    rust: &mut Option<&'a mut dyn Adapter>,
+    v: &mut PathVerdict,
+) {
+    let (go_names, rust_names, rust_targets, suites) = match select {
+        RuleSelect::All => {
+            v.reasons.insert(ReasonCode::RuleSelectsAll, all);
+            return;
+        }
+        RuleSelect::None => return,
+        RuleSelect::Targets {
+            go,
+            rust,
+            rust_targets,
+            suites,
+        } => (go, rust, rust_targets, suites),
+    };
+    v.selects
+        .extend(suites.iter().map(|s| Target::Suite(s.clone())));
+    for (names, adapter, kind) in [
+        (go_names, go.as_deref_mut(), "go"),
+        (rust_names, rust.as_deref_mut(), "rust"),
+    ] {
+        if names.is_empty() {
+            continue;
+        }
+        let resolved = match adapter {
+            Some(a) => a.resolve(names),
+            None => Err(format!("no {kind} adapter applies to this repository")),
+        };
+        match resolved {
+            Ok(t) => v.selects.extend(t),
+            Err(e) => {
+                v.reasons.insert(
+                    ReasonCode::ConfigInvalid,
+                    format!("{at}.select.{kind}: {e}"),
+                );
+            }
+        }
+    }
+    if rust_targets.is_empty() {
+        return;
+    }
+    let resolved = match rust.as_deref_mut() {
+        Some(a) => a.resolve_tests(rust_targets).and_then(|r| {
+            if r.missing.is_empty() {
+                return Ok((r, None));
+            }
+            // Every missing target's package must exist at this head: a
+            // package the head lacks is an error, even beside targets that
+            // resolve.
+            let packages: Vec<String> = r
+                .missing
+                .iter()
+                .map(|t| t.package.clone())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            let whole = a.resolve(&packages)?;
+            // None of the rule's targets exist at this head: run their
+            // packages whole.
+            let all_missing = r.found.is_empty();
+            Ok((r, all_missing.then_some(whole)))
+        }),
+        None => Err("no rust adapter applies to this repository".into()),
+    };
+    match resolved {
+        Ok((r, whole)) => {
+            let all_missing = whole.is_some();
+            v.selects.extend(r.found);
+            v.selects.extend(whole.into_iter().flatten());
+            v.missing_targets.extend(
+                r.missing
+                    .into_iter()
+                    .map(|t| (path.to_string(), at.to_string(), t, all_missing)),
+            );
+        }
+        Err(e) => {
+            v.reasons.insert(
+                ReasonCode::ConfigInvalid,
+                format!("{at}.select.rust_targets: {e}"),
+            );
+        }
     }
 }
 
@@ -352,7 +471,9 @@ mod tests {
             if self.fail {
                 return Err("go list failed".into());
             }
-            if !path.ends_with(".go") {
+            // A package folder holding a non-Go file owns it, as `go`
+            // does for files directly in a package's folder.
+            if !path.ends_with(".go") && !path.starts_with("owned/") {
                 return Ok(Mapping::NotMine);
             }
             if deleted && path.starts_with("gone/") {
@@ -394,6 +515,7 @@ mod tests {
             config,
             go: adapter.map(|a| a as &mut dyn Adapter),
             rust: None,
+            narrowing: Narrowing::default(),
         };
         e.judge(path, deleted)
     }
@@ -504,6 +626,41 @@ mod tests {
         let c = cfg("{}");
         let v = judge(&c, Some(&mut FakeGo { fail: false }), "gone/a.go", true);
         assert_eq!(codes(&v), [ReasonCode::PackageRemoved]);
+    }
+
+    #[test]
+    fn a_narrowed_file_an_adapter_owns_still_needs_a_rule() {
+        let narrowing = || Narrowing {
+            paths: BTreeMap::from([("owned/Cargo.toml".to_string(), Vec::new())]),
+            base: None,
+        };
+        let judge = |c: &Config| {
+            let mut a = FakeGo { fail: false };
+            let mut e = Engine {
+                config: c,
+                go: Some(&mut a as &mut dyn Adapter),
+                rust: None,
+                narrowing: narrowing(),
+            };
+            e.judge("owned/Cargo.toml", false)
+        };
+        let v = judge(&cfg("{}"));
+        assert_eq!(codes(&v), [ReasonCode::GlobalFile], "{v:?}");
+        assert!(v.reasons[&ReasonCode::GlobalFile].contains("no rule matches"));
+        let c = cfg(
+            r#"{"affected": {"rules": [{"paths": ["owned/Cargo.toml"], "select": {"suites": ["version"]}}]}}"#,
+        );
+        let v = judge(&c);
+        assert!(codes(&v).is_empty(), "{v:?}");
+        assert!(v.selects.contains(&Target::Suite("version".into())));
+        // Not narrowed, the same file is still global.
+        let mut a = FakeGo { fail: false };
+        let v = judge_one(&c, &mut a, "owned/Cargo.toml");
+        assert_eq!(codes(&v), [ReasonCode::GlobalFile]);
+    }
+
+    fn judge_one(c: &Config, a: &mut FakeGo, path: &str) -> PathVerdict {
+        judge(c, Some(a), path, false)
     }
 
     #[test]

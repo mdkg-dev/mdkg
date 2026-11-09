@@ -1134,3 +1134,185 @@ fn the_legacy_projections_hint_writes_the_key_in_either_mode() {
         assert_eq!(legacy(&out), 0, "checkout {checkout}: {out}");
     }
 }
+
+#[test]
+fn authority_fields_config_writes_are_refused_in_turns_but_person_writes_work() {
+    for checkout in [false, true] {
+        let s = Scratch::new();
+        if checkout {
+            s.checkout_mode();
+        } else {
+            s.ref_mode();
+        }
+        let agent = serde_json::json!({"harness":"codex","role":"worker","worktree":true,
+            "policy":{"env":{"inherit":false}},"sandbox":"workspace-write","approvals":"never"});
+        let (code, out) = s.mdkg(&[
+            "config",
+            "set",
+            "agents",
+            &serde_json::json!({"worker":agent}).to_string(),
+            "--json",
+        ]);
+        assert_eq!(code, 0, "{out}");
+        for (key, value) in [
+            ("agents.defaults.env.inherit", "true"),
+            ("agents.worker.policy.env.inherit", "true"),
+            ("/agents/worker/sandbox", "read-only"),
+            ("agents.worker.approvals", "on-request"),
+            (
+                "agents.worker.policy",
+                r#"{"env":{"inherit":true},"timeout":30}"#,
+            ),
+        ] {
+            let refs = s.refs();
+            let (code, out) = s.mdkg_with(
+                &["--as", "operator", "config", "set", key, value, "--json"],
+                &[("MDKG_RUN_TURN", "")],
+            );
+            assert_ne!(code, 0, "{out}");
+            assert_eq!(
+                out["diagnostics"][0]["code"], "authority.field_in_turn",
+                "{out}"
+            );
+            assert_eq!(s.refs(), refs);
+            let (code, out) = s.mdkg(&["--as", "operator", "config", "set", key, value, "--json"]);
+            assert_eq!(code, 0, "{out}");
+            let refs = s.refs();
+            let (code, out) = s.mdkg_with(
+                &["--as", "orchestrator", "config", "unset", key, "--json"],
+                &[("MDKG_RUN_TURN", "fixture-turn")],
+            );
+            assert_ne!(code, 0, "{out}");
+            assert_eq!(
+                out["diagnostics"][0]["code"], "authority.field_in_turn",
+                "{out}"
+            );
+            assert_eq!(s.refs(), refs);
+            let (code, out) = s.mdkg(&["--as", "operator", "config", "unset", key, "--json"]);
+            assert_eq!(code, 0, "{out}");
+        }
+        // Whole parents cannot remove protected leaves by avoiding their names.
+        let (code, out) = s.mdkg(&[
+            "config",
+            "set",
+            "agents.worker.policy.env.inherit",
+            "false",
+            "--json",
+        ]);
+        assert_eq!(code, 0, "{out}");
+        let refs = s.refs();
+        let (code, out) = s.mdkg_with(
+            &["config", "unset", "agents", "--json"],
+            &[("MDKG_RUN_TURN", "fixture-turn")],
+        );
+        assert_ne!(code, 0, "{out}");
+        assert_eq!(
+            out["diagnostics"][0]["code"], "authority.field_in_turn",
+            "{out}"
+        );
+        assert_eq!(s.refs(), refs);
+        // No-op authority changes, previews and ordinary settings stay usable.
+        for args in [
+            vec![
+                "config",
+                "set",
+                "agents.worker.policy.env.inherit",
+                "false",
+                "--json",
+            ],
+            vec![
+                "config",
+                "set",
+                "agents.worker.policy.env.inherit",
+                "true",
+                "--dry-run",
+                "--json",
+            ],
+            vec!["config", "set", KEY, "0", "--json"],
+        ] {
+            let (code, out) = s.mdkg_with(&args, &[("MDKG_RUN_TURN", "fixture-turn")]);
+            assert_eq!(code, 0, "{out}");
+        }
+        assert_eq!(s.my_leases(), 0);
+    }
+}
+
+#[test]
+fn authority_fields_live_turn_is_refused_with_its_marker_cleared() {
+    let s = Scratch::new();
+    s.ref_mode();
+    let (code, out) = s.mdkg(&[
+        "agents",
+        "add",
+        "worker",
+        "--harness",
+        "codex",
+        "--role",
+        "worker",
+        "--policy",
+        r#"{"env":{"inherit":false}}"#,
+        "--json",
+    ]);
+    assert_eq!(code, 0, "{out}");
+    let common = s.repo().join(".git");
+    for harness in [
+        mdkg_run::profile::Harness::Claude,
+        mdkg_run::profile::Harness::Codex,
+        mdkg_run::profile::Harness::OpenCode,
+    ] {
+        let held = mdkg_run::hooks::record_turn_context(
+            &common,
+            "authority-live",
+            &mdkg_run::hooks::TurnContext {
+                actor: "worker".into(),
+                harness,
+                session: None,
+                cwd: s.repo(),
+                starting_head: None,
+            },
+        )
+        .unwrap();
+        let refs = s.refs();
+        for args in [
+            vec![
+                "--as",
+                "worker",
+                "config",
+                "set",
+                "agents.worker.policy.env.inherit",
+                "true",
+                "--json",
+            ],
+            vec![
+                "--as",
+                "worker",
+                "agents",
+                "edit",
+                "worker",
+                "--policy",
+                r#"{"env":{"inherit":true}}"#,
+                "--json",
+            ],
+        ] {
+            let (code, out) = s.mdkg(&args); // fixture isolation clears every launcher mark
+            assert_ne!(code, 0, "{out}");
+            assert_eq!(
+                out["diagnostics"][0]["code"], "authority.field_in_turn",
+                "{out}"
+            );
+            assert_eq!(s.refs(), refs);
+        }
+        drop(held);
+    }
+    let (code, out) = s.mdkg(&[
+        "--as",
+        "operator",
+        "agents",
+        "edit",
+        "worker",
+        "--policy",
+        r#"{"env":{"inherit":true}}"#,
+        "--json",
+    ]);
+    assert_eq!(code, 0, "{out}");
+}

@@ -469,16 +469,8 @@ fn bounded(mut cmd: std::process::Command) -> Result<std::process::Output, Bound
 /// Whether the common config file sets `mdkg.graph.ref` (includes never
 /// followed: the key lives in that file only). A file git can't read
 /// counts as naming one, so the full resolve reports why.
-fn names_graph_ref(top: &Path, common: &Path) -> bool {
-    match raw::command(top)
-        .args(["config", "--no-includes", "--file"])
-        .arg(common.join("config"))
-        .args(["--get", "mdkg.graph.ref"])
-        .run(None)
-    {
-        Ok(out) => out.status.code() != Some(1),
-        Err(_) => true,
-    }
+fn names_graph_ref(_top: &Path, common: &Path) -> bool {
+    mdkg_git::own_config_value(common, "mdkg.graph.ref").map_or(true, |value| value.is_some())
 }
 
 fn sorted(paths: &[String]) -> Vec<String> {
@@ -489,15 +481,10 @@ fn sorted(paths: &[String]) -> Vec<String> {
 
 /// `mdkg.graph.migrating`, read from the common config.
 fn migrating(common: &Path) -> Option<String> {
-    let out = raw::command(common)
-        .args(["config", "--no-includes", "--file"])
-        .arg(common.join("config"))
-        .args(["--get", "mdkg.graph.migrating"])
-        .run(None)
-        .ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+    mdkg_git::own_config_value(common, "mdkg.graph.migrating")
+        .ok()
+        .flatten()
+        .map(|s| s.trim().to_owned())
         .filter(|s| !s.is_empty())
 }
 

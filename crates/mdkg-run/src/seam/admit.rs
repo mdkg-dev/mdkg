@@ -223,8 +223,17 @@ pub(crate) fn admit(
     // of 19f1e58). Mail no reply could reach there waits for a turn that
     // reaches it on the first page.
     let mut paused: Vec<String> = Vec::new();
-    if let Some(g) = &opts.loop_guard {
-        let pausing = crate::supervise::Guard::read(dir, &name)?.paused(g, state::now_ms());
+    let select_waking = opts.mail_triggered && opts.digest_budget.is_none();
+    let wake_kinds = opts.wake_kinds.as_deref();
+    let has_wake = |messages: &[crate::mail::Message]| {
+        !select_waking || messages.iter().any(|m| crate::turn::wakes(m, wake_kinds))
+    };
+    if opts.loop_guard.is_some() || select_waking {
+        let pausing = if let Some(g) = &opts.loop_guard {
+            crate::supervise::Guard::read(dir, &name)?.paused(g, state::now_ms())
+        } else {
+            Vec::new()
+        };
         let keep = |m: &crate::mail::Message, paused: &mut Vec<String>| {
             let key = delivery_thread_key(m, opts.digest_budget.is_some());
             if pausing.contains(&key) {
@@ -238,8 +247,21 @@ pub(crate) fn admit(
         };
         inbox.messages.retain(|m| keep(m, &mut paused));
         let mut after = inbox.cursor;
-        while inbox.messages.is_empty() && inbox.more && after.is_some() {
-            let page = mail.inbox_after(&name, after, PAGE)?;
+        while (inbox.messages.is_empty() || !has_wake(&inbox.messages))
+            && inbox.more
+            && after.is_some()
+        {
+            if !has_wake(&inbox.messages) {
+                // Excluded conversations remain unacked. Bound the retained
+                // batch while looking for the kind that admitted this turn.
+                inbox.messages.clear();
+            }
+            let limit = if select_waking {
+                opts.limit.max(1)
+            } else {
+                PAGE
+            };
+            let page = mail.inbox_after(&name, after, limit)?;
             if let Some(watch) = lifecycle.watch.as_mut() {
                 watch.observe_mail(page.cursor)?;
             }
@@ -272,6 +294,9 @@ pub(crate) fn admit(
                     inbox.messages.push(m);
                 }
             }
+        }
+        if !has_wake(&inbox.messages) {
+            inbox.messages.clear();
         }
     }
     // Mail earlier turns showed and failed before acking comes again, with
@@ -355,6 +380,10 @@ pub(crate) fn admit(
             shows.save(dir, &name)?;
         }
     }
+    // Poison handling may have removed the batch's only eligible trigger.
+    if !has_wake(&inbox.messages) {
+        inbox.messages.clear();
+    }
     if inbox.messages.is_empty() && opts.task.is_none() {
         let mut r = base_report(agent, Outcome::Idle, &opts.mdkg);
         r.launcher_notes = launcher_notes;
@@ -381,7 +410,11 @@ pub(crate) fn admit(
     // sender's note in it can't divert the first sender's reply or mark
     // its request answered (audit, 2026-10-22).
     crate::turn::delivery_order(&mut inbox.messages, &agent.spec.reports_to);
-    let lead = inbox.messages.first().map(conversation);
+    let lead = inbox
+        .messages
+        .iter()
+        .find(|m| !select_waking || crate::turn::wakes(m, wake_kinds))
+        .map(conversation);
     if let Some(key) = lead.filter(|_| opts.digest_budget.is_none()) {
         let before = inbox.messages.len();
         inbox.messages.retain(|m| conversation(m) == key);
@@ -740,14 +773,24 @@ pub(crate) fn admit(
         !worker,
     );
     let newest = crate::turn::newest_of(&inbox.messages);
-    let reply_kind = opts.reply_kind.clone().or_else(|| {
+    let digest_reply_default = if worker { "handoff" } else { "findings" };
+    let mut reply_kind = opts.reply_kind.clone().or_else(|| {
         if opts.digest_budget.is_some() {
-            Some(if worker { "handoff" } else { "findings" }.to_string())
+            // Budget with the longer ordinary kind, then resolve the actual
+            // kind from complete bodies after the digest has selected them.
+            Some(digest_reply_default.to_string())
         } else {
-            newest.map(|m| default_reply_kind(&m.kind).to_string())
+            newest.map(|m| {
+                crate::turn::final_reply_kind(
+                    inbox.messages.iter(),
+                    None,
+                    default_reply_kind(&m.kind),
+                )
+                .to_string()
+            })
         }
     });
-    let digest_prefix = |note: Option<&str>| {
+    let digest_prefix = |note: Option<&str>, kind: &str| {
         let mut prefix = crate::digest::digest_at(
             &name,
             opts.definition_commit.as_deref(),
@@ -759,9 +802,9 @@ pub(crate) fn admit(
             &shows,
         );
         prefix.push_str(&format!(
-            "\nYour final reply goes to {} as {}. If nothing needs a reply, respond exactly NO_REPLY. Only complete bodies are acknowledged.\n",
+            "\nYour final reply goes to {} as {}. A notice stays readable without starting its recipient's turn. If nothing needs a reply, respond exactly NO_REPLY. Only complete bodies are acknowledged.\n",
             crate::digest::clean(&agent.spec.reports_to),
-            reply_kind.as_deref().unwrap_or("handoff")
+            kind
         ));
         prefix
     };
@@ -776,7 +819,11 @@ pub(crate) fn admit(
         } else {
             Some(approvals.text.clone())
         };
-        let prefix_len = digest_prefix(candidate_note.as_deref()).len();
+        let prefix_len = digest_prefix(
+            candidate_note.as_deref(),
+            reply_kind.as_deref().unwrap_or("handoff"),
+        )
+        .len();
         fit_digest_approvals(approvals, &inbox.messages, budget, prompt_max, prefix_len)
     } else if let Some(prompt_max) = prompt_max {
         // The prompt as it's sent, but for the section: its reply target
@@ -796,7 +843,7 @@ pub(crate) fn admit(
     // added, so it serves only the prompt budget's passes.
     let (prompt, shown, digest_nodes, digest_references) = if let Some(budget) = opts.digest_budget
     {
-        let mut prefix = digest_prefix(note.as_deref());
+        let prefix = digest_prefix(note.as_deref(), reply_kind.as_deref().unwrap_or("handoff"));
         let hard = prompt_max
             .unwrap_or(usize::MAX)
             .saturating_sub(prefix.len());
@@ -827,6 +874,19 @@ pub(crate) fn admit(
                 "the digest exceeds the harness prompt cap; no turn was admitted",
             )
         })?;
+        // Header-only messages cannot make a passive digest wake its
+        // recipient. The default notice kind is shorter than either digest
+        // default, so replacing the budgeted prefix cannot exceed its cap.
+        let final_kind = crate::turn::final_reply_kind(
+            inbox
+                .messages
+                .iter()
+                .filter(|m| view.bodies.contains(&m.message_id)),
+            opts.reply_kind.as_deref(),
+            digest_reply_default,
+        );
+        let mut prefix = digest_prefix(note.as_deref(), final_kind);
+        reply_kind = Some(final_kind.to_string());
         prefix.push_str(&view.text);
         (prefix, view.bodies, view.nodes, view.references)
     } else {

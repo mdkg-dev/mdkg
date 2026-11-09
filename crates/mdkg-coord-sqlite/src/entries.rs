@@ -667,6 +667,24 @@ pub enum Action {
         at: Option<String>,
         text: Option<String>,
     },
+    /// An outside-turn coordinator relays an assigned reviewer's verdict.
+    ReviewReceipt {
+        round: EntryRef,
+        reviewer: String,
+        message: String,
+        at: String,
+        req: String,
+        state: ReqState,
+        text: Option<String>,
+    },
+    /// A reviewer records its own verdict on a requirement, at the head
+    /// an open review round on the node assigns it by name.
+    ReviewVerdict {
+        req: String,
+        state: ReqState,
+        at: String,
+        text: Option<String>,
+    },
     /// A named reviewer completes a review round (A27, rule 8): the only
     /// op that moves a round.
     ReviewComplete {
@@ -698,6 +716,8 @@ impl Action {
             Action::Resolve { .. } => "resolve",
             Action::Move { .. } => "move",
             Action::Req { .. } => "req",
+            Action::ReviewReceipt { .. } => "review.receipt",
+            Action::ReviewVerdict { .. } => "review.verdict",
             Action::ReviewComplete { .. } => "review.complete",
         }
     }
@@ -962,6 +982,43 @@ impl Op {
                     text: f.str("text")?,
                 }
             }
+            "review.receipt" => {
+                let round = f.entry("round")?;
+                if !round.id.starts_with('V') {
+                    return Err(Fields::bad("round"));
+                }
+                let req = f.need("req")?;
+                check_req_id(&req)?;
+                let state = match f.need("state")?.as_str() {
+                    "met" => ReqState::Met,
+                    "unmet" => ReqState::Unmet,
+                    _ => return Err(Fields::bad("state")),
+                };
+                Action::ReviewReceipt {
+                    round,
+                    reviewer: f.need("reviewer")?,
+                    message: f.need("message")?,
+                    at: f.need("at")?,
+                    req,
+                    state,
+                    text: f.str("text")?,
+                }
+            }
+            "review.verdict" => {
+                let req = f.need("req")?;
+                check_req_id(&req)?;
+                let state = match f.need("state")?.as_str() {
+                    "met" => ReqState::Met,
+                    "unmet" => ReqState::Unmet,
+                    _ => return Err(Fields::bad("state")),
+                };
+                Action::ReviewVerdict {
+                    req,
+                    state,
+                    at: f.need("at")?,
+                    text: f.str("text")?,
+                }
+            }
             "review.complete" => {
                 let round = f.entry("round")?;
                 if !round.id.starts_with('V') {
@@ -1210,6 +1267,19 @@ pub struct Change<'a> {
     /// The message the op came in, if any (a reply's import).
     pub message: Option<&'a str>,
     pub turn: Option<&'a str>,
+    pub now_ms: u64,
+}
+
+/// Evidence supplied only by the installed launcher's in-process final-import
+/// callback, never by an entry op, mail body, CLI flag or MCP argument.
+#[derive(Debug)]
+pub struct ReviewImportEvidence<'a> {
+    pub reviewer: &'a str,
+    pub launcher: &'a str,
+    pub turn: &'a str,
+    pub message: &'a str,
+    pub digest: &'a str,
+    pub requests: &'a [String],
     pub now_ms: u64,
 }
 
@@ -1583,7 +1653,7 @@ fn op_node(c: &Change<'_>, env: &dyn Env) -> Result<NodeLink, EntryError> {
         | Move { entry, .. } => Some(entry),
         Decide { entry, .. } => entry.as_ref(),
         ReviewComplete { round, .. } => Some(round),
-        Add { .. } | Propose(_) | Req { .. } => None,
+        Add { .. } | Propose(_) | Req { .. } | ReviewReceipt { .. } | ReviewVerdict { .. } => None,
     };
     match entry {
         Some(r) => node_of(r, c, env),
@@ -3408,6 +3478,181 @@ pub(crate) fn apply_in(
             let to = if all { "closed" } else { "answered" };
             changed.push(transition(tx, &mut e, to, step, c)?);
         }
+        Action::ReviewReceipt {
+            round,
+            reviewer,
+            message,
+            at,
+            req,
+            state,
+            text,
+        } => {
+            if c.class != Class::Coordinator
+                || c.turn.is_some()
+                || env.in_turn(c.actor)?
+                || matches!(state, ReqState::Waived)
+            {
+                return Err(EntryError::NotAllowed {
+                    class: c.class,
+                    op: name.into(),
+                });
+            }
+            check_text(text.as_deref())?;
+            let node = target(c, env)?;
+            let e = find(tx, round, c, env)?;
+            let at = env.commit(at)?;
+            if e.node.uuid != node.uuid
+                || e.kind != Kind::Review
+                || e.range().is_none_or(|(_, head)| head != at)
+            {
+                return Err(EntryError::RangeMismatch { entry: e.path() });
+            }
+            // Only a direct named assignment is sufficient. A role's current
+            // holder is not proof of who held it when an old verdict was sent.
+            if !e.reviewers().contains(reviewer)
+                || !matches!(env.definitions(reviewer)?, Some((Class::Reviewer, _)))
+            {
+                return Err(EntryError::NotAllowed {
+                    class: c.class,
+                    op: "review.receipt (reviewer is not assigned)".into(),
+                });
+            }
+            let request = e.get_str("request").ok_or_else(|| Fields::bad("round"))?;
+            let bound: bool = tx.query_row(
+                "SELECT EXISTS (SELECT 1 FROM msg_messages verdict
+                 JOIN msg_messages request ON request.message_id = ?2
+                 WHERE verdict.message_id = ?1 AND verdict.sender = ?3
+                   AND request.kind = 'review_request'
+                   AND verdict.via IS NOT NULL
+                   AND verdict.kind IN ('findings', 'note', 'notice')
+                   AND verdict.seq > request.seq
+                   AND EXISTS (SELECT 1 FROM msg_deliveries delivery WHERE delivery.seq = request.seq AND delivery.mailbox = ?3)
+                   AND EXISTS (SELECT 1 FROM json_each(verdict.reference_ids) ref WHERE ref.value = ?2)
+                   AND EXISTS (SELECT 1 FROM msg_links link WHERE link.seq = request.seq AND link.node_uuid = ?4))",
+                params![message, request, reviewer, node.uuid], |r| r.get(0),
+            )?;
+            if !bound {
+                return Err(Fields::bad("message"));
+            }
+            let digest: String = tx.query_row(
+                "SELECT digest FROM msg_messages WHERE message_id = ?1",
+                params![message],
+                |r| r.get(0),
+            )?;
+            let proof = e
+                .data
+                .get("review_imports")
+                .and_then(|p| p.get(message))
+                .filter(|p| {
+                    p["reviewer"] == *reviewer
+                        && p["sha"] == at
+                        && p["digest"] == digest
+                        && p["turn"].as_str().is_some_and(|t| !t.is_empty())
+                })
+                .ok_or_else(|| Fields::bad("message"))?;
+            let provenance = json!({"round":e.path(), "reviewer":reviewer,
+                "recorded_by":c.actor, "message":message, "sha":at, "state":state.as_str(),
+                "turn":proof["turn"], "digest":digest});
+            let relay = Change {
+                message: Some(message),
+                ..*c
+            };
+            req_change(
+                tx,
+                &node,
+                req,
+                *state,
+                Some(at),
+                text.clone(),
+                Some(&provenance),
+                &relay,
+                env,
+                &mut changed,
+            )?;
+        }
+        Action::ReviewVerdict {
+            req,
+            state,
+            at,
+            text,
+        } => {
+            // Only the reviewer itself, by its committed reviewer
+            // definition: never a coordinator or a person on its behalf.
+            if c.class != Class::Reviewer {
+                return Err(EntryError::NotAllowed {
+                    class: c.class,
+                    op: name.into(),
+                });
+            }
+            check_text(text.as_deref())?;
+            let node = target(c, env)?;
+            let at = env.commit(at)?;
+            // A round that isn't closed, names this reviewer directly, and
+            // reviewed exactly `at`: the assignment a `review_request` with
+            // `--node` and `--range` records.
+            let assigned = load_all(tx, &node.uuid)?.iter().any(|e| {
+                e.kind == Kind::Review
+                    && e.state != "closed"
+                    && e.reviewers().iter().any(|r| r == c.actor)
+                    && e.range().is_some_and(|(_, head)| head == at)
+            });
+            if !assigned {
+                return Err(EntryError::NotAllowed {
+                    class: c.class,
+                    op: "review.verdict (no open review round on this node names you at that head)"
+                        .into(),
+                });
+            }
+            // A retry changes nothing: the requirement is still in that
+            // state, and this reviewer's own latest event on it is this
+            // verdict, at this head, with this text. Any other verdict (a
+            // second reviewer's, or one at a later head or with a new
+            // reason) is recorded, even when the state stays the same.
+            if let Some(e) = load(tx, &node.uuid, req)? {
+                let retry = e.state == state.as_str()
+                    && tx
+                        .query_row(
+                            "SELECT op, to_state, sha, note FROM entry_events
+                              WHERE node_uuid = ?1 AND entry_id = ?2 AND actor = ?3
+                              ORDER BY seq DESC LIMIT 1",
+                            params![node.uuid, req, c.actor],
+                            |r| {
+                                Ok((
+                                    r.get::<_, String>(0)?,
+                                    r.get::<_, String>(1)?,
+                                    r.get::<_, Option<String>>(2)?,
+                                    r.get::<_, Option<String>>(3)?,
+                                ))
+                            },
+                        )
+                        .optional()?
+                        .is_some_and(|(op, to, sha, note)| {
+                            op == "req"
+                                && to == state.as_str()
+                                && sha.as_deref() == Some(at.as_str())
+                                && note == *text
+                        });
+                if retry {
+                    return Ok(Applied {
+                        changed,
+                        existing: None,
+                    });
+                }
+            }
+            req_change_as(
+                tx,
+                &node,
+                req,
+                *state,
+                Some(at),
+                text.clone(),
+                None,
+                true,
+                c,
+                env,
+                &mut changed,
+            )?;
+        }
         Action::Req {
             req,
             state,
@@ -3429,6 +3674,7 @@ pub(crate) fn apply_in(
                 *state,
                 at,
                 text.clone(),
+                None,
                 c,
                 env,
                 &mut changed,
@@ -3452,6 +3698,27 @@ fn req_change(
     state: ReqState,
     at: Option<String>,
     note: Option<String>,
+    receipt: Option<&Value>,
+    c: &Change<'_>,
+    env: &dyn Env,
+    out: &mut Vec<Changed>,
+) -> Result<(), EntryError> {
+    req_change_as(tx, node, req, state, at, note, receipt, false, c, env, out)
+}
+
+/// [`req_change`], where `restate` lets a reviewer's own verdict record
+/// the state the requirement is already in: a second reviewer agreeing,
+/// or a verdict at a later head (`review.verdict`).
+#[allow(clippy::too_many_arguments)]
+fn req_change_as(
+    tx: &Connection,
+    node: &NodeLink,
+    req: &str,
+    state: ReqState,
+    at: Option<String>,
+    note: Option<String>,
+    receipt: Option<&Value>,
+    restate: bool,
     c: &Change<'_>,
     env: &dyn Env,
     out: &mut Vec<Changed>,
@@ -3518,19 +3785,29 @@ fn req_change(
         e.data.insert("graph_folder".into(), f.into());
     }
     let op = format!("req {}", state.as_str());
-    let ok = match state {
-        ReqState::Met => matches!(e.state.as_str(), "unverified" | "unmet"),
-        ReqState::Unmet => matches!(e.state.as_str(), "unverified" | "met"),
-        ReqState::Waived => matches!(e.state.as_str(), "unverified" | "unmet"),
-    };
+    let repeated = (receipt.is_some() || restate) && e.state == state.as_str();
+    if repeated && receipt.is_some() && e.data.get("review_receipt") == receipt {
+        return Ok(());
+    }
+    let ok = repeated
+        || match state {
+            ReqState::Met => matches!(e.state.as_str(), "unverified" | "unmet"),
+            ReqState::Unmet => matches!(e.state.as_str(), "unverified" | "met"),
+            ReqState::Waived => matches!(e.state.as_str(), "unverified" | "unmet"),
+        };
     if !ok {
         return Err(bad_transition(&e, &op));
+    }
+    if let Some(receipt) = receipt {
+        e.data.insert("review_receipt".into(), receipt.clone());
+    } else {
+        e.data.remove("review_receipt");
     }
     match state {
         ReqState::Met => {
             e.data.insert(
                 "verified".into(),
-                json!({"sha": at, "by": c.actor, "at": c.now_ms}),
+                json!({"sha": at, "by": receipt.and_then(|p| p["reviewer"].as_str()).unwrap_or(c.actor), "at": c.now_ms}),
             );
         }
         ReqState::Unmet => {
@@ -3540,7 +3817,14 @@ fn req_change(
     }
     let step = Step {
         at_sha: at,
-        ..plain("req", note)
+        ..plain(
+            if receipt.is_some() {
+                "review.receipt"
+            } else {
+                "req"
+            },
+            note,
+        )
     };
     out.push(transition(tx, &mut e, state.as_str(), step, c)?);
     Ok(())
@@ -3570,6 +3854,7 @@ fn residual(
             ReqState::Waived,
             None,
             Some(note),
+            None,
             c,
             env,
             out,
@@ -4550,6 +4835,110 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         crate::store::check_mail_schema(&tx)?;
         Ok(tx)
+    }
+
+    /// Installed-launcher callback only. Public imports and entry ops have no
+    /// path to this operation. The expected digest is computed from the final
+    /// output captured by the runner, not from a claimed sender or a body flag.
+    pub fn entry_attest_review_import(
+        &mut self,
+        proof: &ReviewImportEvidence<'_>,
+    ) -> Result<(), EntryError> {
+        check_name("reviewer", proof.reviewer)?;
+        check_name("launcher", proof.launcher)?;
+        check_name("turn", proof.turn)?;
+        if proof.requests.len() > 1000 {
+            return Err(Fields::bad("requests"));
+        }
+        let tx = self.entry_tx()?;
+        let source: Option<(String, String, String, Option<String>, String)> = tx.query_row(
+            "SELECT sender, digest, reference_ids, via, kind FROM msg_messages WHERE message_id = ?1",
+            params![proof.message], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)),
+        ).optional()?;
+        let (sender, digest, refs, via, kind) = source.ok_or_else(|| Fields::bad("message"))?;
+        if sender != proof.reviewer
+            || digest != proof.digest
+            || via.is_none()
+            || !matches!(kind.as_str(), "findings" | "note" | "notice")
+        {
+            return Err(Fields::bad("message"));
+        }
+        let refs: Vec<String> = serde_json::from_str(&refs)?;
+        for request in proof.requests {
+            if !refs.contains(request) {
+                continue;
+            }
+            let row: Option<(String,String)> = tx.query_row(
+                "SELECT node_uuid, entry_id FROM entries WHERE kind = 'review' AND json_extract(data, '$.request') = ?1",
+                params![request], |r| Ok((r.get(0)?,r.get(1)?)),
+            ).optional()?;
+            let Some((uuid, id)) = row else {
+                continue;
+            };
+            let mut e = load(&tx, &uuid, &id)?.ok_or_else(|| Fields::bad("round"))?;
+            if !e.reviewers().iter().any(|r| r == proof.reviewer) {
+                continue;
+            }
+            let bound: bool = tx.query_row(
+                "SELECT EXISTS (SELECT 1 FROM msg_messages request JOIN msg_links link ON link.seq = request.seq
+                 JOIN msg_deliveries delivery ON delivery.seq = request.seq
+                 WHERE request.message_id = ?1 AND request.kind = 'review_request'
+                   AND link.node_uuid = ?2 AND delivery.mailbox = ?3)",
+                params![request, e.node.uuid, proof.reviewer], |r| r.get(0),
+            )?;
+            if !bound {
+                return Err(Fields::bad("request"));
+            }
+            let (_, head) = e.range().ok_or_else(|| Fields::bad("round"))?;
+            let value = json!({"message":proof.message, "digest":proof.digest,
+                "reviewer":proof.reviewer, "turn":proof.turn, "sha":head,
+                "launcher":proof.launcher});
+            let imports = e
+                .data
+                .entry("review_imports")
+                .or_insert_with(|| json!({}))
+                .as_object_mut()
+                .ok_or_else(|| Fields::bad("review_imports"))?;
+            if let Some(previous) = imports.get(proof.message) {
+                if previous["digest"] != proof.digest
+                    || previous["reviewer"] != proof.reviewer
+                    || previous["sha"] != head
+                {
+                    return Err(Fields::bad("review_imports"));
+                }
+                continue;
+            }
+            imports.insert(proof.message.into(), value);
+            let op = Op {
+                node: None,
+                action: Action::Add {
+                    kind: Kind::Review,
+                    new: New::default(),
+                },
+            };
+            let c = Change {
+                op: &op,
+                actor: proof.launcher,
+                class: Class::Other,
+                node: None,
+                message: Some(proof.message),
+                turn: Some(proof.turn),
+                now_ms: proof.now_ms,
+            };
+            let state = e.state.clone();
+            transition(
+                &tx,
+                &mut e,
+                &state,
+                Step {
+                    at_sha: Some(head),
+                    ..plain("review.import", None)
+                },
+                &c,
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Applies one op in its own transaction.

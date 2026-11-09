@@ -1285,6 +1285,7 @@ fn launcher_refuses_a_valid_decision_for_a_different_graph_in_the_same_repo() {
         trusted_worktree: Some(f.repo.clone()),
         receipts: None,
         receipt_transport_overridden: false,
+        wake_kinds: None,
     };
     let approve = |root: &std::path::Path, mail: &mut mdkg_run::mail::CliMail| {
         mdkg_run::approval::for_turn(

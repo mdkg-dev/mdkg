@@ -342,6 +342,81 @@ fn file_stamp(path: &Path) -> Option<FileStamp> {
     }
 }
 
+/// Files that can change a committed graph authority: repository config,
+/// refs, and worktree registrations/HEADs. Comparing snapshots does no Git
+/// I/O. This is an invalidation hint only; changes still require a fresh,
+/// trusted authority read before they can affect a running supervisor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryState(Vec<(PathBuf, FileStamp)>);
+
+pub fn repository_state(checkout: &Checkout) -> io::Result<RepositoryState> {
+    fn add(paths: &mut Vec<PathBuf>, path: PathBuf, depth: usize) -> io::Result<()> {
+        if paths.len() >= 100_000 || depth > 64 {
+            return Err(failure("repository watch exceeds its file limit"));
+        }
+        paths.push(path.clone());
+        match fs::symlink_metadata(&path) {
+            Ok(m) if m.is_dir() => {
+                for entry in fs::read_dir(path)? {
+                    let entry = entry?;
+                    if !entry.file_name().as_encoded_bytes().ends_with(b".lock") {
+                        add(paths, entry.path(), depth + 1)?;
+                    }
+                }
+            }
+            Ok(_) => (),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+            Err(e) => return Err(e),
+        }
+        Ok(())
+    }
+    let mut paths = vec![checkout.top.join(".git")];
+    for dir in [&checkout.common, &checkout.git_dir] {
+        for name in [
+            "HEAD",
+            "config",
+            "config.worktree",
+            "commondir",
+            "gitdir",
+            "packed-refs",
+        ] {
+            paths.push(dir.join(name));
+        }
+        add(&mut paths, dir.join("refs"), 0)?;
+    }
+    let worktrees = checkout.common.join("worktrees");
+    paths.push(worktrees.clone());
+    match fs::read_dir(&worktrees) {
+        Ok(entries) => {
+            for entry in entries {
+                let dir = entry?.path();
+                // Do not watch logs or private indexes: only registration and
+                // ref files select committed authority.
+                for name in [
+                    "HEAD",
+                    "gitdir",
+                    "commondir",
+                    "config.worktree",
+                    "packed-refs",
+                ] {
+                    paths.push(dir.join(name));
+                }
+                add(&mut paths, dir.join("refs"), 0)?;
+                if let Ok(back) = read_small(&dir.join("gitdir")) {
+                    paths.push(PathBuf::from(back.trim()));
+                }
+            }
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+        Err(e) => return Err(e),
+    }
+    paths.sort();
+    paths.dedup();
+    stamps_of(paths)
+        .map(RepositoryState)
+        .ok_or_else(|| failure("repository watch cannot stamp its inputs"))
+}
+
 /// What a kept value was read for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ValueKey {
@@ -1724,6 +1799,20 @@ fn common_config(common: &Path, key: &str) -> Option<String> {
 /// a key that isn't set): a git that couldn't run or failed otherwise
 /// answers nothing to keep.
 fn read_common_config(common: &Path, key: &str) -> (Option<String>, bool) {
+    if let Ok(bytes) = read_capped(&common.join("config"), KEPT_CONFIG_LIMIT + 1)
+        && bytes.len() as u64 <= KEPT_CONFIG_LIMIT
+        && !String::from_utf8_lossy(&bytes)
+            .to_ascii_lowercase()
+            .contains("include")
+    {
+        let Ok(list) = parse_config_snapshot(common, &bytes) else {
+            return (None, false);
+        };
+        return match snapshot_value(&list, key) {
+            Ok(value) => (value, true),
+            Err(_) => (None, false),
+        };
+    }
     let mut c = hardened(common);
     c.args(["config", "--file"])
         .arg(common.join("config"))
@@ -1739,6 +1828,38 @@ fn read_common_config(common: &Path, key: &str) -> (Option<String>, bool) {
         Some(1) => (None, true),
         _ => (None, false),
     }
+}
+
+/// One key in the common config alone, sharing the complete parsed snapshot
+/// with graph selection and ref-storage checks. Includes are never followed.
+pub fn own_config_value(common: &Path, key: &str) -> io::Result<Option<String>> {
+    let bytes = read_ref_config(&common.join("config"))?;
+    if bytes.len() as u64 > REF_CONFIG_LIMIT {
+        return Err(failure("repository config exceeds its size limit"));
+    }
+    let list = parse_config_snapshot(common, &bytes)?;
+    snapshot_value(&list, key)
+}
+
+fn snapshot_value(list: &[u8], key: &str) -> io::Result<Option<String>> {
+    let key = key.to_ascii_lowercase();
+    let value = list
+        .split(|b| *b == 0)
+        .filter_map(|entry| {
+            let at = entry
+                .iter()
+                .position(|b| *b == b'\n')
+                .unwrap_or(entry.len());
+            (entry[..at] == *key.as_bytes()).then(|| entry.get(at + 1..).unwrap_or_default())
+        })
+        .next_back();
+    value
+        .map(|value| {
+            String::from_utf8(value.to_vec())
+                .map(|v| v.trim_end_matches(['\n', '\r']).to_string())
+                .map_err(|_| failure("repository config value is not UTF-8"))
+        })
+        .transpose()
 }
 
 /// Ref guards need file-backed refs. `common` must already be the caller's
@@ -3371,6 +3492,57 @@ mod read_cache_tests {
         });
     }
 
+    #[test]
+    fn distinct_config_keys_share_one_snapshot_parse() {
+        let _turn = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let (_s, wt) = linked();
+        with_worktree_trust(&none(), || {
+            sh(&wt, &["config", "mdkg.mainRef", "trunk"]);
+            sh(&wt, &["config", "mdkg.leaseScope", "checkout"]);
+            fresh_reads();
+            let common = common_dir(&wt).unwrap();
+            assert_eq!(
+                common_config(&common, "mdkg.mainRef").as_deref(),
+                Some("trunk")
+            );
+            let before = git_runs();
+            assert_eq!(
+                common_config(&common, "mdkg.leaseScope").as_deref(),
+                Some("checkout")
+            );
+            assert_eq!(common_config(&common, "mdkg.unset"), None);
+            assert_eq!(
+                git_runs(),
+                before,
+                "other keys reuse the same config listing"
+            );
+            sh(&wt, &["config", "mdkg.leaseScope", "new"]);
+            assert_eq!(
+                common_config(&common, "mdkg.leaseScope").as_deref(),
+                Some("new")
+            );
+        });
+    }
+
+    #[test]
+    fn own_config_value_preserves_unset_empty_and_invalid_values() {
+        let _turn = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let (_s, wt) = linked();
+        with_worktree_trust(&none(), || {
+            let common = common_dir(&wt).unwrap();
+            sh(&wt, &["config", "mdkg.graph.ref", ""]);
+            assert_eq!(
+                own_config_value(&common, "mdkg.graph.ref").unwrap(),
+                Some(String::new())
+            );
+            assert_eq!(own_config_value(&common, "mdkg.unset").unwrap(), None);
+            let mut bytes = fs::read(common.join("config")).unwrap();
+            bytes.extend_from_slice(b"\n[mdkg \"graph\"]\nref = \xff\n");
+            fs::write(common.join("config"), bytes).unwrap();
+            assert!(own_config_value(&common, "mdkg.graph.ref").is_err());
+        });
+    }
+
     /// mdkg's own writer, and the start of a turn or request, read every
     /// value again.
     #[test]
@@ -3388,7 +3560,11 @@ mod read_cache_tests {
             let before = git_runs();
             assert!(has_ref(&wt, "main"));
             common_config(&common, "mdkg.unread");
-            assert_eq!(git_runs(), before + 2, "read again after a write check");
+            assert_eq!(
+                git_runs(),
+                before + 1,
+                "ref read again; unchanged config bytes reuse their parse"
+            );
             fresh_reads();
             checked_worktree(&wt).unwrap();
             let before = git_runs();

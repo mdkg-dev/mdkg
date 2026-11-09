@@ -3936,7 +3936,7 @@ fn a_template_copy_names_its_own_folder_and_refuses_a_database_that_names_the_bu
 }
 
 /// H-M6 (0.7.2): a config with no `projections` key gets the legacy
-/// default from install, which 0.7.4 drops. install and doctor warn and
+/// default from install, which 0.7.5 drops. install and doctor warn and
 /// name the key; once the key is listed, neither does. Nothing else
 /// changes: install still writes the AGENTS.md block.
 #[test]
@@ -3961,7 +3961,7 @@ fn install_and_doctor_warn_about_the_legacy_projections_default() {
     assert_eq!(warned[0]["severity"], "warning", "{install}");
     let message = warned[0]["message"].as_str().expect("message");
     assert!(message.contains("`projections`"), "{message}");
-    assert!(message.contains("0.7.4"), "{message}");
+    assert!(message.contains("0.7.5"), "{message}");
     assert!(message.contains("agents-md"), "{message}");
     let hint = warned[0]["hint"].as_str().expect("hint");
     assert!(hint.contains("config set projections '["), "{hint}");

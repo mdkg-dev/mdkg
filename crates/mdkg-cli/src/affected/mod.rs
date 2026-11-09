@@ -9,7 +9,7 @@
 //! Code paths and adapter metadata come from the two commits; selection
 //! rules come from one committed graph authority. Uncommitted checkout edits,
 //! filters and sparse entries cannot change either input. `--head` defaults
-//! to `HEAD`. In 0.7.3 the authority is the repository-top graph, even when
+//! to `HEAD`. In 0.7.4 the authority is the repository-top graph, even when
 //! the caller selects a nested root.
 //!
 //! A path whose content at the head is what main had where the head last
@@ -34,6 +34,7 @@ pub mod git;
 pub mod glob;
 pub mod go;
 pub mod modules;
+pub mod narrow;
 pub mod rust;
 pub mod select;
 pub mod tree;
@@ -500,7 +501,7 @@ pub fn decide(
             match rust.unsupported_rule_target(&rule_targets) {
                 Ok(Some((target, reason))) => return Err(GraphError::failure(Code::ConfigInvalid,
                     format!("affected rule selects unsupported opt-in Rust target {} {:?} ({reason})", target.package, target.kind))
-                    .with_hint("In 0.7.3, affected rules require Cargo default test targets. Remove this rust_targets entry or make the target a default Cargo test (test = true and no required-features); run opt-in targets explicitly outside affected.")),
+                    .with_hint("In 0.7.4, affected rules require Cargo default test targets. Remove this rust_targets entry or make the target a default Cargo test (test = true and no required-features); run opt-in targets explicitly outside affected.")),
                 Ok(None) => {},
                 Err(detail) => {
                     let detail = written.as_ref().map_or(detail.clone(), |t| t.scrub(&detail));
@@ -521,11 +522,6 @@ pub fn decide(
             });
         }
     }
-    let mut engine = select::Engine {
-        config: &config,
-        go: go.as_mut().map(|a| a as &mut dyn select::Adapter),
-        rust: rust.as_mut().map(|a| a as &mut dyn select::Adapter),
-    };
     let mut changes = repo.changes(&base_sha, &head_sha).map_err(git_error)?;
     let (main_out, from_main) =
         split_from_main(&repo, &head_sha, &entries, main, strict, &mut changes);
@@ -534,6 +530,12 @@ pub fn decide(
     // Submodule contents aren't in the written tree. Both endpoints matter:
     // a deleted gitlink, rename or type change may exist only at the base.
     let base_entries = repo.tree(&base_sha).map_err(git_error)?;
+    let mut engine = select::Engine {
+        config: &config,
+        go: go.as_mut().map(|a| a as &mut dyn select::Adapter),
+        rust: rust.as_mut().map(|a| a as &mut dyn select::Adapter),
+        narrowing: narrow::find(&repo, &changes, &base_entries, &entries),
+    };
     let gitlinks: BTreeSet<Vec<u8>> = base_entries
         .iter()
         .chain(&entries)
@@ -573,7 +575,7 @@ pub fn decide(
                 path,
                 packages: vec![target.package.clone()],
                 detail: format!(
-                    "affected.rules[{rule}] names Rust target {}, which the head doesn't have; skipped it{fallback}",
+                    "{rule} names Rust target {}, which the head doesn't have; skipped it{fallback}",
                     target_name(&target)
                 ),
             });

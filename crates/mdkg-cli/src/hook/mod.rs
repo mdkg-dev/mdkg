@@ -48,7 +48,7 @@ use serde_json::Value;
 
 use crate::coord::Repo;
 use mdkg_format::program::BIN;
-pub use mdkg_run::hooks::{HarnessEvent, Mail, mail_line, printable, wakes};
+pub use mdkg_run::hooks::{HarnessEvent, Mail, mail_line, printable};
 
 pub use mdkg_run::harness::hook::{Event, Input, Outcome, Rendered};
 
@@ -187,6 +187,11 @@ impl From<Outcome> for Decision {
 pub trait MailSource {
     /// The actor's unacked mail, oldest first.
     fn unread(&self) -> Result<Vec<Mail>, String>;
+    /// The actor's committed optional wake filter. Start notices still show
+    /// all unread mail; only stop and idle-wake checks use this selection.
+    fn wake_kinds(&self) -> Result<Option<Vec<String>>, String> {
+        Ok(None)
+    }
 }
 
 /// What a lease check says about a path an edit writes.
@@ -298,8 +303,12 @@ pub fn stop_mail(input: &Input, mail: &dyn MailSource, reminded: &dyn Reminded) 
         return None;
     }
     let session = input.session.as_deref().unwrap_or("");
+    let kinds = mail.wake_kinds().ok()?;
     let unread = mail.unread().ok()?;
-    let waking: Vec<Mail> = unread.into_iter().filter(wakes).collect();
+    let waking: Vec<Mail> = unread
+        .into_iter()
+        .filter(|m| mdkg_run::hooks::wakes_for(m, kinds.as_deref()))
+        .collect();
     let newest = waking.iter().map(|m| m.seq).max().unwrap_or(0);
     // Only a claimed reminder blocks: one another producer gave, or one
     // whose record failed, would come again at every stop.
@@ -390,12 +399,15 @@ pub fn wait(
 ) -> Outcome {
     let started = Instant::now();
     let session = input.session.as_deref().unwrap_or("");
+    let Ok(kinds) = mail.wake_kinds() else {
+        return Outcome::Silent;
+    };
     loop {
         let told = reminded.last(session);
         if let Ok(unread) = mail.unread() {
             let new: Vec<Mail> = unread
                 .into_iter()
-                .filter(|m| m.seq > told && wakes(m))
+                .filter(|m| m.seq > told && mdkg_run::hooks::wakes_for(m, kinds.as_deref()))
                 .collect();
             let newest = new.iter().map(|m| m.seq).max().unwrap_or(told);
             // Woken once per message: a producer that reminded first has
@@ -1316,6 +1328,64 @@ mod tests {
 
     fn fake(reads: Vec<Vec<Mail>>) -> Fake {
         Fake(RefCell::new(reads))
+    }
+
+    struct Filtered(Fake, Vec<String>);
+
+    impl MailSource for Filtered {
+        fn unread(&self) -> Result<Vec<Mail>, String> {
+            self.0.unread()
+        }
+        fn wake_kinds(&self) -> Result<Option<Vec<String>>, String> {
+            Ok(Some(self.1.clone()))
+        }
+    }
+
+    #[test]
+    fn wake_kinds_filter_stop_and_wait_but_keep_deferred_start_notices() {
+        let input = session("filtered");
+        let quiet = Filtered(
+            fake(vec![vec![mail(5, "note", "peer", None)]]),
+            vec!["question".into()],
+        );
+        assert!(
+            matches!(start(&input, &quiet, &Memory::default()), Outcome::Context(line) if line.contains("#5"))
+        );
+        assert!(stop_mail(&input, &quiet, &Memory::default()).is_none());
+        assert_eq!(
+            wait(
+                &input,
+                &quiet,
+                &Memory::default(),
+                Duration::ZERO,
+                Duration::ZERO,
+                &|_| {}
+            ),
+            Outcome::Silent
+        );
+        let selected = Filtered(
+            fake(vec![vec![mail(6, "question", "peer", None)]]),
+            vec!["question".into()],
+        );
+        assert!(stop_mail(&input, &selected, &Memory::default()).is_some());
+        assert!(matches!(
+            wait(
+                &input,
+                &selected,
+                &Memory::default(),
+                Duration::ZERO,
+                Duration::ZERO,
+                &|_| {}
+            ),
+            Outcome::Wake(_)
+        ));
+        let channel_note = Filtered(
+            fake(vec![vec![mail(7, "note", "peer", Some("dev"))]]),
+            vec!["note".into()],
+        );
+        assert!(stop_mail(&input, &channel_note, &Memory::default()).is_some());
+        let disabled = Filtered(selected.0, vec![]);
+        assert!(stop_mail(&input, &disabled, &Memory::default()).is_none());
     }
 
     #[derive(Default)]

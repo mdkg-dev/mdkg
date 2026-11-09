@@ -471,3 +471,381 @@ fn a_common_word_still_scores_above_zero() {
     assert!(scores.iter().all(|s| *s > 0.0), "{out}");
     assert!(scores.windows(2).all(|w| w[0] >= w[1]), "{out}");
 }
+
+#[test]
+fn message_pack_reuses_budget_for_thread_bound_nodes_requirements_and_decisions() {
+    let r = scratch("message-pack");
+    fs::create_dir_all(r.0.join(".mdkg/work")).unwrap();
+    fs::create_dir_all(r.0.join(".mdkg/design")).unwrap();
+    fs::write(r.0.join(".mdkg/config.json"), serde_json::json!({
+        "schema_version":3, "format_version":"0.7", "graph_id":mdkg_format::Uuid7::now().to_string(),
+        "work":{"location":"git"}
+    }).to_string()).unwrap();
+    let task = format!("task-{}", mdkg_format::Uuid7::now());
+    let other = format!("task-{}", mdkg_format::Uuid7::now());
+    let accepted = format!("dec-{}", mdkg_format::Uuid7::now());
+    let proposed = format!("dec-{}", mdkg_format::Uuid7::now());
+    write(
+        &r.0,
+        "target.md",
+        &node(
+            &task,
+            "task",
+            "Target",
+            &[],
+            "# Overview\n\nTarget opening.\n\n# Requirements\n\n- R1: The output shall retain requirements. (verify: test)\n",
+        ),
+    );
+    write(
+        &r.0,
+        "other.md",
+        &node(&other, "task", "Unrelated", &[], "Unrelated body."),
+    );
+    for (id, status) in [(&accepted, "accepted"), (&proposed, "proposed")] {
+        let text = node(
+            id,
+            "dec",
+            "Choice",
+            &[&format!("refs: [{task}]")],
+            "Accepted decision body.",
+        )
+        .replace("status: todo", &format!("status: {status}"));
+        fs::write(r.0.join(format!(".mdkg/design/{status}.md")), text).unwrap();
+    }
+    git(&r.0, &["init", "-q", "-b", "main"]);
+    git(&r.0, &["add", "."]);
+    git(&r.0, &["commit", "-qm", "fixture"]);
+    ok(
+        &r.0,
+        &[
+            "msg",
+            "send",
+            "--to",
+            "worker",
+            "--kind",
+            "question",
+            "--id",
+            "trigger",
+            "--node",
+            &task,
+            "--text",
+            "Trigger body.",
+        ],
+    );
+    ok(
+        &r.0,
+        &[
+            "msg",
+            "send",
+            "--to",
+            "worker",
+            "--kind",
+            "note",
+            "--id",
+            "followup",
+            "--reply-to",
+            "trigger",
+            "--text",
+            "Thread reply.",
+        ],
+    );
+    let packed = ok(
+        &r.0,
+        &["pack", "--for-message", "trigger", "--budget", "4000"],
+    );
+    let d = &packed["data"];
+    let qids: Vec<_> = d["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["qid"].as_str().unwrap())
+        .collect();
+    assert_eq!(qids.len(), 2, "{packed}");
+    assert!(qids.iter().any(|q| q.ends_with(&task)));
+    assert!(qids.iter().any(|q| q.ends_with(&accepted)));
+    let md = d["markdown"].as_str().unwrap();
+    for content in [
+        "Trigger body.",
+        "Thread reply.",
+        "R1: The output shall retain requirements",
+        "Accepted decision body.",
+    ] {
+        assert!(md.contains(content), "{md}");
+    }
+    assert!(!md.contains("Unrelated body."));
+    assert_eq!(d["requirements"][0]["requirements"][0]["id"], "R1");
+    assert_eq!(d["message"]["messages"], 2);
+    // Neither pack nor pending silently marks mail shown.
+    let store = mdkg_coord_sqlite::git::store_path(&r.0).unwrap();
+    let conn = rusqlite::Connection::open(store).unwrap();
+    let shown: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM msg_deliveries WHERE shown_ms IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(shown, 0);
+    // Expiry masks the body, but send-time UUID bindings still seed the pack.
+    conn.execute(
+        "UPDATE msg_messages SET retention='ttl:1', purge_after_ms=0 WHERE message_id='trigger'",
+        [],
+    )
+    .unwrap();
+    let expired = ok(&r.0, &["pack", "--for-message", "trigger"]);
+    assert_eq!(expired["data"]["nodes"].as_array().unwrap().len(), 2);
+    assert!(
+        expired["data"]["markdown"]
+            .as_str()
+            .unwrap()
+            .contains("(body purged)")
+    );
+    drop(conn);
+    for budget in [64, 128, 256, 500, 1000] {
+        let packed = ok(
+            &r.0,
+            &[
+                "pack",
+                "--for-message",
+                "trigger",
+                "--budget",
+                &budget.to_string(),
+                "--profile",
+                "concise",
+            ],
+        );
+        let d = &packed["data"];
+        let md = d["markdown"].as_str().unwrap();
+        assert!(md.len().div_ceil(4) <= budget, "{packed}");
+        assert_eq!(d["tokens"].as_u64().unwrap() as usize, md.len().div_ceil(4));
+    }
+    fs::write(
+        r.0.join("part.json"),
+        serde_json::json!({"target":task}).to_string(),
+    )
+    .unwrap();
+    ok(
+        &r.0,
+        &[
+            "msg",
+            "send",
+            "--to",
+            "worker",
+            "--kind",
+            "question",
+            "--id",
+            "data-ref",
+            "--data-file",
+            r.0.join("part.json").to_str().unwrap(),
+        ],
+    );
+    let data = ok(&r.0, &["pack", "--for-message", "data-ref"]);
+    assert_eq!(data["data"]["nodes"].as_array().unwrap().len(), 2, "{data}");
+    // A message with no node bindings still produces a useful thread pack.
+    ok(
+        &r.0,
+        &[
+            "msg",
+            "send",
+            "--to",
+            "worker",
+            "--kind",
+            "note",
+            "--id",
+            "plain",
+            "--text",
+            "Plain thread body.",
+        ],
+    );
+    let plain = ok(&r.0, &["pack", "--for-message", "plain"]);
+    assert!(plain["data"]["nodes"].as_array().unwrap().is_empty());
+    assert!(
+        plain["data"]["markdown"]
+            .as_str()
+            .unwrap()
+            .contains("Plain thread body.")
+    );
+    ok(
+        &r.0,
+        &[
+            "msg",
+            "send",
+            "--to",
+            "worker",
+            "--kind",
+            "note",
+            "--id",
+            "long",
+            "--text",
+            &"é long thread line.\n".repeat(1000),
+        ],
+    );
+    let long = ok(&r.0, &["pack", "--for-message", "long", "--budget", "128"]);
+    assert_eq!(long["data"]["message"]["cut"], true);
+    assert!(long["data"]["tokens"].as_u64().unwrap() <= 128);
+    assert_ne!(run(&r.0, &["pack", "--for-message", "missing"]).0, 0);
+}
+
+#[test]
+fn message_pack_resolves_text_and_markdown_references_with_concise_requirements() {
+    let r = repo("message-refs");
+    for id in ["task-1", "task-2"] {
+        write(
+            &r.0,
+            &format!("{id}.md"),
+            &node(
+                id,
+                "task",
+                "Referenced",
+                &[],
+                "# Overview\n\nOpening.\n\n# Detail\n\nDetails.\n\n# Requirements\n\n- R1: The output shall include the tail requirement. (verify: test)\n",
+            ),
+        );
+    }
+    write(
+        &r.0,
+        "dec-1.md",
+        &node("dec-1", "dec", "Accepted", &["refs: [task-2]"], "Decision.")
+            .replace("status: todo", "status: accepted"),
+    );
+    ok(
+        &r.0,
+        &[
+            "msg",
+            "send",
+            "--to",
+            "worker",
+            "--kind",
+            "question",
+            "--id",
+            "text-refs",
+            "--text",
+            "See `task-1`. Also [the second task](.mdkg/work/task-2.md#R1).",
+        ],
+    );
+    let packed = ok(
+        &r.0,
+        &["pack", "--for-message", "text-refs", "--profile", "concise"],
+    );
+    let d = &packed["data"];
+    assert_eq!(d["nodes"].as_array().unwrap().len(), 3, "{packed}");
+    assert_eq!(d["requirements"].as_array().unwrap().len(), 2, "{packed}");
+    assert!(
+        d["markdown"]
+            .as_str()
+            .unwrap()
+            .matches("tail requirement")
+            .count()
+            >= 2,
+        "{packed}"
+    );
+}
+
+#[test]
+fn message_pack_channel_scope_excludes_chatter_and_sibling_node_seeds() {
+    let r = repo("channel-pack");
+    ok(&r.0, &["channel", "create", "dev", "--member", "worker"]);
+    for n in 0..20 {
+        ok(
+            &r.0,
+            &[
+                "msg",
+                "send",
+                "--channel",
+                "dev",
+                "--kind",
+                "note",
+                "--id",
+                &format!("noise-{n}"),
+                "--text",
+                &"Old unrelated task-4 chatter.\n".repeat(100),
+            ],
+        );
+    }
+    for (id, parent, target) in [
+        ("parent", None, "task-1"),
+        ("trigger", Some("parent"), "task-2"),
+        ("sibling", Some("parent"), "task-3"),
+        ("child", Some("trigger"), "task-2"),
+    ] {
+        let mut args = vec![
+            "msg",
+            "send",
+            "--channel",
+            "dev",
+            "--kind",
+            "question",
+            "--id",
+            id,
+            "--text",
+            target,
+        ];
+        if let Some(parent) = parent {
+            args.extend(["--reply-to", parent]);
+        }
+        ok(&r.0, &args);
+    }
+    ok(
+        &r.0,
+        &[
+            "msg",
+            "send",
+            "--to",
+            "worker",
+            "--kind",
+            "note",
+            "--id",
+            "cross-context",
+            "--reply-to",
+            "child",
+            "--text",
+            "Cross-context answer.",
+        ],
+    );
+    let packed = ok(
+        &r.0,
+        &["pack", "--for-message", "trigger", "--budget", "4000"],
+    );
+    let d = &packed["data"];
+    assert_eq!(d["message"]["messages"], 4, "{packed}");
+    let mut qids: Vec<_> = d["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["qid"].as_str().unwrap())
+        .collect();
+    qids.sort_unstable();
+    assert_eq!(qids, ["root:task-1", "root:task-2"], "{packed}");
+    let md = d["markdown"].as_str().unwrap();
+    assert!(md.contains("Cross-context answer."), "{md}");
+    assert!(!md.contains("Old unrelated"), "{md}");
+    assert!(!md.contains("sibling"), "{md}");
+    // More than one read page, but the smallest pack still reads a bounded
+    // body prefix and reports the complete selected header count.
+    for n in 0..20 {
+        ok(
+            &r.0,
+            &[
+                "msg",
+                "send",
+                "--channel",
+                "dev",
+                "--kind",
+                "note",
+                "--id",
+                &format!("reply-{n}"),
+                "--reply-to",
+                "trigger",
+                "--text",
+                &"Reply detail.\n".repeat(100),
+            ],
+        );
+    }
+    let small = ok(
+        &r.0,
+        &["pack", "--for-message", "trigger", "--budget", "128"],
+    );
+    assert_eq!(small["data"]["message"]["messages"], 24);
+    assert_eq!(small["data"]["message"]["cut"], true);
+    assert!(small["data"]["tokens"].as_u64().unwrap() <= 128);
+}

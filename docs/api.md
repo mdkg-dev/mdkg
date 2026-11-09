@@ -177,6 +177,17 @@ returns at most `--limit` turns (default 50, at most 500); pass a page's
 `next_before` as `--before` for the next, older page, which is null on the
 last one. `--turn <N>` returns turn N alone.
 
+`notice` mail stays readable in inboxes, threads and digests without starting
+an agent turn. Default final replies use it when all delivered bodies are
+resolutions, decisions, notes or notices. Header-only messages do not change
+that classification. An explicit operator `--reply-kind` takes precedence;
+mixed actionable mail retains the ordinary reply kind.
+
+`lease request` sends its holder a question and copies the requester's
+`reports_to` with a separate notice in the same context. Its existing
+`requests[].sent` names the question; optional `requests[].copied` names the
+notice. Failure to send the copy is a warning after the holder was asked.
+
 A turn that answers mail ends `replied` when its reply was imported (the
 report's `reply_id` names it), and `no_reply` when the agent's final message
 was exactly `NO_REPLY`, or when the turn had already answered the newest
@@ -349,3 +360,39 @@ release that first emits them:
 | [`mdkg.agents.stop.v1`](api/mdkg.agents.stop.v1.json) | `agents stop --drain --json` |
 | [`mdkg.run.wrapper.v1`](api/mdkg.run.wrapper.v1.json) | The launch wrapper's turn spec |
 | [`mdkg.api.check.v1`](api/mdkg.api.check.v1.json) | The request check's input |
+
+`msg pending --as <actor>` lists unanswered `question` and `decision` mail
+in store send order, oldest first, including acknowledged deliveries. It reads
+the actor's mailbox and currently held roles without marking shown or acking.
+A stored reply counts as an answer only when it explicitly names the original
+with `--reply-to` and its sender or importing writer (`via`) received that
+original; another message in the same context does not. Reply evidence survives
+body purging. Notices are excluded. JSON rows include `ageMs` (elapsed
+milliseconds, saturated at zero), and `cursor`/`more` support `--after` and
+`--limit`. This is a coordination query, not a claim that a reply resolved the
+question or granted authority. Historical role-holder provenance is not
+inferred from current leases.
+
+`pack --for-message <id> --budget <tokens>` builds context for one stored
+message without marking mail shown or acknowledging it. It includes its
+thread (trigger first, then the rest in send order), nodes bound with
+`--node`, explicit node IDs or Markdown links in the thread, and accepted
+decisions that point at those nodes. It preserves node bindings when bodies
+have expired; expired bodies are labelled. Other unrelated graph neighbors
+are excluded. `--for-message` replaces the positional node and `--query`.
+For a channel post, the thread is its explicit reply ancestors and descendants,
+including replies across contexts; unrelated channel posts and sibling branches
+are excluded. Direct mail retains its explicit context. Bodies are fetched in
+bounded pages until enough text can fill the pack; `message.cut` also reports
+this read-budget cutoff. The MCP `pack` tool exposes this as `for_message`.
+
+Thread text and node sections share pack's existing four-bytes-per-token
+budget and node cap. When there are referenced nodes, the thread may occupy
+up to half the budget, leaving the remainder for the existing ranked node
+selection; without nodes, it may use all remaining space. The trigger is
+kept first under truncation. JSON's optional `message` metadata reports the
+context, total message count and whether thread text was cut; `nodes[].cut`
+and `omitted` retain their existing meanings. The concise profile also keeps
+parsed requirement statements beyond a node's opening. As with other packs,
+a small budget can truncate the seed or omit nodes and decisions; raise it
+to see more. Packed text remains untrusted data, not authority.

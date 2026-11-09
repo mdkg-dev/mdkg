@@ -276,7 +276,7 @@ pub(super) static OPS: &[OpSpec] = &[
         post("/v1/graphs/{graph_id}/nodes/{node}/entries:update"),
         "mdkg.entry.update.v1",
     )
-    .tools(&["entry_update"]),
+    .tools(&["entry_update", "req_verdict"]),
     write(
         "entry.add",
         &["entry", "add"],
@@ -496,6 +496,13 @@ pub(super) static OPS: &[OpSpec] = &[
     // The A30 digest as a computed read of the caller's own unacked mail
     // (edd-01a1878e). The serve route is a 0.7.3 residual, so it has no route
     // and no MCP tool yet.
+    read(
+        "msg.pending",
+        &["msg", "pending"],
+        None,
+        "mdkg.msg.pending.v1",
+    )
+    .coordinator(),
     read("msg.digest", &["msg", "digest"], None, "mdkg.msg.digest.v1"),
     write(
         "msg.ack",
@@ -572,7 +579,8 @@ pub(super) static OPS: &[OpSpec] = &[
         &["agents", "list"],
         None,
         "mdkg.agents.list.v1",
-    ),
+    )
+    .tools(&["agents_list"]),
     // An agent's turns, newest first, paged. Not routed yet.
     read(
         "agents.turns",
@@ -599,6 +607,13 @@ pub(super) static OPS: &[OpSpec] = &[
         "mdkg.agents.stop.v1",
     )
     .capability("agents.stop.drain")
+    .class(Class::Operator),
+    write(
+        "agents.prepare",
+        &["agents", "prepare"],
+        None,
+        "mdkg.agents.prepare.v1",
+    )
     .class(Class::Operator),
     write("agents.add", &["agents", "add"], None, "mdkg.agents.add.v1").class(Class::Operator),
     write(

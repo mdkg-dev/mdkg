@@ -87,6 +87,12 @@ pub struct TurnOptions {
     /// The commit that last changed the agent's committed definition in the
     /// checkout's HEAD, named in the turn prompt (`agents up`).
     pub definition_commit: Option<String>,
+    /// The committed kinds allowed to start an automatic turn. Other mail
+    /// stays available to the next turn without triggering it.
+    pub wake_kinds: Option<Vec<String>>,
+    /// This turn was admitted by the supervisor's mail trigger. Manual
+    /// passes keep their ordinary conversation selection.
+    pub mail_triggered: bool,
     /// A dry run's worktree that [`plan_agent_worktree`] planned and
     /// nothing made yet (`run --worktree --dry-run`): the plan checked
     /// where it will be, so the folder's own checks (its pin, branch and
@@ -146,6 +152,8 @@ impl Default for TurnOptions {
             names: crate::orchestration::Names::default(),
             instructions: None,
             definition_commit: None,
+            wake_kinds: None,
+            mail_triggered: false,
             planned_worktree: false,
             loop_guard: None,
             auth: crate::policy::Auth::default(),
@@ -325,7 +333,7 @@ pub struct Peek {
 /// counts only in a kind that wakes ([`wakes`]): a channel note waits for
 /// a turn something else starts (friction 83).
 pub fn peek(mail: &mut dyn Mail, agent: &str, paused: &[String]) -> Result<Peek, RunError> {
-    peek_for(mail, agent, paused, false)
+    peek_for(mail, agent, paused, false, None)
 }
 
 pub(crate) fn peek_for(
@@ -333,6 +341,7 @@ pub(crate) fn peek_for(
     agent: &str,
     paused: &[String],
     digest: bool,
+    wake_kinds: Option<&[String]>,
 ) -> Result<Peek, RunError> {
     let mut out = Peek::default();
     let mut after = None;
@@ -351,7 +360,7 @@ pub(crate) fn peek_for(
             if (writer.as_deref() == Some(m.sender.as_str()) && is_launcher_note(m))
                 || m.sender == agent
                 || m.sender.contains(',')
-                || !wakes(m)
+                || !wakes(m, wake_kinds)
             {
                 continue;
             }
@@ -376,14 +385,17 @@ pub(crate) fn peek_for(
 /// in one of [`crate::hooks::ROOM_WAKE_KINDS`]. A note replying to the
 /// agent's own message still wakes it here: the orchestrator's answer to a
 /// handoff comes as one.
-fn wakes(m: &crate::mail::Message) -> bool {
-    crate::hooks::wakes(&crate::hooks::Mail {
-        seq: m.seq,
-        kind: m.kind.clone(),
-        sender: m.sender.clone(),
-        room: m.room.clone(),
-        own_reply: false,
-    })
+pub(crate) fn wakes(m: &crate::mail::Message, kinds: Option<&[String]>) -> bool {
+    crate::hooks::wakes_for(
+        &crate::hooks::Mail {
+            seq: m.seq,
+            kind: m.kind.clone(),
+            sender: m.sender.clone(),
+            room: m.room.clone(),
+            own_reply: false,
+        },
+        kinds,
+    )
 }
 
 /// The reply kind for the newest message's kind.
@@ -391,6 +403,31 @@ pub fn default_reply_kind(kind: &str) -> &'static str {
     match kind {
         "review_request" => "findings",
         _ => "note",
+    }
+}
+
+/// Resolve a final reply from the complete messages delivered, not headers
+/// or body text. An operator's explicit kind can express a new action.
+pub(crate) fn final_reply_kind<'a, 'm>(
+    messages: impl IntoIterator<Item = &'m crate::mail::Message>,
+    explicit: Option<&'a str>,
+    fallback: &'a str,
+) -> &'a str {
+    if let Some(kind) = explicit {
+        return kind;
+    }
+    let mut any = false;
+    let passive = messages.into_iter().all(|message| {
+        any = true;
+        matches!(
+            message.kind.as_str(),
+            "resolution" | "decision" | "note" | mdkg_coord_sqlite::mail::NOTICE_KIND
+        )
+    });
+    if any && passive {
+        mdkg_coord_sqlite::mail::NOTICE_KIND
+    } else {
+        fallback
     }
 }
 
@@ -889,7 +926,11 @@ pub(crate) fn render_turn_prompt(
     let newest = newest_of(&inbox.messages);
     let target = newest.map(|m| ReplyTarget {
         to: &m.sender,
-        kind: reply_kind.unwrap_or_else(|| default_reply_kind(&m.kind)),
+        kind: final_reply_kind(
+            inbox.messages.iter(),
+            reply_kind,
+            default_reply_kind(&m.kind),
+        ),
         // What people read is a channel (API v1 A21); the stored room name
         // stays as it is. The reply goes to the post's sender alone.
         channel: m.room.as_deref(),
@@ -3803,6 +3844,16 @@ fn held_turn_with_receipts(
         })
         .max_by_key(|m| m.seq)
         .map(|m| m.message_id.as_str());
+    let review_requests: Vec<String> = inbox
+        .messages
+        .iter()
+        .filter(|m| {
+            agent.spec.role == crate::Role::Reviewer
+                && m.kind == "review_request"
+                && shown.contains(&m.message_id)
+        })
+        .map(|m| m.message_id.clone())
+        .collect();
     let imported = crate::seam::import(
         mail,
         dir,
@@ -3810,6 +3861,7 @@ fn held_turn_with_receipts(
         lifecycle,
         crate::seam::ImportRequest {
             agent: &name,
+            review_requests: &review_requests,
             reply: parsed.reply,
             shown,
             newest,

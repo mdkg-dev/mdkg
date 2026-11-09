@@ -190,6 +190,56 @@ fn send(repo: &Path, to: &str, kind: &str, text: &str) -> u64 {
 }
 
 #[test]
+fn wake_kinds_control_committed_hooks_for_every_harness() {
+    for (harness, session_key, stop_event) in [
+        ("claude", "session_id", "Stop"),
+        ("codex", "session_id", "Stop"),
+        ("opencode", "sessionID", "session.execution.succeeded"),
+    ] {
+        let (_dir, repo) = repo();
+        fs::create_dir_all(repo.join(".mdkg/agents")).unwrap();
+        let definition = repo.join(".mdkg/agents/agent-a.json");
+        fs::write(
+            &definition,
+            json!({"schema":"mdkg.agent.v1", "harness":harness,
+            "role":"worker", "cwd":repo, "wake_kinds":["question"]})
+            .to_string(),
+        )
+        .unwrap();
+        git(&repo, &["add", ".mdkg/agents"]);
+        git(&repo, &["commit", "-qm", "Define mail filter"]);
+        let note = send(&repo, "agent-a", "note", "Deferred note");
+        let input = json!({(session_key):"019a1111-1111-7111-8111-111111111111", "cwd":repo,
+            "hook_event_name":stop_event, "stop_hook_active":false});
+        let (_, out, err) = hook(
+            &repo,
+            Some("agent-a"),
+            &["stop", "--harness", harness],
+            &input,
+        );
+        assert!(
+            !format!("{out}{err}").contains(&format!("#{note}")),
+            "{harness}: {out} {err}"
+        );
+        let question = send(&repo, "agent-a", "question", "Needs an answer");
+        let (_, out, err) = hook(
+            &repo,
+            Some("agent-a"),
+            &["stop", "--harness", harness],
+            &input,
+        );
+        let rendered = format!("{out}{err}");
+        assert!(
+            rendered.contains(&format!("#{question} question")),
+            "{harness}: {out} {err}"
+        );
+        assert!(!rendered.contains(&format!("#{note} note")), "{rendered}");
+        let inbox = mdkg(&repo, "agent-a", &["msg", "inbox", "--no-mark"]);
+        assert_eq!(inbox["data"]["messages"].as_array().unwrap().len(), 2);
+    }
+}
+
+#[test]
 fn start_names_mail_and_stop_blocks_once_for_claude() {
     let (_dir, repo) = repo();
     let input = json!({"session_id": "s1", "cwd": repo, "hook_event_name": "SessionStart"});

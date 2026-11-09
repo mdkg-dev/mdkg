@@ -104,6 +104,17 @@ pub struct DigestImport<'a> {
     pub file: &'a Path,
 }
 
+/// Captured reviewer output after a real turn, for the installed launcher's
+/// private attestation callback. None of these fields come from a tool call.
+#[derive(Debug)]
+pub struct ReviewImport<'a> {
+    pub reviewer: &'a str,
+    pub turn: &'a str,
+    pub message: &'a str,
+    pub requests: &'a [String],
+    pub file: &'a Path,
+}
+
 /// A note the launcher sends as itself, never as the agent: what it did
 /// with the agent's turn (audit, 2026-10-22).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,6 +135,7 @@ pub const ANSWER_KINDS: &[&str] = &["handoff", "findings"];
 /// Private installed-launcher receipt adapters. No CLI flag selects these.
 #[derive(Debug, Clone, Copy)]
 pub struct ReceiptCallbacks {
+    pub review_import: fn(&CliMail, &ReviewImport<'_>) -> Result<(), RunError>,
     pub baseline: fn(&CliMail) -> Result<mdkg_coord_sqlite::ActivityCursor, RunError>,
     pub activity: fn(
         &CliMail,
@@ -254,6 +266,21 @@ pub trait Mail {
             "mail client has no no-mark header wait",
         ))
     }
+    /// An in-process invalidation can end a long header wait without
+    /// changing the CLI protocol. Mock/alternate transports retain their
+    /// existing wait implementation by default.
+    fn wait_headers_waking(
+        &mut self,
+        agent: &str,
+        after: Option<u64>,
+        timeout_secs: u64,
+        wake: &dyn Fn() -> bool,
+    ) -> Result<Option<Headers>, RunError> {
+        if wake() {
+            return Ok(None);
+        }
+        self.wait_headers(agent, after, timeout_secs)
+    }
     /// The agent's unacked mail, oldest first.
     fn inbox(&mut self, agent: &str, limit: usize) -> Result<Inbox, RunError>;
     /// The agent's unacked mail newer than `after`, oldest first: the next
@@ -322,6 +349,10 @@ pub trait Mail {
             CODE_MAIL_FAILED,
             "mail client cannot import digest replies",
         ))
+    }
+    /// Non-installed transports produce no trusted review provenance.
+    fn attest_review_import(&mut self, _proof: &ReviewImport<'_>) -> Result<(), RunError> {
+        Ok(())
     }
     fn ack(&mut self, agent: &str, ids: &[String], outcome: &str) -> Result<(), RunError>;
     /// Takes the lease on a scope.
@@ -414,6 +445,9 @@ pub struct CliMail {
     pub receipts: Option<ReceiptCallbacks>,
     /// Preserve selection of an overridden transport even if it names this binary.
     pub receipt_transport_overridden: bool,
+    /// A supervisor's committed wake filter, used only for wake reads and
+    /// waits. Ordinary inbox reads still include deferred mail.
+    pub wake_kinds: Option<Vec<String>>,
 }
 
 /// The most pages of 100 [`CliMail::sender_of`] reads of a conversation
@@ -472,6 +506,7 @@ impl CliMail {
             trusted_worktree: None,
             receipts: None,
             receipt_transport_overridden,
+            wake_kinds: None,
         }
     }
 
@@ -485,6 +520,20 @@ impl CliMail {
         self.receipts.ok_or_else(no_receipts)
     }
 
+    fn wake_filter(&self) -> Option<String> {
+        match &self.wake_kinds {
+            Some(kinds) if !kinds.is_empty() => Some(format!("--kind={}", kinds.join(","))),
+            // With no eligible kind, new mail may invalidate a wait but can
+            // never pass the turn/receiver predicate. Keep the wait blocking
+            // on the existing event transport rather than polling an empty list.
+            Some(_) => None,
+            None => Some(format!(
+                "--channel-kind={}",
+                crate::hooks::ROOM_WAKE_KINDS.join(",")
+            )),
+        }
+    }
+
     fn header_call(
         &self,
         agent: &str,
@@ -492,6 +541,7 @@ impl CliMail {
         after: Option<u64>,
         limit: usize,
         timeout: u64,
+        wake: &dyn Fn() -> bool,
     ) -> Result<Option<Headers>, RunError> {
         // A reminder names at most five messages. Keep pages small even
         // when headless batch policy is larger: no-mark JSON still carries
@@ -523,22 +573,27 @@ impl CliMail {
             .arg("--root")
             .arg(&self.root)
             .arg(format!("--as={agent}"))
-            .args(["msg", event, "--no-mark", "--room-kind"])
-            .arg(crate::hooks::ROOM_WAKE_KINDS.join(","))
+            .args(["msg", event, "--no-mark"])
             .arg("--limit")
             .arg(limit.to_string())
             .arg("--json");
+        if let Some(filter) = self.wake_filter() {
+            command.arg(filter);
+        }
         if let Some(after) = after {
             command.arg("--after").arg(after.to_string());
         }
         if event == "wait" {
             command.arg("--timeout").arg(timeout.to_string());
         }
-        let out = crate::turn::capped_output(
-            &mut command,
-            64 << 20,
-            std::time::Duration::from_secs(timeout.saturating_add(10)),
-        )
+        let out = if event == "wait" {
+            match idle_output_waking(&mut command, timeout, 64 << 20, wake) {
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => return Ok(None),
+                result => result,
+            }
+        } else {
+            crate::turn::capped_output(&mut command, 64 << 20, Duration::from_secs(10))
+        }
         .map_err(|_| RunError::failure(CODE_MAIL_FAILED, "receiver header read failed"))?;
         let envelope: Envelope = serde_json::from_slice(&out.stdout).map_err(|_| {
             RunError::failure(
@@ -665,12 +720,24 @@ impl CliMail {
             .args(&args[split..]);
         let out = match until {
             Some(until) => bounded_output(&mut cmd, until),
+            None if args.starts_with(&["msg", "wait"]) => {
+                let timeout = args
+                    .windows(2)
+                    .find(|pair| pair[0] == "--timeout")
+                    .and_then(|pair| pair[1].parse().ok())
+                    .unwrap_or(600);
+                idle_output(&mut cmd, timeout, 64 << 20)
+            }
             None => cmd.output(),
         }
         .map_err(|e| Renewal {
             timed_out: e.kind() == std::io::ErrorKind::TimedOut,
             error: RunError::failure(
-                CODE_MAIL_FAILED,
+                if e.kind() == std::io::ErrorKind::Interrupted {
+                    WAIT_TIMEOUT
+                } else {
+                    CODE_MAIL_FAILED
+                },
                 format!("can't run {}: {e}", self.program.display()),
             ),
         })?;
@@ -721,6 +788,9 @@ impl CliMail {
 const WAIT_TIMEOUT: &str = "msg.wait_timeout";
 
 impl Mail for CliMail {
+    fn attest_review_import(&mut self, proof: &ReviewImport<'_>) -> Result<(), RunError> {
+        (self.receipt_callbacks()?.review_import)(self, proof)
+    }
     fn digest_inbox_after(
         &mut self,
         agent: &str,
@@ -756,8 +826,11 @@ impl Mail for CliMail {
     ) -> Result<Option<Inbox>, RunError> {
         let timeout = timeout_secs.to_string();
         let after = after.map(|n| n.to_string());
-        let kinds = format!("--channel-kind={}", crate::hooks::ROOM_WAKE_KINDS.join(","));
-        let mut args = vec!["msg", "wait", "--no-mark", "--timeout", &timeout, &kinds];
+        let kinds = self.wake_filter();
+        let mut args = vec!["msg", "wait", "--no-mark", "--timeout", &timeout];
+        if let Some(kinds) = &kinds {
+            args.push(kinds);
+        }
         if let Some(a) = &after {
             args.extend(["--after", a]);
         }
@@ -851,7 +924,7 @@ impl Mail for CliMail {
         after: Option<u64>,
         limit: usize,
     ) -> Result<Headers, RunError> {
-        self.header_call(agent, "inbox", after, limit, 0)?
+        self.header_call(agent, "inbox", after, limit, 0, &|| false)?
             .ok_or_else(|| RunError::failure(CODE_MAIL_FAILED, "missing header page"))
     }
     fn wait_headers(
@@ -860,7 +933,16 @@ impl Mail for CliMail {
         after: Option<u64>,
         timeout_secs: u64,
     ) -> Result<Option<Headers>, RunError> {
-        self.header_call(agent, "wait", after, 200, timeout_secs)
+        self.header_call(agent, "wait", after, 200, timeout_secs, &|| false)
+    }
+    fn wait_headers_waking(
+        &mut self,
+        agent: &str,
+        after: Option<u64>,
+        timeout_secs: u64,
+        wake: &dyn Fn() -> bool,
+    ) -> Result<Option<Headers>, RunError> {
+        self.header_call(agent, "wait", after, 200, timeout_secs, wake)
     }
     fn inbox(&mut self, agent: &str, limit: usize) -> Result<Inbox, RunError> {
         let limit = limit.to_string();
@@ -898,11 +980,14 @@ impl Mail for CliMail {
     ) -> Result<Option<Inbox>, RunError> {
         let timeout = timeout_secs.to_string();
         let after_s = after.map(|a| a.to_string());
-        // Only mail that wakes the agent ends the wait: a channel post in a
-        // kind that doesn't ([`crate::hooks::wakes`]) waits for a turn
-        // something else starts (friction 83).
-        let kinds = format!("--channel-kind={}", crate::hooks::ROOM_WAKE_KINDS.join(","));
-        let mut args = vec!["msg", "wait", "--timeout", &timeout, &kinds];
+        // A nonempty configured filter applies to direct and channel mail.
+        // Without it, keep the default channel selection. An empty filter
+        // permits event invalidation but never passes the turn predicate.
+        let kinds = self.wake_filter();
+        let mut args = vec!["msg", "wait", "--timeout", &timeout];
+        if let Some(kinds) = &kinds {
+            args.push(kinds);
+        }
         if let Some(a) = &after_s {
             args.extend(["--after", a]);
         }
@@ -1150,6 +1235,35 @@ impl Mail for CliMail {
 /// Lease calls have a wall-clock bound independent of a configured authority.
 /// Anonymous files avoid pipe backpressure or descendants holding a pipe open.
 fn bounded_output(cmd: &mut Command, until: Instant) -> std::io::Result<std::process::Output> {
+    command_output(cmd, until, 1 << 20, None)
+}
+
+/// Keep a single long-lived CLI wait. Stop/drain checks are local reads;
+/// cancellation kills and reaps its process group without another child.
+fn idle_output(cmd: &mut Command, timeout: u64, max: u64) -> std::io::Result<std::process::Output> {
+    idle_output_waking(cmd, timeout, max, &|| false)
+}
+
+fn idle_output_waking(
+    cmd: &mut Command,
+    timeout: u64,
+    max: u64,
+    wake: &dyn Fn() -> bool,
+) -> std::io::Result<std::process::Output> {
+    command_output(
+        cmd,
+        Instant::now() + Duration::from_secs(timeout.saturating_add(10)),
+        max,
+        Some(&|| crate::supervise::stop_requested() || wake()),
+    )
+}
+
+fn command_output(
+    cmd: &mut Command,
+    until: Instant,
+    max: u64,
+    interrupt: Option<&dyn Fn() -> bool>,
+) -> std::io::Result<std::process::Output> {
     use std::{
         fs,
         io::{Read, Seek},
@@ -1175,6 +1289,12 @@ fn bounded_output(cmd: &mut Command, until: Instant) -> std::io::Result<std::pro
     }
     let mut stdout = file()?;
     let mut stderr = file()?;
+    if interrupt.is_some_and(|wake| wake()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "CLI wait invalidated",
+        ));
+    }
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(stdout.try_clone()?)
@@ -1186,31 +1306,38 @@ fn bounded_output(cmd: &mut Command, until: Instant) -> std::io::Result<std::pro
         if let Ok(Some(status)) = poll {
             break Ok(status);
         }
-        if poll.is_err()
+        let cancelled = interrupt.is_some_and(|wake| wake());
+        if cancelled
+            || poll.is_err()
             || Instant::now() >= until
-            || stdout.metadata().map_or(true, |m| m.len() > 1 << 20)
-            || stderr.metadata().map_or(true, |m| m.len() > 1 << 20)
+            || stdout.metadata().map_or(true, |m| m.len() > max)
+            || stderr.metadata().map_or(true, |m| m.len() > max)
         {
-            let _ = Command::new("/bin/kill")
-                .args(["-KILL", "--", &format!("-{}", child.id())])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
+            if let Some(pid) = rustix::process::Pid::from_raw(child.id() as i32) {
+                let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+            }
             let _ = child.kill();
             let _ = child.wait();
             break Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "turn lease check timed out or exceeded its output limit",
+                if cancelled {
+                    std::io::ErrorKind::Interrupted
+                } else {
+                    std::io::ErrorKind::TimedOut
+                },
+                "CLI call cancelled, timed out or exceeded its output limit",
             ));
         }
-        std::thread::sleep(Duration::from_millis(5));
+        std::thread::sleep(Duration::from_millis(if interrupt.is_some() {
+            100
+        } else {
+            5
+        }));
     }?;
     let read = |file: &mut fs::File| -> std::io::Result<Vec<u8>> {
         file.rewind()?;
         let mut bytes = Vec::new();
-        file.take((1 << 20) + 1).read_to_end(&mut bytes)?;
-        if bytes.len() > 1 << 20 {
+        file.take(max + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > max {
             return Err(std::io::Error::other("turn lease output exceeds limit"));
         }
         Ok(bytes)
@@ -1225,6 +1352,108 @@ fn bounded_output(cmd: &mut Command, until: Instant) -> std::io::Result<std::pro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn idle_cli_case(kind: &str, drain: bool, idle: Duration) {
+        use crate::supervise::{Control, registry::Registered, stop, with_agent, with_control};
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("mdkg-idle-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(dir.join(".git/mdkg/run")).unwrap();
+        let run_dir = dir.join(".git/mdkg/run");
+        let script = dir.join("wait");
+        // exec keeps a single child PID throughout the wait. No polling
+        // subprocesses, no credentials and no user harness configuration.
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf 'wait\\n' >> '{}'\nwhile [ \"$#\" -gt 0 ]; do if [ \"$1\" = --timeout ]; then shift; timeout=$1; break; fi; shift; done\nexec /bin/sleep \"$timeout\"\n",
+                dir.join("calls").display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let control = Control::default();
+        let registered = std::sync::Arc::new(
+            Registered::register(&run_dir, &["idle".into()], None, None)
+                .unwrap()
+                .unwrap(),
+        );
+        control.set_supervisor(registered.clone());
+        let mut mail = CliMail::new(script, dir.clone(), "launcher".into());
+        let started = Instant::now();
+        std::thread::scope(|scope| {
+            // Unblock the worker even if readiness or a count assertion fails.
+            struct StopOnDrop(Control);
+            impl Drop for StopOnDrop {
+                fn drop(&mut self) {
+                    self.0.request_stop();
+                }
+            }
+            let _stop = StopOnDrop(control.clone());
+            let worker = scope.spawn(|| {
+                with_control(Some(&control), || {
+                    with_agent("idle", || {
+                        while !crate::supervise::stop_requested() {
+                            let timeout = crate::supervise::wait_secs(600);
+                            match kind {
+                                "digest" => assert!(
+                                    mail.wait_digest("idle", None, timeout).unwrap().is_none()
+                                ),
+                                "headers" => assert!(
+                                    mail.wait_headers("idle", None, timeout).unwrap().is_none()
+                                ),
+                                _ => assert!(mail.wait("idle", None, timeout).unwrap().is_none()),
+                            }
+                        }
+                    })
+                })
+            });
+            while !dir.join("calls").exists() {
+                assert!(
+                    started.elapsed() < Duration::from_secs(15),
+                    "child not ready"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            std::thread::sleep(idle);
+            assert_eq!(
+                std::fs::read_to_string(dir.join("calls")).unwrap(),
+                "wait\n"
+            );
+            let stopped = Instant::now();
+            if drain {
+                stop::write(
+                    &run_dir,
+                    "idle",
+                    &stop::Request::drain("fixture", "now".into(), &registered.id()),
+                )
+                .unwrap();
+            } else {
+                control.request_stop();
+            }
+            worker.join().unwrap();
+            assert!(
+                stopped.elapsed() < Duration::from_secs(1),
+                "idle cancellation took {:?}",
+                stopped.elapsed()
+            );
+        });
+        drop(registered);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn idle_cli_wait_starts_only_one_child_in_thirty_seconds() {
+        idle_cli_case("mail", false, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn stop_and_drain_interrupt_all_cli_waits_within_one_second() {
+        for kind in ["mail", "digest", "headers"] {
+            for drain in [false, true] {
+                idle_cli_case(kind, drain, Duration::from_millis(100));
+            }
+        }
+    }
 
     /// A stand-in mdkg: `holds` answers the next of `deadlines` (a
     /// number, or `none`), `renew` fails as a lease authority's outage

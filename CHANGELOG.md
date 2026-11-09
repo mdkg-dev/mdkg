@@ -1,5 +1,102 @@
 # Changelog
 
+## 0.7.4
+
+### Upgrading from 0.7.3
+
+- **No store change.** The coordinator store stays at schema 5 (`doctor`
+  shows `schema 5+msg5`), so 0.7.3 and 0.7.4 open the same store, and
+  going back needs no restore.
+- **Replace every mdkg binary that runs a supervisor.** A running
+  `agents up` re-execs when its binary is replaced in place. One still on
+  0.7.3 keeps its per-second idle polling and wakes on the new `notice`
+  mail.
+- **Set `wake_kinds` only once every machine runs 0.7.4.** 0.7.3 refuses
+  an agent definition that has it.
+- **An agent's turn can no longer change `env`, `sandbox` or
+  `approvals`.** Make those changes from your own terminal (see Security).
+
+### Security
+
+- **Authority fields are refused inside an agent's turn.** `config set`,
+  `config unset` and `agents add`, `edit` and `rm` refuse a change to
+  `env`, `sandbox` or `approvals` from inside a turn with
+  `authority.field_in_turn`, including defaults, nested keys and whole
+  object replacements. A person makes these changes outside a turn, and
+  orchestrators get no exception. Identical values, other edits and
+  config dry runs still work.
+
+### New
+
+- **`wake_kinds` on agent definitions.** `agents add` and `agents edit
+  --wake-kinds question,decision,handoff` list the mail kinds that start
+  an automatic turn, for Claude, Codex and OpenCode alike. Other mail
+  stays unacked and readable until the next woken turn, a manual prompt
+  or digest delivery. An empty list starts no mail-triggered turns, and
+  `--unset wake_kinds` restores the default. `agents list --json` and the
+  MCP `agents_list` tool show it. See
+  [agent definitions](docs/agent-definitions.md).
+- **`notice` mail.** A notice is readable in inboxes, threads and digests
+  but never starts a turn. A turn's final reply is sent as a notice when
+  everything it answered was a resolution, decision, note or notice. An
+  explicit `--reply-kind` still wins.
+- **`msg pending`** lists a mailbox's unanswered questions and decisions,
+  oldest first, with their age (`ageMs` in JSON). Only a reply sent with
+  `--reply-to` counts as an answer.
+- **`pack --for-message <id> --budget <tokens>`** packs one message's
+  thread, the nodes it names and the accepted decisions that point at
+  them, within pack's usual budget. The MCP `pack` tool takes
+  `for_message`.
+- **`agents prepare <name>`** creates or verifies a worker's managed
+  worktree as `agents up` would and prints its path. It runs no turn and
+  starts no supervisor, so settings files can go into the worktree before
+  the first turn.
+- **Reviewers record their own requirement verdicts.** The `req_verdict`
+  MCP tool, offered only to reviewers, records a requirement `met` or
+  `unmet` in the reviewer's name, for a review round that names the
+  reviewer at the reviewed commit. When a reviewer couldn't, a
+  coordinator outside a turn can relay the reviewer's imported verdict
+  with `entry update`'s `review.receipt` op, attributed to the reviewer.
+  See [review receipts](docs/review-receipts.md).
+
+### Changed
+
+- **A lease request asks only its holder.** The holder gets a question,
+  and the requester's `reports_to` gets a separate notice in the same
+  thread. `lease request --json` adds optional `requests[].copied`.
+- **`affected` doesn't force a full run** for a change confined to
+  `.mdkg/config.json`'s `affected` rules, or for a version-only change to
+  a `Cargo.toml` or `Cargo.lock`. See
+  [affected](docs/affected.md#narrowed-global-files).
+- **The shipped `mdkg-workflow` skill** covers ref mode (node bodies
+  through `node edit` and `node save`), launcher turns (the mail in the
+  prompt, the final reply and `NO_REPLY`) and review mail, and runs mdkg
+  as `$MDKG_BIN`.
+
+### Fixed
+
+- **Idle supervisors no longer start a CLI child every second,** plus its
+  git reads. Enough idle agents on one Mac could crash it. An idle
+  `agents up` now keeps one mail wait open for its timeout (600 seconds
+  by default), skips git while refs and config are unchanged, and reads
+  definitions in full at most every 30 seconds. A missing sign-in or
+  repeated turn failures back off 30, 60, 120, 240, then 300 seconds.
+  Interactive receivers wait the same way.
+- **A turn no longer starts from an old agent definition** when mail
+  arrives just after `agents edit`. Before each turn, the supervisor
+  checks the committed definition. On a change, it lets running turns
+  finish and restarts, and the mail starts its turn on the new
+  definition, including a new harness.
+- **`init --setup local` checks the git identity before writing
+  anything.** With no `user.name` or `user.email` it refuses with
+  `graph.identity_unset` and leaves nothing behind.
+
+### Not in 0.7.4
+
+- The projections default is unchanged. A config with no `projections`
+  key still gets the legacy list from `install`. The change to none is
+  planned for 0.7.5.
+
 ## 0.7.3
 
 ### Upgrading from 0.7.2

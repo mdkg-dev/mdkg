@@ -1581,6 +1581,52 @@ fn lease_request_refuses_an_invalid_ack_grace() {
 /// lease's context, copied to whoever the requester reports to, and
 /// releases nothing.
 #[test]
+fn lease_request_copy_failure_preserves_the_holder_question() {
+    let (_dir, _repo, wa, wb) = two_worktrees();
+    fs::create_dir_all(wb.join(".mdkg/agents")).unwrap();
+    fs::write(
+        wb.join(".mdkg/agents/b.json"),
+        r#"{"schema":"mdkg.agent.v1","harness":"claude","role":"worker","reports_to":"lead"}"#,
+    )
+    .unwrap();
+    sh(&wb, &["add", ".mdkg/agents/b.json"]);
+    sh(&wb, &["commit", "-qm", "Define requester"]);
+    assert_eq!(run(&wa, "a", 0, &["claim", "src/lib.rs"]).0, 0);
+    let (code, first) = run(
+        &wb,
+        "b",
+        10,
+        &["lease", "request", "src/lib.rs", "--reason", "x"],
+    );
+    assert_eq!(code, 0, "{first}");
+    let parts = &first["data"]["requests"][0]["sent"]["message"]["parts"];
+    let size = mdkg_coord_sqlite::mail::body_digest(parts).unwrap().2 as usize;
+    // Fill the primary body to its cap. The informational copy's prefix
+    // then exceeds the cap, after the holder's question has been stored.
+    let reason = "x".repeat(64 * 1024 - size + 1);
+    let (code, out) = run(
+        &wb,
+        "b",
+        11,
+        &["lease", "request", "src/lib.rs", "--reason", &reason],
+    );
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(out["ok"], true);
+    assert!(out["data"]["requests"][0].get("copied").is_none());
+    assert!(
+        out["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["code"] == "msg.too_large" && d["severity"] == "warning")
+    );
+    let (_, holder) = run(&wa, "a", 20, &["msg", "inbox", "--no-mark"]);
+    assert_eq!(holder["data"]["messages"].as_array().unwrap().len(), 2);
+    let (_, lead) = run(&wb, "lead", 20, &["msg", "inbox", "--no-mark"]);
+    assert_eq!(lead["data"]["messages"].as_array().unwrap().len(), 1);
+}
+
+#[test]
 fn lease_request_mails_the_holder_and_releases_nothing() {
     let (_dir, _repo, wa, wb) = two_worktrees();
     // b is an agent reporting to lead, as its committed definition says.
@@ -1613,7 +1659,12 @@ fn lease_request_mails_the_holder_and_releases_nothing() {
     let message = &requests[0]["sent"]["message"];
     assert_eq!(message["kind"], "question", "{out}");
     assert_eq!(message["contextId"], format!("lease:{lease}:b"), "{out}");
-    assert_eq!(message["to"], serde_json::json!(["a", "lead"]), "{out}");
+    assert_eq!(message["to"], serde_json::json!(["a"]), "{out}");
+    let copied = &requests[0]["copied"]["message"];
+    assert_eq!(copied["kind"], "notice", "{out}");
+    assert_eq!(copied["to"], serde_json::json!(["lead"]), "{out}");
+    assert_eq!(copied["contextId"], message["contextId"]);
+    assert_ne!(copied["messageId"], message["messageId"]);
     let text = run_text(
         &wb,
         Some("b"),
@@ -1628,6 +1679,14 @@ fn lease_request_mails_the_holder_and_releases_nothing() {
         let (code, inbox) = run(wt, reader, 20, &["msg", "inbox", "--all"]);
         assert_eq!(code, 0, "{inbox}");
         let body = inbox.to_string();
+        let kind = if reader == "a" { "question" } else { "notice" };
+        assert!(
+            inbox["data"]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|m| m["kind"] == kind)
+        );
         assert!(
             body.contains(&format!("lease:{lease}")),
             "{reader}: {inbox}"
@@ -1680,6 +1739,10 @@ fn lease_request_mails_the_holder_and_releases_nothing() {
         out["data"]["requests"][0]["sent"]["message"]["to"],
         serde_json::json!(["b"]),
         "{out}"
+    );
+    assert!(
+        out["data"]["requests"][0].get("copied").is_none(),
+        "no agent definition means no copy"
     );
 
     // Nothing in the way, your own lease, no reason, or a turn: refused.

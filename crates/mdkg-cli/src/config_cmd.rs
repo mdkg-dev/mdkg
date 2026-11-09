@@ -704,6 +704,9 @@ pub struct ListedAgent {
     pub harness: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
+    /// The authored mail kinds that may start a turn; absent uses defaults.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wake_kinds: Option<Vec<String>>,
 }
 
 /// The agents the settings `config show` reads name, with their layers;
@@ -813,6 +816,10 @@ pub(crate) fn agents(root: &Path) -> Result<(Vec<ListedAgent>, Vec<String>), Gra
             layers,
             harness: field("harness"),
             role: field("role"),
+            wake_kinds: shown
+                .as_ref()
+                .and_then(|entry| entry.get("wake_kinds"))
+                .and_then(|value| serde_json::from_value(value.clone()).ok()),
         });
     }
     let warnings = warnings.iter().map(|w| display_text(w)).collect();

@@ -13,6 +13,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use crate::RunError;
 use mdkg_coord_sqlite::git;
 use serde::{Deserialize, Serialize};
 
@@ -48,12 +49,10 @@ impl ExecToken {
     }
 }
 
-/// What a supervisor's definitions come from: the graph authority (R1), as
-/// one pinned read gives it. Each poll reads the authority again and
-/// compares the committed config and each selected agent's definition, so
-/// whatever publishes to the graph ref counts, however it got there. In
-/// ref mode a poll first resolves the graph ref's tip, and reads no further
-/// while it's the pinned commit.
+/// What a supervisor's definitions come from: one pinned graph authority.
+/// Local filesystem snapshots gate fresh authority reads, in both ref and
+/// checkout modes. Whatever publishes a committed change counts, however it
+/// got there; unchanged idle polls start no Git children.
 #[derive(Debug)]
 pub struct Definitions {
     /// The worktree, for naming an edit the authority doesn't hold.
@@ -69,16 +68,18 @@ pub struct Definitions {
     source: String,
     config: serde_json::Value,
     blobs: BTreeMap<String, Option<String>>,
-    /// In ref mode: the graph ref and the pinned commit.
-    pinned: Option<(String, String)>,
-    /// When the authority was last read in full.
-    read_at: std::sync::Mutex<Instant>,
+    /// A filesystem snapshot gates full authority reads in both modes.
+    checkout: Option<mdkg_git::Checkout>,
+    inputs: std::sync::Mutex<Option<mdkg_git::RepositoryState>>,
+    read_at: std::sync::Mutex<Option<Instant>>,
+    /// The first changed path a read found. It stays found, for every
+    /// later read by any thread, so no admission between finding it and
+    /// the stop it causes reads the cached inputs as unchanged.
+    found: std::sync::Mutex<Option<String>>,
 }
 
-/// How often a poll reads the authority in full even when the graph ref's
-/// tip hasn't moved, so a change to which ref or root the repository uses
-/// is still seen.
-const FULL_READ: Duration = Duration::from_secs(60);
+/// Bound every full authority-read attempt, including changed or unreadable inputs.
+const READ_INTERVAL: Duration = Duration::from_secs(30);
 
 /// An agent's definition file inside its worktree, as
 /// [`crate::orchestration::agent::path`] names it: the name unencoded.
@@ -143,11 +144,10 @@ impl Definitions {
             source: authority.source.clone(),
             config: authority.config.clone(),
             blobs,
-            pinned: authority
-                .graph_ref
-                .clone()
-                .map(|r| (r, authority.commit.clone())),
-            read_at: std::sync::Mutex::new(Instant::now()),
+            checkout: mdkg_git::checked_worktree(top).ok(),
+            inputs: std::sync::Mutex::new(None),
+            read_at: std::sync::Mutex::new(None),
+            found: std::sync::Mutex::new(None),
         };
         this.seen = this.fingerprint(authority);
         this
@@ -195,7 +195,8 @@ impl Definitions {
     pub fn differs(&self) -> Option<String> {
         let missing = |path: &str| !self.top.join(path).exists();
         let config = &self.paths[0];
-        let ref_mode = self.pinned.is_some() && missing(config) && !self.head_has(config);
+        let ref_mode =
+            self.source.starts_with("graph:") && missing(config) && !self.head_has(config);
         let here: Option<serde_json::Value> = std::fs::read(self.top.join(config))
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok());
@@ -212,25 +213,56 @@ impl Definitions {
 
     /// The first changed path, if any: added, edited or removed in the
     /// graph authority since the pinned read. An authority that can't be
-    /// read now changes nothing; the next poll reads it again.
+    /// read now changes nothing. Full reads, including failed attempts, are
+    /// separated by at least 30 seconds even when repository inputs change.
     pub fn changed(&self) -> Option<String> {
-        let mut read_at = self.read_at.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((graph_ref, commit)) = &self.pinned
-            && read_at.elapsed() < FULL_READ
-            && git::commit_of(&self.root, graph_ref).is_ok_and(|tip| tip == *commit)
-        {
-            return None;
+        self.read(true).ok().flatten()
+    }
+
+    /// [`Self::changed`] without the 30-second spacing, for the check
+    /// before a turn is admitted: an idle supervisor woken by mail right
+    /// after `agents edit` must not start that turn from the definition it
+    /// read before. Unchanged repository inputs still start no Git child,
+    /// and it runs once per admitted turn, never on a timer. An authority
+    /// that can't be read is an error here, not "unchanged": the turn
+    /// waits instead of starting from a definition that may be stale.
+    pub fn changed_now(&self) -> Result<Option<String>, RunError> {
+        self.read(false)
+    }
+
+    fn read(&self, spaced: bool) -> Result<Option<String>, RunError> {
+        let mut inputs = self.inputs.lock().unwrap_or_else(|e| e.into_inner());
+        let mut found = self.found.lock().unwrap_or_else(|e| e.into_inner());
+        if found.is_some() {
+            return Ok(found.clone());
         }
-        *read_at = Instant::now();
+        let mut read_at = self.read_at.lock().unwrap_or_else(|e| e.into_inner());
+        if spaced && read_at.is_some_and(|at| at.elapsed() < READ_INTERVAL) {
+            return Ok(None);
+        }
+        let now = self
+            .checkout
+            .as_ref()
+            .and_then(|c| mdkg_git::repository_state(c).ok());
+        if now.is_some() && now == *inputs {
+            return Ok(None);
+        }
+        *read_at = Some(Instant::now());
         drop(read_at);
         // Each full read reads the repository fresh (#13066 D2).
         mdkg_git::fresh_reads();
-        let now = crate::orchestration::authority(&self.root).ok()?;
-        let now = self.fingerprint(&now);
-        self.paths
+        // A failed read leaves the inputs as they were, so the next one
+        // reads again.
+        let authority = crate::orchestration::authority(&self.root)?;
+        // Capture before reading: a concurrent commit is observed next poll.
+        *inputs = now;
+        let now = self.fingerprint(&authority);
+        *found = self
+            .paths
             .iter()
             .find(|p| now.get(*p) != self.seen.get(*p))
-            .cloned()
+            .cloned();
+        Ok(found.clone())
     }
 }
 
@@ -289,6 +321,15 @@ impl Watch {
         }
     }
 
+    /// The store's versions, once they're neither this build's nor those
+    /// at start.
+    fn store_moved(&self) -> Option<Reason> {
+        let (path, at_start) = self.store.as_ref()?;
+        let now = mdkg_coord_sqlite::stored_label(path).ok()??;
+        (now != mdkg_coord_sqlite::build_label() && Some(&now) != at_start.as_ref())
+            .then_some(Reason::Store(now))
+    }
+
     /// Whether the binary was replaced since start.
     pub fn binary_replaced(&self) -> bool {
         self.binary.as_ref().is_some_and(|b| b.changed())
@@ -301,14 +342,22 @@ impl Watch {
         if self.binary_replaced() {
             return Some(Reason::Binary);
         }
-        if let Some((path, at_start)) = &self.store
-            && let Ok(Some(now)) = mdkg_coord_sqlite::stored_label(path)
-            && now != mdkg_coord_sqlite::build_label()
-            && Some(&now) != at_start.as_ref()
-        {
-            return Some(Reason::Store(now));
+        if let Some(reason) = self.store_moved() {
+            return Some(reason);
         }
         self.definitions.changed().map(Reason::Definition)
+    }
+
+    /// [`Self::changed`], reading the definitions now whatever the
+    /// spacing: the check before each turn is admitted.
+    pub fn changed_now(&self) -> Result<Option<Reason>, RunError> {
+        if self.binary_replaced() {
+            return Ok(Some(Reason::Binary));
+        }
+        if let Some(reason) = self.store_moved() {
+            return Ok(Some(reason));
+        }
+        Ok(self.definitions.changed_now()?.map(Reason::Definition))
     }
 }
 
@@ -470,6 +519,12 @@ mod tests {
         }
     }
 
+    /// Advance only the read limiter; the filesystem and authority reads remain real.
+    fn after_read_interval(definitions: &Definitions) -> Option<String> {
+        *definitions.read_at.lock().unwrap() = Some(Instant::now() - READ_INTERVAL);
+        definitions.changed()
+    }
+
     #[test]
     fn an_edit_committed_after_the_pinned_read_reloads() {
         let repo = Repo::new();
@@ -487,7 +542,64 @@ mod tests {
         // The committed config counts too.
         std::fs::write(repo.0.join(".mdkg/config.json"), "{\"projections\":[]}").unwrap();
         repo.git(&["commit", "-qam", "config"]);
-        assert_eq!(definitions.changed().as_deref(), Some(".mdkg/config.json"));
+        assert_eq!(
+            after_read_interval(&definitions).as_deref(),
+            Some(".mdkg/config.json")
+        );
+    }
+
+    /// The check before a turn reads an edit made inside the poll's
+    /// 30-second spacing, and starts no git child while nothing changed.
+    #[test]
+    fn the_check_before_a_turn_reads_an_edit_inside_the_spacing() {
+        let repo = Repo::new();
+        repo.commit("alice", "first");
+        let definitions = repo.definitions(&["alice"], &repo.authority());
+        assert_eq!(definitions.changed(), None);
+        assert_eq!(definitions.changed_now().unwrap(), None);
+        let before = mdkg_git::git_runs();
+        for _ in 0..10 {
+            assert_eq!(definitions.changed_now().unwrap(), None);
+        }
+        assert_eq!(mdkg_git::git_runs(), before, "unchanged inputs: no git");
+        repo.commit("alice", "second");
+        // Inside the spacing, the poll doesn't read it; the check does.
+        assert_eq!(definitions.changed(), None);
+        assert_eq!(
+            definitions.changed_now().unwrap().as_deref(),
+            Some(".mdkg/agents/alice.json")
+        );
+        // Found stays found for every later read, spaced or not, though
+        // the inputs it cached are now current (review F1).
+        for _ in 0..3 {
+            assert_eq!(
+                definitions.changed_now().unwrap().as_deref(),
+                Some(".mdkg/agents/alice.json")
+            );
+            assert_eq!(
+                definitions.changed().as_deref(),
+                Some(".mdkg/agents/alice.json")
+            );
+        }
+    }
+
+    /// A committed edit the check can't read isn't "unchanged": the turn
+    /// waits (review F2).
+    #[test]
+    fn the_check_before_a_turn_reports_an_unreadable_authority() {
+        let repo = Repo::new();
+        repo.commit("alice", "first");
+        let definitions = repo.definitions(&["alice"], &repo.authority());
+        std::fs::write(repo.0.join(".mdkg/config.json"), "{not JSON").unwrap();
+        repo.git(&["commit", "-qam", "broken config"]);
+        assert!(definitions.changed_now().is_err());
+        assert!(definitions.changed_now().is_err(), "it reads again");
+        std::fs::write(repo.0.join(".mdkg/config.json"), "{\"projections\":[]}").unwrap();
+        repo.git(&["commit", "-qam", "repair config"]);
+        assert_eq!(
+            definitions.changed_now().unwrap().as_deref(),
+            Some(".mdkg/config.json")
+        );
     }
 
     #[test]
@@ -504,7 +616,7 @@ mod tests {
         assert_eq!(definitions.changed(), None);
         repo.commit("codex:pr19", "second");
         assert_eq!(
-            definitions.changed().as_deref(),
+            after_read_interval(&definitions).as_deref(),
             Some(".mdkg/agents/codex:pr19.json")
         );
         // The prompt still names the commit the pinned read came from.
@@ -618,10 +730,10 @@ mod tests {
         assert!(elsewhere.source().starts_with("graph:"));
         assert_eq!(elsewhere.differs(), None);
         repo.git(&["worktree", "remove", "--force", checkout.to_str().unwrap()]);
-        // Published: the tip moved, so it reloads.
+        // Published: the tip moved, so it reloads once the read interval expires.
         repo.git(&["update-ref", "refs/heads/mdkg-graph", "HEAD"]);
         assert_eq!(
-            definitions.changed().as_deref(),
+            after_read_interval(&definitions).as_deref(),
             Some(".mdkg/agents/alice.json")
         );
         // The repository now names another ref, holding another definition.
@@ -634,31 +746,103 @@ mod tests {
             &format!("mdkg.graph.{id}.ref"),
             "refs/heads/other",
         ]);
-        // The pinned ref's tip hasn't moved, so a poll reads no further...
-        assert_eq!(definitions.changed(), None);
-        // ...until a full read is due, once a minute.
-        let due = Instant::now()
-            .checked_sub(FULL_READ + Duration::from_secs(1))
-            .unwrap();
-        *definitions.read_at.lock().unwrap() = due;
+        // A repository config change invalidates the snapshot, even when
+        // the originally pinned ref has not moved. The read interval still applies.
         assert_eq!(
-            definitions.changed().as_deref(),
+            after_read_interval(&definitions).as_deref(),
             Some(".mdkg/agents/alice.json")
         );
     }
 
-    /// In checkout mode every poll is a full read, and each starts with
-    /// fresh reads of the repository.
+    /// In checkout mode unchanged inputs skip full authority reads too.
     #[test]
-    fn each_full_read_reads_fresh() {
+    fn unchanged_checkout_polls_skip_full_reads() {
         let repo = Repo::new();
         repo.commit("alice", "first");
         let definitions = repo.definitions(&["alice"], &repo.authority());
         let before = mdkg_git::fresh_reads_count();
-        for _ in 0..2 {
-            assert_eq!(definitions.changed(), None);
+        assert_eq!(definitions.changed(), None);
+        let after = mdkg_git::fresh_reads_count();
+        assert!(after > before);
+        for _ in 0..20 {
+            assert_eq!(after_read_interval(&definitions), None);
         }
-        assert!(mdkg_git::fresh_reads_count() >= before + 2);
+        assert_eq!(mdkg_git::fresh_reads_count(), after);
+    }
+
+    #[test]
+    fn idle_reload_polls_spawn_no_git_in_checkout_or_ref_mode() {
+        for ref_mode in [false, true] {
+            let repo = Repo::new();
+            std::fs::write(
+                repo.0.join(".mdkg/config.json"),
+                serde_json::json!({
+                    "schema_version": 3, "format_version": "0.7",
+                    "graph_id": "0192f3a0-0000-7000-8000-000000000001"
+                })
+                .to_string(),
+            )
+            .unwrap();
+            repo.commit("alice", "first");
+            if ref_mode {
+                repo.git(&["update-ref", "refs/heads/mdkg-graph", "HEAD"]);
+                repo.git(&["config", "mdkg.graph.ref", "refs/heads/mdkg-graph"]);
+                repo.git(&[
+                    "config",
+                    "mdkg.graph.0192f3a0-0000-7000-8000-000000000001.ref",
+                    "refs/heads/mdkg-graph",
+                ]);
+            }
+            let definitions = repo.definitions(&["alice"], &repo.authority());
+            assert_eq!(definitions.changed(), None);
+            let before = mdkg_git::git_runs();
+            for _ in 0..30 {
+                assert_eq!(after_read_interval(&definitions), None);
+            }
+            assert_eq!(
+                mdkg_git::git_runs(),
+                before,
+                "idle reload starts no git child"
+            );
+            // Other branches can change at every supervisor poll. They must not
+            // bypass the full-read interval, even though the snapshot changes.
+            let authority = repo.authority();
+            let oid = authority.commit.clone();
+            let definitions = repo.definitions(&["alice"], &authority);
+            assert_eq!(definitions.changed(), None);
+            // Fixture setup above may read Git; measure only supervisor polls.
+            let before = mdkg_git::git_runs();
+            let reads_before = mdkg_git::fresh_reads_count();
+            for i in 0..30 {
+                std::fs::write(
+                    repo.0.join(format!(".git/refs/heads/unrelated-{i}")),
+                    format!("{oid}\n"),
+                )
+                .unwrap();
+                assert_eq!(definitions.changed(), None);
+            }
+            assert_eq!(
+                mdkg_git::git_runs(),
+                before,
+                "unrelated churn starts no child inside the interval"
+            );
+            assert_eq!(mdkg_git::fresh_reads_count(), reads_before);
+            *definitions.read_at.lock().unwrap() =
+                Some(Instant::now() - (READ_INTERVAL - Duration::from_secs(1)));
+            assert_eq!(definitions.changed(), None, "29 seconds is still too soon");
+            assert_eq!(mdkg_git::git_runs(), before);
+            assert_eq!(after_read_interval(&definitions), None);
+            assert_eq!(mdkg_git::fresh_reads_count(), reads_before + 1);
+            let after = mdkg_git::git_runs();
+            assert!(
+                after > before,
+                "the next permitted read validates fresh authority"
+            );
+            for _ in 0..30 {
+                assert_eq!(definitions.changed(), None);
+            }
+            assert_eq!(mdkg_git::git_runs(), after);
+        }
     }
 
     /// A linked worktree replaced at the same path between two polls (moved
@@ -679,7 +863,7 @@ mod tests {
         repo.commit("alice", "second");
         repo.git(&["worktree", "add", "-q", "-b", "b", live_path, "HEAD"]);
         assert_eq!(
-            definitions.changed().as_deref(),
+            after_read_interval(&definitions).as_deref(),
             Some(".mdkg/agents/alice.json")
         );
     }
@@ -691,6 +875,33 @@ mod tests {
         let definitions = repo.definitions(&["alice"], &repo.authority());
         std::fs::write(repo.0.join(".mdkg/config.json"), "{not JSON").unwrap();
         repo.git(&["commit", "-qam", "broken config"]);
+        let before = mdkg_git::fresh_reads_count();
         assert_eq!(definitions.changed(), None);
+        let after = mdkg_git::fresh_reads_count();
+        assert_eq!(after, before + 1, "the failed read was attempted");
+        let git_before = mdkg_git::git_runs();
+        for _ in 0..30 {
+            assert_eq!(definitions.changed(), None);
+        }
+        assert_eq!(mdkg_git::fresh_reads_count(), after);
+        assert_eq!(
+            mdkg_git::git_runs(),
+            git_before,
+            "failed reads are throttled"
+        );
+        assert_eq!(after_read_interval(&definitions), None);
+        assert_eq!(
+            mdkg_git::fresh_reads_count(),
+            after + 1,
+            "failure retries after the interval"
+        );
+        // Repair is picked up on the next permitted read, rather than pinned to failure.
+        std::fs::write(repo.0.join(".mdkg/config.json"), "{\"projections\":[]}").unwrap();
+        repo.git(&["commit", "-qam", "repair config"]);
+        assert_eq!(definitions.changed(), None);
+        assert_eq!(
+            after_read_interval(&definitions).as_deref(),
+            Some(".mdkg/config.json")
+        );
     }
 }

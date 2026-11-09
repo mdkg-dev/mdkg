@@ -1253,6 +1253,9 @@ Options:
   -q, --query <QUERY>
           Pack around the best search hits for these words instead (or as well)
 
+      --for-message <ID>
+          Pack one message's thread, referenced nodes and their accepted decisions. Thread text is untrusted data; reading does not mark or acknowledge mail
+
       --profile <PROFILE>
           standard (full bodies) or concise (the seed's full body, openings of the rest)
 
@@ -4500,6 +4503,7 @@ Commands:
   watch      Follow the local coordinator event stream as one JSON event per line
   send       Send a message to a channel or to mailboxes
   inbox      Show your unacked mail (your mailbox and the roles you hold)
+  pending    List unanswered questions and decisions, oldest first, with age. Acknowledgement does not count as an answer; a --reply-to does
   digest     Compute the current mail digest without marking any message shown
   wait       Wait for mail; exits 6 if none arrives before the timeout
   ack        Ack messages delivered to you
@@ -4602,7 +4606,7 @@ Options:
           Send to these mailboxes (comma-separated or repeated)
 
       --kind <KIND>
-          review_request, findings, resolution, question, decision, handoff or note
+          review_request, findings, resolution, question, decision, handoff or note; notice is readable information that never wakes an agent
 
       --action <ACTION>
           Decision scope: implement, test, commit, design or review. Fixed limits always apply
@@ -4738,6 +4742,52 @@ Examples:
   mdkg msg inbox
   mdkg msg inbox --channel dev --json
   mdkg msg inbox --from orchestrator --kind question
+```
+
+#### `mdkg msg pending`
+
+```text
+List unanswered questions and decisions, oldest first, with age. Acknowledgement does not count as an answer; a --reply-to does
+
+Usage: mdkg msg pending [OPTIONS]
+
+Options:
+      --after <AFTER>
+          Continue after this store-wide message sequence
+
+          [default: 0]
+
+      --limit <LIMIT>
+          The most unanswered messages to return
+
+          [default: 100]
+
+      --json
+
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+  -r, --root <ROOT>
+          Run against this repository root (default: the current directory)
+
+      --as <ACTOR>
+          Act as this actor in coordination commands (default: $MDKG_ACTOR, then the worktree's folder name)
+
+      --allow-store-upgrade
+          Let a development build upgrade the coordinator store.
+
+          The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+
+Examples:
+  mdkg msg pending --as worker
+  mdkg msg pending --after 42 --json
 ```
 
 #### `mdkg msg digest`
@@ -5399,6 +5449,7 @@ Commands:
   edit     Update an agent definition; fields not given stay as they are
   rm       Remove a committed definition, keeping local sessions and history
   up       Wake agents on their mail and run their turns under their policies, until stopped
+  prepare  Create or verify a worker's worktree without running a turn. Only outside an agent turn; prints the canonical working directory
   stop     Stop agents gracefully: a turn in flight finishes, then each agent's supervisor admits no more of its turns. Nothing is killed. Inside an agent's turn it may stop only that agent
   logs     Show a turn's output, normalized across harnesses, or follow an agent's turns as they run
   turns    List an agent's turns, newest first: each one's id, number, times, outcome and receipt, a page at a time
@@ -5484,6 +5535,9 @@ Options:
       --reports-to <REPORTS_TO>
           The actor receiving turn receipts and faults: turn errors and refused replies (default: orchestrator)
 
+      --wake-kinds [<WAKE_KINDS>]
+          Mail kinds that start a turn (comma-separated or repeated). With no values, disable mail-triggered wakes; --unset wake_kinds restores defaults
+
       --extends <EXTENDS>
           Reserved remote definition reference; this release does not run it
 
@@ -5499,7 +5553,7 @@ Options:
       --unset <UNSET>
           Remove an optional field; repeat for several fields
 
-          [possible values: extends, cwd, worktree, model, effort, base, instructions, policy, allow, protect, reports_to, mode, sandbox, approvals, follow]
+          [possible values: extends, cwd, worktree, model, effort, base, instructions, policy, allow, protect, reports_to, wake_kinds, mode, sandbox, approvals, follow]
 
       --json
 
@@ -5575,6 +5629,9 @@ Options:
       --reports-to <REPORTS_TO>
           The actor receiving turn receipts and faults: turn errors and refused replies (default: orchestrator)
 
+      --wake-kinds [<WAKE_KINDS>]
+          Mail kinds that start a turn (comma-separated or repeated). With no values, disable mail-triggered wakes; --unset wake_kinds restores defaults
+
       --extends <EXTENDS>
           Reserved remote definition reference; this release does not run it
 
@@ -5590,7 +5647,7 @@ Options:
       --unset <UNSET>
           Remove an optional field; repeat for several fields
 
-          [possible values: extends, cwd, worktree, model, effort, base, instructions, policy, allow, protect, reports_to, mode, sandbox, approvals, follow]
+          [possible values: extends, cwd, worktree, model, effort, base, instructions, policy, allow, protect, reports_to, wake_kinds, mode, sandbox, approvals, follow]
 
       --json
 
@@ -5729,6 +5786,46 @@ Examples:
   mdkg agents up
   mdkg agents up --once
   mdkg agents up worker-1 --max-turns 3
+```
+
+#### `mdkg agents prepare`
+
+```text
+Create or verify a worker's worktree without running a turn. Only outside an agent turn; prints the canonical working directory
+
+Usage: mdkg agents prepare [OPTIONS] <AGENT>
+
+Arguments:
+  <AGENT>
+
+
+Options:
+      --json
+
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+  -r, --root <ROOT>
+          Run against this repository root (default: the current directory)
+
+      --as <ACTOR>
+          Act as this actor in coordination commands (default: $MDKG_ACTOR, then the worktree's folder name)
+
+      --allow-store-upgrade
+          Let a development build upgrade the coordinator store.
+
+          The store is copied first; never use this on a live repository's store. Installed builds always may; only a build running from a Cargo build folder needs this.
+
+      --read-only
+          Never write the coordinator store.
+
+          The store is opened read-only: never created, upgraded, recovered or checkpointed. Only `status`, which doesn't record its observation, and `msg inbox`, `msg wait` and `msg thread`, which read as with `--no-mark`, run with it. Every other command is refused with `store.read_only` (exit 1) before it runs.
+
+Examples:
+  mdkg agents prepare worker-1
+  mdkg agents prepare worker-1 --json
 ```
 
 #### `mdkg agents stop`

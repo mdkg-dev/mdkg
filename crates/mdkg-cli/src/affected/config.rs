@@ -96,12 +96,22 @@ impl Config {
     }
 
     /// Whether `path` is a global file.
+    #[cfg(test)]
     pub fn is_global(&self, path: &str) -> bool {
+        self.is_builtin_global(path) || self.is_user_global(path)
+    }
+
+    /// Whether a built-in global path matches `path`, ignoring ASCII case.
+    pub fn is_builtin_global(&self, path: &str) -> bool {
         // A removed manifest leaves no adapter to reject its casing. The
         // built-in globals apply whether or not a language adapter exists.
         let folded = path.to_ascii_lowercase();
         self.builtin_global.iter().any(|g| g.matches(&folded))
-            || self.global.iter().any(|g| g.matches(path))
+    }
+
+    /// Whether the config's own `global` list matches `path`.
+    pub fn is_user_global(&self, path: &str) -> bool {
+        self.global.iter().any(|g| g.matches(path))
     }
 }
 

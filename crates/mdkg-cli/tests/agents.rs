@@ -453,6 +453,125 @@ fn definition_concurrent_same_actor_edits_preserve_both_changes() {
 }
 
 #[test]
+fn wake_kinds_one_supervisor_runs_only_agents_with_eligible_mail() {
+    let (_dir, repo) = make_repo(json!({
+        "quiet": {"harness":"claude", "role":"reviewer", "wake_kinds":["question"]},
+        "ready": {"harness":"claude", "role":"reviewer", "wake_kinds":["question"]},
+        "disabled": {"harness":"claude", "role":"reviewer", "wake_kinds":[]}
+    }));
+    let root = graph(&repo);
+    for name in ["quiet", "ready", "disabled"] {
+        ok(
+            &root,
+            "sender",
+            &[
+                "msg", "send", "--to", name, "--kind", "note", "--text", "Deferred",
+            ],
+        );
+    }
+    for name in ["ready", "disabled"] {
+        ok(
+            &root,
+            "sender",
+            &[
+                "msg",
+                "send",
+                "--to",
+                name,
+                "--kind",
+                "question",
+                "--text",
+                "Answer this",
+            ],
+        );
+    }
+    // One supervisor process, one temporary repository, no timing/poll loop.
+    let (code, events) = up(&repo, &[]);
+    assert_eq!(code, 0, "{events:?}");
+    assert_eq!(turns(&events, "quiet").len(), 0, "{events:?}");
+    assert_eq!(turns(&events, "disabled").len(), 0, "{events:?}");
+    let ready = turns(&events, "ready");
+    assert_eq!(ready.len(), 1, "{events:?}");
+    assert_eq!(
+        ready[0]["data"]["turn"]["shown"].as_array().unwrap().len(),
+        1,
+        "batch delivery selects the question's conversation"
+    );
+    for (name, expected) in [("quiet", 1), ("disabled", 2), ("ready", 1)] {
+        let inbox = ok(&root, name, &["msg", "inbox", "--no-mark"]);
+        assert_eq!(
+            inbox["data"]["messages"].as_array().unwrap().len(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn definition_wake_kinds_can_be_added_edited_disabled_and_unset() {
+    for harness in ["claude", "codex", "opencode"] {
+        let (_dir, repo) = make_repo(json!({}));
+        let root = graph(&repo);
+        let added = ok(
+            &root,
+            "launcher",
+            &[
+                "agents",
+                "add",
+                "writer",
+                "--harness",
+                harness,
+                "--role",
+                "worker",
+                "--wake-kinds",
+                "question,decision",
+                "--wake-kinds",
+                "handoff",
+            ],
+        );
+        assert_definition_commit(&root, &added, "Add");
+        assert_eq!(
+            added["data"]["definition"]["wake_kinds"],
+            json!(["question", "decision", "handoff"])
+        );
+        let preserved = ok(
+            &root,
+            "launcher",
+            &["agents", "edit", "writer", "--instructions", "Use leases."],
+        );
+        assert_eq!(
+            preserved["data"]["definition"]["wake_kinds"],
+            added["data"]["definition"]["wake_kinds"]
+        );
+        let path = root.join(".mdkg/agents/writer.json");
+        let original = fs::read(&path).unwrap();
+        let head = git_text(&root, &["rev-parse", "HEAD"]);
+        for invalid in ["unknown", "question,unknown", ""] {
+            let (code, _) = mdkg(
+                &root,
+                "launcher",
+                &["agents", "edit", "writer", "--wake-kinds", invalid],
+            );
+            assert_ne!(code, 0);
+            assert_eq!(fs::read(&path).unwrap(), original);
+            assert_eq!(git_text(&root, &["rev-parse", "HEAD"]), head);
+        }
+        let disabled = ok(
+            &root,
+            "launcher",
+            &["agents", "edit", "writer", "--wake-kinds"],
+        );
+        assert_eq!(disabled["data"]["definition"]["wake_kinds"], json!([]));
+        let defaults = ok(
+            &root,
+            "launcher",
+            &["agents", "edit", "writer", "--unset", "wake_kinds"],
+        );
+        assert!(defaults["data"]["definition"].get("wake_kinds").is_none());
+        assert_clean(&root);
+    }
+}
+
+#[test]
 fn definition_commands_preserve_fields_validate_before_writing_and_remove_only_the_file() {
     let (_dir, repo) = make_repo(json!({}));
     let root = graph(&repo);
@@ -2597,6 +2716,112 @@ fn a_running_watch_reloads_an_edited_definition_before_its_next_turn() {
         assert_eq!(exit["reason"], "cap", "{harness}: {exit}");
         assert!(exit.get("code").is_none(), "{harness}: {exit}");
         assert!(exit["at"].is_string(), "{harness}: {exit}");
+    }
+}
+
+/// Mail sent right after `agents edit`, while the supervisor is idle and
+/// before its spaced poll reads the definitions again, still starts its
+/// turn on the edited definition: the supervisor reads them again before
+/// admitting the turn, finishes and re-execs. A harness change takes
+/// effect the same way, with no manual restart.
+#[test]
+fn an_idle_watch_woken_right_after_an_edit_runs_the_edited_definition() {
+    use std::time::{Duration, Instant};
+    for (from, from_file, to, to_file) in [
+        ("claude", "claude.prompt", "codex", "codex.prompt"),
+        ("codex", "codex.prompt", "opencode", "opencode.args"),
+        ("opencode", "opencode.args", "claude", "claude.prompt"),
+    ] {
+        let case = format!("{from} to {to}");
+        let (scratch, repo) = make_repo(json!({}));
+        let root = graph(&repo);
+        let home = scratch.0.join("home");
+        fs::create_dir_all(home.join(".codex")).unwrap();
+        let add = [
+            "agents",
+            "add",
+            "rev",
+            "--harness",
+            from,
+            "--role",
+            "reviewer",
+            "--instructions",
+            "FIRST-DEFINITION",
+        ];
+        ok(&root, "launcher", &add);
+        send(&repo, "rev", "first request", None);
+        let stderr = scratch.0.join("watch.err");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_mdkg"));
+        isolated(&mut command)
+            .current_dir(&root)
+            .arg("--root")
+            .arg(&root)
+            .args(["--as", "launcher", "agents", "up", "rev"])
+            .args(["--max-turns", "2", "--wait", "1", "--json"])
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("XDG_DATA_HOME", home.join(".local/share"))
+            .env("CODEX_HOME", home.join(".codex"))
+            .env("MDKG_RUN_CODEX", fixture("fake-codex.sh"))
+            .env("MDKG_RUN_OPENCODE", fixture("fake-opencode.sh"))
+            .stdout(fs::File::create(scratch.0.join("watch.out")).unwrap())
+            .stderr(fs::File::create(&stderr).unwrap());
+        let mut child = Group::spawn(&mut command, &scratch.0);
+        let read = |file: &str| fs::read_to_string(root.join(file)).unwrap_or_default();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !read(from_file).contains("FIRST-DEFINITION") {
+            let err = fs::read_to_string(&stderr).unwrap_or_default();
+            assert!(child.child.try_wait().unwrap().is_none(), "{case}: {err}");
+            assert!(Instant::now() < deadline, "{case}: no first turn: {err}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // Past the watcher's first poll, which reads the definitions; its
+        // next read is 30 seconds later.
+        std::thread::sleep(Duration::from_secs(3));
+        ok(
+            &root,
+            "launcher",
+            &[
+                "agents",
+                "edit",
+                "rev",
+                "--harness",
+                to,
+                "--instructions",
+                "SECOND-DEFINITION",
+            ],
+        );
+        let second = git_text(&root, &["rev-parse", "HEAD"]);
+        // At once: no wait for the watcher to notice.
+        send(&repo, "rev", "second request", None);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let status = loop {
+            if let Some(status) = child.child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "{case}: no second turn");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let err = fs::read_to_string(&stderr).unwrap();
+        assert!(status.success(), "{case}: {err}");
+        let text = read(to_file);
+        assert!(text.contains("SECOND-DEFINITION"), "{case}: {text}");
+        assert!(!text.contains("FIRST-DEFINITION"), "{case}: {text}");
+        assert!(
+            text.contains(&format!("last committed in {second}")),
+            "{case}: {text}"
+        );
+        // The old harness ran only the first turn.
+        let old = read(from_file);
+        assert!(!old.contains("SECOND-DEFINITION"), "{case}: {old}");
+        assert_eq!(
+            err.matches("turns finished, restarting").count(),
+            1,
+            "{case}: {err}"
+        );
+        let progress = read_progress(&repo, "rev");
+        assert_eq!(progress["progress"]["ran"], 2, "{case}: {progress}");
+        assert_eq!(progress["finished"], true);
     }
 }
 
@@ -6270,4 +6495,549 @@ fn named_once_uses_the_digest_policy() {
         prompt.contains("final reply goes to coordinator"),
         "{prompt}"
     );
+}
+
+#[test]
+fn prepare_materializes_file_workers_for_every_harness_and_is_idempotent() {
+    for harness in ["claude", "codex", "opencode"] {
+        let (_dir, repo) = make_repo(json!({}));
+        let root = graph(&repo);
+        sh(&repo, &["branch", "prep-base", "main"]);
+        let base = git_text(&repo, &["rev-parse", "prep-base"]);
+        let path = root.join(".mdkg/config.json");
+        let mut cfg: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        cfg["orchestration"] = json!({"worktree":".workers/{agent}","branch":"work/{agent}"});
+        fs::write(path, cfg.to_string()).unwrap();
+        fs::create_dir_all(root.join(".mdkg/agents")).unwrap();
+        fs::write(
+            root.join(".mdkg/agents/writer.json"),
+            json!({
+                "schema":"mdkg.agent.v1", "harness":harness, "role":"worker",
+                "worktree":true,"base":"prep-base"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        sh(&root, &["add", ".mdkg"]);
+        sh(&root, &["commit", "-qm", "configure preparation"]);
+        let first = ok(&root, "launcher", &["agents", "prepare", "writer"]);
+        let cwd = PathBuf::from(first["data"]["cwd"].as_str().unwrap());
+        assert_eq!(cwd, fs::canonicalize(repo.join(".workers/writer")).unwrap());
+        assert_eq!(git_text(&cwd, &["branch", "--show-current"]), "work/writer");
+        assert_eq!(git_text(&cwd, &["rev-parse", "HEAD"]), base);
+        let state_path = repo.join(".git/mdkg/run/writer.json");
+        let bytes = fs::read(&state_path).unwrap();
+        let state: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(state["turns"], 0, "{state}");
+        assert_eq!(state["work_base"]["commit"], base, "{state}");
+        assert!(!repo.join(".git/mdkg/run/supervisors").exists());
+        assert!(!repo.join(".git/mdkg/run/progress").exists());
+        fs::create_dir_all(cwd.join(".claude")).unwrap();
+        fs::write(cwd.join(".claude/settings.json"), "{\"prepared\":true}\n").unwrap();
+        let second = ok(&root, "launcher", &["agents", "prepare", "writer"]);
+        assert_eq!(first["data"], second["data"]);
+        assert_eq!(fs::read(state_path).unwrap(), bytes);
+        assert_eq!(
+            fs::read_to_string(cwd.join(".claude/settings.json")).unwrap(),
+            "{\"prepared\":true}\n"
+        );
+    }
+}
+
+#[test]
+fn prepare_preserves_used_file_worker_state_at_the_resolved_worktree() {
+    for harness in ["claude", "codex", "opencode"] {
+        let (_dir, repo) = make_repo(json!({}));
+        let root = graph(&repo);
+        fs::create_dir_all(root.join(".mdkg/agents")).unwrap();
+        let definition = root.join(".mdkg/agents/writer.json");
+        fs::write(
+            &definition,
+            json!({"schema":"mdkg.agent.v1", "harness":harness,
+                "role":"worker", "worktree":true})
+            .to_string(),
+        )
+        .unwrap();
+        sh(&root, &["add", ".mdkg"]);
+        sh(&root, &["commit", "-qm", "configure used worker"]);
+        let first = ok(&root, "launcher", &["agents", "prepare", "writer"]);
+        let path = repo.join(".git/mdkg/run/writer.json");
+        let mut saved: mdkg_run::AgentState =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        saved.session = Some("fixture-session".into());
+        saved.user_session = true;
+        saved.commit_refused = Some("fixture commit needs review".into());
+        saved.turns = 7;
+        saved.cursor = Some(91);
+        let cwd = PathBuf::from(first["data"]["cwd"].as_str().unwrap());
+        saved.spec.pinned = Some(mdkg_run::state::Pinned {
+            top: cwd.clone(),
+            git_dir: PathBuf::from(git_text(&cwd, &["rev-parse", "--absolute-git-dir"])),
+        });
+        let base = saved.work_base.as_mut().unwrap();
+        base.notes
+            .push("fixture base note retained after restart".into());
+        base.turns = 3;
+        let bytes = serde_json::to_vec_pretty(&saved).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        let second = ok(&root, "launcher", &["agents", "prepare", "writer"]);
+        assert_eq!(first["data"], second["data"]);
+        assert_eq!(fs::read(&path).unwrap(), bytes, "{harness}");
+
+        // A genuine execution change still uses the launcher's invalidation
+        // rules; only the provisional launcher cwd must be ignored.
+        let replacement = if harness == "claude" {
+            "codex"
+        } else {
+            "claude"
+        };
+        let mut changed: Value = serde_json::from_slice(&fs::read(&definition).unwrap()).unwrap();
+        changed["harness"] = json!(replacement);
+        fs::write(&definition, changed.to_string()).unwrap();
+        sh(&root, &["add", ".mdkg"]);
+        sh(&root, &["commit", "-qm", "change worker execution"]);
+        ok(&root, "launcher", &["agents", "prepare", "writer"]);
+        let updated: mdkg_run::AgentState =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(updated.session.is_none());
+        assert!(!updated.user_session);
+        assert!(updated.commit_refused.is_none());
+        assert_eq!(updated.work_base, saved.work_base);
+        assert_eq!(updated.spec.pinned, saved.spec.pinned);
+        assert_eq!((updated.turns, updated.cursor), (saved.turns, saved.cursor));
+    }
+}
+
+#[test]
+fn prepare_refuses_a_held_turn_lease_without_writing_worker_state() {
+    let (_dir, repo) =
+        make_repo(json!({"writer":{"harness":"claude","role":"worker","worktree":true}}));
+    let root = graph(&repo);
+    ok(&root, "launcher", &["agents", "prepare", "writer"]);
+    let state_path = repo.join(".git/mdkg/run/writer.json");
+    let bytes = fs::read(&state_path).unwrap();
+    let trees = git_text(&repo, &["worktree", "list", "--porcelain"]);
+    ok(&root, "other-launcher", &["claim", "run:writer"]);
+    let (code, reply) = mdkg(&root, "launcher", &["agents", "prepare", "writer"]);
+    assert_ne!(code, 0, "{reply}");
+    assert_eq!(
+        reply["diagnostics"][0]["code"], "coord.lease_held",
+        "{reply}"
+    );
+    assert_eq!(fs::read(&state_path).unwrap(), bytes);
+    assert_eq!(git_text(&repo, &["worktree", "list", "--porcelain"]), trees);
+    ok(&root, "other-launcher", &["release", "run:writer"]);
+    ok(&root, "launcher", &["agents", "prepare", "writer"]);
+    // Preparation must release its lease on success as well as refusal.
+    ok(&root, "other-launcher", &["claim", "run:writer"]);
+    ok(&root, "other-launcher", &["release", "run:writer"]);
+}
+
+#[test]
+fn prepare_reuses_legacy_inline_state_and_refuses_saved_only_or_cwd() {
+    let (_dir, repo) = make_repo(
+        json!({"writer":{"harness":"claude","role":"worker","worktree":true},"local":{"harness":"claude","role":"worker","cwd":"."}}),
+    );
+    let root = graph(&repo);
+    let before = git_text(&repo, &["worktree", "list", "--porcelain"]);
+    for (name, code) in [
+        ("missing", "run.unknown_agent"),
+        ("local", "run.unsupported"),
+    ] {
+        let (exit, out) = mdkg(&root, "launcher", &["agents", "prepare", name]);
+        assert_ne!(exit, 0);
+        assert_eq!(out["diagnostics"][0]["code"], code, "{out}");
+        assert_eq!(
+            git_text(&repo, &["worktree", "list", "--porcelain"]),
+            before
+        );
+        assert!(!repo.join(format!(".git/mdkg/run/{name}.json")).exists());
+    }
+    let first = ok(&root, "launcher", &["agents", "prepare", "writer"]);
+    let bytes = fs::read(repo.join(".git/mdkg/run/writer.json")).unwrap();
+    assert_eq!(
+        ok(&root, "launcher", &["agents", "prepare", "writer"])["data"],
+        first["data"]
+    );
+    assert_eq!(
+        fs::read(repo.join(".git/mdkg/run/writer.json")).unwrap(),
+        bytes
+    );
+    let path = root.join(".mdkg/config.json");
+    let mut cfg: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    cfg["agents"].as_object_mut().unwrap().remove("writer");
+    fs::write(path, cfg.to_string()).unwrap();
+    commit_graph_config(&root);
+    let (code, out) = mdkg(&root, "launcher", &["agents", "prepare", "writer"]);
+    assert_ne!(code, 0);
+    assert_eq!(out["diagnostics"][0]["code"], "run.unsupported", "{out}");
+    assert_eq!(
+        fs::read(repo.join(".git/mdkg/run/writer.json")).unwrap(),
+        bytes
+    );
+}
+
+#[test]
+fn prepare_refuses_inside_a_turn_before_making_worktree_or_state() {
+    let (_dir, repo) =
+        make_repo(json!({"writer":{"harness":"claude","role":"worker","worktree":true}}));
+    let root = graph(&repo);
+    let out = isolated(Command::new(env!("CARGO_BIN_EXE_mdkg")).current_dir(&root))
+        .args([
+            "--root",
+            root.to_str().unwrap(),
+            "--as",
+            "launcher",
+            "agents",
+            "prepare",
+            "writer",
+            "--json",
+        ])
+        .env(mdkg_run::profile::TURN_MARK, "fixture-turn")
+        .output()
+        .unwrap();
+    let value: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(!out.status.success());
+    assert_eq!(
+        value["diagnostics"][0]["code"], "run.turn_active",
+        "{value}"
+    );
+    assert!(!repo.join(".worktrees/writer").exists());
+    assert!(!repo.join(".git/mdkg/run/writer.json").exists());
+}
+
+#[test]
+fn prepare_then_up_keeps_project_settings_until_the_first_harness_call() {
+    let (_dir, repo) = make_repo(json!({}));
+    let root = graph(&repo);
+    fs::create_dir_all(root.join(".mdkg/agents")).unwrap();
+    fs::write(
+        root.join(".mdkg/agents/writer.json"),
+        json!({"schema":"mdkg.agent.v1","harness":"claude","role":"worker","worktree":true})
+            .to_string(),
+    )
+    .unwrap();
+    sh(&root, &["add", ".mdkg/agents/writer.json"]);
+    sh(&root, &["commit", "-qm", "configure prepared worker"]);
+    let prepared = ok(&root, "launcher", &["agents", "prepare", "writer"]);
+    let cwd = PathBuf::from(prepared["data"]["cwd"].as_str().unwrap());
+    fs::create_dir_all(cwd.join(".claude")).unwrap();
+    let settings = "{\"prepared\":true}\n";
+    fs::write(cwd.join(".claude/settings.json"), settings).unwrap();
+    let harness = repo.parent().unwrap().join("prepared-harness.sh");
+    fs::write(&harness, "#!/bin/sh\nif [ \"$1\" = auth ]; then printf '%s\\n' '{\"loggedIn\":true,\"authMethod\":\"claude.ai\"}'; exit 0; fi\ncat >/dev/null\n[ -f .claude/settings.json ] || exit 9\ncp .claude/settings.json observed-settings.json\nprintf '%s\\n' '{\"type\":\"result\",\"result\":\"NO_REPLY\"}'\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&harness, fs::Permissions::from_mode(0o755)).unwrap();
+    let before = git_text(&cwd, &["rev-parse", "HEAD"]);
+    let out = isolated(Command::new(env!("CARGO_BIN_EXE_mdkg")).current_dir(&root))
+        .args([
+            "--root",
+            root.to_str().unwrap(),
+            "--as",
+            "launcher",
+            "agents",
+            "up",
+            "writer",
+            "--once",
+            "--prompt",
+            "Inspect prepared settings.",
+            "--json",
+        ])
+        .env("MDKG_RUN_CLAUDE", &harness)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(cwd.join("observed-settings.json")).unwrap_or_else(|e| panic!(
+            "{e}: {}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )),
+        settings
+    );
+    assert_eq!(
+        fs::read_to_string(cwd.join(".claude/settings.json")).unwrap(),
+        settings
+    );
+    assert_eq!(git_text(&cwd, &["rev-parse", "HEAD"]), before);
+}
+
+#[test]
+fn prepare_checks_base_and_branch_protection_before_creating_anything() {
+    for entry in [
+        json!({"harness":"claude","role":"worker","worktree":true,"base":"missing-base"}),
+        json!({"harness":"claude","role":"worker","worktree":true,"protect":["agent/writer"]}),
+    ] {
+        let (_dir, repo) = make_repo(json!({"writer":entry}));
+        let root = graph(&repo);
+        let branches = git_text(
+            &repo,
+            &["for-each-ref", "--format=%(refname)", "refs/heads"],
+        );
+        let trees = git_text(&repo, &["worktree", "list", "--porcelain"]);
+        let (code, out) = mdkg(&root, "launcher", &["agents", "prepare", "writer"]);
+        assert_ne!(code, 0, "{out}");
+        assert_eq!(
+            git_text(
+                &repo,
+                &["for-each-ref", "--format=%(refname)", "refs/heads"]
+            ),
+            branches
+        );
+        assert_eq!(git_text(&repo, &["worktree", "list", "--porcelain"]), trees);
+        assert!(!repo.join(".git/mdkg/run/writer.json").exists());
+    }
+}
+
+#[test]
+fn authority_fields_definition_writes_require_an_outside_turn_person() {
+    let (_dir, repo) = make_repo(json!({"inline":{"harness":"codex","role":"worker",
+        "policy":{"env":{"inherit":false}}}}));
+    let root = graph(&repo);
+    let marked = |args: &[&str]| -> Value {
+        let out = isolated(Command::new(env!("CARGO_BIN_EXE_mdkg")).current_dir(&root))
+            .args(["--root", root.to_str().unwrap(), "--as", "orchestrator"])
+            .args(args)
+            .arg("--json")
+            .env(mdkg_run::profile::TURN_MARK, "fixture-turn")
+            .output()
+            .unwrap();
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+    let refused = |args: &[&str]| {
+        let before = git_text(
+            &repo,
+            &["for-each-ref", "--format=%(refname) %(objectname)"],
+        );
+        let out = marked(args);
+        assert_eq!(out["ok"], false, "{out}");
+        assert_eq!(
+            out["diagnostics"][0]["code"], "authority.field_in_turn",
+            "{out}"
+        );
+        assert_eq!(
+            git_text(
+                &repo,
+                &["for-each-ref", "--format=%(refname) %(objectname)"]
+            ),
+            before
+        );
+    };
+    // Promotion from an inline definition preserves its environment; an
+    // ordinary edit does not become an authority change merely by copying it.
+    let out = marked(&[
+        "agents",
+        "edit",
+        "inline",
+        "--instructions",
+        "ordinary edit",
+    ]);
+    assert_eq!(out["ok"], true, "{out}");
+    for harness in ["claude", "codex", "opencode"] {
+        let name = format!("guard-{harness}");
+        ok(
+            &root,
+            "operator",
+            &[
+                "agents",
+                "add",
+                &name,
+                "--harness",
+                harness,
+                "--role",
+                "worker",
+                "--policy",
+                r#"{"env":{"inherit":false}}"#,
+            ],
+        );
+        refused(&[
+            "agents",
+            "edit",
+            &name,
+            "--policy",
+            r#"{"env":{"inherit":true}}"#,
+        ]);
+        let out = marked(&["agents", "edit", &name, "--instructions", "ordinary edit"]);
+        assert_eq!(out["ok"], true, "{out}");
+        ok(
+            &root,
+            "operator",
+            &[
+                "agents",
+                "edit",
+                &name,
+                "--policy",
+                r#"{"env":{"inherit":true}}"#,
+            ],
+        );
+        refused(&["agents", "edit", &name, "--policy", r#"{"timeout":30}"#]);
+    }
+    refused(&[
+        "agents",
+        "add",
+        "new-worker",
+        "--harness",
+        "codex",
+        "--role",
+        "worker",
+        "--policy",
+        r#"{"env":{"inherit":true}}"#,
+    ]);
+    assert!(!root.join(".mdkg/agents/new-worker.json").exists());
+    for (field, value) in [("sandbox", "read-only"), ("approvals", "on-request")] {
+        let flag = format!("--{field}");
+        refused(&["agents", "edit", "guard-codex", &flag, value]);
+        ok(
+            &root,
+            "operator",
+            &["agents", "edit", "guard-codex", &flag, value],
+        );
+        refused(&["agents", "edit", "guard-codex", "--unset", field]);
+        ok(
+            &root,
+            "operator",
+            &["agents", "edit", "guard-codex", "--unset", field],
+        );
+    }
+    refused(&["agents", "rm", "guard-codex"]);
+    let replacement = repo.parent().unwrap().join("replacement.json");
+    fs::write(
+        &replacement,
+        json!({"schema":"mdkg.agent.v1","harness":"codex","role":"worker",
+        "policy":{"env":{"inherit":false}}})
+        .to_string(),
+    )
+    .unwrap();
+    let file = replacement.to_str().unwrap();
+    refused(&["agents", "edit", "guard-codex", "--file", file]);
+    ok(
+        &root,
+        "operator",
+        &["agents", "edit", "guard-codex", "--file", file],
+    );
+    ok(&root, "operator", &["agents", "rm", "guard-codex"]);
+}
+
+#[test]
+fn authority_fields_cannot_be_laundered_through_a_dirty_definition() {
+    let (_dir, repo) = make_repo(json!({}));
+    let root = graph(&repo);
+    ok(
+        &root,
+        "operator",
+        &[
+            "agents",
+            "add",
+            "worker",
+            "--harness",
+            "codex",
+            "--role",
+            "worker",
+            "--policy",
+            r#"{"env":{"inherit":false}}"#,
+        ],
+    );
+    let path = root.join(".mdkg/agents/worker.json");
+    let mut candidate: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    candidate["policy"]["env"]["inherit"] = json!(true);
+    let bytes = serde_json::to_vec(&candidate).unwrap();
+    fs::write(&path, &bytes).unwrap();
+    let before = git_text(
+        &repo,
+        &["for-each-ref", "--format=%(refname) %(objectname)"],
+    );
+    let out = isolated(Command::new(env!("CARGO_BIN_EXE_mdkg")).current_dir(&root))
+        .args([
+            "--as",
+            "worker",
+            "agents",
+            "edit",
+            "worker",
+            "--instructions",
+            "ordinary edit",
+            "--json",
+        ])
+        .env(mdkg_run::profile::TURN_MARK, "fixture-turn")
+        .output()
+        .unwrap();
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(!out.status.success(), "{v}");
+    assert_eq!(v["diagnostics"][0]["code"], "io.write_failed", "{v}");
+    assert_eq!(
+        git_text(
+            &repo,
+            &["for-each-ref", "--format=%(refname) %(objectname)"]
+        ),
+        before
+    );
+    assert_eq!(
+        fs::read(path).unwrap(),
+        bytes,
+        "refusal preserves the dirty candidate"
+    );
+}
+
+#[test]
+fn authority_fields_null_native_overrides_allow_ordinary_turn_edits() {
+    let (_dir, repo) = make_repo(json!({}));
+    let root = graph(&repo);
+    fs::create_dir_all(root.join(".mdkg/agents")).unwrap();
+    for field in ["sandbox", "approvals"] {
+        let mut definition = json!({"schema":"mdkg.agent.v1","harness":"codex","role":"worker"});
+        definition[field] = Value::Null;
+        fs::write(
+            root.join(format!(".mdkg/agents/null-{field}.json")),
+            definition.to_string(),
+        )
+        .unwrap();
+    }
+    sh(&root, &["add", ".mdkg/agents"]);
+    sh(&root, &["commit", "-qm", "seed nullable overrides"]);
+    for (field, value) in [("sandbox", "workspace-write"), ("approvals", "never")] {
+        let name = format!("null-{field}");
+        let marked = |args: &[&str]| -> Value {
+            let out = isolated(Command::new(env!("CARGO_BIN_EXE_mdkg")).current_dir(&root))
+                .args(["--as", "worker"])
+                .args(args)
+                .arg("--json")
+                .env(mdkg_run::profile::TURN_MARK, "fixture-turn")
+                .output()
+                .unwrap();
+            serde_json::from_slice(&out.stdout).unwrap()
+        };
+        let out = marked(&["agents", "edit", &name, "--instructions", "ordinary edit"]);
+        assert_eq!(out["ok"], true, "{field}: {out}");
+        let stored: Value = serde_json::from_slice(
+            &fs::read(root.join(format!(".mdkg/agents/{name}.json"))).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            stored.get(field).is_none(),
+            "canonical absent override: {stored}"
+        );
+        assert_eq!(stored["instructions"], "ordinary edit");
+        let before = git_text(
+            &repo,
+            &["for-each-ref", "--format=%(refname) %(objectname)"],
+        );
+        let flag = format!("--{field}");
+        let out = marked(&["agents", "edit", &name, &flag, value]);
+        assert_eq!(out["ok"], false, "{out}");
+        assert_eq!(
+            out["diagnostics"][0]["code"], "authority.field_in_turn",
+            "{out}"
+        );
+        assert_eq!(
+            git_text(
+                &repo,
+                &["for-each-ref", "--format=%(refname) %(objectname)"]
+            ),
+            before
+        );
+    }
 }

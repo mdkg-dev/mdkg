@@ -204,6 +204,10 @@
           "description": "A verified finding's or a met requirement's verification.",
           "$ref": "#/$defs/Verified"
         },
+        "review_receipt": {
+          "description": "A requirement verdict relayed by an outside-turn coordinator.",
+          "$ref": "#/$defs/ReviewReceipt"
+        },
         "duplicate_of": {
           "description": "A duplicate finding's original (`<node>#<id>`).",
           "type": "string"
@@ -447,6 +451,49 @@
         "at"
       ]
     },
+    "ReviewReceipt": {
+      "type": "object",
+      "properties": {
+        "round": {
+          "type": "string"
+        },
+        "reviewer": {
+          "type": "string"
+        },
+        "recorded_by": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "sha": {
+          "type": "string"
+        },
+        "state": {
+          "type": "string"
+        },
+        "turn": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "digest": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "round",
+        "reviewer",
+        "recorded_by",
+        "message",
+        "sha",
+        "state"
+      ]
+    },
     "Waives": {
       "type": "object",
       "properties": {
@@ -553,6 +600,7 @@
         "config.missing",
         "config.unreadable",
         "config.invalid",
+        "authority.field_in_turn",
         "config.unknown_workspace",
         "config.graph_v2_unsupported",
         "frontmatter.missing_open",

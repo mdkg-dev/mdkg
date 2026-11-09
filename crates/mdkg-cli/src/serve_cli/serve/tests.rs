@@ -791,7 +791,7 @@ fn the_production_check_walks_the_callers_ancestry() {
     drop(_turn);
     // A live turn launched by this test's own process tree: the caller is
     // its descendant, so it's refused whatever actor it names.
-    let _mine = live_turn(&f, "b-agent", std::process::id());
+    let mine = live_turn(&f, "b-agent", std::process::id());
     let (status, v) = send(&r.data.socket, &with_actor("/v1/unrouted", "lane-b"));
     assert_eq!(status, 403, "{v}");
     assert_eq!(v["diagnostics"][0]["code"], "api.actor_not_allowed");
@@ -799,6 +799,10 @@ fn the_production_check_walks_the_callers_ancestry() {
         send(&r.data.socket, &Outgoing::new("GET", "/", None)).0,
         200
     );
+    // End the turn before the stop: the drain's grace lasts while a turn
+    // runs, so a turn still held here would hold the stop for the whole
+    // grace (120 s by default).
+    drop(mine);
     assert_eq!(r.stop(), 0);
 }
 

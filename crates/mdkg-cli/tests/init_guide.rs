@@ -178,6 +178,13 @@ fn ref_mode_readme_describes_ref_mode() {
             "ref-mode guide has {checkout_only:?}"
         );
     }
+    // Agents get a lead: read the skill, never init an existing clone.
+    let lead = guide.split_once("\n\n## ").expect("the guide's opening").0;
+    assert!(lead.contains("mdkg skills show mdkg-workflow"), "{lead}");
+    assert!(
+        lead.contains("Never run\n`mdkg init` in an existing clone"),
+        "{lead}"
+    );
     // A graph-only init adds the skill later, on the graph ref (#19581).
     assert!(guide.contains("publishes it on the graph ref"), "{guide}");
     // The integration recipe, as written, mirrors the skills from the
